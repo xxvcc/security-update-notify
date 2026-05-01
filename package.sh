@@ -29,6 +29,7 @@ tar -C "$ROOT" \
   --exclude='./*.sha256' \
   --exclude='./*~' \
   --exclude='./.DS_Store' \
+  --exclude='./README-longlan.md' \
   -cf - . | tar -C "$WORK/$PKG" --strip-components=1 -xf -
 
 # Normalize executable permissions.
