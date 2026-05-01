@@ -3,7 +3,7 @@ set -euo pipefail
 
 VERSION="${VERSION:-}"
 if [[ -z "$VERSION" ]]; then
-  VERSION="$(grep -E '^VERSION=' files/debian-security-notify | head -1 | cut -d'"' -f2)"
+  VERSION="$(grep -E '^VERSION=' files/security-update-notify | head -1 | cut -d'"' -f2)"
 fi
 [[ -n "$VERSION" ]] || { echo "Cannot determine version" >&2; exit 1; }
 
@@ -14,11 +14,11 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 cd "$ROOT"
-bash -n install.sh menu.sh test.sh uninstall.sh package.sh files/debian-security-notify
+bash -n install.sh menu.sh test.sh uninstall.sh package.sh files/security-update-notify
 [[ -f README.md ]] || { echo "README.md missing" >&2; exit 1; }
 [[ -f CHANGELOG.md ]] || { echo "CHANGELOG.md missing" >&2; exit 1; }
 [[ -f LICENSE ]] || { echo "LICENSE missing" >&2; exit 1; }
-[[ -f files/debian-security-notify.service ]] || { echo "service file missing" >&2; exit 1; }
+[[ -f files/security-update-notify.service ]] || { echo "service file missing" >&2; exit 1; }
 [[ -f files/needrestart-report-only.conf ]] || { echo "needrestart config missing" >&2; exit 1; }
 
 mkdir -p "$WORK/$PKG" "$DIST"
@@ -32,8 +32,8 @@ tar -C "$ROOT" \
   -cf - . | tar -C "$WORK/$PKG" --strip-components=1 -xf -
 
 # Normalize executable permissions.
-chmod 0755 "$WORK/$PKG"/*.sh "$WORK/$PKG/files/debian-security-notify"
-chmod 0644 "$WORK/$PKG/README.md" "$WORK/$PKG/CHANGELOG.md" "$WORK/$PKG/LICENSE" "$WORK/$PKG/files/debian-security-notify.service" "$WORK/$PKG/files/needrestart-report-only.conf" "$WORK/$PKG/files/security-update-notify.logrotate"
+chmod 0755 "$WORK/$PKG"/*.sh "$WORK/$PKG/files/security-update-notify"
+chmod 0644 "$WORK/$PKG/README.md" "$WORK/$PKG/CHANGELOG.md" "$WORK/$PKG/LICENSE" "$WORK/$PKG/files/security-update-notify.service" "$WORK/$PKG/files/needrestart-report-only.conf" "$WORK/$PKG/files/security-update-notify.logrotate"
 
 # Safety: release package must not contain local runtime config/state files.
 if find "$WORK/$PKG" -type f \( -name 'telegram.env' -o -name '*.log' -o -name 'last-alert*' \) | grep -q .; then

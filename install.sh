@@ -241,8 +241,8 @@ chmod 0640 /var/log/security-update-notify.log
 if [[ -d /etc/logrotate.d ]]; then
   install -m 0644 "$SCRIPT_DIR/files/security-update-notify.logrotate" /etc/logrotate.d/security-update-notify
 fi
-install -m 0750 "$SCRIPT_DIR/files/debian-security-notify" /usr/local/sbin/security-update-notify
-install -m 0644 "$SCRIPT_DIR/files/debian-security-notify.service" /etc/systemd/system/security-update-notify.service
+install -m 0750 "$SCRIPT_DIR/files/security-update-notify" /usr/local/sbin/security-update-notify
+install -m 0644 "$SCRIPT_DIR/files/security-update-notify.service" /etc/systemd/system/security-update-notify.service
 # Backward-compatible symlink for old command name.
 ln -sf /usr/local/sbin/security-update-notify /usr/local/sbin/debian-security-notify
 
