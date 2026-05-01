@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Bootstrap installer for security-update-notify.
-# Put this script on your website, e.g. https://example.com/install/security-update-notify.sh
+# Publish this script on your website, e.g. https://example.com/install/sun.sh
 
 REPO="${SECURITY_UPDATE_NOTIFY_REPO:-YOUR_GITHUB_USER/security-update-notify}"
 VERSION="${SECURITY_UPDATE_NOTIFY_VERSION:-latest}"
@@ -13,8 +13,8 @@ INSTALL_ARGS=()
 usage() {
   cat <<'EOF'
 Usage:
-  curl -fsSL https://example.com/install/security-update-notify.sh | sudo bash
-  curl -fsSL https://example.com/install/security-update-notify.sh | sudo bash -s -- install [install args]
+  curl -fsSL https://example.com/install/sun.sh | sudo bash
+  curl -fsSL https://example.com/install/sun.sh | sudo bash -s -- install [install args]
 
 Bootstrap options:
   --version VERSION       Release version, e.g. 1.1.0. Default: latest

@@ -63,13 +63,13 @@ prompt_secret() {
   set +u; current="${!var_name}"; set -u
   [[ -n "$current" ]] && return
   [[ "$NON_INTERACTIVE" -eq 1 ]] && { echo "Missing required option: $prompt" >&2; exit 2; }
-  echo "$prompt（输入时不会显示，输完按回车）:"
+  echo "$prompt (input is hidden; press Enter when done):"
   read -r -s current; echo
   while [[ -z "$current" ]]; do
-    echo "$prompt 不能为空。输入时仍然不会显示，输完按回车："
+    echo "$prompt cannot be empty. Input is still hidden; press Enter when done:"
     read -r -s current; echo
   done
-  echo "$prompt 已收到。"
+  echo "$prompt received."
   printf -v "$var_name" '%s' "$current"
 }
 prompt_text() { local var_name="$1" prompt="$2" default="$3" current; set +u; current="${!var_name}"; set -u; [[ -n "$current" ]] && return; [[ "$NON_INTERACTIVE" -eq 1 ]] && { printf -v "$var_name" '%s' "$default"; return; }; read -r -p "$prompt [$default]: " current; printf -v "$var_name" '%s' "${current:-$default}"; }
@@ -79,39 +79,39 @@ valid_time() { [[ "$1" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; }
 telegram_preflight() {
   [[ "$SKIP_TELEGRAM_TEST" -eq 1 ]] && { echo "Skipping Telegram preflight test."; return; }
   while true; do
-    echo "正在验证 Telegram Bot Token..."
+    echo "Validating Telegram Bot Token..."
     local getme bot_user
     if ! getme="$(curl -fsS --connect-timeout 10 --max-time 20 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" 2>/tmp/security-update-notify-tg.err)"; then
-      echo "❌ Telegram Token 验证失败。"
+      echo "❌ Telegram token validation failed."
       cat /tmp/security-update-notify-tg.err 2>/dev/null || true
     elif ! printf '%s' "$getme" | grep -q '"ok":true'; then
-      echo "❌ Telegram Token 无效。返回：$getme"
+      echo "❌ Telegram token is invalid. Response: $getme"
     else
       bot_user="$(printf '%s' "$getme" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("result",{}).get("username", "unknown"))' 2>/dev/null || echo unknown)"
-      echo "✅ Token 有效：@${bot_user}"
-      echo "正在发送测试消息到 Telegram Chat ID..."
-      local text="✅ security-update-notify Telegram 测试成功。主机：$(hostname -f 2>/dev/null || hostname)"
+      echo "✅ Token is valid: @${bot_user}"
+      echo "Sending test message to Telegram Chat ID..."
+      local text="✅ security-update-notify Telegram test succeeded. Host: $(hostname -f 2>/dev/null || hostname)"
       if curl -fsS --connect-timeout 10 --max-time 20         -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"         -d "chat_id=${TELEGRAM_CHAT_ID}"         --data-urlencode "text=${text}" >/tmp/security-update-notify-send.out 2>/tmp/security-update-notify-tg.err; then
-        echo "✅ Telegram 测试消息发送成功。"
+        echo "✅ Telegram test message sent."
         return
       else
-        echo "❌ Telegram 测试消息发送失败。"
+        echo "❌ Telegram test message failed."
         cat /tmp/security-update-notify-tg.err 2>/dev/null || true
       fi
     fi
     cat <<'EOF'
-可能原因：
-1. Bot Token 错误
-2. Chat ID 错误
-3. 你还没有给 bot 发过 /start
-4. bot 没有进入对应群组或没有发言权限
-5. 服务器无法访问 api.telegram.org
+Possible causes:
+1. Bot token is wrong
+2. Chat ID is wrong
+3. You have not sent /start to the bot
+4. The bot is not in the target group or cannot post there
+5. This server cannot reach api.telegram.org
 EOF
     if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
       echo "Non-interactive mode: Telegram preflight failed." >&2
       exit 2
     fi
-    read -r -p "是否重新输入 Telegram Token 和 Chat ID？[Y/n]: " retry
+    read -r -p "Re-enter Telegram token and chat ID? [Y/n]: " retry
     [[ "${retry:-Y}" =~ ^[Yy]$ ]] || { echo "Telegram preflight failed; aborting." >&2; exit 2; }
     TELEGRAM_BOT_TOKEN=""
     TELEGRAM_CHAT_ID=""

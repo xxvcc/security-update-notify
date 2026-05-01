@@ -1,38 +1,65 @@
 # security-update-notify
 
-Portable security-update notifier for systemd Linux servers.
+`security-update-notify` (SUN) is a small systemd-based Linux utility that installs unattended **security** updates, checks whether a reboot or service restart is needed, and sends Telegram alerts only when attention is required.
 
-It configures unattended security updates, keeps automatic reboot disabled, checks whether reboot/service restarts are needed, then sends Telegram alerts only when attention is needed.
+It is designed for people who manage multiple servers and want fast security update coverage without exposing a remote-control endpoint.
 
-No public callback endpoint. No Telegram polling. No remote reboot button. Multiple servers can reuse the same Telegram bot token and chat ID because each host only calls `sendMessage`.
+## Highlights
+
+- Automatic security updates via the distribution's official mechanism
+- No automatic reboot
+- Reboot/service-restart detection
+- Telegram notifications via outbound HTTPS only
+- Duplicate-alert suppression (`always`, `daily`, or `interval`)
+- Interactive menu and non-interactive install modes
+- `apt` and `dnf` backends
+- systemd timer scheduling
+- Release packaging and checksum generation
+
+## Security posture
+
+SUN is intentionally notification-only:
+
+- It does **not** reboot servers automatically.
+- It does **not** listen on any network port.
+- It does **not** use Telegram long polling or webhooks.
+- It only sends outbound HTTPS requests to the Telegram Bot API.
+- Telegram credentials are stored in `/etc/security-update-notify/telegram.env` with root-only permissions (`0600`).
+- Runtime state is stored in `/var/lib/security-update-notify`.
+- Logs are written to `/var/log/security-update-notify.log` and rotated with logrotate when available.
+- Best-effort distributions require explicit `--allow-best-effort` opt-in.
+
+Release `.sha256` files protect against accidental corruption or mismatch. They do **not** protect against a compromised release host. Stronger artifact signing may be added later.
 
 ## Supported systems
 
 The installer is intentionally strict and stops on unsupported distributions.
 
-Supported:
+### Supported
 
 - Debian 12 / 13 (`apt` backend)
 - Ubuntu 22.04 / 24.04 (`apt` backend)
-- RHEL / Rocky / AlmaLinux 8 / 9 (`dnf` backend)
+- RHEL / Rocky Linux / AlmaLinux 8 / 9 (`dnf` backend)
 - Fedora current releases (`dnf` backend)
 
-Best effort (requires `--allow-best-effort`):
+### Best effort (`--allow-best-effort` required)
 
 - Debian 11
 - Ubuntu 20.04
 - CentOS Stream 8 / 9
 - Amazon Linux 2023
 
-Not supported yet:
+### Not supported yet
 
-- Alpine, Arch, SUSE/openSUSE
+- Alpine
+- Arch Linux
+- SUSE / openSUSE
 - Containers or minimal systems without full systemd
 - EOL systems without active security repositories
 
 ## Backends
 
-### apt backend
+### `apt` backend
 
 Installs/configures:
 
@@ -47,7 +74,7 @@ Detection:
 - `/var/run/reboot-required.pkgs`
 - `needrestart -b`
 
-### dnf backend
+### `dnf` backend
 
 Installs/configures:
 
@@ -61,32 +88,31 @@ Detection:
 - `needs-restarting`
 - `dnf updateinfo list security updates`
 
-The DNF backend configures `dnf-automatic` with `upgrade_type = security` and `apply_updates = yes` where `/etc/dnf/automatic.conf` exists.
+When `/etc/dnf/automatic.conf` exists, the installer configures `dnf-automatic` with:
 
-## What it installs
+```ini
+upgrade_type = security
+apply_updates = yes
+```
 
-- `/usr/local/sbin/security-update-notify`
-- `/etc/security-update-notify/telegram.env` (`0600`, contains bot token)
-- `/etc/systemd/system/security-update-notify.service`
-- `/etc/systemd/system/security-update-notify.timer`
-- backend-specific automatic security update configuration
+## Installation
 
-## Interactive menu
+### Interactive menu
 
 ```bash
 sudo ./menu.sh
 ```
 
-The interactive entry starts with:
+Menu:
 
 ```text
-1) 安装 / 升级
-2) 卸载
-3) 检测 / 诊断
-0) 退出
+1) Install / upgrade
+2) Uninstall
+3) Check / diagnose
+0) Exit
 ```
 
-## Interactive install directly
+### Direct interactive install
 
 ```bash
 sudo ./install.sh
@@ -94,23 +120,22 @@ sudo ./install.sh
 
 Prompts for:
 
-- Telegram Bot Token（隐藏输入；Token 输入时不会回显，输完按回车即可）
+- Telegram Bot Token (hidden input; press Enter when done)
 - Telegram Chat ID
 - Daily check time, default `09:00`
 - Same-alert reminder mode:
   - `always`: same alert only once until state changes
   - `daily`: same alert once per day
   - `interval`: same alert every N days, default/recommended `3`
-- Whether to send a test message
+- Whether to send an additional test message after install
 
-
-Telegram validation is run by default after entering token and chat ID:
+Telegram validation runs by default after token and chat ID are entered:
 
 - `getMe` validates the bot token
 - `sendMessage` validates the chat ID and bot permissions
-- use `--skip-telegram-test` only if you intentionally want to skip this preflight
+- Use `--skip-telegram-test` only when intentionally skipping this preflight
 
-## Non-interactive install
+### Non-interactive install
 
 ```bash
 sudo ./install.sh \
@@ -119,32 +144,67 @@ sudo ./install.sh \
   --time '09:00' \
   --dedup-mode interval \
   --dedup-interval-days 3 \
-  --send-test \
   --non-interactive \
   -y
 ```
 
-Force backend if needed:
+Optional flags:
 
 ```bash
 sudo ./install.sh --backend apt ...
 sudo ./install.sh --backend dnf ...
-```
-
-
-Best-effort systems require explicit opt-in:
-
-```bash
 sudo ./install.sh --allow-best-effort ...
+sudo ./install.sh --host-label 'prod-web-01' ...
+sudo ./install.sh --skip-telegram-test ...
 ```
 
-Optional host label:
+## One-command bootstrap installer
+
+`sun.sh` is the website/bootstrap installer. Publish it at a stable URL, for example:
+
+```text
+https://example.com/install/sun.sh
+```
+
+Before publishing, edit its default `REPO`, or provide it at runtime:
 
 ```bash
-sudo ./install.sh --host-label 'prod-web-01' ...
+curl -fsSL https://example.com/install/sun.sh | sudo SECURITY_UPDATE_NOTIFY_REPO='OWNER/security-update-notify' bash
 ```
 
-## Test
+Interactive menu:
+
+```bash
+curl -fsSL https://example.com/install/sun.sh | sudo bash
+```
+
+Non-interactive install:
+
+```bash
+curl -fsSL https://example.com/install/sun.sh | sudo bash -s -- install \
+  --telegram-token 'TOKEN' \
+  --telegram-chat-id 'CHAT_ID' \
+  --non-interactive \
+  -y
+```
+
+The bootstrap script downloads the release tarball and `.sha256`, verifies the checksum, extracts the package, then runs `menu.sh`, `install.sh`, `test.sh`, or `uninstall.sh`.
+
+## What gets installed
+
+- `/usr/local/sbin/security-update-notify`
+- `/etc/security-update-notify/telegram.env`
+- `/etc/systemd/system/security-update-notify.service`
+- `/etc/systemd/system/security-update-notify.timer`
+- `/etc/logrotate.d/security-update-notify` when logrotate is available
+- backend-specific automatic security update configuration
+
+Packages installed as needed:
+
+- `apt`: `unattended-upgrades`, `needrestart`, `apt-listchanges`, `curl`, `python3`, `ca-certificates`
+- `dnf`: `dnf-automatic`, `yum-utils` or `dnf-utils`, `curl`, `python3`, `ca-certificates`
+
+## Testing and diagnostics
 
 Read-only checks:
 
@@ -164,89 +224,36 @@ Send a simulated reboot-required alert. This does **not** reboot:
 sudo ./test.sh --simulate-reboot --no-dedupe
 ```
 
-## Useful commands
-
-Check timer:
-
-```bash
-systemctl list-timers security-update-notify.timer
-```
-
-Run once manually:
-
-```bash
-sudo systemctl start security-update-notify.service
-```
-
-Run script directly:
-
-```bash
-sudo /usr/local/sbin/security-update-notify --test-ok --no-dedupe
-```
-
-Version:
+Installed command diagnostics:
 
 ```bash
 security-update-notify --version
-```
-
-Doctor/config check:
-
-```bash
 sudo security-update-notify --doctor
 ```
 
-Logs:
+Useful systemd/log commands:
 
 ```bash
+systemctl list-timers security-update-notify.timer
+sudo systemctl start security-update-notify.service
 sudo tail -n 100 /var/log/security-update-notify.log
 ```
 
-
-
-## Security notes
-
-This tool is designed to reduce update lag without adding a remote-control surface.
-
-- It does **not** automatically reboot servers.
-- It does **not** listen on any network port.
-- It does **not** use Telegram long polling or webhooks.
-- It only sends outbound HTTPS requests to the Telegram Bot API.
-- The Telegram token is stored in `/etc/security-update-notify/telegram.env` with root-only permissions (`0600`).
-- Runtime state is stored under `/var/lib/security-update-notify`.
-- Logs are written to `/var/log/security-update-notify.log` and rotated via logrotate when available.
-- `best-effort` distributions require explicit `--allow-best-effort` opt-in.
-- Release `.sha256` files protect against accidental corruption/mismatch, not against a compromised release host. Stronger signing may be added later.
-
-Before deploying widely, test on one non-critical host first:
-
-```bash
-sudo ./test.sh --send-test --no-dedupe
-sudo ./test.sh --simulate-reboot --no-dedupe
-```
-
-## Security model
-
-- Updates are handled by the distro's official unattended update mechanism.
-- Only security updates are enabled by the local policy where the distro supports that distinction.
-- Automatic reboot is disabled.
-- Restart detectors are report-only; they do not auto-restart services.
-- Telegram token is root-only in `/etc/security-update-notify/telegram.env`.
-- The script only sends outbound Telegram HTTPS requests; it does not listen on any port.
-
 ## Uninstall
+
+Remove the program and system integration while keeping configuration/state:
 
 ```bash
 sudo ./uninstall.sh
 ```
 
-Remove config/state too:
+Remove configuration and state too:
 
 ```bash
 sudo ./uninstall.sh --purge-config
 ```
 
-Packages are intentionally left installed.
+Packages installed by the tool are intentionally left installed.
 
 ## Release packaging
 
@@ -263,44 +270,34 @@ dist/security-update-notify-VERSION.tar.gz
 dist/security-update-notify-VERSION.tar.gz.sha256
 ```
 
-## Website bootstrap installer
-
-Publish `sun.sh` to your website, for example:
+## Repository layout
 
 ```text
-https://example.com/install/security-update-notify.sh
+.github/workflows/ci.yml      GitHub Actions CI
+CHANGELOG.md                  Release notes
+LICENSE                       MIT license
+README.md                     Project documentation
+sun.sh                        Website/bootstrap installer
+install.sh                    Installer
+menu.sh                       Interactive menu
+package.sh                    Release package builder
+test.sh                       Diagnostics/test helper
+uninstall.sh                  Uninstaller
+files/                        Installed runtime templates
 ```
 
-Edit its default `REPO` first, or provide it at runtime:
+## Development
+
+Run local checks before committing:
 
 ```bash
-curl -fsSL https://example.com/install/security-update-notify.sh | sudo SECURITY_UPDATE_NOTIFY_REPO='OWNER/security-update-notify' bash
+bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify
+./package.sh
+cd dist && sha256sum -c security-update-notify-*.tar.gz.sha256
 ```
 
-Interactive menu:
+GitHub Actions runs the same syntax and packaging checks on push and pull requests.
 
-```bash
-curl -fsSL https://example.com/install/security-update-notify.sh | sudo bash
-```
+## License
 
-Non-interactive install:
-
-```bash
-curl -fsSL https://example.com/install/security-update-notify.sh | sudo bash -s -- install \
-  --telegram-token 'TOKEN' \
-  --telegram-chat-id 'CHAT_ID' \
-  --non-interactive \
-  -y
-```
-
-The bootstrap downloads the release tarball and `.sha256`, verifies checksum, then runs `menu.sh`, `install.sh`, `test.sh`, or `uninstall.sh`.
-
-## Log rotation
-
-The installer adds `/etc/logrotate.d/security-update-notify` when logrotate is available.
-
-## Project metadata
-
-- Changelog: `CHANGELOG.md`
-- License: MIT, see `LICENSE`
-- CI: `.github/workflows/ci.yml`
+MIT. See [`LICENSE`](LICENSE).
