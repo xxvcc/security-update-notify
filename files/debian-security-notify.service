@@ -1,0 +1,8 @@
+[Unit]
+Description=Notify Telegram when security updates require reboot or service restart
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/security-update-notify

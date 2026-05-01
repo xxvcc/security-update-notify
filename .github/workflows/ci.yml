@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shell-and-package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Shell syntax check
+        run: |
+          bash -n install.sh menu.sh test.sh uninstall.sh package.sh bootstrap-install.sh files/debian-security-notify
+
+      - name: Package release artifact
+        run: ./package.sh
+
+      - name: Verify checksum
+        run: |
+          cd dist
+          sha256sum -c security-update-notify-*.tar.gz.sha256
+
+      - name: Inspect package contents
+        run: |
+          mkdir -p /tmp/security-update-notify-ci
+          tar -xzf dist/security-update-notify-*.tar.gz -C /tmp/security-update-notify-ci
+          find /tmp/security-update-notify-ci -maxdepth 3 -type f -print | sort
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-update-notify-dist
+          path: dist/*
