@@ -15,7 +15,7 @@ jobs:
 
       - name: Shell syntax check
         run: |
-          bash -n install.sh menu.sh test.sh uninstall.sh package.sh bootstrap-install.sh files/security-update-notify
+          bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify
 
       - name: Package release artifact
         run: ./package.sh

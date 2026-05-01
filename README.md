@@ -265,7 +265,7 @@ dist/security-update-notify-VERSION.tar.gz.sha256
 
 ## Website bootstrap installer
 
-Publish `bootstrap-install.sh` to your website, for example:
+Publish `sun.sh` to your website, for example:
 
 ```text
 https://example.com/install/security-update-notify.sh
