@@ -16,3 +16,6 @@ last-alert*
 .vscode/
 .idea/
 .cache/
+
+# Personal/private maintainer notes
+README-longlan.md
