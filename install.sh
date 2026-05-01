@@ -243,8 +243,6 @@ if [[ -d /etc/logrotate.d ]]; then
 fi
 install -m 0750 "$SCRIPT_DIR/files/security-update-notify" /usr/local/sbin/security-update-notify
 install -m 0644 "$SCRIPT_DIR/files/security-update-notify.service" /etc/systemd/system/security-update-notify.service
-# Backward-compatible symlink for old command name.
-ln -sf /usr/local/sbin/security-update-notify /usr/local/sbin/debian-security-notify
 
 if [[ "$BACKEND" == "apt" ]]; then
   install -d -m 0755 /etc/needrestart/conf.d
@@ -307,11 +305,6 @@ umask 077
   printf 'BACKEND=%s\n' "$(shell_quote "$BACKEND")"
 } >/etc/security-update-notify/telegram.env
 chmod 600 /etc/security-update-notify/telegram.env
-# Backward-compatible config path.
-install -d -m 0750 /etc/debian-security-notify
-cp /etc/security-update-notify/telegram.env /etc/debian-security-notify/telegram.env
-chmod 600 /etc/debian-security-notify/telegram.env
-
 cat >/etc/systemd/system/security-update-notify.timer <<EOF
 [Unit]
 Description=Daily security update reboot/service-restart notification
@@ -333,7 +326,6 @@ if [[ "$BACKEND" == "apt" ]]; then
 elif [[ "$BACKEND" == "dnf" ]]; then
   systemctl enable --now dnf-automatic.timer >/dev/null 2>&1 || true
 fi
-systemctl disable --now debian-security-notify.timer >/dev/null 2>&1 || true
 systemctl enable --now security-update-notify.timer >/dev/null
 
 bash -n /usr/local/sbin/security-update-notify

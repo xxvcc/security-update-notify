@@ -72,9 +72,8 @@ fi
 echo
 
 CONFIG=/etc/security-update-notify/telegram.env
-[[ -r "$CONFIG" ]] || CONFIG=/etc/debian-security-notify/telegram.env
 if [[ ! -r "$CONFIG" ]]; then
-  echo "ERROR config file not readable: /etc/security-update-notify/telegram.env or /etc/debian-security-notify/telegram.env" >&2
+  echo "ERROR config file not readable: /etc/security-update-notify/telegram.env" >&2
   exit 1
 fi
 # shellcheck disable=SC1090

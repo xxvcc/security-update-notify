@@ -66,9 +66,7 @@ The DNF backend configures `dnf-automatic` with `upgrade_type = security` and `a
 ## What it installs
 
 - `/usr/local/sbin/security-update-notify`
-- compatibility symlink: `/usr/local/sbin/debian-security-notify`
 - `/etc/security-update-notify/telegram.env` (`0600`, contains bot token)
-- compatibility copy: `/etc/debian-security-notify/telegram.env`
 - `/etc/systemd/system/security-update-notify.service`
 - `/etc/systemd/system/security-update-notify.timer`
 - backend-specific automatic security update configuration

@@ -17,7 +17,7 @@ Security and release-quality fixes.
 
 Multi-distro and release-prep update.
 
-- Renamed runtime tool to `security-update-notify` while preserving `debian-security-notify` compatibility symlink.
+- Renamed runtime tool to `security-update-notify`.
 - Added `apt` backend for Debian/Ubuntu.
 - Added `dnf` backend for RHEL/Rocky/AlmaLinux/Fedora/CentOS Stream/Amazon Linux 2023 support tiers.
 - Added interactive menu: install/upgrade, uninstall, diagnostics.
