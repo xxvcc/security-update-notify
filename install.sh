@@ -14,6 +14,9 @@ SKIP_TELEGRAM_TEST=0
 NON_INTERACTIVE=0
 ASSUME_YES=0
 ALLOW_BEST_EFFORT=0
+TMP_DIR=""
+cleanup() { [[ -n "$TMP_DIR" ]] && rm -rf "$TMP_DIR"; }
+trap cleanup EXIT
 
 usage() {
   cat <<'EOF'
@@ -78,12 +81,16 @@ valid_time() { [[ "$1" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; }
 
 telegram_preflight() {
   [[ "$SKIP_TELEGRAM_TEST" -eq 1 ]] && { echo "Skipping Telegram preflight test."; return; }
+  local tg_err send_out
+  TMP_DIR="${TMP_DIR:-$(mktemp -d)}"
+  tg_err="$TMP_DIR/telegram.err"
+  send_out="$TMP_DIR/send.out"
   while true; do
     echo "Validating Telegram Bot Token..."
     local getme bot_user
-    if ! getme="$(curl -fsS --connect-timeout 10 --max-time 20 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" 2>/tmp/security-update-notify-tg.err)"; then
+    if ! getme="$(curl -fsS --connect-timeout 10 --max-time 20 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" 2>"$tg_err")"; then
       echo "❌ Telegram token validation failed."
-      cat /tmp/security-update-notify-tg.err 2>/dev/null || true
+      cat "$tg_err" 2>/dev/null || true
     elif ! printf '%s' "$getme" | grep -q '"ok":true'; then
       echo "❌ Telegram token is invalid. Response: $getme"
     else
@@ -91,12 +98,12 @@ telegram_preflight() {
       echo "✅ Token is valid: @${bot_user}"
       echo "Sending test message to Telegram Chat ID..."
       local text="✅ security-update-notify Telegram test succeeded. Host: $(hostname -f 2>/dev/null || hostname)"
-      if curl -fsS --connect-timeout 10 --max-time 20         -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"         -d "chat_id=${TELEGRAM_CHAT_ID}"         --data-urlencode "text=${text}" >/tmp/security-update-notify-send.out 2>/tmp/security-update-notify-tg.err; then
+      if printf '%s' "$text" | curl -fsS --connect-timeout 10 --max-time 20         -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"         -d "chat_id=${TELEGRAM_CHAT_ID}"         --data-urlencode "text@-" >"$send_out" 2>"$tg_err"; then
         echo "✅ Telegram test message sent."
         return
       else
         echo "❌ Telegram test message failed."
-        cat /tmp/security-update-notify-tg.err 2>/dev/null || true
+        cat "$tg_err" 2>/dev/null || true
       fi
     fi
     cat <<'EOF'

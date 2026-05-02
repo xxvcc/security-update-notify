@@ -2,6 +2,8 @@
 set -euo pipefail
 
 SEND_TEST=0; SIMULATE_REBOOT=0; NO_DEDUPE=0
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
 usage(){ cat <<'EOU'
 Usage: sudo ./test.sh [options]
   --send-test        Send a normal OK Telegram test message
@@ -56,7 +58,7 @@ echo "== syntax/systemd =="
 bash -n /usr/local/sbin/security-update-notify && echo "OK script syntax"
 /usr/local/sbin/security-update-notify --version
 /usr/local/sbin/security-update-notify --doctor
-systemd-analyze verify /etc/systemd/system/security-update-notify.service /etc/systemd/system/security-update-notify.timer >/tmp/security-update-notify-systemd-verify.log 2>&1 && echo "OK systemd units" || { cat /tmp/security-update-notify-systemd-verify.log; exit 1; }
+systemd-analyze verify /etc/systemd/system/security-update-notify.service /etc/systemd/system/security-update-notify.timer >"$TMP_DIR/systemd-verify.log" 2>&1 && echo "OK systemd units" || { cat "$TMP_DIR/systemd-verify.log"; exit 1; }
 echo
 
 echo "== timer =="; systemctl is-enabled security-update-notify.timer; systemctl list-timers security-update-notify.timer --no-pager; echo
@@ -64,7 +66,7 @@ echo "== timer =="; systemctl is-enabled security-update-notify.timer; systemctl
 echo "== reboot/restart detection =="
 if [[ "$BACKEND" == apt ]]; then
   [[ -f /var/run/reboot-required ]] && { echo REBOOT_REQUIRED=yes; cat /var/run/reboot-required.pkgs 2>/dev/null || true; } || echo REBOOT_REQUIRED=no
-  needrestart -b 2>&1 | sed -n '1,120p'
+  needrestart -b 2>&1 | sed -n '1,120p' || true
 elif [[ "$BACKEND" == dnf ]]; then
   needs-restarting -r 2>&1 || true
   needs-restarting 2>&1 | sed -n '1,120p' || true

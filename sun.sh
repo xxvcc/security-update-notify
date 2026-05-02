@@ -45,6 +45,8 @@ done
 [[ "$(id -u)" -eq 0 ]] || { echo "Please run with sudo/root" >&2; exit 1; }
 for c in curl tar sha256sum mktemp python3; do command -v "$c" >/dev/null 2>&1 || { echo "Missing required command: $c" >&2; exit 1; }; done
 
+[[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "Invalid REPO format: $REPO" >&2; exit 2; }
+
 if [[ "$VERSION" == "latest" ]]; then
   [[ "$REPO" != "YOUR_GITHUB_USER/security-update-notify" ]] || { echo "Set SECURITY_UPDATE_NOTIFY_REPO or edit bootstrap REPO before publishing." >&2; exit 2; }
   api="https://api.github.com/repos/${REPO}/releases/latest"

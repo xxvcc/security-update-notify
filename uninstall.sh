@@ -23,6 +23,7 @@ if [[ "$PURGE_CONFIG" -eq 1 ]]; then
   rm -f /etc/apt/apt.conf.d/52unattended-upgrades-local
   rm -f /etc/needrestart/conf.d/99-security-update-notify-report-only.conf
   echo "Removed config/state too. Note: packages and /etc/apt/apt.conf.d/20auto-upgrades were left in place."
+  ls /etc/dnf/automatic.conf.bak.* >/dev/null 2>&1 && echo "Note: /etc/dnf/automatic.conf backups remain; remove manually if desired." || true
 fi
 
 echo "Uninstalled security-update-notify."

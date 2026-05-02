@@ -41,8 +41,7 @@ flock -n 9 || exit 0
 log_event() {
   local line="$1"
   mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
-  printf '%s %s
-' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$line" >>"$LOG_FILE" 2>/dev/null || true
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$line" >>"$LOG_FILE" 2>/dev/null || true
 }
 
 if [[ -r "$ENV_FILE" ]]; then
@@ -198,6 +197,8 @@ else
   rs="$(printf '%s\n' "$restart_summary" | sed -n '1,100p')"
   msg="⚠️ 安全更新后需要处理\n\n主机：$HOST\n系统：$OS\n后端：$BACKEND\n当前内核：$KERNEL\n时间：$NOW\n\n整机重启：$([[ "$reboot_required" -eq 1 ]] && echo '需要' || echo '暂不需要')\n相关包/安全更新：\n$pkgs_block\n\n重启检测摘要：\n$rs\n\n建议：请在方便的维护窗口 SSH 登录该服务器后手动执行 reboot；如只是服务需要重启，可先评估并重启对应服务。"
 fi
+msg="${msg//\\n/$'\n'}"
+
 
 alert_hash="$(printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$HOST" "$BACKEND" "$reboot_required" "$reboot_pkgs" "$restart_attention" "$restart_summary" | sha256sum | awk '{print $1}')"
 last_hash="$(cat "$STATE_FILE" 2>/dev/null || true)"
@@ -205,6 +206,7 @@ last_sent="$(cat "$STATE_TIME_FILE" 2>/dev/null || echo 0)"
 now_epoch="$(date +%s)"
 dedup_mode="${DEDUP_MODE:-interval}"
 dedup_days="${DEDUP_INTERVAL_DAYS:-3}"
+[[ "$dedup_days" =~ ^[0-9]+$ && "$dedup_days" -ge 1 ]] || dedup_days=3
 should_send=1
 if [[ "$NO_DEDUPE" -ne 1 && "$alert_hash" == "$last_hash" ]]; then
   case "$dedup_mode" in
@@ -231,10 +233,10 @@ if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
 fi
 
 send_url="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
-if curl -fsS --retry 3 --connect-timeout 10 --max-time 30 \
+if printf '%s' "$msg" | curl -fsS --retry 3 --connect-timeout 10 --max-time 30 \
   -X POST "$send_url" \
   -d "chat_id=${TELEGRAM_CHAT_ID}" \
-  --data-urlencode "text=${msg}" \
+  --data-urlencode "text@-" \
   -d "disable_web_page_preview=true" >/dev/null; then
   printf '%s\n' "$alert_hash" >"$STATE_FILE"
   printf '%s\n' "$now_epoch" >"$STATE_TIME_FILE"
