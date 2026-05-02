@@ -128,7 +128,13 @@ SUN **不会**：
 
 ### 2. 安装
 
-克隆项目并运行交互式安装器：
+推荐使用网站引导安装器。它会下载最新 GitHub Release、校验 `.sha256`，然后启动交互式菜单：
+
+```bash
+curl -fsSL https://xxv.cc/sun.sh | sudo bash
+```
+
+如果你更想从源码运行，也可以：
 
 ```bash
 git clone https://github.com/xxvcc/security-update-notify.git

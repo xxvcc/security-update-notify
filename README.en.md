@@ -128,7 +128,13 @@ For groups, add the bot to the group and make sure it can send messages there.
 
 ### 2. Install
 
-Clone the project and run the interactive installer:
+Recommended: use the website-hosted bootstrap installer. It downloads the latest GitHub Release, verifies the `.sha256` file, then opens the interactive menu:
+
+```bash
+curl -fsSL https://xxv.cc/sun.sh | sudo bash
+```
+
+If you prefer running from source:
 
 ```bash
 git clone https://github.com/xxvcc/security-update-notify.git
