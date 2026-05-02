@@ -74,15 +74,22 @@ tar -xzf "$PKG"
 cd "security-update-notify-${VERSION}"
 
 # When invoked as `curl ... | sudo bash`, stdin is the script stream, not the
-# user terminal. Reattach stdin to /dev/tty before running interactive scripts.
-if [[ -r /dev/tty ]]; then
-  exec < /dev/tty
-fi
+# user terminal. For interactive modes, run the target script with stdin attached
+# to /dev/tty. Non-interactive install/test/uninstall calls can still use normal
+# stdin behavior when no terminal is available.
+run_target() {
+  local script="$1"; shift
+  if [[ -r /dev/tty ]]; then
+    exec "$script" "$@" < /dev/tty
+  else
+    exec "$script" "$@"
+  fi
+}
 
 case "$RUN_MODE" in
-  menu) exec ./menu.sh "${INSTALL_ARGS[@]}" ;;
-  install) exec ./install.sh "${INSTALL_ARGS[@]}" ;;
+  menu) run_target ./menu.sh "${INSTALL_ARGS[@]}" ;;
+  install) run_target ./install.sh "${INSTALL_ARGS[@]}" ;;
   test) exec ./test.sh "${INSTALL_ARGS[@]}" ;;
-  uninstall) exec ./uninstall.sh "${INSTALL_ARGS[@]}" ;;
+  uninstall) run_target ./uninstall.sh "${INSTALL_ARGS[@]}" ;;
   *) echo "Invalid mode: $RUN_MODE" >&2; exit 2 ;;
 esac
