@@ -73,6 +73,12 @@ sha256sum -c "$PKG.sha256"
 tar -xzf "$PKG"
 cd "security-update-notify-${VERSION}"
 
+# When invoked as `curl ... | sudo bash`, stdin is the script stream, not the
+# user terminal. Reattach stdin to /dev/tty before running interactive scripts.
+if [[ -r /dev/tty ]]; then
+  exec < /dev/tty
+fi
+
 case "$RUN_MODE" in
   menu) exec ./menu.sh "${INSTALL_ARGS[@]}" ;;
   install) exec ./install.sh "${INSTALL_ARGS[@]}" ;;
