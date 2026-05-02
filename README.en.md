@@ -44,19 +44,19 @@ SUN keeps the boring part automatic and makes the human part obvious.
 Example Telegram alert:
 
 ```text
-⚠️ 安全更新后需要处理
+⚠️ Security update action required
 
-主机：prod-web-01
-系统：Debian GNU/Linux 12 (bookworm)
-后端：apt
-当前内核：6.1.0-43-amd64
-时间：2026-05-02 09:08 CST
+Host: prod-web-01
+OS: Debian GNU/Linux 12 (bookworm)
+Backend: apt
+Current kernel: 6.1.0-43-amd64
+Time: 2026-05-02 09:08 CST
 
-整机重启：需要
-相关包/安全更新：
+Full reboot: Required
+Related packages/security updates:
 linux-image-amd64
 
-建议：请在方便的维护窗口 SSH 登录该服务器后手动执行 reboot。
+Recommendation: SSH into this server during a suitable maintenance window and run reboot if a full reboot is required.
 ```
 
 ## How it works
@@ -263,6 +263,13 @@ Run a check now:
 
 ```bash
 sudo systemctl start security-update-notify.service
+```
+
+Change Telegram alert language after installation:
+
+```bash
+sudoedit /etc/security-update-notify/telegram.env
+# Set NOTIFY_LANG=zh or NOTIFY_LANG=en
 ```
 
 Run built-in diagnostics:

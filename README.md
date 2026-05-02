@@ -265,6 +265,13 @@ systemctl list-timers security-update-notify.timer
 sudo systemctl start security-update-notify.service
 ```
 
+安装后切换 Telegram 提醒语言：
+
+```bash
+sudoedit /etc/security-update-notify/telegram.env
+# 设置 NOTIFY_LANG=zh 或 NOTIFY_LANG=en
+```
+
 运行内置诊断：
 
 ```bash
