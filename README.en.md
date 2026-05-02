@@ -56,7 +56,13 @@ Full reboot: Required
 Related packages/security updates:
 linux-image-amd64
 
-Recommendation: SSH into this server during a suitable maintenance window and run reboot if a full reboot is required.
+Restart detection summary:
+Kernel: current 6.1.0-43-amd64, expected 6.1.0-44-amd64
+Services to review/restart (2):
+• nginx.service
+• ssh.service
+
+Recommendation: SSH into this server during a suitable maintenance window and run reboot if a full reboot is required. If only services need restarting, review them first and restart the affected services manually.
 ```
 
 ## How it works

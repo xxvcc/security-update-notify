@@ -44,6 +44,35 @@ log_event() {
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$line" >>"$LOG_FILE" 2>/dev/null || true
 }
 
+load_config_file() {
+  local file="$1" line key value
+  [[ -r "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" == export\ * ]] && line="${line#export }"
+    [[ "$line" == *"="* ]] || { echo "Invalid config line in $file" >&2; return 2; }
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="${key//[[:space:]]/}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "Invalid config key in $file: $key" >&2; return 2; }
+    value="${value#${value%%[![:space:]]*}}"
+    value="${value%${value##*[![:space:]]}}"
+    if [[ "$value" != \"* && "$value" != \'* ]]; then
+      value="${value%%[[:space:]]#*}"
+      value="${value%${value##*[![:space:]]}}"
+    fi
+    if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
+    if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
+    case "$key" in
+      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|HOST_LABEL|NOTIFY_OK|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND)
+        printf -v "$key" '%s' "$value"
+        ;;
+      *) echo "Unsupported config key in $file: $key" >&2; return 2 ;;
+    esac
+  done <"$file"
+}
+
 telegram_get_me() {
   printf '%s' "${TELEGRAM_BOT_TOKEN:-}" | python3 -c '
 import sys, urllib.request
@@ -104,10 +133,7 @@ sys.exit(1)
 '
 }
 
-if [[ -r "$ENV_FILE" ]]; then
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
-fi
+load_config_file "$ENV_FILE" || exit $?
 
 HOST="${HOST_LABEL:-$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown)}"
 OS="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}")"

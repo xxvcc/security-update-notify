@@ -81,8 +81,36 @@ if [[ ! -r "$CONFIG" ]]; then
   echo "ERROR config file not readable: /etc/security-update-notify/telegram.env" >&2
   exit 1
 fi
-# shellcheck disable=SC1090
-source "$CONFIG"
+
+load_config_file() {
+  local file="$1" line key value
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" == export\ * ]] && line="${line#export }"
+    [[ "$line" == *"="* ]] || { echo "Invalid config line in $file" >&2; return 2; }
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="${key//[[:space:]]/}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "Invalid config key in $file: $key" >&2; return 2; }
+    value="${value#${value%%[![:space:]]*}}"
+    value="${value%${value##*[![:space:]]}}"
+    if [[ "$value" != \"* && "$value" != \'* ]]; then
+      value="${value%%[[:space:]]#*}"
+      value="${value%${value##*[![:space:]]}}"
+    fi
+    if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
+    if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
+    case "$key" in
+      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|HOST_LABEL|NOTIFY_OK|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND)
+        printf -v "$key" '%s' "$value"
+        ;;
+      *) echo "Unsupported config key in $file: $key" >&2; return 2 ;;
+    esac
+  done <"$file"
+}
+
+load_config_file "$CONFIG" || exit $?
 
 telegram_get_me() {
   printf '%s' "${TELEGRAM_BOT_TOKEN:-}" | python3 -c '
