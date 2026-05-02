@@ -62,13 +62,13 @@ Recommendation: SSH into this server during a suitable maintenance window and ru
 ## How it works
 
 ```text
-systemd timer
+distro auto-update timer (apt/dnf)
     ↓
-security-update-notify
+install security updates
     ↓
-install security updates using apt/dnf native tooling
+SUN systemd timer
     ↓
-check reboot / restarted-service state
+check post-update reboot / service-restart state
     ↓
 send Telegram message only if attention is required
 ```
@@ -261,7 +261,7 @@ SUN configures or uses:
 
 - `dnf-automatic`
 - `yum-utils` or `dnf-utils`
-- `curl`, `python3`, `ca-certificates`
+- `python3`, `ca-certificates`
 
 It checks:
 
@@ -356,7 +356,9 @@ dist/security-update-notify-VERSION.tar.gz
 dist/security-update-notify-VERSION.tar.gz.sha256
 ```
 
-The release archive contains only user-facing files:
+The release archive contains only user-facing installation, diagnostic, and documentation files. `sun.sh` is a website-hosted bootstrap script and is not included in release archives; publish it separately to your stable URL if you want to use it.
+
+Release archive contents:
 
 ```text
 .env.example

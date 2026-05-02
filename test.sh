@@ -40,9 +40,9 @@ echo "== OS =="; sed -n '1,8p' /etc/os-release; echo "Support: $SUPPORT"; echo "
 
 echo "== packages =="
 if [[ "$BACKEND" == apt ]]; then
-  for pkg in unattended-upgrades needrestart apt-listchanges curl python3 ca-certificates; do dpkg -s "$pkg" >/dev/null 2>&1 && echo "OK $pkg $(dpkg-query -W -f='${Version}' "$pkg")" || echo "MISSING $pkg"; done
+  for pkg in unattended-upgrades needrestart apt-listchanges python3 ca-certificates; do dpkg -s "$pkg" >/dev/null 2>&1 && echo "OK $pkg $(dpkg-query -W -f='${Version}' "$pkg")" || echo "MISSING $pkg"; done
 elif [[ "$BACKEND" == dnf ]]; then
-  for pkg in dnf-automatic curl python3 ca-certificates yum-utils dnf-utils; do rpm -q "$pkg" >/dev/null 2>&1 && echo "OK $(rpm -q "$pkg")" || true; done
+  for pkg in dnf-automatic python3 ca-certificates yum-utils dnf-utils; do rpm -q "$pkg" >/dev/null 2>&1 && echo "OK $(rpm -q "$pkg")" || true; done
   command -v needs-restarting >/dev/null && echo "OK needs-restarting present" || echo "MISSING needs-restarting"
 else
   echo "Unsupported backend"
@@ -85,10 +85,10 @@ fi
 source "$CONFIG"
 
 telegram_get_me() {
-  TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" python3 - <<'PY'
-import os, sys, urllib.request
+  python3 - "${TELEGRAM_BOT_TOKEN:-}" <<'PY'
+import sys, urllib.request
 
-token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+token = sys.argv[1] if len(sys.argv) > 1 else ""
 if not token:
     print("missing TELEGRAM_BOT_TOKEN", file=sys.stderr)
     sys.exit(2)

@@ -32,8 +32,7 @@ tar -C "$ROOT" \
   --exclude='./*.tar.gz' \
   --exclude='./*.sha256' \
   --exclude='./.env' \
-  --exclude='./.env.local' \
-  --exclude='./.env.production' \
+  --exclude='./.env.*' \
   --exclude='*.bak' \
   --exclude='*.tmp' \
   --exclude='./*~' \
@@ -46,6 +45,7 @@ tar -C "$ROOT" \
   --exclude='./package.sh' \
   --exclude='./sun.sh' \
   -cf - . | tar -C "$WORK/$PKG" --strip-components=1 -xf -
+cp "$ROOT/.env.example" "$WORK/$PKG/.env.example"
 
 # Normalize executable permissions.
 chmod 0755 "$WORK/$PKG"/*.sh "$WORK/$PKG/files/security-update-notify"
@@ -53,9 +53,9 @@ chmod 0644 "$WORK/$PKG/README.md" "$WORK/$PKG/README.en.md" "$WORK/$PKG/CHANGELO
 [[ -f "$WORK/$PKG/.env.example" ]] && chmod 0644 "$WORK/$PKG/.env.example"
 
 # Safety: release package must not contain local runtime config/state files.
-if find "$WORK/$PKG" -type f \( -name 'telegram.env' -o -name '*.log' -o -name 'last-alert*' \) | grep -q .; then
+if find "$WORK/$PKG" -type f \( -name '.env' -o -name '.env.*' ! -name '.env.example' -o -name 'telegram.env' -o -name '*.log' -o -name 'last-alert*' \) | grep -q .; then
   echo "Refusing to package runtime config/state files" >&2
-  find "$WORK/$PKG" -type f \( -name 'telegram.env' -o -name '*.log' -o -name 'last-alert*' \) >&2
+  find "$WORK/$PKG" -type f \( -name '.env' -o -name '.env.*' ! -name '.env.example' -o -name 'telegram.env' -o -name '*.log' -o -name 'last-alert*' \) >&2
   exit 1
 fi
 

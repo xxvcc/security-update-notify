@@ -20,6 +20,49 @@ jobs:
         run: |
           bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify
 
+      - name: Dotenv parser regression check
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          s = Path('install.sh').read_text()
+          start = s.index('load_env_file() {')
+          end = s.index('\nrequire_arg()', start)
+          harness = '''#!/usr/bin/env bash
+          set -euo pipefail
+          CHECK_TIME="09:00"; TELEGRAM_BOT_TOKEN=""; TELEGRAM_CHAT_ID=""; HOST_LABEL=""; DEDUP_MODE=""; DEDUP_INTERVAL_DAYS="3"; NOTIFY_LANG="zh"; BACKEND="auto"; SEND_TEST=0; SKIP_TELEGRAM_TEST=0; NON_INTERACTIVE=0; ASSUME_YES=0; ALLOW_BEST_EFFORT=0
+          ''' + s[start:end] + '''
+          load_env_file "$1"
+          printf '%s\n' "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" "$CHECK_TIME" "$NOTIFY_LANG" "$DEDUP_MODE" "$SEND_TEST" "$ALLOW_BEST_EFFORT" "$HOST_LABEL"
+          '''
+          Path('/tmp/sun-env-harness.sh').write_text(harness)
+          PY
+          chmod +x /tmp/sun-env-harness.sh
+          cat >/tmp/sun.env <<'EOF'
+          TELEGRAM_BOT_TOKEN=abc123 # inline comment
+          TELEGRAM_CHAT_ID=-100123
+          CHECK_TIME=10:30
+          NOTIFY_LANG=en
+          DEDUP_MODE=daily
+          SEND_TEST=TRUE
+          ALLOW_BEST_EFFORT=Yes
+          HOST_LABEL="prod web 01"
+          EOF
+          /tmp/sun-env-harness.sh /tmp/sun.env > /tmp/sun-env.out
+          diff -u /tmp/sun-env.out - <<'EOF'
+          abc123
+          -100123
+          10:30
+          en
+          daily
+          1
+          1
+          prod web 01
+          EOF
+          if /tmp/sun-env-harness.sh <(echo 'BAD_KEY=x') >/tmp/bad.out 2>/tmp/bad.err; then
+            echo "Unexpectedly accepted unknown env key" >&2
+            exit 1
+          fi
+
       - name: Package release artifact
         run: ./package.sh
 
@@ -33,6 +76,8 @@ jobs:
           mkdir -p /tmp/security-update-notify-ci
           tar -xzf dist/security-update-notify-*.tar.gz -C /tmp/security-update-notify-ci
           find /tmp/security-update-notify-ci -maxdepth 3 -type f -print | sort
+          tar -tzf dist/security-update-notify-*.tar.gz | grep '/.env.example$'
+          ! tar -tzf dist/security-update-notify-*.tar.gz | grep -E '/\.env$|/\.env\.(local|production)$'
 
       - name: Upload dist artifact
         uses: actions/upload-artifact@v4

@@ -45,7 +45,7 @@ EOF
 }
 
 load_env_file() {
-  local file="$1" line key value
+  local file="$1" line key value lower
   [[ -r "$file" ]] || { echo "Cannot read env file: $file" >&2; exit 2; }
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
@@ -57,6 +57,10 @@ load_env_file() {
     [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "Invalid env key in $file: $key" >&2; exit 2; }
     value="${value#${value%%[![:space:]]*}}"
     value="${value%${value##*[![:space:]]}}"
+    if [[ "$value" != \"* && "$value" != \'* ]]; then
+      value="${value%%[[:space:]]#*}"
+      value="${value%${value##*[![:space:]]}}"
+    fi
     if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
     if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
     case "$key" in
@@ -64,8 +68,9 @@ load_env_file() {
         printf -v "$key" '%s' "$value"
         ;;
       SEND_TEST|SKIP_TELEGRAM_TEST|NON_INTERACTIVE|ASSUME_YES|ALLOW_BEST_EFFORT)
-        [[ "$value" =~ ^(0|1|true|false|yes|no)$ ]] || { echo "Invalid boolean for $key in $file" >&2; exit 2; }
-        case "$value" in 1|true|yes) printf -v "$key" '%s' 1 ;; *) printf -v "$key" '%s' 0 ;; esac
+        lower="${value,,}"
+        [[ "$lower" =~ ^(0|1|true|false|yes|no)$ ]] || { echo "Invalid boolean for $key in $file" >&2; exit 2; }
+        case "$lower" in 1|true|yes) printf -v "$key" '%s' 1 ;; *) printf -v "$key" '%s' 0 ;; esac
         ;;
       *) echo "Unsupported env key in $file: $key" >&2; exit 2 ;;
     esac
@@ -250,11 +255,11 @@ echo "Detected ${PRETTY_NAME:-$ID $VERSION_ID} ($SUPPORT_LABEL, backend=$BACKEND
 [[ -d /run/systemd/system ]] || { echo "systemd is required; containers without systemd are not supported." >&2; exit 1; }
 command -v systemctl >/dev/null || { echo "systemctl is required" >&2; exit 1; }
 
-# Telegram preflight needs curl/python3/CA roots even on fresh servers.
+# Telegram preflight needs python3/CA roots even on fresh servers.
 MINIMAL_PACKAGES=()
 case "$BACKEND" in
   apt)
-    for pkg in curl python3 ca-certificates; do dpkg -s "$pkg" >/dev/null 2>&1 || MINIMAL_PACKAGES+=("$pkg"); done
+    for pkg in python3 ca-certificates; do dpkg -s "$pkg" >/dev/null 2>&1 || MINIMAL_PACKAGES+=("$pkg"); done
     if [[ "${#MINIMAL_PACKAGES[@]}" -gt 0 ]]; then
       echo "Installing minimal preflight packages: ${MINIMAL_PACKAGES[*]}"
       apt-get update
@@ -262,7 +267,7 @@ case "$BACKEND" in
     fi
     ;;
   dnf)
-    for pkg in curl python3 ca-certificates; do rpm -q "$pkg" >/dev/null 2>&1 || MINIMAL_PACKAGES+=("$pkg"); done
+    for pkg in python3 ca-certificates; do rpm -q "$pkg" >/dev/null 2>&1 || MINIMAL_PACKAGES+=("$pkg"); done
     if [[ "${#MINIMAL_PACKAGES[@]}" -gt 0 ]]; then
       echo "Installing minimal preflight packages: ${MINIMAL_PACKAGES[*]}"
       if command -v dnf >/dev/null 2>&1; then dnf install -y "${MINIMAL_PACKAGES[@]}"; elif command -v yum >/dev/null 2>&1; then yum install -y "${MINIMAL_PACKAGES[@]}"; else echo "dnf or yum is required" >&2; exit 1; fi
@@ -316,12 +321,12 @@ MISSING_PACKAGES=()
 case "$BACKEND" in
   apt)
     command -v apt-get >/dev/null || { echo "apt-get is required" >&2; exit 1; }
-    REQUIRED_PACKAGES=(unattended-upgrades needrestart apt-listchanges curl python3 ca-certificates)
+    REQUIRED_PACKAGES=(unattended-upgrades needrestart apt-listchanges python3 ca-certificates)
     for pkg in "${REQUIRED_PACKAGES[@]}"; do dpkg -s "$pkg" >/dev/null 2>&1 || MISSING_PACKAGES+=("$pkg"); done
     ;;
   dnf)
     command -v rpm >/dev/null || { echo "rpm is required for dnf backend" >&2; exit 1; }
-    REQUIRED_PACKAGES=(dnf-automatic curl python3 ca-certificates)
+    REQUIRED_PACKAGES=(dnf-automatic python3 ca-certificates)
     [[ "${ID:-}" == "fedora" ]] && REQUIRED_PACKAGES+=(dnf-utils) || REQUIRED_PACKAGES+=(yum-utils)
     for pkg in "${REQUIRED_PACKAGES[@]}"; do rpm -q "$pkg" >/dev/null 2>&1 || MISSING_PACKAGES+=("$pkg"); done
     ;;

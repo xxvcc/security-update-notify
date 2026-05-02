@@ -45,10 +45,10 @@ log_event() {
 }
 
 telegram_get_me() {
-  TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" python3 - <<'PY'
-import os, sys, urllib.request
+  python3 - "${TELEGRAM_BOT_TOKEN:-}" <<'PY'
+import sys, urllib.request
 
-token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+token = sys.argv[1] if len(sys.argv) > 1 else ""
 if not token:
     print("missing TELEGRAM_BOT_TOKEN", file=sys.stderr)
     sys.exit(2)
@@ -68,12 +68,12 @@ PY
 
 telegram_send_message() {
   local text="$1"
-  TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}" TELEGRAM_TEXT="$text" python3 - <<'PY'
-import os, sys, time, urllib.parse, urllib.request
+  python3 - "${TELEGRAM_BOT_TOKEN:-}" "${TELEGRAM_CHAT_ID:-}" <<'PY' <<<"$text"
+import sys, time, urllib.parse, urllib.request
 
-token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-text = os.environ.get("TELEGRAM_TEXT", "")
+token = sys.argv[1] if len(sys.argv) > 1 else ""
+chat_id = sys.argv[2] if len(sys.argv) > 2 else ""
+text = sys.stdin.read()
 if not token or not chat_id:
     print("missing Telegram token or chat id", file=sys.stderr)
     sys.exit(2)

@@ -62,13 +62,13 @@ linux-image-amd64
 ## 工作方式
 
 ```text
-systemd timer
+发行版自动更新机制（apt/dnf timer）
     ↓
-security-update-notify
+安装安全更新
     ↓
-通过 apt/dnf 原生机制安装安全更新
+SUN 的 systemd timer
     ↓
-检查是否需要整机重启或服务重启
+检查更新后是否需要整机重启或服务重启
     ↓
 只有在需要人工处理时发送 Telegram 消息
 ```
@@ -261,7 +261,7 @@ SUN 会配置或使用：
 
 - `dnf-automatic`
 - `yum-utils` 或 `dnf-utils`
-- `curl`、`python3`、`ca-certificates`
+- `python3`、`ca-certificates`
 
 检测方式：
 
@@ -356,7 +356,9 @@ dist/security-update-notify-VERSION.tar.gz
 dist/security-update-notify-VERSION.tar.gz.sha256
 ```
 
-发布压缩包只包含面向用户的文件：
+发布压缩包只包含面向用户的安装、诊断和文档文件。`sun.sh` 是用于网站托管的一键引导脚本，不放入发布压缩包；如需使用，请从源码仓库单独发布到你的稳定 URL。
+
+发布包内容：
 
 ```text
 .env.example
