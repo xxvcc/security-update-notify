@@ -261,7 +261,7 @@ SUN 会配置或使用：
 - `apt-listchanges`
 - apt periodic timers
 
-安装器会启用 unattended-upgrades 的安全更新周期任务，并在首次写入 `/etc/apt/apt.conf.d/20auto-upgrades` 前保存一份 SUN 专用备份；`--purge-config` 会在备份存在时恢复它。
+安装器会启用 unattended-upgrades 的安全更新周期任务。每次覆盖 `/etc/apt/apt.conf.d/20auto-upgrades` 前都会保存一份带时间戳的 SUN 专用备份；首次安装时还会保留一份固定名称备份，`--purge-config` 会在该备份存在时恢复它。
 
 检测方式：
 

@@ -6,7 +6,7 @@ STATE_DIR="/var/lib/security-update-notify"
 STATE_FILE="$STATE_DIR/last-alert.sha256"
 STATE_TIME_FILE="$STATE_DIR/last-alert.sent_at"
 LOCK_FILE="/run/security-update-notify.lock"
-VERSION="1.2.1"
+VERSION="1.2.2"
 LOG_FILE="/var/log/security-update-notify.log"
 TEST_REBOOT=0
 SEND_OK=0
@@ -144,7 +144,26 @@ sys.exit(1)
 load_config_file "$ENV_FILE" || exit $?
 
 HOST="${HOST_LABEL:-$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown)}"
-OS="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}")"
+OS_RELEASE_ID=""
+OS_RELEASE_PRETTY_NAME="unknown"
+if [[ -r /etc/os-release ]]; then
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    case "$line" in
+      ID=*|PRETTY_NAME=*)
+        key="${line%%=*}"
+        value="${line#*=}"
+        if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
+        if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
+        case "$key" in
+          ID) OS_RELEASE_ID="$value" ;;
+          PRETTY_NAME) OS_RELEASE_PRETTY_NAME="$value" ;;
+        esac
+        ;;
+    esac
+  done </etc/os-release
+fi
+OS="$OS_RELEASE_PRETTY_NAME"
 KERNEL="$(uname -r 2>/dev/null || echo unknown)"
 NOW="$(date '+%Y-%m-%d %H:%M:%S %Z')"
 BACKEND="${BACKEND:-auto}"
@@ -152,10 +171,8 @@ NOTIFY_LANG="${NOTIFY_LANG:-zh}"
 case "$NOTIFY_LANG" in zh|en) ;; *) NOTIFY_LANG="zh" ;; esac
 
 if [[ "$BACKEND" == "auto" ]]; then
-  if [[ -r /etc/os-release ]]; then
-    # shellcheck disable=SC1091
-    . /etc/os-release
-    case "${ID:-}" in
+  if [[ -n "$OS_RELEASE_ID" ]]; then
+    case "$OS_RELEASE_ID" in
       debian|ubuntu) BACKEND="apt" ;;
       rhel|rocky|almalinux|fedora|centos) BACKEND="dnf" ;;
       amzn) BACKEND="dnf" ;;

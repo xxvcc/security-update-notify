@@ -28,7 +28,10 @@ if [[ "$PURGE_CONFIG" -eq 1 ]]; then
   rm -f /etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify
   rm -f /etc/apt/apt.conf.d/52unattended-upgrades-local
   rm -f /etc/needrestart/conf.d/99-security-update-notify-report-only.conf
-  latest_dnf_backup="$(ls -1t /etc/dnf/automatic.conf.bak.* 2>/dev/null | head -1 || true)"
+  latest_dnf_backup=""
+  if compgen -G '/etc/dnf/automatic.conf.bak.*' >/dev/null; then
+    latest_dnf_backup="$(find /etc/dnf -maxdepth 1 -type f -name 'automatic.conf.bak.*' -printf '%T@ %p\n' | sort -rn | awk 'NR==1 {sub(/^[^ ]+ /, ""); print}')"
+  fi
   if [[ -n "$latest_dnf_backup" ]]; then
     cp -a "$latest_dnf_backup" /etc/dnf/automatic.conf
     echo "Restored /etc/dnf/automatic.conf from $latest_dnf_backup."

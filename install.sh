@@ -148,8 +148,6 @@ sys.exit(0 if ok else 1)
 ' 2>"$tg_err")"; then
       echo "❌ Telegram token validation failed."
       cat "$tg_err" 2>/dev/null || true
-    elif ! printf '%s' "$getme" | grep -q '"ok":true'; then
-      echo "❌ Telegram token is invalid. Response: $getme"
     else
       bot_user="$(printf '%s' "$getme" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("result",{}).get("username", "unknown"))' 2>/dev/null || echo unknown)"
       echo "✅ Token is valid: @${bot_user}"
@@ -207,8 +205,19 @@ EOF
 
 require_root
 [[ -r /etc/os-release ]] || { echo "Missing /etc/os-release" >&2; exit 1; }
-# shellcheck disable=SC1091
-. /etc/os-release
+ID=""; VERSION_ID=""; PRETTY_NAME=""
+while IFS= read -r line || [[ -n "$line" ]]; do
+  line="${line%$'\r'}"
+  case "$line" in
+    ID=*|VERSION_ID=*|PRETTY_NAME=*)
+      key="${line%%=*}"
+      value="${line#*=}"
+      if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
+      if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
+      case "$key" in ID|VERSION_ID|PRETTY_NAME) printf -v "$key" '%s' "$value" ;; esac
+      ;;
+  esac
+done </etc/os-release
 
 SUPPORTED=0; SUPPORT_LABEL="unsupported"; DETECTED_BACKEND="unknown"
 case "${ID:-}" in
@@ -345,8 +354,12 @@ install -m 0644 "$SCRIPT_DIR/files/security-update-notify.service" /etc/systemd/
 if [[ "$BACKEND" == "apt" ]]; then
   install -d -m 0755 /etc/needrestart/conf.d
   install -m 0644 "$SCRIPT_DIR/files/needrestart-report-only.conf" /etc/needrestart/conf.d/99-security-update-notify-report-only.conf
-  if [[ -f /etc/apt/apt.conf.d/20auto-upgrades && ! -e /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak ]]; then
-    cp -a /etc/apt/apt.conf.d/20auto-upgrades /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak
+  if [[ -f /etc/apt/apt.conf.d/20auto-upgrades ]]; then
+    timestamp="$(date +%Y%m%d%H%M%S)"
+    cp -a /etc/apt/apt.conf.d/20auto-upgrades "/etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak.$timestamp"
+    if [[ ! -e /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak ]]; then
+      cp -a /etc/apt/apt.conf.d/20auto-upgrades /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak
+    fi
   fi
   cat >/etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 APT::Periodic::Update-Package-Lists "1";

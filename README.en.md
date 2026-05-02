@@ -261,7 +261,7 @@ SUN configures or uses:
 - `apt-listchanges`
 - apt periodic timers
 
-The installer enables unattended-upgrades security update timers and saves a SUN-specific backup before first writing `/etc/apt/apt.conf.d/20auto-upgrades`; `--purge-config` restores it when the backup exists.
+The installer enables unattended-upgrades security update timers. Before each overwrite of `/etc/apt/apt.conf.d/20auto-upgrades`, it saves a timestamped SUN-specific backup; on first install it also keeps a fixed-name backup, and `--purge-config` restores that fixed backup when it exists.
 
 It checks:
 

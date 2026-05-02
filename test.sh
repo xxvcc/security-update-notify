@@ -25,7 +25,19 @@ while [[ $# -gt 0 ]]; do
 done
 [[ "$(id -u)" -eq 0 ]] || { echo "Please run as root" >&2; exit 1; }
 
-. /etc/os-release
+[[ -r /etc/os-release ]] || { echo "ERROR /etc/os-release not readable" >&2; exit 1; }
+while IFS= read -r line || [[ -n "$line" ]]; do
+  line="${line%$'\r'}"
+  case "$line" in
+    ID=*|VERSION_ID=*|PRETTY_NAME=*)
+      key="${line%%=*}"
+      value="${line#*=}"
+      if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
+      if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
+      case "$key" in ID|VERSION_ID|PRETTY_NAME) printf -v "$key" '%s' "$value" ;; esac
+      ;;
+  esac
+done </etc/os-release
 BACKEND="unknown"; SUPPORT="unsupported"
 case "${ID:-}" in
   debian) BACKEND=apt; case "${VERSION_ID:-}" in 12|13) SUPPORT=supported ;; 11) SUPPORT=best-effort ;; esac ;;

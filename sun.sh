@@ -110,7 +110,7 @@ cd "$PKG_DIR"
 # hang after checksum verification. Redirect stdin only on the final exec.
 run_target() {
   local script="$1"; shift
-  if [[ -r /dev/tty ]]; then
+  if { : < /dev/tty; } 2>/dev/null; then
     exec "$script" "$@" < /dev/tty
   fi
   if [[ "$script" == "./menu.sh" && ! -t 0 ]]; then
