@@ -4,7 +4,7 @@ set -euo pipefail
 # Bootstrap installer for security-update-notify.
 # Publish this script on your website, e.g. https://example.com/install/sun.sh
 
-REPO="${SECURITY_UPDATE_NOTIFY_REPO:-YOUR_GITHUB_USER/security-update-notify}"
+REPO="${SECURITY_UPDATE_NOTIFY_REPO:-xxvcc/security-update-notify}"
 VERSION="${SECURITY_UPDATE_NOTIFY_VERSION:-latest}"
 BASE_URL="${SECURITY_UPDATE_NOTIFY_BASE_URL:-}"
 RUN_MODE="menu"
