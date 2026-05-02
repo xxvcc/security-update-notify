@@ -6,7 +6,7 @@ STATE_DIR="/var/lib/security-update-notify"
 STATE_FILE="$STATE_DIR/last-alert.sha256"
 STATE_TIME_FILE="$STATE_DIR/last-alert.sent_at"
 LOCK_FILE="/run/security-update-notify.lock"
-VERSION="1.2.0"
+VERSION="1.2.1"
 LOG_FILE="/var/log/security-update-notify.log"
 TEST_REBOOT=0
 SEND_OK=0
@@ -75,7 +75,7 @@ load_config_file() {
 
 telegram_get_me() {
   printf '%s' "${TELEGRAM_BOT_TOKEN:-}" | python3 -c '
-import sys, urllib.request
+import json, sys, urllib.request
 
 token = sys.stdin.read()
 if not token:
@@ -91,14 +91,18 @@ except Exception as exc:
     sys.exit(1)
 
 print(body)
-sys.exit(0 if '"ok":true' in body else 1)
+try:
+    ok = bool(json.loads(body).get("ok"))
+except Exception:
+    ok = False
+sys.exit(0 if ok else 1)
 '
 }
 
 telegram_send_message() {
   local text="$1"
   printf '%s\0%s\0%s' "${TELEGRAM_BOT_TOKEN:-}" "${TELEGRAM_CHAT_ID:-}" "$text" | python3 -c '
-import sys, time, urllib.parse, urllib.request
+import json, sys, time, urllib.parse, urllib.request
 
 payload = sys.stdin.buffer.read().split(b"\0", 2)
 token = payload[0].decode("utf-8", "replace") if len(payload) > 0 else ""
@@ -120,7 +124,11 @@ for attempt in range(3):
     try:
         with urllib.request.urlopen(url, data=data, timeout=30) as response:
             body = response.read().decode("utf-8", "replace")
-        if '"ok":true' in body:
+        try:
+            ok = bool(json.loads(body).get("ok"))
+        except Exception:
+            ok = False
+        if ok:
             sys.exit(0)
         last_error = body
     except Exception as exc:

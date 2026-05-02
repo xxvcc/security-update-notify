@@ -114,7 +114,7 @@ load_config_file "$CONFIG" || exit $?
 
 telegram_get_me() {
   printf '%s' "${TELEGRAM_BOT_TOKEN:-}" | python3 -c '
-import sys, urllib.request
+import json, sys, urllib.request
 
 token = sys.stdin.read()
 if not token:
@@ -129,7 +129,11 @@ except Exception as exc:
     sys.exit(1)
 
 print(body)
-sys.exit(0 if '"ok":true' in body else 1)
+try:
+    ok = bool(json.loads(body).get("ok"))
+except Exception:
+    ok = False
+sys.exit(0 if ok else 1)
 '
 }
 
