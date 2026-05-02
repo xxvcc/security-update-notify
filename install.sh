@@ -25,6 +25,7 @@ Usage: sudo ./install.sh [options]
 
 Options:
   --telegram-token TOKEN       Telegram bot token
+  --telegram-token-file FILE   Read Telegram bot token from file, safer for automation
   --telegram-chat-id CHAT_ID   Telegram target chat id
   --time HH:MM                 Daily check time, default 09:00
   --host-label NAME            Optional host label in notifications
@@ -45,6 +46,7 @@ require_arg() { [[ $# -ge 2 && -n "${2:-}" ]] || { echo "Missing value for $1" >
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --telegram-token) require_arg "$1" "${2:-}"; TELEGRAM_BOT_TOKEN="$2"; shift 2 ;;
+    --telegram-token-file) require_arg "$1" "${2:-}"; TELEGRAM_BOT_TOKEN="$(tr -d '\r\n' <"$2")"; shift 2 ;;
     --telegram-chat-id) require_arg "$1" "${2:-}"; TELEGRAM_CHAT_ID="$2"; shift 2 ;;
     --time) require_arg "$1" "${2:-}"; CHECK_TIME="$2"; shift 2 ;;
     --host-label) require_arg "$1" "${2:-}"; HOST_LABEL="$2"; shift 2 ;;
@@ -91,7 +93,24 @@ telegram_preflight() {
   while true; do
     echo "Validating Telegram Bot Token..."
     local getme bot_user
-    if ! getme="$(curl -fsS --connect-timeout 10 --max-time 20 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" 2>"$tg_err")"; then
+    if ! getme="$(TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" python3 - <<'PY' 2>"$tg_err"
+import json, os, sys, urllib.request
+
+token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+try:
+    with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/getMe", timeout=20) as response:
+        body = response.read().decode("utf-8", "replace")
+except Exception as exc:
+    print(exc, file=sys.stderr)
+    sys.exit(1)
+print(body)
+try:
+    ok = bool(json.loads(body).get("ok"))
+except Exception:
+    ok = False
+sys.exit(0 if ok else 1)
+PY
+)"; then
       echo "❌ Telegram token validation failed."
       cat "$tg_err" 2>/dev/null || true
     elif ! printf '%s' "$getme" | grep -q '"ok":true'; then
@@ -101,7 +120,27 @@ telegram_preflight() {
       echo "✅ Token is valid: @${bot_user}"
       echo "Sending test message to Telegram Chat ID..."
       local text="✅ security-update-notify Telegram test succeeded. Host: $(hostname -f 2>/dev/null || hostname)"
-      if printf '%s' "$text" | curl -fsS --connect-timeout 10 --max-time 20         -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"         -d "chat_id=${TELEGRAM_CHAT_ID}"         --data-urlencode "text@-" >"$send_out" 2>"$tg_err"; then
+      if TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" TELEGRAM_CHAT_ID="$TELEGRAM_CHAT_ID" TELEGRAM_TEXT="$text" python3 - <<'PY' >"$send_out" 2>"$tg_err"; then
+import json, os, sys, urllib.parse, urllib.request
+
+token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+text = os.environ.get("TELEGRAM_TEXT", "")
+url = f"https://api.telegram.org/bot{token}/sendMessage"
+data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+try:
+    with urllib.request.urlopen(url, data=data, timeout=20) as response:
+        body = response.read().decode("utf-8", "replace")
+except Exception as exc:
+    print(exc, file=sys.stderr)
+    sys.exit(1)
+print(body)
+try:
+    ok = bool(json.loads(body).get("ok"))
+except Exception:
+    ok = False
+sys.exit(0 if ok else 1)
+PY
         echo "✅ Telegram test message sent."
         return
       else
@@ -276,12 +315,9 @@ APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::AutocleanInterval "7";
 APT::Periodic::Unattended-Upgrade "1";
 EOF
-  cat >/etc/apt/apt.conf.d/52unattended-upgrades-local <<'EOF'
-// Local policy: install Debian/Ubuntu security updates automatically, do not reboot automatically.
-Unattended-Upgrade::Origins-Pattern {
-        "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
-        "origin=Ubuntu,archive=${distro_codename}-security";
-};
+  cat >/etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify <<'EOF'
+// Local policy: never reboot automatically. The distribution package keeps
+// its default Origins-Pattern security rules.
 Unattended-Upgrade::Automatic-Reboot "false";
 Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
 Unattended-Upgrade::Remove-New-Unused-Dependencies "true";

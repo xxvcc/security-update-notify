@@ -20,6 +20,7 @@ systemctl daemon-reload
 
 if [[ "$PURGE_CONFIG" -eq 1 ]]; then
   rm -rf /etc/security-update-notify /var/lib/security-update-notify /var/log/security-update-notify.log /etc/logrotate.d/security-update-notify
+  rm -f /etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify
   rm -f /etc/apt/apt.conf.d/52unattended-upgrades-local
   rm -f /etc/needrestart/conf.d/99-security-update-notify-report-only.conf
   echo "Removed config/state too. Note: packages and /etc/apt/apt.conf.d/20auto-upgrades were left in place."

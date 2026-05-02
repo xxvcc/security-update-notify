@@ -6,3 +6,10 @@ After=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/security-update-notify
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/security-update-notify /var/log/security-update-notify.log

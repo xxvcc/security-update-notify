@@ -56,7 +56,8 @@ fi
 
 TAR="$DIST/$PKG.tar.gz"
 SHA="$TAR.sha256"
-tar -C "$WORK" --sort=name --owner=0 --group=0 --numeric-owner -czf "$TAR" "$PKG"
+SOURCE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || date +%s)}"
+tar -C "$WORK" --sort=name --mtime="@$SOURCE_EPOCH" --owner=0 --group=0 --numeric-owner -cf - "$PKG" | gzip -n >"$TAR"
 (cd "$DIST" && sha256sum "$PKG.tar.gz" >"$PKG.tar.gz.sha256")
 
 printf 'Created:\n  %s\n  %s\n' "$TAR" "$SHA"

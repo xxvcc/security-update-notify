@@ -6,7 +6,7 @@ STATE_DIR="/var/lib/security-update-notify"
 STATE_FILE="$STATE_DIR/last-alert.sha256"
 STATE_TIME_FILE="$STATE_DIR/last-alert.sent_at"
 LOCK_FILE="/run/security-update-notify.lock"
-VERSION="1.1.1"
+VERSION="1.2.0"
 LOG_FILE="/var/log/security-update-notify.log"
 TEST_REBOOT=0
 SEND_OK=0
@@ -42,6 +42,65 @@ log_event() {
   local line="$1"
   mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$line" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+telegram_get_me() {
+  TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" python3 - <<'PY'
+import os, sys, urllib.request
+
+token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+if not token:
+    print("missing TELEGRAM_BOT_TOKEN", file=sys.stderr)
+    sys.exit(2)
+
+url = f"https://api.telegram.org/bot{token}/getMe"
+try:
+    with urllib.request.urlopen(url, timeout=20) as response:
+        body = response.read().decode("utf-8", "replace")
+except Exception as exc:
+    print(exc, file=sys.stderr)
+    sys.exit(1)
+
+print(body)
+sys.exit(0 if '"ok":true' in body else 1)
+PY
+}
+
+telegram_send_message() {
+  local text="$1"
+  TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}" TELEGRAM_TEXT="$text" python3 - <<'PY'
+import os, sys, time, urllib.parse, urllib.request
+
+token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+text = os.environ.get("TELEGRAM_TEXT", "")
+if not token or not chat_id:
+    print("missing Telegram token or chat id", file=sys.stderr)
+    sys.exit(2)
+
+url = f"https://api.telegram.org/bot{token}/sendMessage"
+data = urllib.parse.urlencode({
+    "chat_id": chat_id,
+    "text": text,
+    "disable_web_page_preview": "true",
+}).encode()
+
+last_error = ""
+for attempt in range(3):
+    try:
+        with urllib.request.urlopen(url, data=data, timeout=30) as response:
+            body = response.read().decode("utf-8", "replace")
+        if '"ok":true' in body:
+            sys.exit(0)
+        last_error = body
+    except Exception as exc:
+        last_error = str(exc)
+    if attempt < 2:
+        time.sleep(1)
+
+print(last_error or "Telegram notification failed", file=sys.stderr)
+sys.exit(1)
+PY
 }
 
 if [[ -r "$ENV_FILE" ]]; then
@@ -102,7 +161,7 @@ run_doctor() {
   esac
   if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
     echo "OK Telegram config present"
-    if curl -fsS --connect-timeout 10 --max-time 20 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" | grep -q '"ok":true'; then
+    if telegram_get_me >/dev/null; then
       echo "OK Telegram bot token works"
     else
       echo "FAIL Telegram getMe failed"; ok=0
@@ -179,6 +238,66 @@ check_dnf() {
   reboot_pkgs="$(printf '%s\n' "$update_summary" | awk '{print $NF}' | sed '/^$/d' | sort -u | sed -n '1,40p')"
 }
 
+format_restart_summary() {
+  local lang="$1" summary kcur kexp ksta services service_count other_count processes process_count
+  summary="${restart_summary//\\n/$'\n'}"
+  case "$BACKEND" in
+    apt)
+      kcur="$(printf '%s\n' "$summary" | awk -F': ' '/^NEEDRESTART-KCUR:/{print $2; exit}')"
+      kexp="$(printf '%s\n' "$summary" | awk -F': ' '/^NEEDRESTART-KEXP:/{print $2; exit}')"
+      ksta="$(printf '%s\n' "$summary" | awk -F': ' '/^NEEDRESTART-KSTA:/{print $2; exit}')"
+      services="$(printf '%s\n' "$summary" | awk -F': ' '/^NEEDRESTART-SVC:/{print $2}' | sed '/^$/d' | sort -u)"
+      service_count="$(printf '%s\n' "$services" | sed '/^$/d' | wc -l | tr -d ' ')"
+      other_count="$(printf '%s\n' "$summary" | grep -Ec '^NEEDRESTART-(AUX|SESS|UCSTA|UCCUR|UCEXP):' || true)"
+
+      if [[ "$lang" == "en" ]]; then
+        [[ -n "$kcur" || -n "$kexp" ]] && printf 'Kernel: current %s, expected %s\n' "${kcur:-unknown}" "${kexp:-unknown}"
+        [[ -n "$ksta" ]] && printf 'Kernel status code: %s\n' "$ksta"
+        if [[ "${service_count:-0}" -gt 0 ]]; then
+          printf 'Services to review/restart (%s):\n' "$service_count"
+          printf '%s\n' "$services" | sed -n '1,12p' | sed 's/^/• /'
+          [[ "$service_count" -gt 12 ]] && printf '• ... and %s more\n' "$((service_count - 12))"
+        fi
+        [[ "${other_count:-0}" -gt 0 ]] && printf 'Additional sessions/containers/processes need review. Run needrestart on the server for details.\n'
+        [[ -z "$kcur$kexp$services" && "${other_count:-0}" -eq 0 ]] && printf 'No detailed restart list was available. Run needrestart -b on the server for details.\n'
+      else
+        [[ -n "$kcur" || -n "$kexp" ]] && printf '内核：当前 %s，建议 %s\n' "${kcur:-未知}" "${kexp:-未知}"
+        [[ -n "$ksta" ]] && printf '内核状态码：%s\n' "$ksta"
+        if [[ "${service_count:-0}" -gt 0 ]]; then
+          printf '建议评估/重启的服务（%s 个）：\n' "$service_count"
+          printf '%s\n' "$services" | sed -n '1,12p' | sed 's/^/• /'
+          [[ "$service_count" -gt 12 ]] && printf '• ……另有 %s 个\n' "$((service_count - 12))"
+        fi
+        [[ "${other_count:-0}" -gt 0 ]] && printf '另有用户会话、容器或进程需要关注；可在服务器上运行 needrestart 查看详情。\n'
+        [[ -z "$kcur$kexp$services" && "${other_count:-0}" -eq 0 ]] && printf '没有拿到详细重启列表；可在服务器上运行 needrestart -b 查看详情。\n'
+      fi
+      ;;
+    dnf)
+      processes="$(printf '%s\n' "$summary" | awk 'found && NF {print} /^needs-restarting:/{found=1}' | sed -n '1,12p')"
+      process_count="$(printf '%s\n' "$summary" | awk 'found && NF {print} /^needs-restarting:/{found=1}' | wc -l | tr -d ' ')"
+      if [[ "$lang" == "en" ]]; then
+        [[ "$reboot_required" -eq 1 ]] && printf 'Full reboot: required by needs-restarting -r\n'
+        if [[ -n "$processes" ]]; then
+          printf 'Processes/services to review (%s shown):\n' "$(printf '%s\n' "$processes" | wc -l | tr -d ' ')"
+          printf '%s\n' "$processes" | sed 's/^/• /'
+          [[ "${process_count:-0}" -gt 12 ]] && printf '• ... and %s more\n' "$((process_count - 12))"
+        else
+          printf 'No detailed process list was available. Run needs-restarting on the server for details.\n'
+        fi
+      else
+        [[ "$reboot_required" -eq 1 ]] && printf '整机重启：needs-restarting -r 判断为需要\n'
+        if [[ -n "$processes" ]]; then
+          printf '建议评估的进程/服务（显示 %s 条）：\n' "$(printf '%s\n' "$processes" | wc -l | tr -d ' ')"
+          printf '%s\n' "$processes" | sed 's/^/• /'
+          [[ "${process_count:-0}" -gt 12 ]] && printf '• ……另有 %s 条\n' "$((process_count - 12))"
+        else
+          printf '没有拿到详细进程列表；可在服务器上运行 needs-restarting 查看详情。\n'
+        fi
+      fi
+      ;;
+  esac
+}
+
 case "$BACKEND" in
   apt) check_apt ;;
   dnf) check_dnf ;;
@@ -200,7 +319,7 @@ if [[ "$reboot_required" -eq 0 && "$restart_attention" -eq 0 ]]; then
 else
   pkgs_block="无"
   [[ -n "$reboot_pkgs" ]] && pkgs_block="$reboot_pkgs"
-  rs="$(printf '%s\n' "$restart_summary" | sed -n '1,100p')"
+  rs="$(format_restart_summary "$NOTIFY_LANG" | sed -n '1,80p')"
   if [[ "$NOTIFY_LANG" == "en" ]]; then
     [[ "$pkgs_block" == "无" ]] && pkgs_block="None"
     reboot_text="$([[ "$reboot_required" -eq 1 ]] && echo 'Required' || echo 'Not required for now')"
@@ -244,12 +363,7 @@ if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
   exit 2
 fi
 
-send_url="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
-if printf '%s' "$msg" | curl -fsS --retry 3 --connect-timeout 10 --max-time 30 \
-  -X POST "$send_url" \
-  -d "chat_id=${TELEGRAM_CHAT_ID}" \
-  --data-urlencode "text@-" \
-  -d "disable_web_page_preview=true" >/dev/null; then
+if telegram_send_message "$msg"; then
   printf '%s\n' "$alert_hash" >"$STATE_FILE"
   printf '%s\n' "$now_epoch" >"$STATE_TIME_FILE"
   log_event "telegram sent backend=$BACKEND host=$HOST reboot_required=$reboot_required restart_attention=$restart_attention hash=$alert_hash"

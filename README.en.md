@@ -171,9 +171,23 @@ sudo ./install.sh \
   -y
 ```
 
+For safer automation, put the token in a root-only file so it does not appear in shell history or process lists:
+
+```bash
+sudo install -m 600 /dev/null /root/.security-update-notify-token
+sudoedit /root/.security-update-notify-token
+
+sudo ./install.sh \
+  --telegram-token-file /root/.security-update-notify-token \
+  --telegram-chat-id 'CHAT_ID' \
+  --non-interactive \
+  -y
+```
+
 Common options:
 
 ```bash
+--telegram-token-file FILE # read Telegram Bot Token from file, recommended for automation
 --backend apt              # force apt backend
 --backend dnf              # force dnf backend
 --notify-lang zh           # Telegram alerts in Chinese, default

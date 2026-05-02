@@ -9,13 +9,16 @@ Usage: sudo ./test.sh [options]
   --send-test        Send a normal OK Telegram test message
   --simulate-reboot  Send a simulated reboot-required alert; does not reboot
   --no-dedupe        Bypass duplicate-alert suppression for this test
+  --verbose          Show full Telegram chat ID in diagnostics
 EOU
 }
+VERBOSE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --send-test) SEND_TEST=1; shift ;;
     --simulate-reboot) SIMULATE_REBOOT=1; shift ;;
     --no-dedupe) NO_DEDUPE=1; shift ;;
+    --verbose) VERBOSE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -50,7 +53,7 @@ echo "== config files =="
 for f in /etc/security-update-notify/telegram.env /usr/local/sbin/security-update-notify /etc/systemd/system/security-update-notify.service /etc/systemd/system/security-update-notify.timer /var/log/security-update-notify.log /etc/logrotate.d/security-update-notify; do
   [[ -e "$f" ]] && stat -c 'OK %a %U:%G %n' "$f" || echo "MISSING $f"
 done
-[[ "$BACKEND" == apt ]] && for f in /etc/apt/apt.conf.d/20auto-upgrades /etc/apt/apt.conf.d/52unattended-upgrades-local /etc/needrestart/conf.d/99-security-update-notify-report-only.conf; do [[ -e "$f" ]] && stat -c 'OK %a %U:%G %n' "$f" || echo "MISSING $f"; done
+[[ "$BACKEND" == apt ]] && for f in /etc/apt/apt.conf.d/20auto-upgrades /etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify /etc/needrestart/conf.d/99-security-update-notify-report-only.conf; do [[ -e "$f" ]] && stat -c 'OK %a %U:%G %n' "$f" || echo "MISSING $f"; done
 [[ "$BACKEND" == dnf && -e /etc/dnf/automatic.conf ]] && stat -c 'OK %a %U:%G %n' /etc/dnf/automatic.conf
 echo
 
@@ -80,10 +83,41 @@ if [[ ! -r "$CONFIG" ]]; then
 fi
 # shellcheck disable=SC1090
 source "$CONFIG"
+
+telegram_get_me() {
+  TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" python3 - <<'PY'
+import os, sys, urllib.request
+
+token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+if not token:
+    print("missing TELEGRAM_BOT_TOKEN", file=sys.stderr)
+    sys.exit(2)
+
+try:
+    with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/getMe", timeout=20) as response:
+        body = response.read().decode("utf-8", "replace")
+except Exception as exc:
+    print(exc, file=sys.stderr)
+    sys.exit(1)
+
+print(body)
+sys.exit(0 if '"ok":true' in body else 1)
+PY
+}
+
 echo "== telegram config =="
 [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] && echo "OK token present (${#TELEGRAM_BOT_TOKEN} chars)" || echo "MISSING token"
-[[ -n "${TELEGRAM_CHAT_ID:-}" ]] && echo "OK chat id present: ${TELEGRAM_CHAT_ID}" || echo "MISSING chat id"
-curl -fsS --connect-timeout 10 --max-time 20 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" | grep -q '"ok":true' && echo "OK Telegram bot token works" || { echo "ERROR Telegram getMe failed" >&2; exit 1; }
+if [[ -n "${TELEGRAM_CHAT_ID:-}" ]]; then
+  if [[ "$VERBOSE" -eq 1 ]]; then
+    echo "OK chat id present: ${TELEGRAM_CHAT_ID}"
+  else
+    chat_tail="${TELEGRAM_CHAT_ID: -4}"
+    echo "OK chat id present: ****${chat_tail}"
+  fi
+else
+  echo "MISSING chat id"
+fi
+telegram_get_me >/dev/null && echo "OK Telegram bot token works" || { echo "ERROR Telegram getMe failed" >&2; exit 1; }
 
 args=(); [[ "$NO_DEDUPE" -eq 1 ]] && args+=(--no-dedupe)
 [[ "$SEND_TEST" -eq 1 ]] && { echo "== send OK test =="; /usr/local/sbin/security-update-notify --test-ok "${args[@]}"; echo "OK sent test message"; }

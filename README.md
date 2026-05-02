@@ -171,9 +171,23 @@ sudo ./install.sh \
   -y
 ```
 
+更安全的自动化方式是把 token 放在 root-only 文件里，避免 token 出现在 shell history 或进程列表：
+
+```bash
+sudo install -m 600 /dev/null /root/.security-update-notify-token
+sudoedit /root/.security-update-notify-token
+
+sudo ./install.sh \
+  --telegram-token-file /root/.security-update-notify-token \
+  --telegram-chat-id 'CHAT_ID' \
+  --non-interactive \
+  -y
+```
+
 常用参数：
 
 ```bash
+--telegram-token-file FILE # 从文件读取 Telegram Bot Token，推荐用于自动化
 --backend apt              # 强制使用 apt 后端
 --backend dnf              # 强制使用 dnf 后端
 --notify-lang zh           # Telegram 提醒语言：中文（默认）
