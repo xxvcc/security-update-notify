@@ -1,10 +1,12 @@
 # security-update-notify
 
-> Install security updates automatically. Get a clean Telegram alert only when a reboot or service restart needs your attention.
+> 自动安装安全更新；只有在需要重启服务器或重启服务时，才发送一条清晰的 Telegram 提醒。
 
-**security-update-notify** — or **SUN** — is a small Linux utility for people who maintain servers and do not want to miss important post-update actions.
+**security-update-notify**（简称 **SUN**）是一个轻量 Linux 工具，适合维护服务器、VPS 或小型基础设施的人使用。
 
-It uses your distro's native update tools, runs from a systemd timer, and sends outbound-only Telegram notifications. No dashboard. No agent port. No remote-control bot.
+它使用发行版原生更新机制，通过 systemd timer 定时运行，只向 Telegram Bot API 发起出站 HTTPS 请求。没有 Web 面板，没有常驻控制端口，也不会接收 Telegram 命令。
+
+**语言 / Languages**：中文 | [English](README.en.md)
 
 <p align="center">
   <img alt="Linux" src="https://img.shields.io/badge/Linux-systemd-1793D1?style=flat-square&logo=linux&logoColor=white">
@@ -16,29 +18,29 @@ It uses your distro's native update tools, runs from a systemd timer, and sends 
 
 ---
 
-## Why use it?
+## 为什么需要它？
 
-Most servers can install security updates automatically. The part people miss is what happens after:
+很多服务器都能自动安装安全更新，但真正容易被忽略的是更新之后：
 
-- the kernel was updated, but the machine still runs the old kernel;
-- services are still using old shared libraries;
-- a reboot is needed, but nobody notices until much later;
-- update tools are noisy, so alerts get ignored.
+- 内核已经更新，但服务器仍在运行旧内核；
+- 服务还在使用旧版本共享库；
+- 系统需要重启，但没人注意到；
+- 更新日志太吵，真正重要的提醒反而被忽略。
 
-SUN keeps the boring part automatic and makes the human part obvious.
+SUN 负责把“安全更新”这件事自动化，同时只在确实需要人工处理时提醒你。
 
-## What you get
+## 主要特性
 
-- **Automatic security updates** through official distro mechanisms.
-- **No automatic reboot** — you stay in control of downtime.
-- **Telegram alerts only when action is needed**.
-- **Reboot and service-restart detection** with `needrestart` or `needs-restarting`.
-- **Duplicate alert suppression**: once, daily, or every N days.
-- **Interactive and non-interactive installation**.
-- **systemd timer based scheduling**.
-- **No inbound network listener**.
+- **自动安装安全更新**：使用发行版官方机制。
+- **不自动重启服务器**：停机窗口仍由你决定。
+- **只在需要处理时发送 Telegram 提醒**。
+- **检测整机重启与服务/进程重启需求**：基于 `needrestart` 或 `needs-restarting`。
+- **重复提醒抑制**：支持只提醒一次、每天一次、每 N 天一次。
+- **支持交互式与非交互式安装**。
+- **使用 systemd timer 定时运行**。
+- **不监听任何入站端口**。
 
-Example Telegram alert:
+Telegram 提醒示例：
 
 ```text
 ⚠️ 安全更新后需要处理
@@ -56,70 +58,70 @@ linux-image-amd64
 建议：请在方便的维护窗口 SSH 登录该服务器后手动执行 reboot。
 ```
 
-## How it works
+## 工作方式
 
 ```text
 systemd timer
     ↓
 security-update-notify
     ↓
-install security updates using apt/dnf native tooling
+通过 apt/dnf 原生机制安装安全更新
     ↓
-check reboot / restarted-service state
+检查是否需要整机重启或服务重启
     ↓
-send Telegram message only if attention is required
+只有在需要人工处理时发送 Telegram 消息
 ```
 
-SUN does **not**:
+SUN **不会**：
 
-- reboot the server;
-- expose a web service;
-- accept Telegram commands;
-- use Telegram polling or webhooks;
-- open any inbound port.
+- 自动重启服务器；
+- 暴露 Web 服务；
+- 接收 Telegram 命令；
+- 使用 Telegram long polling 或 webhook；
+- 打开任何入站端口。
 
-## Supported systems
+## 支持系统
 
-### Officially supported
+### 正式支持
 
-| Family | Versions | Backend |
+| 系统家族 | 版本 | 后端 |
 | --- | --- | --- |
 | Debian | 12, 13 | `apt` |
 | Ubuntu | 22.04, 24.04 | `apt` |
 | RHEL / Rocky / AlmaLinux | 8, 9 | `dnf` |
-| Fedora | current releases | `dnf` |
+| Fedora | 当前版本 | `dnf` |
 
-### Best-effort support
+### 尽力支持
 
-These require `--allow-best-effort`:
+以下系统需要显式加 `--allow-best-effort`：
 
 - Debian 11
 - Ubuntu 20.04
 - CentOS Stream 8 / 9
 - Amazon Linux 2023
 
-### Not supported
+### 暂不支持
 
 - Alpine
 - Arch Linux
 - SUSE / openSUSE
-- containers or minimal systems without full systemd
-- end-of-life systems without security updates
+- 没有完整 systemd 的容器或极简系统
+- 已停止安全更新的 EOL 系统
 
-## Quick start
+## 快速开始
 
-### 1. Create a Telegram bot
+### 1. 创建 Telegram Bot
 
-1. Open Telegram and talk to [@BotFather](https://t.me/BotFather).
-2. Create a bot and copy the bot token.
-3. Send `/start` to your new bot.
-4. Get your target chat ID.
+1. 在 Telegram 打开 [@BotFather](https://t.me/BotFather)。
+2. 创建一个 bot，并复制 Bot Token。
+3. 给新 bot 发送 `/start`。
+4. 获取要接收提醒的 Chat ID。
 
-For groups, add the bot to the group and make sure it can send messages there.
+如果要发到群组，把 bot 加入群组，并确认它有发消息权限。
 
-### 2. Install
+### 2. 安装
 
-Clone the project and run the interactive installer:
+克隆项目并运行交互式安装器：
 
 ```bash
 git clone https://github.com/xxvcc/security-update-notify.git
@@ -127,20 +129,20 @@ cd security-update-notify
 sudo ./install.sh
 ```
 
-The installer will ask for:
+安装器会询问：
 
-- Telegram Bot Token;
-- Telegram Chat ID;
-- daily check time, default `09:00`;
-- duplicate-alert behavior;
-- whether to send an extra test message after installation.
+- Telegram Bot Token；
+- Telegram Chat ID；
+- 每日检查时间，默认 `09:00`；
+- 重复提醒策略；
+- 安装后是否额外发送一条测试消息。
 
-Before writing the config, it verifies Telegram with:
+写入配置前，安装器会先做 Telegram 预检：
 
-- `getMe` for the bot token;
-- `sendMessage` for the chat ID and bot permissions.
+- 使用 `getMe` 验证 Bot Token；
+- 使用 `sendMessage` 验证 Chat ID 与发消息权限。
 
-### 3. Verify
+### 3. 验证
 
 ```bash
 sudo ./test.sh
@@ -148,11 +150,11 @@ sudo ./test.sh --send-test --no-dedupe
 sudo ./test.sh --simulate-reboot --no-dedupe
 ```
 
-The simulated reboot test only sends a test alert. It does **not** reboot the server.
+模拟重启测试只会发送测试提醒，**不会真的重启服务器**。
 
-## Non-interactive install
+## 非交互式安装
 
-Useful for provisioning scripts:
+适合放进初始化脚本、云服务器模板或批量部署流程：
 
 ```bash
 sudo ./install.sh \
@@ -166,27 +168,27 @@ sudo ./install.sh \
   -y
 ```
 
-Common options:
+常用参数：
 
 ```bash
---backend apt              # force apt backend
---backend dnf              # force dnf backend
---allow-best-effort        # allow best-effort distro versions
---send-test                # send an extra install-complete test message
---skip-telegram-test       # skip Telegram preflight validation
+--backend apt              # 强制使用 apt 后端
+--backend dnf              # 强制使用 dnf 后端
+--allow-best-effort        # 允许尽力支持的发行版
+--send-test                # 安装完成后额外发送测试消息
+--skip-telegram-test       # 跳过 Telegram 预检
 ```
 
-## Duplicate alert modes
+## 重复提醒策略
 
-| Mode | Behavior |
+| 模式 | 行为 |
 | --- | --- |
-| `always` | Send once for the same alert until the state changes. |
-| `daily` | Send the same alert at most once per day. |
-| `interval` | Send the same alert every N days. Default: `3`. |
+| `always` | 同一个告警只发送一次，直到状态变化。 |
+| `daily` | 同一个告警每天最多发送一次。 |
+| `interval` | 同一个告警每 N 天发送一次，默认 `3` 天。 |
 
-`interval` is the recommended default for production servers: it prevents spam but still reminds you if a reboot stays pending.
+生产环境推荐使用 `interval`：既不会频繁打扰，也能在重启长期未处理时继续提醒。
 
-## Installed files
+## 安装后写入的内容
 
 ```text
 /usr/local/sbin/security-update-notify
@@ -198,111 +200,111 @@ Common options:
 /var/log/security-update-notify.log
 ```
 
-Telegram credentials are stored in:
+Telegram 凭据保存在：
 
 ```text
 /etc/security-update-notify/telegram.env
 ```
 
-The installer writes it as root-only (`0600`).
+安装器会将该文件设置为 root-only（`0600`）。
 
-## Backend details
+## 后端说明
 
 ### Debian / Ubuntu (`apt`)
 
-SUN configures or uses:
+SUN 会配置或使用：
 
 - `unattended-upgrades`
 - `needrestart`
 - `apt-listchanges`
 - apt periodic timers
 
-It checks:
+检测方式：
 
 - `/var/run/reboot-required`
 - `/var/run/reboot-required.pkgs`
 - `needrestart -b`
 
-### RHEL-compatible / Fedora (`dnf`)
+### RHEL 兼容发行版 / Fedora (`dnf`)
 
-SUN configures or uses:
+SUN 会配置或使用：
 
 - `dnf-automatic`
-- `yum-utils` or `dnf-utils`
-- `curl`, `python3`, `ca-certificates`
+- `yum-utils` 或 `dnf-utils`
+- `curl`、`python3`、`ca-certificates`
 
-It checks:
+检测方式：
 
 - `needs-restarting -r`
 - `needs-restarting`
 - `dnf updateinfo list security updates`
 
-If `/etc/dnf/automatic.conf` exists, SUN configures security-only automatic updates:
+如果 `/etc/dnf/automatic.conf` 存在，SUN 会将其配置为只安装安全更新：
 
 ```ini
 upgrade_type = security
 apply_updates = yes
 ```
 
-## Operations
+## 日常操作
 
-Check timer status:
+查看 timer：
 
 ```bash
 systemctl list-timers security-update-notify.timer
 ```
 
-Run a check now:
+立即运行一次检查：
 
 ```bash
 sudo systemctl start security-update-notify.service
 ```
 
-Run built-in diagnostics:
+运行内置诊断：
 
 ```bash
 security-update-notify --version
 sudo security-update-notify --doctor
 ```
 
-View logs:
+查看日志：
 
 ```bash
 sudo tail -n 100 /var/log/security-update-notify.log
 ```
 
-## Uninstall
+## 卸载
 
-Remove the program and systemd/logrotate integration, while keeping config and state:
+移除程序与 systemd/logrotate 集成，但保留配置和状态：
 
 ```bash
 sudo ./uninstall.sh
 ```
 
-Remove config and state too:
+同时删除配置和状态：
 
 ```bash
 sudo ./uninstall.sh --purge-config
 ```
 
-Packages installed as dependencies are left in place.
+作为依赖安装的软件包会保留，不会自动卸载。
 
-## Security notes
+## 安全说明
 
-SUN is intentionally narrow:
+SUN 的范围刻意保持很小：
 
-- outbound HTTPS to Telegram Bot API only;
-- no command receiver;
-- no public HTTP endpoint;
-- no automatic reboot;
-- root-only Telegram credential file;
-- explicit opt-in for best-effort distro support.
+- 只向 Telegram Bot API 发起出站 HTTPS 请求；
+- 不接收远程命令；
+- 不提供公开 HTTP 入口；
+- 不自动重启；
+- Telegram 凭据文件仅 root 可读；
+- 尽力支持的发行版必须显式开启。
 
-The release `.sha256` file protects against accidental corruption or version mismatch. It is not a substitute for a signed release if your threat model includes a compromised download source.
+发布包的 `.sha256` 文件可以防止下载损坏或版本不匹配；如果你的威胁模型包含发布源被攻破，请考虑额外的签名校验流程。
 
-## Build a release package
+## 构建发布包
 
-From the source checkout:
+在源码目录运行：
 
 ```bash
 bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify
@@ -310,14 +312,14 @@ bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security
 cd dist && sha256sum -c security-update-notify-*.tar.gz.sha256
 ```
 
-Generated files:
+生成文件：
 
 ```text
 dist/security-update-notify-VERSION.tar.gz
 dist/security-update-notify-VERSION.tar.gz.sha256
 ```
 
-The release archive contains only user-facing files:
+发布压缩包只包含面向用户的文件：
 
 ```text
 CHANGELOG.md
@@ -330,6 +332,6 @@ uninstall.sh
 files/
 ```
 
-## License
+## 许可证
 
-MIT. See [LICENSE](LICENSE).
+MIT。详见 [LICENSE](LICENSE)。
