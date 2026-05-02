@@ -8,11 +8,13 @@
 - 新增 `.env.example` 与 `--env-file`，并保留 `--telegram-token-file`，便于自动化安装时避免 token 出现在 shell history 或进程列表；`.env` 支持未引号值的行尾注释与大小写布尔值。
 - Telegram 通知新增中英文双语配置：`NOTIFY_LANG=zh|en`，安装时可选择，默认中文。
 - Telegram 提醒摘要改为更易读的人工摘要，减少直接暴露 `needrestart` 原始输出。
-- 增强 systemd service 基础硬化，并避免在服务运行时把 Telegram token 暴露到 curl 命令参数或子进程环境中。
+- 增强 systemd service 基础硬化，并避免在服务运行时把 Telegram token 暴露到 curl 命令参数中；Telegram 调用会在 Python 进程启动后移除临时环境变量。
 - `test.sh` 默认遮蔽 Telegram Chat ID，使用 `--verbose` 才显示完整值。
 - 发布包改为使用可复现 gzip 元数据。
-- apt 后端不再覆盖发行版默认 `Origins-Pattern`，只设置本工具需要的 unattended-upgrades 本地策略。
+- apt 后端不再覆盖发行版默认 `Origins-Pattern`，只设置本工具需要的 unattended-upgrades 本地策略；首次安装会备份 `20auto-upgrades`，purge 时恢复。
 - 移除运行时对 `curl` 的依赖，Telegram 调用统一使用 Python 标准库。
+- purge 卸载会尝试恢复 SUN 创建的 apt/dnf 配置备份。
+- 打包前会清理旧版本 dist 产物，避免 CI/发布混入旧包。
 
 ## 1.1.1
 

@@ -249,6 +249,8 @@ SUN 会配置或使用：
 - `apt-listchanges`
 - apt periodic timers
 
+安装器会启用 unattended-upgrades 的安全更新周期任务，并在首次写入 `/etc/apt/apt.conf.d/20auto-upgrades` 前保存一份 SUN 专用备份；`--purge-config` 会在备份存在时恢复它。
+
 检测方式：
 
 - `/var/run/reboot-required`
@@ -269,7 +271,7 @@ SUN 会配置或使用：
 - `needs-restarting`
 - `dnf updateinfo list security updates`
 
-如果 `/etc/dnf/automatic.conf` 存在，SUN 会将其配置为只安装安全更新：
+如果 `/etc/dnf/automatic.conf` 存在，SUN 会先保存一份带时间戳的备份，再将其配置为只安装安全更新；`--purge-config` 会尝试恢复最新一份 SUN 创建的备份。
 
 ```ini
 upgrade_type = security
@@ -324,7 +326,7 @@ sudo ./uninstall.sh
 sudo ./uninstall.sh --purge-config
 ```
 
-作为依赖安装的软件包会保留，不会自动卸载。
+作为依赖安装的软件包会保留，不会自动卸载。`--purge-config` 会删除 SUN 的配置/状态，并在备份存在时恢复 apt/dnf 自动更新配置。
 
 ## 安全说明
 

@@ -25,6 +25,7 @@ bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security
 [[ -f files/security-update-notify.logrotate ]] || { echo "logrotate file missing" >&2; exit 1; }
 
 mkdir -p "$WORK/$PKG" "$DIST"
+rm -f "$DIST"/security-update-notify-*.tar.gz "$DIST"/security-update-notify-*.tar.gz.sha256
 tar -C "$ROOT" \
   --exclude='./.git' \
   --exclude='./.github' \

@@ -85,10 +85,10 @@ fi
 source "$CONFIG"
 
 telegram_get_me() {
-  python3 - "${TELEGRAM_BOT_TOKEN:-}" <<'PY'
+  printf '%s' "${TELEGRAM_BOT_TOKEN:-}" | python3 -c '
 import sys, urllib.request
 
-token = sys.argv[1] if len(sys.argv) > 1 else ""
+token = sys.stdin.read()
 if not token:
     print("missing TELEGRAM_BOT_TOKEN", file=sys.stderr)
     sys.exit(2)
@@ -102,7 +102,7 @@ except Exception as exc:
 
 print(body)
 sys.exit(0 if '"ok":true' in body else 1)
-PY
+'
 }
 
 echo "== telegram config =="

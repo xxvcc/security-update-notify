@@ -249,6 +249,8 @@ SUN configures or uses:
 - `apt-listchanges`
 - apt periodic timers
 
+The installer enables unattended-upgrades security update timers and saves a SUN-specific backup before first writing `/etc/apt/apt.conf.d/20auto-upgrades`; `--purge-config` restores it when the backup exists.
+
 It checks:
 
 - `/var/run/reboot-required`
@@ -269,7 +271,7 @@ It checks:
 - `needs-restarting`
 - `dnf updateinfo list security updates`
 
-If `/etc/dnf/automatic.conf` exists, SUN configures security-only automatic updates:
+If `/etc/dnf/automatic.conf` exists, SUN first saves a timestamped backup, then configures security-only automatic updates; `--purge-config` attempts to restore the newest SUN-created backup.
 
 ```ini
 upgrade_type = security
@@ -324,7 +326,7 @@ Remove config and state too:
 sudo ./uninstall.sh --purge-config
 ```
 
-Packages installed as dependencies are left in place.
+Packages installed as dependencies are left in place. `--purge-config` removes SUN config/state and restores apt/dnf automatic-update config when a SUN-created backup exists.
 
 ## Security notes
 

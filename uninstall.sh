@@ -20,11 +20,20 @@ systemctl daemon-reload
 
 if [[ "$PURGE_CONFIG" -eq 1 ]]; then
   rm -rf /etc/security-update-notify /var/lib/security-update-notify /var/log/security-update-notify.log /etc/logrotate.d/security-update-notify
+  if [[ -f /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak ]]; then
+    cp -a /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak /etc/apt/apt.conf.d/20auto-upgrades
+    rm -f /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak
+    echo "Restored /etc/apt/apt.conf.d/20auto-upgrades from security-update-notify backup."
+  fi
   rm -f /etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify
   rm -f /etc/apt/apt.conf.d/52unattended-upgrades-local
   rm -f /etc/needrestart/conf.d/99-security-update-notify-report-only.conf
-  echo "Removed config/state too. Note: packages and /etc/apt/apt.conf.d/20auto-upgrades were left in place."
-  ls /etc/dnf/automatic.conf.bak.* >/dev/null 2>&1 && echo "Note: /etc/dnf/automatic.conf backups remain; remove manually if desired." || true
+  latest_dnf_backup="$(ls -1t /etc/dnf/automatic.conf.bak.* 2>/dev/null | head -1 || true)"
+  if [[ -n "$latest_dnf_backup" ]]; then
+    cp -a "$latest_dnf_backup" /etc/dnf/automatic.conf
+    echo "Restored /etc/dnf/automatic.conf from $latest_dnf_backup."
+  fi
+  echo "Removed config/state too. Packages installed as dependencies were left in place."
 fi
 
 echo "Uninstalled security-update-notify."

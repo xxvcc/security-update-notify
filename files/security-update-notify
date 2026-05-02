@@ -45,10 +45,10 @@ log_event() {
 }
 
 telegram_get_me() {
-  python3 - "${TELEGRAM_BOT_TOKEN:-}" <<'PY'
+  printf '%s' "${TELEGRAM_BOT_TOKEN:-}" | python3 -c '
 import sys, urllib.request
 
-token = sys.argv[1] if len(sys.argv) > 1 else ""
+token = sys.stdin.read()
 if not token:
     print("missing TELEGRAM_BOT_TOKEN", file=sys.stderr)
     sys.exit(2)
@@ -63,17 +63,18 @@ except Exception as exc:
 
 print(body)
 sys.exit(0 if '"ok":true' in body else 1)
-PY
+'
 }
 
 telegram_send_message() {
   local text="$1"
-  python3 - "${TELEGRAM_BOT_TOKEN:-}" "${TELEGRAM_CHAT_ID:-}" <<'PY' <<<"$text"
+  printf '%s\0%s\0%s' "${TELEGRAM_BOT_TOKEN:-}" "${TELEGRAM_CHAT_ID:-}" "$text" | python3 -c '
 import sys, time, urllib.parse, urllib.request
 
-token = sys.argv[1] if len(sys.argv) > 1 else ""
-chat_id = sys.argv[2] if len(sys.argv) > 2 else ""
-text = sys.stdin.read()
+payload = sys.stdin.buffer.read().split(b"\0", 2)
+token = payload[0].decode("utf-8", "replace") if len(payload) > 0 else ""
+chat_id = payload[1].decode("utf-8", "replace") if len(payload) > 1 else ""
+text = payload[2].decode("utf-8", "replace") if len(payload) > 2 else ""
 if not token or not chat_id:
     print("missing Telegram token or chat id", file=sys.stderr)
     sys.exit(2)
@@ -100,7 +101,7 @@ for attempt in range(3):
 
 print(last_error or "Telegram notification failed", file=sys.stderr)
 sys.exit(1)
-PY
+'
 }
 
 if [[ -r "$ENV_FILE" ]]; then

@@ -129,10 +129,10 @@ telegram_preflight() {
   while true; do
     echo "Validating Telegram Bot Token..."
     local getme bot_user
-    if ! getme="$(TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" python3 - <<'PY' 2>"$tg_err"
-import json, os, sys, urllib.request
+    if ! getme="$(printf '%s' "$TELEGRAM_BOT_TOKEN" | python3 -c '
+import json, sys, urllib.request
 
-token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+token = sys.stdin.read()
 try:
     with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/getMe", timeout=20) as response:
         body = response.read().decode("utf-8", "replace")
@@ -145,8 +145,7 @@ try:
 except Exception:
     ok = False
 sys.exit(0 if ok else 1)
-PY
-)"; then
+' 2>"$tg_err")"; then
       echo "❌ Telegram token validation failed."
       cat "$tg_err" 2>/dev/null || true
     elif ! printf '%s' "$getme" | grep -q '"ok":true'; then
@@ -156,12 +155,13 @@ PY
       echo "✅ Token is valid: @${bot_user}"
       echo "Sending test message to Telegram Chat ID..."
       local text="✅ security-update-notify Telegram test succeeded. Host: $(hostname -f 2>/dev/null || hostname)"
-      if TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" TELEGRAM_CHAT_ID="$TELEGRAM_CHAT_ID" TELEGRAM_TEXT="$text" python3 - <<'PY' >"$send_out" 2>"$tg_err"; then
-import json, os, sys, urllib.parse, urllib.request
+      if printf '%s\0%s\0%s' "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" "$text" | python3 -c '
+import json, sys, urllib.parse, urllib.request
 
-token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-text = os.environ.get("TELEGRAM_TEXT", "")
+payload = sys.stdin.buffer.read().split(b"\0", 2)
+token = payload[0].decode("utf-8", "replace") if len(payload) > 0 else ""
+chat_id = payload[1].decode("utf-8", "replace") if len(payload) > 1 else ""
+text = payload[2].decode("utf-8", "replace") if len(payload) > 2 else ""
 url = f"https://api.telegram.org/bot{token}/sendMessage"
 data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
 try:
@@ -176,7 +176,7 @@ try:
 except Exception:
     ok = False
 sys.exit(0 if ok else 1)
-PY
+' >"$send_out" 2>"$tg_err"; then
         echo "✅ Telegram test message sent."
         return
       else
@@ -345,6 +345,9 @@ install -m 0644 "$SCRIPT_DIR/files/security-update-notify.service" /etc/systemd/
 if [[ "$BACKEND" == "apt" ]]; then
   install -d -m 0755 /etc/needrestart/conf.d
   install -m 0644 "$SCRIPT_DIR/files/needrestart-report-only.conf" /etc/needrestart/conf.d/99-security-update-notify-report-only.conf
+  if [[ -f /etc/apt/apt.conf.d/20auto-upgrades && ! -e /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak ]]; then
+    cp -a /etc/apt/apt.conf.d/20auto-upgrades /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak
+  fi
   cat >/etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Download-Upgradeable-Packages "1";
