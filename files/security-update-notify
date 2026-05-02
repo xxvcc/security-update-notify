@@ -54,6 +54,8 @@ OS="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}")"
 KERNEL="$(uname -r 2>/dev/null || echo unknown)"
 NOW="$(date '+%Y-%m-%d %H:%M:%S %Z')"
 BACKEND="${BACKEND:-auto}"
+NOTIFY_LANG="${NOTIFY_LANG:-zh}"
+case "$NOTIFY_LANG" in zh|en) ;; *) NOTIFY_LANG="zh" ;; esac
 
 if [[ "$BACKEND" == "auto" ]]; then
   if [[ -r /etc/os-release ]]; then
@@ -186,7 +188,11 @@ esac
 if [[ "$reboot_required" -eq 0 && "$restart_attention" -eq 0 ]]; then
   log_event "check ok backend=$BACKEND host=$HOST no_attention=1"
   if [[ "$SEND_OK" -eq 1 || "${NOTIFY_OK:-0}" == "1" ]]; then
-    msg="✅ 安全更新检查正常\n\n主机：$HOST\n系统：$OS\n后端：$BACKEND\n当前内核：$KERNEL\n时间：$NOW\n\n没有发现整机重启或服务/进程重启需要关注的问题。"
+    if [[ "$NOTIFY_LANG" == "en" ]]; then
+      msg="✅ Security update check OK\n\nHost: $HOST\nOS: $OS\nBackend: $BACKEND\nCurrent kernel: $KERNEL\nTime: $NOW\n\nNo reboot or service/process restart requiring attention was detected."
+    else
+      msg="✅ 安全更新检查正常\n\n主机：$HOST\n系统：$OS\n后端：$BACKEND\n当前内核：$KERNEL\n时间：$NOW\n\n没有发现整机重启或服务/进程重启需要关注的问题。"
+    fi
   else
     log_event "silent ok backend=$BACKEND host=$HOST"
     exit 0
@@ -195,7 +201,13 @@ else
   pkgs_block="无"
   [[ -n "$reboot_pkgs" ]] && pkgs_block="$reboot_pkgs"
   rs="$(printf '%s\n' "$restart_summary" | sed -n '1,100p')"
-  msg="⚠️ 安全更新后需要处理\n\n主机：$HOST\n系统：$OS\n后端：$BACKEND\n当前内核：$KERNEL\n时间：$NOW\n\n整机重启：$([[ "$reboot_required" -eq 1 ]] && echo '需要' || echo '暂不需要')\n相关包/安全更新：\n$pkgs_block\n\n重启检测摘要：\n$rs\n\n建议：请在方便的维护窗口 SSH 登录该服务器后手动执行 reboot；如只是服务需要重启，可先评估并重启对应服务。"
+  if [[ "$NOTIFY_LANG" == "en" ]]; then
+    [[ "$pkgs_block" == "无" ]] && pkgs_block="None"
+    reboot_text="$([[ "$reboot_required" -eq 1 ]] && echo 'Required' || echo 'Not required for now')"
+    msg="⚠️ Security update action required\n\nHost: $HOST\nOS: $OS\nBackend: $BACKEND\nCurrent kernel: $KERNEL\nTime: $NOW\n\nFull reboot: $reboot_text\nRelated packages/security updates:\n$pkgs_block\n\nRestart detection summary:\n$rs\n\nRecommendation: SSH into this server during a suitable maintenance window and run reboot if a full reboot is required. If only services need restarting, review them first and restart the affected services manually."
+  else
+    msg="⚠️ 安全更新后需要处理\n\n主机：$HOST\n系统：$OS\n后端：$BACKEND\n当前内核：$KERNEL\n时间：$NOW\n\n整机重启：$([[ "$reboot_required" -eq 1 ]] && echo '需要' || echo '暂不需要')\n相关包/安全更新：\n$pkgs_block\n\n重启检测摘要：\n$rs\n\n建议：请在方便的维护窗口 SSH 登录该服务器后手动执行 reboot；如只是服务需要重启，可先评估并重启对应服务。"
+  fi
 fi
 msg="${msg//\\n/$'\n'}"
 

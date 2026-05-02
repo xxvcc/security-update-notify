@@ -35,6 +35,7 @@ SUN keeps the boring part automatic and makes the human part obvious.
 - **No automatic reboot** — you stay in control of downtime.
 - **Telegram alerts only when action is needed**.
 - **Reboot and service-restart detection** with `needrestart` or `needs-restarting`.
+- **Chinese or English Telegram alerts** selected during installation. Default: Chinese.
 - **Duplicate alert suppression**: once, daily, or every N days.
 - **Interactive and non-interactive installation**.
 - **systemd timer based scheduling**.
@@ -133,6 +134,7 @@ The installer will ask for:
 
 - Telegram Bot Token;
 - Telegram Chat ID;
+- Telegram notification language, default `zh`;
 - daily check time, default `09:00`;
 - duplicate-alert behavior;
 - whether to send an extra test message after installation.
@@ -161,6 +163,7 @@ sudo ./install.sh \
   --telegram-token '123456:ABC...' \
   --telegram-chat-id 'CHAT_ID' \
   --time '09:00' \
+  --notify-lang en \
   --dedup-mode interval \
   --dedup-interval-days 3 \
   --host-label 'prod-web-01' \
@@ -173,6 +176,8 @@ Common options:
 ```bash
 --backend apt              # force apt backend
 --backend dnf              # force dnf backend
+--notify-lang zh           # Telegram alerts in Chinese, default
+--notify-lang en           # Telegram alerts in English
 --allow-best-effort        # allow best-effort distro versions
 --send-test                # send an extra install-complete test message
 --skip-telegram-test       # skip Telegram preflight validation
@@ -325,6 +330,7 @@ The release archive contains only user-facing files:
 CHANGELOG.md
 LICENSE
 README.md
+README.en.md
 install.sh
 menu.sh
 test.sh

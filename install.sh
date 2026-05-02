@@ -8,6 +8,7 @@ TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 HOST_LABEL="${HOST_LABEL:-}"
 DEDUP_MODE="${DEDUP_MODE:-}"
 DEDUP_INTERVAL_DAYS="${DEDUP_INTERVAL_DAYS:-3}"
+NOTIFY_LANG="${NOTIFY_LANG:-zh}"
 BACKEND="${BACKEND:-auto}"
 SEND_TEST=0
 SKIP_TELEGRAM_TEST=0
@@ -29,6 +30,7 @@ Options:
   --host-label NAME            Optional host label in notifications
   --dedup-mode MODE            always | daily | interval
   --dedup-interval-days N      Used when mode=interval, default 3
+  --notify-lang LANG           Telegram notification language: zh | en, default zh
   --backend BACKEND            auto | apt | dnf, default auto
   --allow-best-effort          Permit best-effort distro versions
   --send-test                  Send additional test message after install
@@ -48,6 +50,7 @@ while [[ $# -gt 0 ]]; do
     --host-label) require_arg "$1" "${2:-}"; HOST_LABEL="$2"; shift 2 ;;
     --dedup-mode) require_arg "$1" "${2:-}"; DEDUP_MODE="$2"; shift 2 ;;
     --dedup-interval-days) require_arg "$1" "${2:-}"; DEDUP_INTERVAL_DAYS="$2"; shift 2 ;;
+    --notify-lang) require_arg "$1" "${2:-}"; NOTIFY_LANG="$2"; shift 2 ;;
     --backend) require_arg "$1" "${2:-}"; BACKEND="$2"; shift 2 ;;
     --send-test) SEND_TEST=1; shift ;;
     --skip-telegram-test) SKIP_TELEGRAM_TEST=1; shift ;;
@@ -199,6 +202,19 @@ esac
 
 prompt_secret TELEGRAM_BOT_TOKEN "Telegram Bot Token"
 prompt_required_text TELEGRAM_CHAT_ID "Telegram Chat ID"
+if [[ -z "${NOTIFY_LANG:-}" ]]; then NOTIFY_LANG="zh"; fi
+if [[ "$NON_INTERACTIVE" -ne 1 && "$NOTIFY_LANG" == "zh" ]]; then
+  echo "Telegram notification language / Telegram 提醒语言:"
+  echo "  1) 中文（默认）"
+  echo "  2) English"
+  read -r -p "Choose [1]: " lang_choice
+  case "${lang_choice:-1}" in
+    1) NOTIFY_LANG="zh" ;;
+    2) NOTIFY_LANG="en" ;;
+    *) echo "Invalid notification language choice" >&2; exit 2 ;;
+  esac
+fi
+case "$NOTIFY_LANG" in zh|en) ;; *) echo "Invalid notify language: $NOTIFY_LANG (expected zh or en)" >&2; exit 2 ;; esac
 prompt_text CHECK_TIME "Daily check time HH:MM" "09:00"
 if [[ -z "$DEDUP_MODE" ]]; then
   if [[ "$NON_INTERACTIVE" -eq 1 ]]; then DEDUP_MODE="interval"; else
@@ -309,6 +325,7 @@ umask 077
   echo 'NOTIFY_OK=0'
   printf 'DEDUP_MODE=%s\n' "$(shell_quote "$DEDUP_MODE")"
   printf 'DEDUP_INTERVAL_DAYS=%s\n' "$(shell_quote "$DEDUP_INTERVAL_DAYS")"
+  printf 'NOTIFY_LANG=%s\n' "$(shell_quote "$NOTIFY_LANG")"
   printf 'BACKEND=%s\n' "$(shell_quote "$BACKEND")"
 } >/etc/security-update-notify/telegram.env
 chmod 600 /etc/security-update-notify/telegram.env
