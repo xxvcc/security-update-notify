@@ -30,6 +30,35 @@ EOF
 }
 
 require_arg() { [[ $# -ge 2 && -n "${2:-}" ]] || { echo "Missing value for $1" >&2; exit 2; }; }
+validate_version() { [[ "$1" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]] || { echo "Invalid VERSION: $1" >&2; exit 2; }; }
+
+verify_checksum() {
+  local file="$1" sha_file="$2" expected
+  expected="$(awk 'NF {print $1; exit}' "$sha_file")"
+  [[ "$expected" =~ ^[A-Fa-f0-9]{64}$ ]] || { echo "Invalid checksum file: $SHA_URL" >&2; exit 1; }
+  printf '%s  %s\n' "$expected" "$file" | sha256sum -c -
+}
+
+safe_extract_tar() {
+  local archive="$1" topdir="$2" entry
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    case "$entry" in
+      /*|../*|*/../*|*/..|..)
+        echo "Unsafe path in archive: $entry" >&2
+        exit 1
+        ;;
+    esac
+    case "$entry" in
+      "$topdir"|"$topdir/"|"$topdir"/*) ;;
+      *)
+        echo "Unexpected path in archive: $entry" >&2
+        exit 1
+        ;;
+    esac
+  done < <(tar -tzf "$archive")
+  tar --no-same-owner -xzf "$archive"
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,8 +81,10 @@ if [[ "$VERSION" == "latest" ]]; then
   api="https://api.github.com/repos/${REPO}/releases/latest"
   VERSION="$(curl -fsSL "$api" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"].lstrip("v"))')"
 fi
+validate_version "$VERSION"
 
 PKG="security-update-notify-${VERSION}.tar.gz"
+PKG_DIR="security-update-notify-${VERSION}"
 if [[ -n "$BASE_URL" ]]; then
   URL="${BASE_URL%/}/${PKG}"
   SHA_URL="${URL}.sha256"
@@ -69,21 +100,25 @@ cd "$TMP"
 echo "Downloading $URL"
 curl -fL --retry 3 -o "$PKG" "$URL"
 curl -fL --retry 3 -o "$PKG.sha256" "$SHA_URL"
-sha256sum -c "$PKG.sha256"
-tar -xzf "$PKG"
-cd "security-update-notify-${VERSION}"
+verify_checksum "$PKG" "$PKG.sha256"
+safe_extract_tar "$PKG" "$PKG_DIR"
+cd "$PKG_DIR"
 
 # When invoked as `curl ... | sudo bash`, stdin is the script stream, not the
-# user terminal. For interactive modes, run the target script with stdin attached
-# to /dev/tty. Non-interactive install/test/uninstall calls can still use normal
-# stdin behavior when no terminal is available.
+# user terminal. Do not run a standalone `exec < /dev/tty` here: bash would then
+# start reading the remaining bootstrap script from the terminal and appear to
+# hang after checksum verification. Redirect stdin only on the final exec.
 run_target() {
   local script="$1"; shift
   if [[ -r /dev/tty ]]; then
     exec "$script" "$@" < /dev/tty
-  else
-    exec "$script" "$@"
   fi
+  if [[ "$script" == "./menu.sh" && ! -t 0 ]]; then
+    echo "No interactive terminal is available for the menu." >&2
+    echo "Run a non-interactive mode, for example: bash sun.sh install --non-interactive -y ..." >&2
+    exit 2
+  fi
+  exec "$script" "$@"
 }
 
 case "$RUN_MODE" in
