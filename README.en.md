@@ -171,7 +171,17 @@ sudo ./install.sh \
   -y
 ```
 
-For safer automation, put the token in a root-only file so it does not appear in shell history or process lists:
+For safer automation, use a local `.env` file so the token does not appear in shell history or process lists:
+
+```bash
+cp .env.example .env
+chmod 600 .env
+sudoedit .env
+
+sudo ./install.sh --env-file .env --non-interactive -y
+```
+
+You can also keep only the token in a root-only file:
 
 ```bash
 sudo install -m 600 /dev/null /root/.security-update-notify-token
@@ -187,7 +197,8 @@ sudo ./install.sh \
 Common options:
 
 ```bash
---telegram-token-file FILE # read Telegram Bot Token from file, recommended for automation
+--env-file FILE            # read install config from dotenv-style file, recommended for automation
+--telegram-token-file FILE # read Telegram Bot Token from file
 --backend apt              # force apt backend
 --backend dnf              # force dnf backend
 --notify-lang zh           # Telegram alerts in Chinese, default
@@ -348,6 +359,7 @@ dist/security-update-notify-VERSION.tar.gz.sha256
 The release archive contains only user-facing files:
 
 ```text
+.env.example
 CHANGELOG.md
 LICENSE
 README.md

@@ -17,6 +17,7 @@ cd "$ROOT"
 bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify
 [[ -f README.md ]] || { echo "README.md missing" >&2; exit 1; }
 [[ -f README.en.md ]] || { echo "README.en.md missing" >&2; exit 1; }
+[[ -f .env.example ]] || { echo ".env.example missing" >&2; exit 1; }
 [[ -f CHANGELOG.md ]] || { echo "CHANGELOG.md missing" >&2; exit 1; }
 [[ -f LICENSE ]] || { echo "LICENSE missing" >&2; exit 1; }
 [[ -f files/security-update-notify.service ]] || { echo "service file missing" >&2; exit 1; }
@@ -30,6 +31,9 @@ tar -C "$ROOT" \
   --exclude='./dist' \
   --exclude='./*.tar.gz' \
   --exclude='./*.sha256' \
+  --exclude='./.env' \
+  --exclude='./.env.local' \
+  --exclude='./.env.production' \
   --exclude='*.bak' \
   --exclude='*.tmp' \
   --exclude='./*~' \
@@ -46,6 +50,7 @@ tar -C "$ROOT" \
 # Normalize executable permissions.
 chmod 0755 "$WORK/$PKG"/*.sh "$WORK/$PKG/files/security-update-notify"
 chmod 0644 "$WORK/$PKG/README.md" "$WORK/$PKG/README.en.md" "$WORK/$PKG/CHANGELOG.md" "$WORK/$PKG/LICENSE" "$WORK/$PKG/files/security-update-notify.service" "$WORK/$PKG/files/needrestart-report-only.conf" "$WORK/$PKG/files/security-update-notify.logrotate"
+[[ -f "$WORK/$PKG/.env.example" ]] && chmod 0644 "$WORK/$PKG/.env.example"
 
 # Safety: release package must not contain local runtime config/state files.
 if find "$WORK/$PKG" -type f \( -name 'telegram.env' -o -name '*.log' -o -name 'last-alert*' \) | grep -q .; then

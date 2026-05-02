@@ -4,6 +4,9 @@ dist/
 *.tar.gz.sha256
 
 # Local/runtime files must never be committed
+.env
+.env.*
+!.env.example
 telegram.env
 *.log
 last-alert*

@@ -15,6 +15,7 @@ SKIP_TELEGRAM_TEST=0
 NON_INTERACTIVE=0
 ASSUME_YES=0
 ALLOW_BEST_EFFORT=0
+ENV_FILE=""
 TMP_DIR=""
 cleanup() { [[ -n "$TMP_DIR" ]] && rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
@@ -26,6 +27,7 @@ Usage: sudo ./install.sh [options]
 Options:
   --telegram-token TOKEN       Telegram bot token
   --telegram-token-file FILE   Read Telegram bot token from file, safer for automation
+  --env-file FILE              Load install options from dotenv-style file
   --telegram-chat-id CHAT_ID   Telegram target chat id
   --time HH:MM                 Daily check time, default 09:00
   --host-label NAME            Optional host label in notifications
@@ -42,9 +44,38 @@ Options:
 EOF
 }
 
+load_env_file() {
+  local file="$1" line key value
+  [[ -r "$file" ]] || { echo "Cannot read env file: $file" >&2; exit 2; }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" == export\ * ]] && line="${line#export }"
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="${key//[[:space:]]/}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "Invalid env key in $file: $key" >&2; exit 2; }
+    value="${value#${value%%[![:space:]]*}}"
+    value="${value%${value##*[![:space:]]}}"
+    if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
+    if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
+    case "$key" in
+      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|CHECK_TIME|HOST_LABEL|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND)
+        printf -v "$key" '%s' "$value"
+        ;;
+      SEND_TEST|SKIP_TELEGRAM_TEST|NON_INTERACTIVE|ASSUME_YES|ALLOW_BEST_EFFORT)
+        [[ "$value" =~ ^(0|1|true|false|yes|no)$ ]] || { echo "Invalid boolean for $key in $file" >&2; exit 2; }
+        case "$value" in 1|true|yes) printf -v "$key" '%s' 1 ;; *) printf -v "$key" '%s' 0 ;; esac
+        ;;
+      *) echo "Unsupported env key in $file: $key" >&2; exit 2 ;;
+    esac
+  done <"$file"
+}
+
 require_arg() { [[ $# -ge 2 && -n "${2:-}" ]] || { echo "Missing value for $1" >&2; exit 2; }; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --env-file) require_arg "$1" "${2:-}"; ENV_FILE="$2"; load_env_file "$2"; shift 2 ;;
     --telegram-token) require_arg "$1" "${2:-}"; TELEGRAM_BOT_TOKEN="$2"; shift 2 ;;
     --telegram-token-file) require_arg "$1" "${2:-}"; TELEGRAM_BOT_TOKEN="$(tr -d '\r\n' <"$2")"; shift 2 ;;
     --telegram-chat-id) require_arg "$1" "${2:-}"; TELEGRAM_CHAT_ID="$2"; shift 2 ;;

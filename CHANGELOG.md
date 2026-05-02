@@ -5,7 +5,7 @@
 
 安全性与用户体验改进。
 
-- 新增 `--telegram-token-file`，便于自动化安装时避免 token 出现在 shell history 或进程列表。
+- 新增 `.env.example` 与 `--env-file`，并保留 `--telegram-token-file`，便于自动化安装时避免 token 出现在 shell history 或进程列表。
 - Telegram 通知新增中英文双语配置：`NOTIFY_LANG=zh|en`，安装时可选择，默认中文。
 - Telegram 提醒摘要改为更易读的人工摘要，减少直接暴露 `needrestart` 原始输出。
 - 增强 systemd service 基础硬化，并避免在服务运行时把 Telegram token 暴露到 curl 命令参数中。

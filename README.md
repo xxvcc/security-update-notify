@@ -171,7 +171,17 @@ sudo ./install.sh \
   -y
 ```
 
-更安全的自动化方式是把 token 放在 root-only 文件里，避免 token 出现在 shell history 或进程列表：
+更安全的自动化方式是使用本地 `.env` 文件，避免 token 出现在 shell history 或进程列表：
+
+```bash
+cp .env.example .env
+chmod 600 .env
+sudoedit .env
+
+sudo ./install.sh --env-file .env --non-interactive -y
+```
+
+也可以只把 token 单独放进 root-only 文件：
 
 ```bash
 sudo install -m 600 /dev/null /root/.security-update-notify-token
@@ -187,7 +197,8 @@ sudo ./install.sh \
 常用参数：
 
 ```bash
---telegram-token-file FILE # 从文件读取 Telegram Bot Token，推荐用于自动化
+--env-file FILE            # 从 dotenv 风格文件读取安装配置，推荐用于自动化
+--telegram-token-file FILE # 从文件读取 Telegram Bot Token
 --backend apt              # 强制使用 apt 后端
 --backend dnf              # 强制使用 dnf 后端
 --notify-lang zh           # Telegram 提醒语言：中文（默认）
@@ -348,6 +359,7 @@ dist/security-update-notify-VERSION.tar.gz.sha256
 发布压缩包只包含面向用户的文件：
 
 ```text
+.env.example
 CHANGELOG.md
 LICENSE
 README.md
