@@ -1,5 +1,13 @@
 # security-update-notify
 
+<p align="center">
+  <img alt="Linux" src="https://img.shields.io/badge/Linux-systemd-1793D1?style=flat-square&logo=linux&logoColor=white">
+  <img alt="Debian" src="https://img.shields.io/badge/Debian-12%20%7C%2013-A81D33?style=flat-square&logo=debian&logoColor=white">
+  <img alt="Ubuntu" src="https://img.shields.io/badge/Ubuntu-22.04%20%7C%2024.04-E95420?style=flat-square&logo=ubuntu&logoColor=white">
+  <img alt="RHEL compatible" src="https://img.shields.io/badge/RHEL%20compatible-8%20%7C%209-EE0000?style=flat-square&logo=redhat&logoColor=white">
+  <img alt="License" src="https://img.shields.io/badge/License-MIT-green?style=flat-square">
+</p>
+
 > Install security updates automatically. Get a clean Telegram alert only when a reboot or service restart needs your attention.
 
 **security-update-notify** — or **SUN** — is a small Linux utility for people who maintain servers and do not want to miss important post-update actions.
@@ -13,14 +21,6 @@ It uses your distro's native update tools, runs from a systemd timer, and sends 
 ```bash
 curl -fsSL https://xxv.cc/sun.sh | sudo bash
 ```
-
-<p align="center">
-  <img alt="Linux" src="https://img.shields.io/badge/Linux-systemd-1793D1?style=flat-square&logo=linux&logoColor=white">
-  <img alt="Debian" src="https://img.shields.io/badge/Debian-12%20%7C%2013-A81D33?style=flat-square&logo=debian&logoColor=white">
-  <img alt="Ubuntu" src="https://img.shields.io/badge/Ubuntu-22.04%20%7C%2024.04-E95420?style=flat-square&logo=ubuntu&logoColor=white">
-  <img alt="RHEL compatible" src="https://img.shields.io/badge/RHEL%20compatible-8%20%7C%209-EE0000?style=flat-square&logo=redhat&logoColor=white">
-  <img alt="License" src="https://img.shields.io/badge/License-MIT-green?style=flat-square">
-</p>
 
 ---
 
