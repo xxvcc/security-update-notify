@@ -398,7 +398,8 @@ def set_ini(section,key,val):
             if in_sec and not done:
                 out.append(f'{key} = {val}'); done=True
             in_sec=(stripped==f'[{section}]'); seen=seen or in_sec; out.append(line); continue
-        if in_sec and stripped.startswith(key): out.append(f'{key} = {val}'); done=True
+        line_key = stripped.split('=', 1)[0].strip() if '=' in stripped else ''
+        if in_sec and line_key == key: out.append(f'{key} = {val}'); done=True
         else: out.append(line)
     if not seen: out += [f'[{section}]', f'{key} = {val}']
     elif in_sec and not done: out.append(f'{key} = {val}')

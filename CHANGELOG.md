@@ -5,6 +5,8 @@
 - 所有终端交互、帮助、菜单、错误、诊断输出和安装预检 Telegram 测试消息改为中英双语同屏。
 - Telegram OK/告警提醒改为中英双语同屏；`NOTIFY_LANG=zh|en` 现在控制中文或英文优先显示顺序。
 - README、`.env.example`、systemd 描述和 needrestart 配置注释同步更新为中英双语说明。
+- 发布打包改为白名单复制明确文件，避免未跟踪本地文件或维护笔记误入 release。
+- 收紧 DNF automatic INI 写入的键匹配，并修正 DNF 模拟重启测试摘要格式。
 
 ## 1.2.2
 

@@ -266,7 +266,7 @@ check_dnf() {
   if [[ "$TEST_REBOOT" -eq 1 ]]; then
     reboot_required=1
     reboot_pkgs=$'kernel\nTEST-MODE-no-real-reboot'
-    restart_summary=$'needs-restarting -r: Reboot is required to ensure that your system benefits from these updates.\nneeds-restarting: test-service (pid 123)'
+    restart_summary=$'needs-restarting -r: Reboot is required to ensure that your system benefits from these updates.\nneeds-restarting:\ntest-service (pid 123)'
     restart_attention=1
     return
   fi

@@ -38,35 +38,22 @@ fi
 [[ -f files/needrestart-report-only.conf ]] || { echo "缺少 needrestart 配置 / needrestart config missing" >&2; exit 1; }
 [[ -f files/security-update-notify.logrotate ]] || { echo "缺少 logrotate 文件 / logrotate file missing" >&2; exit 1; }
 
-mkdir -p "$WORK/$PKG" "$DIST"
+mkdir -p "$WORK/$PKG/files" "$DIST"
 rm -f "$DIST"/security-update-notify-*.tar.gz "$DIST"/security-update-notify-*.tar.gz.sha256
-tar -C "$ROOT" \
-  --exclude='./.git' \
-  --exclude='./.github' \
-  --exclude='./dist' \
-  --exclude='./*.tar.gz' \
-  --exclude='./*.sha256' \
-  --exclude='./.env' \
-  --exclude='./.env.*' \
-  --exclude='*.bak' \
-  --exclude='*.tmp' \
-  --exclude='./*~' \
-  --exclude='./.DS_Store' \
-  --exclude='./.vscode' \
-  --exclude='./.idea' \
-  --exclude='./.cache' \
-  --exclude='./README-longlan.md' \
-  --exclude='./.gitignore' \
-  --exclude='./package.sh' \
-  --exclude='./sun.sh' \
-  -cf - . | tar -C "$WORK/$PKG" --strip-components=1 -xf -
-cp "$ROOT/.env.example" "$WORK/$PKG/.env.example"
+
+# 只复制明确允许进入发布包的文件，避免未跟踪的本地文件或维护笔记误入 release。
+# Copy only explicitly allowed release files, preventing untracked local files or maintainer notes from leaking into releases.
+for f in .env.example CHANGELOG.md LICENSE README.md README.en.md install.sh menu.sh test.sh uninstall.sh; do
+  cp "$ROOT/$f" "$WORK/$PKG/$f"
+done
+for f in needrestart-report-only.conf security-update-notify security-update-notify.logrotate security-update-notify.service; do
+  cp "$ROOT/files/$f" "$WORK/$PKG/files/$f"
+done
 
 # 规范化可执行权限。
 # Normalize executable permissions.
 chmod 0755 "$WORK/$PKG"/*.sh "$WORK/$PKG/files/security-update-notify"
-chmod 0644 "$WORK/$PKG/README.md" "$WORK/$PKG/README.en.md" "$WORK/$PKG/CHANGELOG.md" "$WORK/$PKG/LICENSE" "$WORK/$PKG/files/security-update-notify.service" "$WORK/$PKG/files/needrestart-report-only.conf" "$WORK/$PKG/files/security-update-notify.logrotate"
-[[ -f "$WORK/$PKG/.env.example" ]] && chmod 0644 "$WORK/$PKG/.env.example"
+chmod 0644 "$WORK/$PKG/.env.example" "$WORK/$PKG/README.md" "$WORK/$PKG/README.en.md" "$WORK/$PKG/CHANGELOG.md" "$WORK/$PKG/LICENSE" "$WORK/$PKG/files/security-update-notify.service" "$WORK/$PKG/files/needrestart-report-only.conf" "$WORK/$PKG/files/security-update-notify.logrotate"
 
 # 安全检查：发布包不能包含本地运行配置或状态文件。
 # Safety: release package must not contain local runtime config/state files.
