@@ -1,5 +1,5 @@
 [Unit]
-Description=Notify Telegram when security updates require reboot or service restart
+Description=安全更新需要整机重启或服务重启时通知 Telegram / Notify Telegram when security updates require reboot or service restart
 Wants=network-online.target
 After=network-online.target
 

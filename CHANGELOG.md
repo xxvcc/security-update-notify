@@ -1,5 +1,11 @@
 # 变更记录
 
+## 未发布 / Unreleased
+
+- 所有终端交互、帮助、菜单、错误、诊断输出和安装预检 Telegram 测试消息改为中英双语同屏。
+- Telegram OK/告警提醒改为中英双语同屏；`NOTIFY_LANG=zh|en` 现在控制中文或英文优先显示顺序。
+- README、`.env.example`、systemd 描述和 needrestart 配置注释同步更新为中英双语说明。
+
 ## 1.2.2
 
 审计加固与发布流程改进。

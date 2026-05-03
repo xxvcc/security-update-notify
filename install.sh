@@ -17,36 +17,36 @@ ASSUME_YES=0
 ALLOW_BEST_EFFORT=0
 ENV_FILE=""
 TMP_DIR=""
-cleanup() { [[ -n "$TMP_DIR" ]] && rm -rf "$TMP_DIR"; }
+cleanup() { [[ -z "$TMP_DIR" ]] || rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
 
 usage() {
   cat <<'EOF'
-Usage: sudo ./install.sh [options]
+用法 / Usage: sudo ./install.sh [选项 / options]
 
-Options:
-  --telegram-token TOKEN       Telegram bot token
-  --telegram-token-file FILE   Read Telegram bot token from file, safer for automation
-  --env-file FILE              Load install options from dotenv-style file
-  --telegram-chat-id CHAT_ID   Telegram target chat id
-  --time HH:MM                 Daily check time, default 09:00
-  --host-label NAME            Optional host label in notifications
+选项 / Options:
+  --telegram-token TOKEN       Telegram Bot Token / Telegram bot token
+  --telegram-token-file FILE   从文件读取 Telegram Bot Token，更适合自动化 / Read Telegram bot token from file, safer for automation
+  --env-file FILE              从 dotenv 风格文件加载安装选项 / Load install options from dotenv-style file
+  --telegram-chat-id CHAT_ID   Telegram 目标 Chat ID / Telegram target chat id
+  --time HH:MM                 每日检查时间，默认 09:00 / Daily check time, default 09:00
+  --host-label NAME            通知中的可选主机标签 / Optional host label in notifications
   --dedup-mode MODE            always | daily | interval
-  --dedup-interval-days N      Used when mode=interval, default 3
-  --notify-lang LANG           Telegram notification language: zh | en, default zh
-  --backend BACKEND            auto | apt | dnf, default auto
-  --allow-best-effort          Permit best-effort distro versions
-  --send-test                  Send additional test message after install
-  --skip-telegram-test         Skip pre-install Telegram token/chat validation
-  --non-interactive            Fail if required options are missing
-  -y, --yes                    Do not prompt before installing packages
-  -h, --help                   Show help
+  --dedup-interval-days N      mode=interval 时使用，默认 3 / Used when mode=interval, default 3
+  --notify-lang LANG           Telegram 双语通知显示顺序：zh 中文在前 | en 英文在前，默认 zh / Bilingual Telegram alert display order: zh Chinese first | en English first, default zh
+  --backend BACKEND            auto | apt | dnf，默认 auto / auto | apt | dnf, default auto
+  --allow-best-effort          允许尽力支持的发行版 / Permit best-effort distro versions
+  --send-test                  安装后额外发送测试消息 / Send additional test message after install
+  --skip-telegram-test         跳过安装前 Telegram token/chat 校验 / Skip pre-install Telegram token/chat validation
+  --non-interactive            缺少必需选项时直接失败 / Fail if required options are missing
+  -y, --yes                    安装软件包前不再询问 / Do not prompt before installing packages
+  -h, --help                   显示帮助 / Show help
 EOF
 }
 
 load_env_file() {
   local file="$1" line key value lower
-  [[ -r "$file" ]] || { echo "Cannot read env file: $file" >&2; exit 2; }
+  [[ -r "$file" ]] || { echo "无法读取 env 文件 / Cannot read env file: $file" >&2; exit 2; }
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
     [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
@@ -54,7 +54,7 @@ load_env_file() {
     key="${line%%=*}"
     value="${line#*=}"
     key="${key//[[:space:]]/}"
-    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "Invalid env key in $file: $key" >&2; exit 2; }
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "env 文件中的键无效 / Invalid env key in $file: $key" >&2; exit 2; }
     value="${value#${value%%[![:space:]]*}}"
     value="${value%${value##*[![:space:]]}}"
     if [[ "$value" != \"* && "$value" != \'* ]]; then
@@ -69,15 +69,15 @@ load_env_file() {
         ;;
       SEND_TEST|SKIP_TELEGRAM_TEST|NON_INTERACTIVE|ASSUME_YES|ALLOW_BEST_EFFORT)
         lower="${value,,}"
-        [[ "$lower" =~ ^(0|1|true|false|yes|no)$ ]] || { echo "Invalid boolean for $key in $file" >&2; exit 2; }
+        [[ "$lower" =~ ^(0|1|true|false|yes|no)$ ]] || { echo "$key 在 $file 中的布尔值无效 / Invalid boolean for $key in $file" >&2; exit 2; }
         case "$lower" in 1|true|yes) printf -v "$key" '%s' 1 ;; *) printf -v "$key" '%s' 0 ;; esac
         ;;
-      *) echo "Unsupported env key in $file: $key" >&2; exit 2 ;;
+      *) echo "$file 中存在不支持的 env 键 / Unsupported env key in $file: $key" >&2; exit 2 ;;
     esac
   done <"$file"
 }
 
-require_arg() { [[ $# -ge 2 && -n "${2:-}" ]] || { echo "Missing value for $1" >&2; exit 2; }; }
+require_arg() { [[ $# -ge 2 && -n "${2:-}" ]] || { echo "缺少 $1 的值 / Missing value for $1" >&2; exit 2; }; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --env-file) require_arg "$1" "${2:-}"; ENV_FILE="$2"; load_env_file "$2"; shift 2 ;;
@@ -96,38 +96,38 @@ while [[ $# -gt 0 ]]; do
     --non-interactive) NON_INTERACTIVE=1; shift ;;
     -y|--yes) ASSUME_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    *) echo "未知参数 / Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
-require_root() { [[ "$(id -u)" -eq 0 ]] || { echo "Please run as root, e.g. sudo ./install.sh" >&2; exit 1; }; }
+require_root() { [[ "$(id -u)" -eq 0 ]] || { echo "请以 root 运行，例如 sudo ./install.sh / Please run as root, e.g. sudo ./install.sh" >&2; exit 1; }; }
 shell_quote() { printf "%q" "$1"; }
 prompt_secret() {
   local var_name="$1" prompt="$2" current
   set +u; current="${!var_name}"; set -u
   [[ -n "$current" ]] && return
-  [[ "$NON_INTERACTIVE" -eq 1 ]] && { echo "Missing required option: $prompt" >&2; exit 2; }
-  echo "$prompt (input is hidden; press Enter when done):"
+  [[ "$NON_INTERACTIVE" -eq 1 ]] && { echo "缺少必需选项 / Missing required option: $prompt" >&2; exit 2; }
+  echo "$prompt（输入隐藏，完成后按 Enter）/ $prompt (input is hidden; press Enter when done):"
   read -r -s current; echo
   while [[ -z "$current" ]]; do
-    echo "$prompt cannot be empty. Input is still hidden; press Enter when done:"
+    echo "$prompt 不能为空；输入仍会隐藏，完成后按 Enter。/ $prompt cannot be empty. Input is still hidden; press Enter when done:"
     read -r -s current; echo
   done
-  echo "$prompt received."
+  echo "已收到 $prompt。/ $prompt received."
   printf -v "$var_name" '%s' "$current"
 }
 prompt_text() { local var_name="$1" prompt="$2" default="$3" current; set +u; current="${!var_name}"; set -u; [[ -n "$current" ]] && return; [[ "$NON_INTERACTIVE" -eq 1 ]] && { printf -v "$var_name" '%s' "$default"; return; }; read -r -p "$prompt [$default]: " current; printf -v "$var_name" '%s' "${current:-$default}"; }
-prompt_required_text() { local var_name="$1" prompt="$2" current; set +u; current="${!var_name}"; set -u; [[ -n "$current" ]] && return; [[ "$NON_INTERACTIVE" -eq 1 ]] && { echo "Missing required option: $prompt" >&2; exit 2; }; while [[ -z "$current" ]]; do read -r -p "$prompt: " current; done; printf -v "$var_name" '%s' "$current"; }
+prompt_required_text() { local var_name="$1" prompt="$2" current; set +u; current="${!var_name}"; set -u; [[ -n "$current" ]] && return; [[ "$NON_INTERACTIVE" -eq 1 ]] && { echo "缺少必需选项 / Missing required option: $prompt" >&2; exit 2; }; while [[ -z "$current" ]]; do read -r -p "$prompt: " current; done; printf -v "$var_name" '%s' "$current"; }
 valid_time() { [[ "$1" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; }
 
 telegram_preflight() {
-  [[ "$SKIP_TELEGRAM_TEST" -eq 1 ]] && { echo "Skipping Telegram preflight test."; return; }
+  [[ "$SKIP_TELEGRAM_TEST" -eq 1 ]] && { echo "跳过 Telegram 预检。/ Skipping Telegram preflight test."; return; }
   local tg_err send_out
   TMP_DIR="${TMP_DIR:-$(mktemp -d)}"
   tg_err="$TMP_DIR/telegram.err"
   send_out="$TMP_DIR/send.out"
   while true; do
-    echo "Validating Telegram Bot Token..."
+    echo "正在验证 Telegram Bot Token... / Validating Telegram Bot Token..."
     local getme bot_user
     if ! getme="$(printf '%s' "$TELEGRAM_BOT_TOKEN" | python3 -c '
 import json, sys, urllib.request
@@ -146,13 +146,13 @@ except Exception:
     ok = False
 sys.exit(0 if ok else 1)
 ' 2>"$tg_err")"; then
-      echo "❌ Telegram token validation failed."
+      echo "❌ Telegram token 校验失败。/ Telegram token validation failed."
       cat "$tg_err" 2>/dev/null || true
     else
       bot_user="$(printf '%s' "$getme" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("result",{}).get("username", "unknown"))' 2>/dev/null || echo unknown)"
-      echo "✅ Token is valid: @${bot_user}"
-      echo "Sending test message to Telegram Chat ID..."
-      local text="✅ security-update-notify Telegram test succeeded. Host: $(hostname -f 2>/dev/null || hostname)"
+      echo "✅ Token 有效 / Token is valid: @${bot_user}"
+      echo "正在向 Telegram Chat ID 发送测试消息... / Sending test message to Telegram Chat ID..."
+      local text="✅ security-update-notify Telegram 测试成功 / Telegram test succeeded. 主机 / Host: $(hostname -f 2>/dev/null || hostname)"
       if printf '%s\0%s\0%s' "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" "$text" | python3 -c '
 import json, sys, urllib.parse, urllib.request
 
@@ -175,27 +175,27 @@ except Exception:
     ok = False
 sys.exit(0 if ok else 1)
 ' >"$send_out" 2>"$tg_err"; then
-        echo "✅ Telegram test message sent."
+        echo "✅ Telegram 测试消息已发送。/ Telegram test message sent."
         return
       else
-        echo "❌ Telegram test message failed."
+        echo "❌ Telegram 测试消息发送失败。/ Telegram test message failed."
         cat "$tg_err" 2>/dev/null || true
       fi
     fi
     cat <<'EOF'
-Possible causes:
-1. Bot token is wrong
-2. Chat ID is wrong
-3. You have not sent /start to the bot
-4. The bot is not in the target group or cannot post there
-5. This server cannot reach api.telegram.org
+可能原因 / Possible causes:
+1. Bot Token 错误 / Bot token is wrong
+2. Chat ID 错误 / Chat ID is wrong
+3. 你还没有给 bot 发送 /start / You have not sent /start to the bot
+4. bot 不在目标群组中，或没有发消息权限 / The bot is not in the target group or cannot post there
+5. 这台服务器无法访问 api.telegram.org / This server cannot reach api.telegram.org
 EOF
     if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
-      echo "Non-interactive mode: Telegram preflight failed." >&2
+      echo "非交互模式：Telegram 预检失败。/ Non-interactive mode: Telegram preflight failed." >&2
       exit 2
     fi
-    read -r -p "Re-enter Telegram token and chat ID? [Y/n]: " retry
-    [[ "${retry:-Y}" =~ ^[Yy]$ ]] || { echo "Telegram preflight failed; aborting." >&2; exit 2; }
+    read -r -p "重新输入 Telegram token 和 chat ID？/ Re-enter Telegram token and chat ID? [Y/n]: " retry
+    [[ "${retry:-Y}" =~ ^[Yy]$ ]] || { echo "Telegram 预检失败，安装中止。/ Telegram preflight failed; aborting." >&2; exit 2; }
     TELEGRAM_BOT_TOKEN=""
     TELEGRAM_CHAT_ID=""
     prompt_secret TELEGRAM_BOT_TOKEN "Telegram Bot Token"
@@ -204,7 +204,7 @@ EOF
 }
 
 require_root
-[[ -r /etc/os-release ]] || { echo "Missing /etc/os-release" >&2; exit 1; }
+[[ -r /etc/os-release ]] || { echo "缺少 /etc/os-release / Missing /etc/os-release" >&2; exit 1; }
 ID=""; VERSION_ID=""; PRETTY_NAME=""
 while IFS= read -r line || [[ -n "$line" ]]; do
   line="${line%$'\r'}"
@@ -229,24 +229,25 @@ case "${ID:-}" in
   amzn) DETECTED_BACKEND="dnf"; case "${VERSION_ID:-}" in 2023) SUPPORTED=1; SUPPORT_LABEL="best-effort" ;; esac ;;
 esac
 [[ "$BACKEND" == "auto" ]] && BACKEND="$DETECTED_BACKEND"
-case "$BACKEND" in apt|dnf) ;; *) echo "Invalid/unsupported backend: $BACKEND" >&2; exit 2 ;; esac
+case "$BACKEND" in apt|dnf) ;; *) echo "无效或不支持的后端 / Invalid/unsupported backend: $BACKEND" >&2; exit 2 ;; esac
 
 if [[ "$SUPPORTED" -ne 1 ]]; then
   cat >&2 <<EOF
-Unsupported distribution: ID=${ID:-unknown} VERSION_ID=${VERSION_ID:-unknown}
+不支持的发行版 / Unsupported distribution: ID=${ID:-unknown} VERSION_ID=${VERSION_ID:-unknown}
 
-Supported:
+正式支持 / Supported:
 - Debian 12 / 13
 - Ubuntu 22.04 / 24.04
 - RHEL/Rocky/AlmaLinux 8 / 9
-- Fedora current releases
+- Fedora 当前版本 / Fedora current releases
 
-Best effort:
+尽力支持 / Best effort:
 - Debian 11
 - Ubuntu 20.04
 - CentOS Stream 8 / 9
 - Amazon Linux 2023
 
+安装器会在不支持的发行版上停止，因为更新与重启检测和发行版强相关。
 This installer intentionally stops on unsupported distributions because update and reboot detection are distro-specific.
 EOF
   exit 1
@@ -254,23 +255,27 @@ fi
 
 if [[ "$SUPPORT_LABEL" == "best-effort" && "$ALLOW_BEST_EFFORT" -ne 1 ]]; then
   cat >&2 <<EOF
+检测到 ${PRETTY_NAME:-$ID $VERSION_ID}，该系统属于尽力支持范围。
 Detected ${PRETTY_NAME:-$ID $VERSION_ID}, which is best-effort support.
+
+如果明确要在这里安装，请加 --allow-best-effort 重新运行。
 Re-run with --allow-best-effort if you explicitly want to install here.
 EOF
   exit 1
 fi
 
-echo "Detected ${PRETTY_NAME:-$ID $VERSION_ID} ($SUPPORT_LABEL, backend=$BACKEND)."
-[[ -d /run/systemd/system ]] || { echo "systemd is required; containers without systemd are not supported." >&2; exit 1; }
-command -v systemctl >/dev/null || { echo "systemctl is required" >&2; exit 1; }
+echo "检测到 / Detected ${PRETTY_NAME:-$ID $VERSION_ID} ($SUPPORT_LABEL, backend=$BACKEND)."
+[[ -d /run/systemd/system ]] || { echo "需要 systemd；不支持没有 systemd 的容器。/ systemd is required; containers without systemd are not supported." >&2; exit 1; }
+command -v systemctl >/dev/null || { echo "需要 systemctl / systemctl is required" >&2; exit 1; }
 
+# Telegram 预检即使在全新服务器上也需要 python3/CA 根证书。
 # Telegram preflight needs python3/CA roots even on fresh servers.
 MINIMAL_PACKAGES=()
 case "$BACKEND" in
   apt)
     for pkg in python3 ca-certificates; do dpkg -s "$pkg" >/dev/null 2>&1 || MINIMAL_PACKAGES+=("$pkg"); done
     if [[ "${#MINIMAL_PACKAGES[@]}" -gt 0 ]]; then
-      echo "Installing minimal preflight packages: ${MINIMAL_PACKAGES[*]}"
+      echo "正在安装预检所需的最小软件包 / Installing minimal preflight packages: ${MINIMAL_PACKAGES[*]}"
       apt-get update
       DEBIAN_FRONTEND=noninteractive apt-get install -y "${MINIMAL_PACKAGES[@]}"
     fi
@@ -278,8 +283,8 @@ case "$BACKEND" in
   dnf)
     for pkg in python3 ca-certificates; do rpm -q "$pkg" >/dev/null 2>&1 || MINIMAL_PACKAGES+=("$pkg"); done
     if [[ "${#MINIMAL_PACKAGES[@]}" -gt 0 ]]; then
-      echo "Installing minimal preflight packages: ${MINIMAL_PACKAGES[*]}"
-      if command -v dnf >/dev/null 2>&1; then dnf install -y "${MINIMAL_PACKAGES[@]}"; elif command -v yum >/dev/null 2>&1; then yum install -y "${MINIMAL_PACKAGES[@]}"; else echo "dnf or yum is required" >&2; exit 1; fi
+      echo "正在安装预检所需的最小软件包 / Installing minimal preflight packages: ${MINIMAL_PACKAGES[*]}"
+      if command -v dnf >/dev/null 2>&1; then dnf install -y "${MINIMAL_PACKAGES[@]}"; elif command -v yum >/dev/null 2>&1; then yum install -y "${MINIMAL_PACKAGES[@]}"; else echo "需要 dnf 或 yum / dnf or yum is required" >&2; exit 1; fi
     fi
     ;;
 esac
@@ -288,53 +293,53 @@ prompt_secret TELEGRAM_BOT_TOKEN "Telegram Bot Token"
 prompt_required_text TELEGRAM_CHAT_ID "Telegram Chat ID"
 if [[ -z "${NOTIFY_LANG:-}" ]]; then NOTIFY_LANG="zh"; fi
 if [[ "$NON_INTERACTIVE" -ne 1 && "$NOTIFY_LANG" == "zh" ]]; then
-  echo "Telegram notification language / Telegram 提醒语言:"
-  echo "  1) 中文（默认）"
-  echo "  2) English"
-  read -r -p "Choose [1]: " lang_choice
+  echo "Telegram 双语通知显示顺序 / Bilingual Telegram alert display order:"
+  echo "  1) 中文在前（默认）/ Chinese first (default)"
+  echo "  2) 英文在前 / English first"
+  read -r -p "请选择 / Choose [1]: " lang_choice
   case "${lang_choice:-1}" in
     1) NOTIFY_LANG="zh" ;;
     2) NOTIFY_LANG="en" ;;
-    *) echo "Invalid notification language choice" >&2; exit 2 ;;
+    *) echo "无效通知显示顺序选项 / Invalid notification display-order choice" >&2; exit 2 ;;
   esac
 fi
-case "$NOTIFY_LANG" in zh|en) ;; *) echo "Invalid notify language: $NOTIFY_LANG (expected zh or en)" >&2; exit 2 ;; esac
-prompt_text CHECK_TIME "Daily check time HH:MM" "09:00"
+case "$NOTIFY_LANG" in zh|en) ;; *) echo "无效通知显示顺序 / Invalid notify display order: $NOTIFY_LANG (expected zh or en)" >&2; exit 2 ;; esac
+prompt_text CHECK_TIME "每日检查时间 HH:MM / Daily check time HH:MM" "09:00"
 if [[ -z "$DEDUP_MODE" ]]; then
   if [[ "$NON_INTERACTIVE" -eq 1 ]]; then DEDUP_MODE="interval"; else
-    echo "Same-alert reminder mode:"; echo "  1) always   same alert only once until state changes"; echo "  2) daily    same alert once per day"; echo "  3) interval same alert every N days (recommended)"; read -r -p "Choose [3]: " choice
-    case "${choice:-3}" in 1) DEDUP_MODE="always" ;; 2) DEDUP_MODE="daily" ;; 3) DEDUP_MODE="interval" ;; *) echo "Invalid choice" >&2; exit 2 ;; esac
+    echo "相同告警重复提醒模式 / Same-alert reminder mode:"; echo "  1) always   状态变化前同一告警只提醒一次 / same alert only once until state changes"; echo "  2) daily    同一告警每天最多提醒一次 / same alert once per day"; echo "  3) interval 同一告警每 N 天提醒一次（推荐）/ same alert every N days (recommended)"; read -r -p "请选择 / Choose [3]: " choice
+    case "${choice:-3}" in 1) DEDUP_MODE="always" ;; 2) DEDUP_MODE="daily" ;; 3) DEDUP_MODE="interval" ;; *) echo "无效选项 / Invalid choice" >&2; exit 2 ;; esac
   fi
 fi
-case "$DEDUP_MODE" in always|daily|interval) ;; *) echo "Invalid dedup mode: $DEDUP_MODE" >&2; exit 2 ;; esac
+case "$DEDUP_MODE" in always|daily|interval) ;; *) echo "无效去重模式 / Invalid dedup mode: $DEDUP_MODE" >&2; exit 2 ;; esac
 if [[ "$DEDUP_MODE" == "interval" ]]; then
-  if [[ "$DEDUP_INTERVAL_DAYS" == "3" && "$NON_INTERACTIVE" -ne 1 ]]; then read -r -p "Repeat same alert every N days [3]: " ans; DEDUP_INTERVAL_DAYS="${ans:-3}"; fi
-  [[ "$DEDUP_INTERVAL_DAYS" =~ ^[0-9]+$ ]] && [[ "$DEDUP_INTERVAL_DAYS" -ge 1 ]] || { echo "Invalid interval days" >&2; exit 2; }
+  if [[ "$DEDUP_INTERVAL_DAYS" == "3" && "$NON_INTERACTIVE" -ne 1 ]]; then read -r -p "同一告警每 N 天重复提醒 / Repeat same alert every N days [3]: " ans; DEDUP_INTERVAL_DAYS="${ans:-3}"; fi
+  [[ "$DEDUP_INTERVAL_DAYS" =~ ^[0-9]+$ ]] && [[ "$DEDUP_INTERVAL_DAYS" -ge 1 ]] || { echo "无效间隔天数 / Invalid interval days" >&2; exit 2; }
 fi
-valid_time "$CHECK_TIME" || { echo "Invalid --time, expected HH:MM" >&2; exit 2; }
-if [[ "$SEND_TEST" -eq 0 && "$NON_INTERACTIVE" -ne 1 ]]; then read -r -p "Send additional test Telegram message after install? [y/N]: " ans; [[ "${ans:-N}" =~ ^[Yy]$ ]] && SEND_TEST=1; fi
+valid_time "$CHECK_TIME" || { echo "无效 --time，期望 HH:MM / Invalid --time, expected HH:MM" >&2; exit 2; }
+if [[ "$SEND_TEST" -eq 0 && "$NON_INTERACTIVE" -ne 1 ]]; then read -r -p "安装后额外发送 Telegram 测试消息？/ Send additional test Telegram message after install? [y/N]: " ans; [[ "${ans:-N}" =~ ^[Yy]$ ]] && SEND_TEST=1; fi
 
 telegram_preflight
 
 install_missing_packages() {
-  [[ "${#MISSING_PACKAGES[@]}" -eq 0 ]] && { echo "All required packages are already installed."; return; }
-  echo "Missing packages: ${MISSING_PACKAGES[*]}"
-  if [[ "$ASSUME_YES" -ne 1 && "$NON_INTERACTIVE" -ne 1 ]]; then read -r -p "Install missing packages now? [Y/n]: " ans; [[ "${ans:-Y}" =~ ^[Yy]$ ]] || { echo "Cannot continue without required packages." >&2; exit 1; }; fi
+  [[ "${#MISSING_PACKAGES[@]}" -eq 0 ]] && { echo "所有必需软件包均已安装。/ All required packages are already installed."; return; }
+  echo "缺少软件包 / Missing packages: ${MISSING_PACKAGES[*]}"
+  if [[ "$ASSUME_YES" -ne 1 && "$NON_INTERACTIVE" -ne 1 ]]; then read -r -p "现在安装缺少的软件包？/ Install missing packages now? [Y/n]: " ans; [[ "${ans:-Y}" =~ ^[Yy]$ ]] || { echo "缺少必需软件包，无法继续。/ Cannot continue without required packages." >&2; exit 1; }; fi
   case "$BACKEND" in
     apt) apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y "${MISSING_PACKAGES[@]}" ;;
-    dnf) if command -v dnf >/dev/null 2>&1; then dnf install -y "${MISSING_PACKAGES[@]}"; elif command -v yum >/dev/null 2>&1; then yum install -y "${MISSING_PACKAGES[@]}"; else echo "dnf or yum is required" >&2; exit 1; fi ;;
+    dnf) if command -v dnf >/dev/null 2>&1; then dnf install -y "${MISSING_PACKAGES[@]}"; elif command -v yum >/dev/null 2>&1; then yum install -y "${MISSING_PACKAGES[@]}"; else echo "需要 dnf 或 yum / dnf or yum is required" >&2; exit 1; fi ;;
   esac
 }
 
 MISSING_PACKAGES=()
 case "$BACKEND" in
   apt)
-    command -v apt-get >/dev/null || { echo "apt-get is required" >&2; exit 1; }
+    command -v apt-get >/dev/null || { echo "需要 apt-get / apt-get is required" >&2; exit 1; }
     REQUIRED_PACKAGES=(unattended-upgrades needrestart apt-listchanges python3 ca-certificates)
     for pkg in "${REQUIRED_PACKAGES[@]}"; do dpkg -s "$pkg" >/dev/null 2>&1 || MISSING_PACKAGES+=("$pkg"); done
     ;;
   dnf)
-    command -v rpm >/dev/null || { echo "rpm is required for dnf backend" >&2; exit 1; }
+    command -v rpm >/dev/null || { echo "dnf 后端需要 rpm / rpm is required for dnf backend" >&2; exit 1; }
     REQUIRED_PACKAGES=(dnf-automatic python3 ca-certificates)
     [[ "${ID:-}" == "fedora" ]] && REQUIRED_PACKAGES+=(dnf-utils) || REQUIRED_PACKAGES+=(yum-utils)
     for pkg in "${REQUIRED_PACKAGES[@]}"; do rpm -q "$pkg" >/dev/null 2>&1 || MISSING_PACKAGES+=("$pkg"); done
@@ -368,6 +373,7 @@ APT::Periodic::AutocleanInterval "7";
 APT::Periodic::Unattended-Upgrade "1";
 EOF
   cat >/etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify <<'EOF'
+// 本地策略：永不自动重启。发行版软件包保留其默认 Origins-Pattern 安全规则。
 // Local policy: never reboot automatically. The distribution package keeps
 // its default Origins-Pattern security rules.
 Unattended-Upgrade::Automatic-Reboot "false";
@@ -405,8 +411,8 @@ fi
 
 umask 077
 {
-  echo "# Telegram notification settings for security-update-notify."
-  echo "# Keep this file root-only: it contains the bot token."
+  echo "# security-update-notify 的 Telegram 通知设置；NOTIFY_LANG 控制中英双语显示顺序 / Telegram notification settings for security-update-notify; NOTIFY_LANG controls bilingual display order."
+  echo "# 请保持此文件仅 root 可读：它包含 Bot Token / Keep this file root-only: it contains the bot token."
   printf 'TELEGRAM_BOT_TOKEN=%s\n' "$(shell_quote "$TELEGRAM_BOT_TOKEN")"
   printf 'TELEGRAM_CHAT_ID=%s\n' "$(shell_quote "$TELEGRAM_CHAT_ID")"
   printf 'HOST_LABEL=%s\n' "$(shell_quote "$HOST_LABEL")"
@@ -419,7 +425,7 @@ umask 077
 chmod 600 /etc/security-update-notify/telegram.env
 cat >/etc/systemd/system/security-update-notify.timer <<EOF
 [Unit]
-Description=Daily security update reboot/service-restart notification
+Description=安全更新每日重启/服务重启通知 / Daily security update reboot/service-restart notification
 
 [Timer]
 OnCalendar=*-*-* ${CHECK_TIME}:00
@@ -444,6 +450,6 @@ bash -n /usr/local/sbin/security-update-notify
 systemctl list-timers security-update-notify.timer --no-pager
 [[ "$SEND_TEST" -eq 1 ]] && /usr/local/sbin/security-update-notify --test-ok --no-dedupe
 
-echo "Installed security-update-notify."
-echo "Config: /etc/security-update-notify/telegram.env"
-echo "Timer:  systemctl list-timers security-update-notify.timer"
+echo "已安装 security-update-notify。/ Installed security-update-notify."
+echo "配置文件 / Config: /etc/security-update-notify/telegram.env"
+echo "查看定时器 / Timer:  systemctl list-timers security-update-notify.timer"

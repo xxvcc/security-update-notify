@@ -15,8 +15,9 @@ DOCTOR=0
 
 usage() {
   cat <<'EOF'
-Usage: security-update-notify [--test-ok] [--test-reboot] [--no-dedupe] [--doctor] [--version]
+用法 / Usage: security-update-notify [--test-ok] [--test-reboot] [--no-dedupe] [--doctor] [--version]
 
+检查系统后端的整机重启/服务重启状态，然后发送 Telegram 提醒。
 Checks OS backend reboot/service-restart state, then sends Telegram alerts.
 EOF
 }
@@ -29,7 +30,7 @@ while [[ $# -gt 0 ]]; do
     --doctor) DOCTOR=1; shift ;;
     --version) echo "security-update-notify $VERSION"; exit 0 ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    *) echo "未知参数 / Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
@@ -51,11 +52,11 @@ load_config_file() {
     line="${line%$'\r'}"
     [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
     [[ "$line" == export\ * ]] && line="${line#export }"
-    [[ "$line" == *"="* ]] || { echo "Invalid config line in $file" >&2; return 2; }
+    [[ "$line" == *"="* ]] || { echo "配置行无效 / Invalid config line in $file" >&2; return 2; }
     key="${line%%=*}"
     value="${line#*=}"
     key="${key//[[:space:]]/}"
-    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "Invalid config key in $file: $key" >&2; return 2; }
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "配置键无效 / Invalid config key in $file: $key" >&2; return 2; }
     value="${value#${value%%[![:space:]]*}}"
     value="${value%${value##*[![:space:]]}}"
     if [[ "$value" != \"* && "$value" != \'* ]]; then
@@ -68,7 +69,7 @@ load_config_file() {
       TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|HOST_LABEL|NOTIFY_OK|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND)
         printf -v "$key" '%s' "$value"
         ;;
-      *) echo "Unsupported config key in $file: $key" >&2; return 2 ;;
+      *) echo "配置键不支持 / Unsupported config key in $file: $key" >&2; return 2 ;;
     esac
   done <"$file"
 }
@@ -79,7 +80,7 @@ import json, sys, urllib.request
 
 token = sys.stdin.read()
 if not token:
-    print("missing TELEGRAM_BOT_TOKEN", file=sys.stderr)
+    print("缺少 TELEGRAM_BOT_TOKEN / missing TELEGRAM_BOT_TOKEN", file=sys.stderr)
     sys.exit(2)
 
 url = f"https://api.telegram.org/bot{token}/getMe"
@@ -109,7 +110,7 @@ token = payload[0].decode("utf-8", "replace") if len(payload) > 0 else ""
 chat_id = payload[1].decode("utf-8", "replace") if len(payload) > 1 else ""
 text = payload[2].decode("utf-8", "replace") if len(payload) > 2 else ""
 if not token or not chat_id:
-    print("missing Telegram token or chat id", file=sys.stderr)
+    print("缺少 Telegram token 或 chat id / missing Telegram token or chat id", file=sys.stderr)
     sys.exit(2)
 
 url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -136,7 +137,7 @@ for attempt in range(3):
     if attempt < 2:
         time.sleep(1)
 
-print(last_error or "Telegram notification failed", file=sys.stderr)
+print(last_error or "Telegram 通知发送失败 / Telegram notification failed", file=sys.stderr)
 sys.exit(1)
 '
 }
@@ -186,40 +187,40 @@ fi
 run_doctor() {
   local ok=1
   echo "security-update-notify $VERSION"
-  echo "Config: $ENV_FILE"
-  [[ -r "$ENV_FILE" ]] && echo "OK config readable" || { echo "FAIL config not readable"; ok=0; }
-  echo "Backend: $BACKEND"
-  echo "Host: $HOST"
-  echo "OS: $OS"
-  echo "Kernel: $KERNEL"
+  echo "配置文件 / Config: $ENV_FILE"
+  [[ -r "$ENV_FILE" ]] && echo "正常：配置可读 / OK config readable" || { echo "失败：配置不可读 / FAIL config not readable"; ok=0; }
+  echo "后端 / Backend: $BACKEND"
+  echo "主机 / Host: $HOST"
+  echo "系统 / OS: $OS"
+  echo "内核 / Kernel: $KERNEL"
   if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
-    echo "OK systemd present"
-    systemctl is-enabled security-update-notify.timer >/dev/null 2>&1 && echo "OK timer enabled" || { echo "WARN timer not enabled"; ok=0; }
+    echo "正常：systemd 存在 / OK systemd present"
+    systemctl is-enabled security-update-notify.timer >/dev/null 2>&1 && echo "正常：timer 已启用 / OK timer enabled" || { echo "警告：timer 未启用 / WARN timer not enabled"; ok=0; }
     systemctl list-timers security-update-notify.timer --no-pager 2>/dev/null || true
   else
-    echo "FAIL systemd unavailable"; ok=0
+    echo "失败：systemd 不可用 / FAIL systemd unavailable"; ok=0
   fi
   case "$BACKEND" in
     apt)
-      for c in apt-get dpkg needrestart; do command -v "$c" >/dev/null 2>&1 && echo "OK command $c" || { echo "FAIL missing command $c"; ok=0; }; done
-      dpkg -s unattended-upgrades >/dev/null 2>&1 && echo "OK unattended-upgrades installed" || { echo "FAIL unattended-upgrades missing"; ok=0; }
+      for c in apt-get dpkg needrestart; do command -v "$c" >/dev/null 2>&1 && echo "正常：命令存在 / OK command $c" || { echo "失败：缺少命令 / FAIL missing command $c"; ok=0; }; done
+      dpkg -s unattended-upgrades >/dev/null 2>&1 && echo "正常：unattended-upgrades 已安装 / OK unattended-upgrades installed" || { echo "失败：缺少 unattended-upgrades / FAIL unattended-upgrades missing"; ok=0; }
       ;;
     dnf)
-      command -v dnf >/dev/null 2>&1 && echo "OK command dnf" || command -v yum >/dev/null 2>&1 && echo "OK command yum" || { echo "FAIL missing dnf/yum"; ok=0; }
-      command -v needs-restarting >/dev/null 2>&1 && echo "OK command needs-restarting" || { echo "FAIL missing needs-restarting"; ok=0; }
-      systemctl is-enabled dnf-automatic.timer >/dev/null 2>&1 && echo "OK dnf-automatic.timer enabled" || echo "WARN dnf-automatic.timer not enabled"
+      command -v dnf >/dev/null 2>&1 && echo "正常：命令存在 / OK command dnf" || command -v yum >/dev/null 2>&1 && echo "正常：命令存在 / OK command yum" || { echo "失败：缺少 dnf/yum / FAIL missing dnf/yum"; ok=0; }
+      command -v needs-restarting >/dev/null 2>&1 && echo "正常：命令存在 / OK command needs-restarting" || { echo "失败：缺少 needs-restarting / FAIL missing needs-restarting"; ok=0; }
+      systemctl is-enabled dnf-automatic.timer >/dev/null 2>&1 && echo "正常：dnf-automatic.timer 已启用 / OK dnf-automatic.timer enabled" || echo "警告：dnf-automatic.timer 未启用 / WARN dnf-automatic.timer not enabled"
       ;;
-    *) echo "FAIL unsupported backend $BACKEND"; ok=0 ;;
+    *) echo "失败：不支持的后端 / FAIL unsupported backend $BACKEND"; ok=0 ;;
   esac
   if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
-    echo "OK Telegram config present"
+    echo "正常：Telegram 配置存在 / OK Telegram config present"
     if telegram_get_me >/dev/null; then
-      echo "OK Telegram bot token works"
+      echo "正常：Telegram Bot Token 可用 / OK Telegram bot token works"
     else
-      echo "FAIL Telegram getMe failed"; ok=0
+      echo "失败：Telegram getMe 失败 / FAIL Telegram getMe failed"; ok=0
     fi
   else
-    echo "FAIL Telegram config missing"; ok=0
+    echo "失败：Telegram 配置缺失 / FAIL Telegram config missing"; ok=0
   fi
   [[ "$ok" -eq 1 ]] || return 1
 }
@@ -257,7 +258,7 @@ check_apt() {
     [[ -n "$ksta" && "$ksta" != "1" ]] && restart_attention=1
     printf '%s\n' "$restart_summary" | grep -Eq '^NEEDRESTART-(SVC|AUX|SESS|UCSTA|UCCUR|UCEXP):' && restart_attention=1
   else
-    restart_summary="needrestart command not found"
+    restart_summary="needrestart 命令不存在 / needrestart command not found"
   fi
 }
 
@@ -282,7 +283,7 @@ check_dnf() {
       restart_attention=1
     fi
   else
-    restart_summary="needs-restarting command not found; install dnf-utils/yum-utils"
+    restart_summary="needs-restarting 命令不存在；请安装 dnf-utils/yum-utils / needs-restarting command not found; install dnf-utils/yum-utils"
   fi
   if command -v dnf >/dev/null 2>&1; then
     update_summary="$(dnf -q updateinfo list security updates 2>/dev/null | sed -n '1,40p' || true)"
@@ -353,31 +354,40 @@ format_restart_summary() {
 case "$BACKEND" in
   apt) check_apt ;;
   dnf) check_dnf ;;
-  *) echo "Unsupported backend: $BACKEND" >&2; exit 2 ;;
+  *) echo "不支持的后端 / Unsupported backend: $BACKEND" >&2; exit 2 ;;
 esac
 
 if [[ "$reboot_required" -eq 0 && "$restart_attention" -eq 0 ]]; then
   log_event "check ok backend=$BACKEND host=$HOST no_attention=1"
   if [[ "$SEND_OK" -eq 1 || "${NOTIFY_OK:-0}" == "1" ]]; then
+    zh_msg="✅ 安全更新检查正常\n\n主机：$HOST\n系统：$OS\n后端：$BACKEND\n当前内核：$KERNEL\n时间：$NOW\n\n没有发现整机重启或服务/进程重启需要关注的问题。"
+    en_msg="✅ Security update check OK\n\nHost: $HOST\nOS: $OS\nBackend: $BACKEND\nCurrent kernel: $KERNEL\nTime: $NOW\n\nNo reboot or service/process restart requiring attention was detected."
     if [[ "$NOTIFY_LANG" == "en" ]]; then
-      msg="✅ Security update check OK\n\nHost: $HOST\nOS: $OS\nBackend: $BACKEND\nCurrent kernel: $KERNEL\nTime: $NOW\n\nNo reboot or service/process restart requiring attention was detected."
+      msg="$en_msg\n\n---\n\n$zh_msg"
     else
-      msg="✅ 安全更新检查正常\n\n主机：$HOST\n系统：$OS\n后端：$BACKEND\n当前内核：$KERNEL\n时间：$NOW\n\n没有发现整机重启或服务/进程重启需要关注的问题。"
+      msg="$zh_msg\n\n---\n\n$en_msg"
     fi
   else
     log_event "silent ok backend=$BACKEND host=$HOST"
     exit 0
   fi
 else
-  pkgs_block="无"
-  [[ -n "$reboot_pkgs" ]] && pkgs_block="$reboot_pkgs"
-  rs="$(format_restart_summary "$NOTIFY_LANG" | sed -n '1,80p')"
+  pkgs_zh="无"
+  pkgs_en="None"
+  if [[ -n "$reboot_pkgs" ]]; then
+    pkgs_zh="$reboot_pkgs"
+    pkgs_en="$reboot_pkgs"
+  fi
+  rs_zh="$(format_restart_summary zh | sed -n '1,80p')"
+  rs_en="$(format_restart_summary en | sed -n '1,80p')"
+  reboot_text_zh="$([[ "$reboot_required" -eq 1 ]] && echo '需要' || echo '暂不需要')"
+  reboot_text_en="$([[ "$reboot_required" -eq 1 ]] && echo 'Required' || echo 'Not required for now')"
+  zh_msg="⚠️ 安全更新后需要处理\n\n主机：$HOST\n系统：$OS\n后端：$BACKEND\n当前内核：$KERNEL\n时间：$NOW\n\n整机重启：$reboot_text_zh\n相关包/安全更新：\n$pkgs_zh\n\n重启检测摘要：\n$rs_zh\n\n建议：请在方便的维护窗口 SSH 登录该服务器后手动执行 reboot；如只是服务需要重启，可先评估并重启对应服务。"
+  en_msg="⚠️ Security update action required\n\nHost: $HOST\nOS: $OS\nBackend: $BACKEND\nCurrent kernel: $KERNEL\nTime: $NOW\n\nFull reboot: $reboot_text_en\nRelated packages/security updates:\n$pkgs_en\n\nRestart detection summary:\n$rs_en\n\nRecommendation: SSH into this server during a suitable maintenance window and run reboot if a full reboot is required. If only services need restarting, review them first and restart the affected services manually."
   if [[ "$NOTIFY_LANG" == "en" ]]; then
-    [[ "$pkgs_block" == "无" ]] && pkgs_block="None"
-    reboot_text="$([[ "$reboot_required" -eq 1 ]] && echo 'Required' || echo 'Not required for now')"
-    msg="⚠️ Security update action required\n\nHost: $HOST\nOS: $OS\nBackend: $BACKEND\nCurrent kernel: $KERNEL\nTime: $NOW\n\nFull reboot: $reboot_text\nRelated packages/security updates:\n$pkgs_block\n\nRestart detection summary:\n$rs\n\nRecommendation: SSH into this server during a suitable maintenance window and run reboot if a full reboot is required. If only services need restarting, review them first and restart the affected services manually."
+    msg="$en_msg\n\n---\n\n$zh_msg"
   else
-    msg="⚠️ 安全更新后需要处理\n\n主机：$HOST\n系统：$OS\n后端：$BACKEND\n当前内核：$KERNEL\n时间：$NOW\n\n整机重启：$([[ "$reboot_required" -eq 1 ]] && echo '需要' || echo '暂不需要')\n相关包/安全更新：\n$pkgs_block\n\n重启检测摘要：\n$rs\n\n建议：请在方便的维护窗口 SSH 登录该服务器后手动执行 reboot；如只是服务需要重启，可先评估并重启对应服务。"
+    msg="$zh_msg\n\n---\n\n$en_msg"
   fi
 fi
 msg="${msg//\\n/$'\n'}"
@@ -411,7 +421,7 @@ if [[ "$should_send" -eq 0 ]]; then
 fi
 
 if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
-  echo "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in $ENV_FILE" >&2
+  echo "在 $ENV_FILE 中缺少 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID / Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in $ENV_FILE" >&2
   exit 2
 fi
 
@@ -421,6 +431,6 @@ if telegram_send_message "$msg"; then
   log_event "telegram sent backend=$BACKEND host=$HOST reboot_required=$reboot_required restart_attention=$restart_attention hash=$alert_hash"
 else
   log_event "telegram failed backend=$BACKEND host=$HOST"
-  echo "Telegram notification failed" >&2
+  echo "Telegram 通知发送失败 / Telegram notification failed" >&2
   exit 1
 fi
