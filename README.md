@@ -8,6 +8,12 @@
 
 **语言 / Languages**：中文 | [English](README.en.md)
 
+## 一键安装
+
+```bash
+curl -fsSL https://xxv.cc/sun.sh | sudo bash
+```
+
 <p align="center">
   <img alt="Linux" src="https://img.shields.io/badge/Linux-systemd-1793D1?style=flat-square&logo=linux&logoColor=white">
   <img alt="Debian" src="https://img.shields.io/badge/Debian-12%20%7C%2013-A81D33?style=flat-square&logo=debian&logoColor=white">
