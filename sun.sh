@@ -43,7 +43,7 @@ verify_checksum() {
 }
 
 safe_extract_tar() {
-  local archive="$1" topdir="$2" entry
+  local archive="$1" topdir="$2" entry listing_type
   while IFS= read -r entry; do
     [[ -n "$entry" ]] || continue
     case "$entry" in
@@ -60,6 +60,17 @@ safe_extract_tar() {
         ;;
     esac
   done < <(tar -tzf "$archive")
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    listing_type="${entry:0:1}"
+    case "$listing_type" in
+      -|d) ;;
+      *)
+        echo "压缩包中存在不支持的条目类型 / Unsupported archive entry type: $entry" >&2
+        exit 1
+        ;;
+    esac
+  done < <(tar -tzvf "$archive")
   tar --no-same-owner -xzf "$archive"
 }
 

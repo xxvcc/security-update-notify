@@ -33,7 +33,7 @@ usage() {
   --host-label NAME            通知中的可选主机标签 / Optional host label in notifications
   --dedup-mode MODE            always | daily | interval
   --dedup-interval-days N      mode=interval 时使用，默认 3 / Used when mode=interval, default 3
-  --notify-lang LANG           Telegram 双语通知显示顺序：zh 中文在前 | en 英文在前，默认 zh / Bilingual Telegram alert display order: zh Chinese first | en English first, default zh
+  --notify-lang LANG           Telegram 通知语言：zh 中文 | en English，默认 zh / Telegram notification language: zh Chinese | en English, default zh
   --backend BACKEND            auto | apt | dnf，默认 auto / auto | apt | dnf, default auto
   --allow-best-effort          允许尽力支持的发行版 / Permit best-effort distro versions
   --send-test                  安装后额外发送测试消息 / Send additional test message after install
@@ -101,7 +101,31 @@ while [[ $# -gt 0 ]]; do
 done
 
 require_root() { [[ "$(id -u)" -eq 0 ]] || { echo "请以 root 运行，例如 sudo ./install.sh / Please run as root, e.g. sudo ./install.sh" >&2; exit 1; }; }
-shell_quote() { printf "%q" "$1"; }
+validate_config_value() {
+  local name="$1" value="$2"
+  case "$value" in
+    *$'\n'*|*$'\r'*) echo "$name 不能包含换行 / $name cannot contain newlines" >&2; exit 2 ;;
+  esac
+  if [[ "$value" == *"'"* && "$value" == *\"* ]]; then
+    echo "$name 不能同时包含单引号和双引号 / $name cannot contain both single and double quotes" >&2
+    exit 2
+  fi
+}
+validate_config_values() {
+  local name value
+  for name in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID HOST_LABEL DEDUP_MODE DEDUP_INTERVAL_DAYS NOTIFY_LANG BACKEND; do
+    set +u; value="${!name}"; set -u
+    validate_config_value "$name" "$value"
+  done
+}
+config_quote() {
+  local value="$1"
+  if [[ "$value" == *"'"* ]]; then
+    printf '"%s"' "$value"
+  else
+    printf "'%s'" "$value"
+  fi
+}
 prompt_secret() {
   local var_name="$1" prompt="$2" current
   set +u; current="${!var_name}"; set -u
@@ -293,17 +317,17 @@ prompt_secret TELEGRAM_BOT_TOKEN "Telegram Bot Token"
 prompt_required_text TELEGRAM_CHAT_ID "Telegram Chat ID"
 if [[ -z "${NOTIFY_LANG:-}" ]]; then NOTIFY_LANG="zh"; fi
 if [[ "$NON_INTERACTIVE" -ne 1 && "$NOTIFY_LANG" == "zh" ]]; then
-  echo "Telegram 双语通知显示顺序 / Bilingual Telegram alert display order:"
-  echo "  1) 中文在前（默认）/ Chinese first (default)"
-  echo "  2) 英文在前 / English first"
+  echo "Telegram 通知语言 / Telegram notification language:"
+  echo "  1) 中文（默认）/ Chinese (default)"
+  echo "  2) English"
   read -r -p "请选择 / Choose [1]: " lang_choice
   case "${lang_choice:-1}" in
     1) NOTIFY_LANG="zh" ;;
     2) NOTIFY_LANG="en" ;;
-    *) echo "无效通知显示顺序选项 / Invalid notification display-order choice" >&2; exit 2 ;;
+    *) echo "无效通知语言选项 / Invalid notification language choice" >&2; exit 2 ;;
   esac
 fi
-case "$NOTIFY_LANG" in zh|en) ;; *) echo "无效通知显示顺序 / Invalid notify display order: $NOTIFY_LANG (expected zh or en)" >&2; exit 2 ;; esac
+case "$NOTIFY_LANG" in zh|en) ;; *) echo "无效通知语言 / Invalid notify language: $NOTIFY_LANG (expected zh or en)" >&2; exit 2 ;; esac
 prompt_text CHECK_TIME "每日检查时间 HH:MM / Daily check time HH:MM" "09:00"
 if [[ -z "$DEDUP_MODE" ]]; then
   if [[ "$NON_INTERACTIVE" -eq 1 ]]; then DEDUP_MODE="interval"; else
@@ -384,7 +408,7 @@ Unattended-Upgrade::SyslogEnable "true";
 EOF
 elif [[ "$BACKEND" == "dnf" ]]; then
   if [[ -f /etc/dnf/automatic.conf ]]; then
-    cp -a /etc/dnf/automatic.conf "/etc/dnf/automatic.conf.bak.$(date +%Y%m%d%H%M%S)"
+    cp -a /etc/dnf/automatic.conf "/etc/dnf/automatic.conf.security-update-notify.bak.$(date +%Y%m%d%H%M%S)"
     python3 - <<'PY'
 from pathlib import Path
 p=Path('/etc/dnf/automatic.conf')
@@ -410,18 +434,19 @@ PY
   fi
 fi
 
+validate_config_values
 umask 077
 {
-  echo "# security-update-notify 的 Telegram 通知设置；NOTIFY_LANG 控制中英双语显示顺序 / Telegram notification settings for security-update-notify; NOTIFY_LANG controls bilingual display order."
+  echo "# security-update-notify 的 Telegram 通知设置；NOTIFY_LANG 控制发送语言：zh 中文，en English / Telegram notification settings for security-update-notify; NOTIFY_LANG controls the sent language: zh Chinese, en English."
   echo "# 请保持此文件仅 root 可读：它包含 Bot Token / Keep this file root-only: it contains the bot token."
-  printf 'TELEGRAM_BOT_TOKEN=%s\n' "$(shell_quote "$TELEGRAM_BOT_TOKEN")"
-  printf 'TELEGRAM_CHAT_ID=%s\n' "$(shell_quote "$TELEGRAM_CHAT_ID")"
-  printf 'HOST_LABEL=%s\n' "$(shell_quote "$HOST_LABEL")"
+  printf 'TELEGRAM_BOT_TOKEN=%s\n' "$(config_quote "$TELEGRAM_BOT_TOKEN")"
+  printf 'TELEGRAM_CHAT_ID=%s\n' "$(config_quote "$TELEGRAM_CHAT_ID")"
+  printf 'HOST_LABEL=%s\n' "$(config_quote "$HOST_LABEL")"
   echo 'NOTIFY_OK=0'
-  printf 'DEDUP_MODE=%s\n' "$(shell_quote "$DEDUP_MODE")"
-  printf 'DEDUP_INTERVAL_DAYS=%s\n' "$(shell_quote "$DEDUP_INTERVAL_DAYS")"
-  printf 'NOTIFY_LANG=%s\n' "$(shell_quote "$NOTIFY_LANG")"
-  printf 'BACKEND=%s\n' "$(shell_quote "$BACKEND")"
+  printf 'DEDUP_MODE=%s\n' "$(config_quote "$DEDUP_MODE")"
+  printf 'DEDUP_INTERVAL_DAYS=%s\n' "$(config_quote "$DEDUP_INTERVAL_DAYS")"
+  printf 'NOTIFY_LANG=%s\n' "$(config_quote "$NOTIFY_LANG")"
+  printf 'BACKEND=%s\n' "$(config_quote "$BACKEND")"
 } >/etc/security-update-notify/telegram.env
 chmod 600 /etc/security-update-notify/telegram.env
 cat >/etc/systemd/system/security-update-notify.timer <<EOF

@@ -6,7 +6,7 @@ STATE_DIR="/var/lib/security-update-notify"
 STATE_FILE="$STATE_DIR/last-alert.sha256"
 STATE_TIME_FILE="$STATE_DIR/last-alert.sent_at"
 LOCK_FILE="/run/security-update-notify.lock"
-VERSION="1.3.0"
+VERSION="1.3.1"
 LOG_FILE="/var/log/security-update-notify.log"
 TEST_REBOOT=0
 SEND_OK=0
@@ -363,9 +363,9 @@ if [[ "$reboot_required" -eq 0 && "$restart_attention" -eq 0 ]]; then
     zh_msg="✅ 安全更新检查正常\n\n主机：$HOST\n系统：$OS\n后端：$BACKEND\n当前内核：$KERNEL\n时间：$NOW\n\n没有发现整机重启或服务/进程重启需要关注的问题。"
     en_msg="✅ Security update check OK\n\nHost: $HOST\nOS: $OS\nBackend: $BACKEND\nCurrent kernel: $KERNEL\nTime: $NOW\n\nNo reboot or service/process restart requiring attention was detected."
     if [[ "$NOTIFY_LANG" == "en" ]]; then
-      msg="$en_msg\n\n---\n\n$zh_msg"
+      msg="$en_msg"
     else
-      msg="$zh_msg\n\n---\n\n$en_msg"
+      msg="$zh_msg"
     fi
   else
     log_event "silent ok backend=$BACKEND host=$HOST"
@@ -385,15 +385,15 @@ else
   zh_msg="⚠️ 安全更新后需要处理\n\n主机：$HOST\n系统：$OS\n后端：$BACKEND\n当前内核：$KERNEL\n时间：$NOW\n\n整机重启：$reboot_text_zh\n相关包/安全更新：\n$pkgs_zh\n\n重启检测摘要：\n$rs_zh\n\n建议：请在方便的维护窗口 SSH 登录该服务器后手动执行 reboot；如只是服务需要重启，可先评估并重启对应服务。"
   en_msg="⚠️ Security update action required\n\nHost: $HOST\nOS: $OS\nBackend: $BACKEND\nCurrent kernel: $KERNEL\nTime: $NOW\n\nFull reboot: $reboot_text_en\nRelated packages/security updates:\n$pkgs_en\n\nRestart detection summary:\n$rs_en\n\nRecommendation: SSH into this server during a suitable maintenance window and run reboot if a full reboot is required. If only services need restarting, review them first and restart the affected services manually."
   if [[ "$NOTIFY_LANG" == "en" ]]; then
-    msg="$en_msg\n\n---\n\n$zh_msg"
+    msg="$en_msg"
   else
-    msg="$zh_msg\n\n---\n\n$en_msg"
+    msg="$zh_msg"
   fi
 fi
 msg="${msg//\\n/$'\n'}"
 
 
-alert_hash="$(printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$HOST" "$BACKEND" "$reboot_required" "$reboot_pkgs" "$restart_attention" "$restart_summary" | sha256sum | awk '{print $1}')"
+alert_hash="$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$HOST" "$BACKEND" "$NOTIFY_LANG" "$reboot_required" "$reboot_pkgs" "$restart_attention" "$restart_summary" | sha256sum | awk '{print $1}')"
 last_hash="$(cat "$STATE_FILE" 2>/dev/null || true)"
 last_sent="$(cat "$STATE_TIME_FILE" 2>/dev/null || echo 0)"
 now_epoch="$(date +%s)"

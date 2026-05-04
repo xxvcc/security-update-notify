@@ -29,8 +29,11 @@ if [[ "$PURGE_CONFIG" -eq 1 ]]; then
   rm -f /etc/apt/apt.conf.d/52unattended-upgrades-local
   rm -f /etc/needrestart/conf.d/99-security-update-notify-report-only.conf
   latest_dnf_backup=""
-  if compgen -G '/etc/dnf/automatic.conf.bak.*' >/dev/null; then
+  if compgen -G '/etc/dnf/automatic.conf.security-update-notify.bak.*' >/dev/null; then
+    latest_dnf_backup="$(find /etc/dnf -maxdepth 1 -type f -name 'automatic.conf.security-update-notify.bak.*' -printf '%T@ %p\n' | sort -rn | awk 'NR==1 {sub(/^[^ ]+ /, ""); print}')"
+  elif compgen -G '/etc/dnf/automatic.conf.bak.*' >/dev/null; then
     latest_dnf_backup="$(find /etc/dnf -maxdepth 1 -type f -name 'automatic.conf.bak.*' -printf '%T@ %p\n' | sort -rn | awk 'NR==1 {sub(/^[^ ]+ /, ""); print}')"
+    echo "警告：使用旧版 dnf 备份命名恢复；新版本会使用 security-update-notify 专用备份名。/ WARN: using legacy dnf backup naming for restore; newer versions use a security-update-notify-specific backup name."
   fi
   if [[ -n "$latest_dnf_backup" ]]; then
     cp -a "$latest_dnf_backup" /etc/dnf/automatic.conf

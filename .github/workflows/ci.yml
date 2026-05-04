@@ -63,6 +63,76 @@ jobs:
             exit 1
           fi
 
+      - name: Notification language regression check
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          cp files/security-update-notify "$tmp/security-update-notify"
+          sed -i \
+            -e "s|^STATE_DIR=.*|STATE_DIR=\"$tmp/state\"|" \
+            -e "s|^LOCK_FILE=.*|LOCK_FILE=\"$tmp/security-update-notify.lock\"|" \
+            -e "s|^LOG_FILE=.*|LOG_FILE=\"$tmp/security-update-notify.log\"|" \
+            "$tmp/security-update-notify"
+          chmod +x "$tmp/security-update-notify"
+          mkdir -p "$tmp/bin"
+          cat >"$tmp/bin/python3" <<'EOF'
+          #!/usr/bin/env bash
+          exec /usr/bin/python3 -c 'import os, sys
+          payload = sys.stdin.buffer.read().split(b"\0", 2)
+          text = payload[2].decode("utf-8", "replace") if len(payload) > 2 else ""
+          capture = os.environ.get("CAPTURE")
+          if capture:
+              with open(capture, "w", encoding="utf-8") as fh:
+                  fh.write(text)
+          print("{\"ok\": true}")
+          '
+          EOF
+          chmod +x "$tmp/bin/python3"
+
+          cat >"$tmp/env.alert.zh" <<'EOF'
+          TELEGRAM_BOT_TOKEN=fake
+          TELEGRAM_CHAT_ID=fake
+          NOTIFY_LANG=zh
+          BACKEND=apt
+          DEDUP_MODE=always
+          EOF
+          cat >"$tmp/env.alert.en" <<'EOF'
+          TELEGRAM_BOT_TOKEN=fake
+          TELEGRAM_CHAT_ID=fake
+          NOTIFY_LANG=en
+          BACKEND=apt
+          DEDUP_MODE=always
+          EOF
+          cat >"$tmp/env.ok.zh" <<'EOF'
+          TELEGRAM_BOT_TOKEN=fake
+          TELEGRAM_CHAT_ID=fake
+          NOTIFY_LANG=zh
+          BACKEND=dnf
+          DEDUP_MODE=always
+          EOF
+          cat >"$tmp/env.ok.en" <<'EOF'
+          TELEGRAM_BOT_TOKEN=fake
+          TELEGRAM_CHAT_ID=fake
+          NOTIFY_LANG=en
+          BACKEND=dnf
+          DEDUP_MODE=always
+          EOF
+
+          PATH="$tmp/bin:$PATH" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env.alert.zh" CAPTURE="$tmp/alert.zh.msg" "$tmp/security-update-notify" --test-reboot --no-dedupe >/dev/null
+          PATH="$tmp/bin:$PATH" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env.alert.en" CAPTURE="$tmp/alert.en.msg" "$tmp/security-update-notify" --test-reboot --no-dedupe >/dev/null
+          PATH="$tmp/bin:$PATH" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env.ok.zh" CAPTURE="$tmp/ok.zh.msg" "$tmp/security-update-notify" --test-ok --no-dedupe >/dev/null
+          PATH="$tmp/bin:$PATH" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env.ok.en" CAPTURE="$tmp/ok.en.msg" "$tmp/security-update-notify" --test-ok --no-dedupe >/dev/null
+
+          grep -q '安全更新后需要处理' "$tmp/alert.zh.msg"
+          ! grep -q 'Security update action required' "$tmp/alert.zh.msg"
+          grep -q 'Security update action required' "$tmp/alert.en.msg"
+          ! grep -q '安全更新后需要处理' "$tmp/alert.en.msg"
+          grep -q '安全更新检查正常' "$tmp/ok.zh.msg"
+          ! grep -q 'Security update check OK' "$tmp/ok.zh.msg"
+          grep -q 'Security update check OK' "$tmp/ok.en.msg"
+          ! grep -q '安全更新检查正常' "$tmp/ok.en.msg"
+
       - name: Package release artifact
         run: ./package.sh
 

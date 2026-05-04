@@ -41,13 +41,13 @@ SUN keeps the boring part automatic and makes the human part obvious.
 - **No automatic reboot** — you stay in control of downtime.
 - **Telegram alerts only when action is needed**.
 - **Reboot and service-restart detection** with `needrestart` or `needs-restarting`.
-- **Bilingual Chinese/English Telegram alerts** with the preferred display order selected during installation. Default: Chinese first.
+- **Selectable Telegram alert language**: choose Chinese or English during installation. Default: Chinese.
 - **Duplicate alert suppression**: once, daily, or every N days.
 - **Interactive and non-interactive installation**.
 - **systemd timer based scheduling**.
 - **No inbound network listener**.
 
-Example Telegram alert:
+Example Telegram alert (`NOTIFY_LANG=en`):
 
 ```text
 ⚠️ Security update action required
@@ -69,28 +69,6 @@ Services to review/restart (2):
 • ssh.service
 
 Recommendation: SSH into this server during a suitable maintenance window and run reboot if a full reboot is required. If only services need restarting, review them first and restart the affected services manually.
-
----
-
-⚠️ 安全更新后需要处理
-
-主机：prod-web-01
-系统：Debian GNU/Linux 12 (bookworm)
-后端：apt
-当前内核：6.1.0-43-amd64
-时间：2026-05-02 09:08 CST
-
-整机重启：需要
-相关包/安全更新：
-linux-image-amd64
-
-重启检测摘要：
-内核：当前 6.1.0-43-amd64，建议 6.1.0-44-amd64
-建议评估/重启的服务（2 个）：
-• nginx.service
-• ssh.service
-
-建议：请在方便的维护窗口 SSH 登录该服务器后手动执行 reboot；如只是服务需要重启，可先评估并重启对应服务。
 ```
 
 ## How it works
@@ -174,7 +152,7 @@ The installer will ask for:
 
 - Telegram Bot Token;
 - Telegram Chat ID;
-- bilingual Telegram alert display order, default `zh` (Chinese first);
+- Telegram alert language, default `zh` (Chinese);
 - daily check time, default `09:00`;
 - duplicate-alert behavior;
 - whether to send an extra test message after installation.
@@ -241,8 +219,8 @@ Common options:
 --telegram-token-file FILE # read Telegram Bot Token from file
 --backend apt              # force apt backend
 --backend dnf              # force dnf backend
---notify-lang zh           # bilingual Telegram alerts: Chinese first, default
---notify-lang en           # bilingual Telegram alerts: English first
+--notify-lang zh           # Telegram alert language: Chinese, default
+--notify-lang en           # Telegram alert language: English
 --allow-best-effort        # allow best-effort distro versions
 --send-test                # send an extra install-complete test message
 --skip-telegram-test       # skip Telegram preflight validation
@@ -332,11 +310,11 @@ Run a check now:
 sudo systemctl start security-update-notify.service
 ```
 
-Change bilingual Telegram alert display order after installation:
+Change Telegram alert language after installation:
 
 ```bash
 sudoedit /etc/security-update-notify/telegram.env
-# Set NOTIFY_LANG=zh (Chinese first) or NOTIFY_LANG=en (English first)
+# Set NOTIFY_LANG=zh (Chinese) or NOTIFY_LANG=en (English)
 ```
 
 Run built-in diagnostics:
