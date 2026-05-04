@@ -1,5 +1,13 @@
 # 变更记录
 
+## 1.3.2
+
+- 运行时及安装器中所有 Telegram API 调用新增 bot token 格式校验（`^\d+:[A-Za-z0-9_-]+$`），作为 URL 注入纵深防御。
+- 运行时脚本明确注释说明 `set -uo pipefail` 故意省略 `-e` 的设计意图。
+- systemd service 新增 `ProtectHostname`、`RestrictNamespaces`、`RestrictRealtime` 硬化指令。
+- CI 新增 ShellCheck 静态分析步骤。
+- `.env.example` 新增关于未引号值中 `#` 字符需要用引号包裹的说明。
+
 ## 1.3.1
 
 - 修复 Telegram OK/告警提醒总是中英双语同屏的问题；`NOTIFY_LANG=zh|en` 现在只控制实际发送中文或英文。

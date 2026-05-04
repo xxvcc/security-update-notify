@@ -154,9 +154,12 @@ telegram_preflight() {
     echo "正在验证 Telegram Bot Token... / Validating Telegram Bot Token..."
     local getme bot_user
     if ! getme="$(printf '%s' "$TELEGRAM_BOT_TOKEN" | python3 -c '
-import json, sys, urllib.request
+import json, re, sys, urllib.request
 
 token = sys.stdin.read()
+if not re.match(r"^\d+:[A-Za-z0-9_-]+$", token):
+    print("TELEGRAM_BOT_TOKEN \u683c\u5f0f\u65e0\u6548 / invalid TELEGRAM_BOT_TOKEN format", file=sys.stderr)
+    sys.exit(2)
 try:
     with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/getMe", timeout=20) as response:
         body = response.read().decode("utf-8", "replace")
@@ -178,12 +181,15 @@ sys.exit(0 if ok else 1)
       echo "正在向 Telegram Chat ID 发送测试消息... / Sending test message to Telegram Chat ID..."
       local text="✅ security-update-notify Telegram 测试成功 / Telegram test succeeded. 主机 / Host: $(hostname -f 2>/dev/null || hostname)"
       if printf '%s\0%s\0%s' "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" "$text" | python3 -c '
-import json, sys, urllib.parse, urllib.request
+import json, re, sys, urllib.parse, urllib.request
 
 payload = sys.stdin.buffer.read().split(b"\0", 2)
 token = payload[0].decode("utf-8", "replace") if len(payload) > 0 else ""
 chat_id = payload[1].decode("utf-8", "replace") if len(payload) > 1 else ""
 text = payload[2].decode("utf-8", "replace") if len(payload) > 2 else ""
+if not re.match(r"^\d+:[A-Za-z0-9_-]+$", token):
+    print("TELEGRAM_BOT_TOKEN \u683c\u5f0f\u65e0\u6548 / invalid TELEGRAM_BOT_TOKEN format", file=sys.stderr)
+    sys.exit(2)
 url = f"https://api.telegram.org/bot{token}/sendMessage"
 data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
 try:

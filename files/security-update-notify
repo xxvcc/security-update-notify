@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 故意不加 -e：后端检测命令（needrestart、needs-restarting）的非零退出码不应中断通知流程。
+# Intentionally omit -e: non-zero exits from backend detection commands must not abort the notification flow.
 set -uo pipefail
 
 ENV_FILE="${SECURITY_UPDATE_NOTIFY_ENV:-/etc/security-update-notify/telegram.env}"
@@ -6,7 +8,7 @@ STATE_DIR="/var/lib/security-update-notify"
 STATE_FILE="$STATE_DIR/last-alert.sha256"
 STATE_TIME_FILE="$STATE_DIR/last-alert.sent_at"
 LOCK_FILE="/run/security-update-notify.lock"
-VERSION="1.3.1"
+VERSION="1.3.2"
 LOG_FILE="/var/log/security-update-notify.log"
 TEST_REBOOT=0
 SEND_OK=0
@@ -76,11 +78,14 @@ load_config_file() {
 
 telegram_get_me() {
   printf '%s' "${TELEGRAM_BOT_TOKEN:-}" | python3 -c '
-import json, sys, urllib.request
+import json, re, sys, urllib.request
 
 token = sys.stdin.read()
 if not token:
     print("缺少 TELEGRAM_BOT_TOKEN / missing TELEGRAM_BOT_TOKEN", file=sys.stderr)
+    sys.exit(2)
+if not re.match(r"^\d+:[A-Za-z0-9_-]+$", token):
+    print("TELEGRAM_BOT_TOKEN 格式无效 / invalid TELEGRAM_BOT_TOKEN format", file=sys.stderr)
     sys.exit(2)
 
 url = f"https://api.telegram.org/bot{token}/getMe"
@@ -103,7 +108,7 @@ sys.exit(0 if ok else 1)
 telegram_send_message() {
   local text="$1"
   printf '%s\0%s\0%s' "${TELEGRAM_BOT_TOKEN:-}" "${TELEGRAM_CHAT_ID:-}" "$text" | python3 -c '
-import json, sys, time, urllib.parse, urllib.request
+import json, re, sys, time, urllib.parse, urllib.request
 
 payload = sys.stdin.buffer.read().split(b"\0", 2)
 token = payload[0].decode("utf-8", "replace") if len(payload) > 0 else ""
@@ -111,6 +116,9 @@ chat_id = payload[1].decode("utf-8", "replace") if len(payload) > 1 else ""
 text = payload[2].decode("utf-8", "replace") if len(payload) > 2 else ""
 if not token or not chat_id:
     print("缺少 Telegram token 或 chat id / missing Telegram token or chat id", file=sys.stderr)
+    sys.exit(2)
+if not re.match(r"^\d+:[A-Za-z0-9_-]+$", token):
+    print("TELEGRAM_BOT_TOKEN 格式无效 / invalid TELEGRAM_BOT_TOKEN format", file=sys.stderr)
     sys.exit(2)
 
 url = f"https://api.telegram.org/bot{token}/sendMessage"

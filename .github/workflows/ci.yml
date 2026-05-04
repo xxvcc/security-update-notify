@@ -20,6 +20,10 @@ jobs:
         run: |
           bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify
 
+      - name: ShellCheck
+        run: |
+          shellcheck -s bash -S warning -e SC2034,SC1091 install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify
+
       - name: Dotenv parser regression check
         run: |
           python3 - <<'PY'

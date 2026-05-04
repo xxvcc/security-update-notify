@@ -126,11 +126,14 @@ load_config_file "$CONFIG" || exit $?
 
 telegram_get_me() {
   printf '%s' "${TELEGRAM_BOT_TOKEN:-}" | python3 -c '
-import json, sys, urllib.request
+import json, re, sys, urllib.request
 
 token = sys.stdin.read()
 if not token:
     print("缺少 TELEGRAM_BOT_TOKEN / missing TELEGRAM_BOT_TOKEN", file=sys.stderr)
+    sys.exit(2)
+if not re.match(r"^\d+:[A-Za-z0-9_-]+$", token):
+    print("TELEGRAM_BOT_TOKEN 格式无效 / invalid TELEGRAM_BOT_TOKEN format", file=sys.stderr)
     sys.exit(2)
 
 try:
