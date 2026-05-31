@@ -233,7 +233,7 @@ jobs:
             chmod +x /usr/local/bin/systemd-analyze
             cd /src
             ./install.sh --telegram-token 123456:abc_DEF-ghi --telegram-chat-id -100123 --skip-telegram-test --non-interactive -y --skip-post-install-check
-            expected_version="$(grep -E '^VERSION=' files/security-update-notify | head -1 | cut -d'"' -f2)"
+            expected_version="$(grep -E "^VERSION=" files/security-update-notify | head -1 | cut -d\" -f2)"
             /usr/local/sbin/security-update-notify --version | grep "$expected_version"
             grep -q "CONFIG_VERSION" /etc/security-update-notify/telegram.env
             ./install.sh --skip-telegram-test --non-interactive -y --skip-post-install-check

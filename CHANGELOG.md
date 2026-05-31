@@ -1,5 +1,9 @@
 # 变更记录
 
+## 1.5.3
+
+- Patch release: fix CI smoke-test shell quoting after the dynamic version check change.
+
 ## 1.5.2
 
 - Patch release: make CI container smoke test validate the current script version dynamically instead of hardcoding `1.5.0`.
