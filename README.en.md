@@ -42,8 +42,9 @@ SUN keeps the boring part automatic and makes the human part obvious.
 - **Telegram alerts only when action is needed**.
 - **Reboot and service-restart detection** with `needrestart` or `needs-restarting`.
 - **Selectable Telegram alert language**: choose Chinese or English during installation. Default: Chinese.
+- **Public IP in notifications**: auto-detect the server public IP by default; you can also set it manually or disable it. Auto-detection uses Python's standard library and does not add a `curl` dependency.
 - **Duplicate alert suppression**: once, daily, or every N days.
-- **Interactive and non-interactive installation**.
+- **Interactive and non-interactive install/upgrade**: rerunning the installer reuses the existing config.
 - **systemd timer based scheduling**.
 - **No inbound network listener**.
 
@@ -53,6 +54,7 @@ Example Telegram alert (`NOTIFY_LANG=en`):
 ⚠️ Security update action required
 
 Host: prod-web-01
+Public IP: 203.0.113.10
 OS: Debian GNU/Linux 12 (bookworm)
 Backend: apt
 Current kernel: 6.1.0-43-amd64
@@ -185,6 +187,7 @@ sudo ./install.sh \
   --dedup-mode interval \
   --dedup-interval-days 3 \
   --host-label 'prod-web-01' \
+  --public-ip '203.0.113.10' \
   --non-interactive \
   -y
 ```
@@ -221,10 +224,24 @@ Common options:
 --backend dnf              # force dnf backend
 --notify-lang zh           # Telegram alert language: Chinese, default
 --notify-lang en           # Telegram alert language: English
+--public-ip IP             # manually set public IP in notifications; auto-detected at runtime when empty
+--include-public-ip 0      # disable public IP in notifications; default 1
+--notify-ok 1             # send OK notification when no action is needed; default 0
 --allow-best-effort        # allow best-effort distro versions
 --send-test                # send an extra install-complete test message
 --skip-telegram-test       # skip Telegram preflight validation
 ```
+
+
+### Upgrade
+
+Rerun the one-line installer to upgrade to the latest release:
+
+```bash
+curl -fsSL https://xxv.cc/sun.sh | sudo bash -s -- install --non-interactive -y
+```
+
+If SUN is already installed, the installer reads `/etc/security-update-notify/telegram.env` and the existing timer time first. Options not explicitly overridden by CLI flags or `--env-file` keep their old values, so you usually do not need to re-enter the Telegram token or chat ID.
 
 ## Duplicate alert modes
 
@@ -248,7 +265,7 @@ Common options:
 /var/log/security-update-notify.log
 ```
 
-Telegram credentials are stored in:
+Telegram credentials and notification options are stored in:
 
 ```text
 /etc/security-update-notify/telegram.env

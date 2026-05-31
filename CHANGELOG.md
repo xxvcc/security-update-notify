@@ -1,5 +1,12 @@
 # 变更记录
 
+## 1.4.0
+
+- Telegram OK/告警提醒新增公网 IP 字段，默认运行时自动获取，便于多 VPS 场景下快速识别服务器。
+- 新增 `PUBLIC_IP` 与 `INCLUDE_PUBLIC_IP` 配置项；可手动固定 IP，或关闭通知中的公网 IP 显示。
+- 安装器支持 `--public-ip`、`--include-public-ip` 与 `--notify-ok` 参数，并会把对应配置写入 `telegram.env`。
+- 安装器升级体验改进：重新运行安装器时会读取已有 `telegram.env` 和 timer 时间，未显式覆盖的选项自动沿用旧配置。
+
 ## 1.3.2
 
 - 运行时及安装器中所有 Telegram API 调用新增 bot token 格式校验（`^\d+:[A-Za-z0-9_-]+$`），作为 URL 注入纵深防御。

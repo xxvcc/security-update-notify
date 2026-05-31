@@ -114,7 +114,7 @@ load_config_file() {
     if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
     if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
     case "$key" in
-      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|HOST_LABEL|NOTIFY_OK|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND)
+      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND)
         printf -v "$key" '%s' "$value"
         ;;
       *) echo "配置键不支持 / Unsupported config key in $file: $key" >&2; return 2 ;;
@@ -163,6 +163,15 @@ if [[ -n "${TELEGRAM_CHAT_ID:-}" ]]; then
   fi
 else
   echo "缺失：chat id / MISSING chat id"
+fi
+if [[ "${INCLUDE_PUBLIC_IP:-1}" =~ ^(1|true|yes|on)$ ]]; then
+  if [[ -n "${PUBLIC_IP:-}" ]]; then
+    echo "公网 IP：使用手动配置 / Public IP: using configured value: ${PUBLIC_IP}"
+  else
+    echo "公网 IP：运行时自动获取 / Public IP: auto-detected at runtime"
+  fi
+else
+  echo "公网 IP：通知中不显示 / Public IP: not shown in notifications"
 fi
 telegram_get_me >/dev/null && echo "正常：Telegram Bot Token 可用 / OK Telegram bot token works" || { echo "错误：Telegram getMe 失败 / ERROR Telegram getMe failed" >&2; exit 1; }
 

@@ -2,19 +2,26 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CHECK_TIME="${CHECK_TIME:-09:00}"
+CHECK_TIME="${CHECK_TIME:-}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 HOST_LABEL="${HOST_LABEL:-}"
+PUBLIC_IP="${PUBLIC_IP:-}"
+INCLUDE_PUBLIC_IP="${INCLUDE_PUBLIC_IP:-}"
 DEDUP_MODE="${DEDUP_MODE:-}"
-DEDUP_INTERVAL_DAYS="${DEDUP_INTERVAL_DAYS:-3}"
-NOTIFY_LANG="${NOTIFY_LANG:-zh}"
-BACKEND="${BACKEND:-auto}"
+DEDUP_INTERVAL_DAYS="${DEDUP_INTERVAL_DAYS:-}"
+NOTIFY_LANG="${NOTIFY_LANG:-}"
+BACKEND="${BACKEND:-}"
 SEND_TEST=0
 SKIP_TELEGRAM_TEST=0
 NON_INTERACTIVE=0
 ASSUME_YES=0
 ALLOW_BEST_EFFORT=0
+NOTIFY_OK="${NOTIFY_OK:-}"
+CONFIG_FILE="/etc/security-update-notify/telegram.env"
+TIMER_FILE="/etc/systemd/system/security-update-notify.timer"
+EXISTING_CONFIG_LOADED=0
+EXISTING_TIMER_LOADED=0
 ENV_FILE=""
 TMP_DIR=""
 cleanup() { [[ -z "$TMP_DIR" ]] || rm -rf "$TMP_DIR"; }
@@ -31,6 +38,9 @@ usage() {
   --telegram-chat-id CHAT_ID   Telegram 目标 Chat ID / Telegram target chat id
   --time HH:MM                 每日检查时间，默认 09:00 / Daily check time, default 09:00
   --host-label NAME            通知中的可选主机标签 / Optional host label in notifications
+  --public-ip IP               手动指定通知中的公网 IP / Manually set public IP in notifications
+  --include-public-ip BOOL     是否在通知中显示公网 IP，默认 1 / Show public IP in notifications, default 1
+  --notify-ok BOOL             无需处理时是否也发送 OK 通知，默认 0 / Send OK notification when no action is needed, default 0
   --dedup-mode MODE            always | daily | interval
   --dedup-interval-days N      mode=interval 时使用，默认 3 / Used when mode=interval, default 3
   --notify-lang LANG           Telegram 通知语言：zh 中文 | en English，默认 zh / Telegram notification language: zh Chinese | en English, default zh
@@ -64,16 +74,67 @@ load_env_file() {
     if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
     if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
     case "$key" in
-      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|CHECK_TIME|HOST_LABEL|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND)
+      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|CHECK_TIME|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND)
         printf -v "$key" '%s' "$value"
         ;;
-      SEND_TEST|SKIP_TELEGRAM_TEST|NON_INTERACTIVE|ASSUME_YES|ALLOW_BEST_EFFORT)
+      SEND_TEST|SKIP_TELEGRAM_TEST|NON_INTERACTIVE|ASSUME_YES|ALLOW_BEST_EFFORT|NOTIFY_OK)
         lower="${value,,}"
         [[ "$lower" =~ ^(0|1|true|false|yes|no)$ ]] || { echo "$key 在 $file 中的布尔值无效 / Invalid boolean for $key in $file" >&2; exit 2; }
         case "$lower" in 1|true|yes) printf -v "$key" '%s' 1 ;; *) printf -v "$key" '%s' 0 ;; esac
         ;;
       *) echo "$file 中存在不支持的 env 键 / Unsupported env key in $file: $key" >&2; exit 2 ;;
     esac
+  done <"$file"
+}
+
+
+set_config_default() {
+  local key="$1" value="$2" current
+  set +u; current="${!key:-}"; set -u
+  [[ -n "$current" ]] && return
+  printf -v "$key" '%s' "$value"
+}
+
+load_existing_config_defaults() {
+  local file="$1" line key value
+  [[ -r "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" == export\ * ]] && line="${line#export }"
+    [[ "$line" == *"="* ]] || continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="${key//[[:space:]]/}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    value="${value#${value%%[![:space:]]*}}"
+    value="${value%${value##*[![:space:]]}}"
+    if [[ "$value" != \"* && "$value" != \'* ]]; then
+      value="${value%%[[:space:]]#*}"
+      value="${value%${value##*[![:space:]]}}"
+    fi
+    if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
+    if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
+    case "$key" in
+      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND)
+        set_config_default "$key" "$value"
+        EXISTING_CONFIG_LOADED=1
+        ;;
+      *) : ;; # Forward-compatible: ignore unknown keys in an installed config.
+    esac
+  done <"$file"
+}
+
+load_existing_timer_default() {
+  local file="$1" line
+  [[ -z "${CHECK_TIME:-}" && -r "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    if [[ "$line" =~ ^OnCalendar=\*-\*-\*[[:space:]]+([0-9]{2}:[0-9]{2}):[0-9]{2}$ ]]; then
+      CHECK_TIME="${BASH_REMATCH[1]}"
+      EXISTING_TIMER_LOADED=1
+      return 0
+    fi
   done <"$file"
 }
 
@@ -86,6 +147,9 @@ while [[ $# -gt 0 ]]; do
     --telegram-chat-id) require_arg "$1" "${2:-}"; TELEGRAM_CHAT_ID="$2"; shift 2 ;;
     --time) require_arg "$1" "${2:-}"; CHECK_TIME="$2"; shift 2 ;;
     --host-label) require_arg "$1" "${2:-}"; HOST_LABEL="$2"; shift 2 ;;
+    --public-ip) require_arg "$1" "${2:-}"; PUBLIC_IP="$2"; shift 2 ;;
+    --include-public-ip) require_arg "$1" "${2:-}"; INCLUDE_PUBLIC_IP="$2"; shift 2 ;;
+    --notify-ok) require_arg "$1" "${2:-}"; NOTIFY_OK="$2"; shift 2 ;;
     --dedup-mode) require_arg "$1" "${2:-}"; DEDUP_MODE="$2"; shift 2 ;;
     --dedup-interval-days) require_arg "$1" "${2:-}"; DEDUP_INTERVAL_DAYS="$2"; shift 2 ;;
     --notify-lang) require_arg "$1" "${2:-}"; NOTIFY_LANG="$2"; shift 2 ;;
@@ -113,7 +177,7 @@ validate_config_value() {
 }
 validate_config_values() {
   local name value
-  for name in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID HOST_LABEL DEDUP_MODE DEDUP_INTERVAL_DAYS NOTIFY_LANG BACKEND; do
+  for name in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID HOST_LABEL PUBLIC_IP INCLUDE_PUBLIC_IP NOTIFY_OK DEDUP_MODE DEDUP_INTERVAL_DAYS NOTIFY_LANG BACKEND; do
     set +u; value="${!name}"; set -u
     validate_config_value "$name" "$value"
   done
@@ -234,6 +298,16 @@ EOF
 }
 
 require_root
+load_existing_config_defaults "$CONFIG_FILE"
+load_existing_timer_default "$TIMER_FILE"
+[[ "$EXISTING_CONFIG_LOADED" -eq 1 ]] && echo "检测到已有配置，升级时将复用未显式覆盖的旧设置。/ Existing config detected; reusing old settings not explicitly overridden."
+[[ "$EXISTING_TIMER_LOADED" -eq 1 ]] && echo "检测到已有定时器时间：$CHECK_TIME / Existing timer time detected: $CHECK_TIME"
+: "${CHECK_TIME:=09:00}"
+: "${DEDUP_INTERVAL_DAYS:=3}"
+: "${NOTIFY_LANG:=zh}"
+: "${BACKEND:=auto}"
+: "${INCLUDE_PUBLIC_IP:=1}"
+: "${NOTIFY_OK:=0}"
 [[ -r /etc/os-release ]] || { echo "缺少 /etc/os-release / Missing /etc/os-release" >&2; exit 1; }
 ID=""; VERSION_ID=""; PRETTY_NAME=""
 while IFS= read -r line || [[ -n "$line" ]]; do
@@ -334,6 +408,8 @@ if [[ "$NON_INTERACTIVE" -ne 1 && "$NOTIFY_LANG" == "zh" ]]; then
   esac
 fi
 case "$NOTIFY_LANG" in zh|en) ;; *) echo "无效通知语言 / Invalid notify language: $NOTIFY_LANG (expected zh or en)" >&2; exit 2 ;; esac
+case "${INCLUDE_PUBLIC_IP,,}" in 1|true|yes|on) INCLUDE_PUBLIC_IP=1 ;; 0|false|no|off) INCLUDE_PUBLIC_IP=0 ;; *) echo "无效 INCLUDE_PUBLIC_IP / Invalid INCLUDE_PUBLIC_IP: $INCLUDE_PUBLIC_IP (expected 0 or 1)" >&2; exit 2 ;; esac
+case "${NOTIFY_OK,,}" in 1|true|yes|on) NOTIFY_OK=1 ;; 0|false|no|off) NOTIFY_OK=0 ;; *) echo "无效 NOTIFY_OK / Invalid NOTIFY_OK: $NOTIFY_OK (expected 0 or 1)" >&2; exit 2 ;; esac
 prompt_text CHECK_TIME "每日检查时间 HH:MM / Daily check time HH:MM" "09:00"
 if [[ -z "$DEDUP_MODE" ]]; then
   if [[ "$NON_INTERACTIVE" -eq 1 ]]; then DEDUP_MODE="interval"; else
@@ -448,7 +524,9 @@ umask 077
   printf 'TELEGRAM_BOT_TOKEN=%s\n' "$(config_quote "$TELEGRAM_BOT_TOKEN")"
   printf 'TELEGRAM_CHAT_ID=%s\n' "$(config_quote "$TELEGRAM_CHAT_ID")"
   printf 'HOST_LABEL=%s\n' "$(config_quote "$HOST_LABEL")"
-  echo 'NOTIFY_OK=0'
+  printf 'PUBLIC_IP=%s\n' "$(config_quote "$PUBLIC_IP")"
+  printf 'INCLUDE_PUBLIC_IP=%s\n' "$(config_quote "$INCLUDE_PUBLIC_IP")"
+  printf 'NOTIFY_OK=%s\n' "$(config_quote "$NOTIFY_OK")"
   printf 'DEDUP_MODE=%s\n' "$(config_quote "$DEDUP_MODE")"
   printf 'DEDUP_INTERVAL_DAYS=%s\n' "$(config_quote "$DEDUP_INTERVAL_DAYS")"
   printf 'NOTIFY_LANG=%s\n' "$(config_quote "$NOTIFY_LANG")"
