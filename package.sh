@@ -84,7 +84,7 @@ tar -C "$WORK" --sort=name --mtime="@$SOURCE_EPOCH" --owner=0 --group=0 --numeri
 
 case "$SIGN_RELEASE" in
   auto|1|true|yes)
-    if command -v gpg >/dev/null 2>&1 && gpg --list-secret-keys ${GPG_KEY_ID:+"$GPG_KEY_ID"} >/dev/null 2>&1; then
+    if command -v gpg >/dev/null 2>&1 && gpg --list-secret-keys ${GPG_KEY_ID:+"$GPG_KEY_ID"} 2>/dev/null | grep -q '^sec'; then
       gpg --batch --yes --armor --detach-sign ${GPG_KEY_ID:+--local-user "$GPG_KEY_ID"} -o "$SIG" "$TAR"
     elif [[ "$SIGN_RELEASE" != "auto" ]]; then
       echo "请求签名但没有可用 GPG 私钥 / Signing requested but no usable GPG secret key was found" >&2
