@@ -1,5 +1,10 @@
 # 变更记录
 
+## 1.5.1
+
+- Patch release: include CI fixes after v1.5.0 for ShellCheck compatibility and packaging without a CI signing secret key.
+- Fix alert hash formatting argument count.
+
 ## 1.5.0
 
 - 新增明确升级入口：`security-update-notify --check-upgrade`、`security-update-notify --upgrade`、`sun.sh upgrade`。
