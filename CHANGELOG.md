@@ -1,5 +1,9 @@
 # 变更记录
 
+## 1.5.2
+
+- Patch release: make CI container smoke test validate the current script version dynamically instead of hardcoding `1.5.0`.
+
 ## 1.5.1
 
 - Patch release: include CI fixes after v1.5.0 for ShellCheck compatibility and packaging without a CI signing secret key.
