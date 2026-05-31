@@ -325,7 +325,8 @@ sys.exit(0 if ok else 1)
       bot_user="$(printf '%s' "$getme" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("result",{}).get("username", "unknown"))' 2>/dev/null || echo unknown)"
       echo "✅ Token 有效 / Token is valid: @${bot_user}"
       echo "正在向 Telegram Chat ID 发送测试消息... / Sending test message to Telegram Chat ID..."
-      local text="✅ security-update-notify Telegram 测试成功 / Telegram test succeeded. 主机 / Host: $(hostname -f 2>/dev/null || hostname)"
+      local text
+      text="✅ security-update-notify Telegram 测试成功 / Telegram test succeeded. 主机 / Host: $(hostname -f 2>/dev/null || hostname)"
       if printf '%s\0%s\0%s' "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" "$text" | python3 -c '
 import json, re, sys, urllib.parse, urllib.request
 

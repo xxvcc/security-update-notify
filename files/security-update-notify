@@ -535,7 +535,7 @@ fi
 msg="${msg//\\n/$'\n'}"
 
 
-alert_hash="$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$HOST" "$PUBLIC_IP_VALUE" "$BACKEND" "$NOTIFY_LANG" "$reboot_required" "$reboot_pkgs" "$restart_attention" "$restart_summary" | sha256sum | awk '{print $1}')"
+alert_hash="$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$HOST" "$PUBLIC_IP_VALUE" "$BACKEND" "$NOTIFY_LANG" "$reboot_required" "$reboot_pkgs" "$restart_attention" "$restart_summary" | sha256sum | awk '{print $1}')"
 last_hash="$(cat "$STATE_FILE" 2>/dev/null || true)"
 last_sent="$(cat "$STATE_TIME_FILE" 2>/dev/null || echo 0)"
 now_epoch="$(date +%s)"
