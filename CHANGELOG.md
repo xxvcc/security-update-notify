@@ -1,5 +1,15 @@
 # 变更记录
 
+## 1.5.0
+
+- 新增明确升级入口：`security-update-notify --check-upgrade`、`security-update-notify --upgrade`、`sun.sh upgrade`。
+- 升级前自动备份关键文件到 `/var/backups/security-update-notify/<timestamp>`；安装/升级失败时尝试自动回滚。
+- 安装/升级后默认运行自检：版本、systemd unit 校验、doctor（跳过 Telegram 联通性）。
+- 新增 `NOTIFY_UPGRADE` / `--notify-upgrade`：升级成功后可发送 Telegram 通知。
+- 新增 `CONFIG_VERSION=2`，为后续配置迁移预留稳定字段。
+- 发布包支持可选 GPG detached signature；`sun.sh` 新增 `--verify-signature auto|required|off`。
+- CI 增加升级默认值与通知回归覆盖。
+
 ## 1.4.0
 
 - Telegram OK/告警提醒新增公网 IP 字段，默认运行时自动获取，便于多 VPS 场景下快速识别服务器。

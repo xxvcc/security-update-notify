@@ -72,7 +72,7 @@ echo
 echo "== 语法和 systemd / syntax and systemd =="
 bash -n /usr/local/sbin/security-update-notify && echo "正常：脚本语法通过 / OK script syntax"
 /usr/local/sbin/security-update-notify --version
-/usr/local/sbin/security-update-notify --doctor
+/usr/local/sbin/security-update-notify --doctor --skip-telegram
 systemd-analyze verify /etc/systemd/system/security-update-notify.service /etc/systemd/system/security-update-notify.timer >"$TMP_DIR/systemd-verify.log" 2>&1 && echo "正常：systemd 单元通过 / OK systemd units" || { cat "$TMP_DIR/systemd-verify.log"; exit 1; }
 echo
 
@@ -114,7 +114,7 @@ load_config_file() {
     if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
     if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
     case "$key" in
-      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND)
+      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|NOTIFY_UPGRADE|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION)
         printf -v "$key" '%s' "$value"
         ;;
       *) echo "配置键不支持 / Unsupported config key in $file: $key" >&2; return 2 ;;

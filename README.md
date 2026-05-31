@@ -227,6 +227,8 @@ sudo ./install.sh \
 --public-ip IP             # 手动指定通知中的公网 IP；不填则运行时自动获取
 --include-public-ip 0      # 关闭通知中的公网 IP 显示；默认 1
 --notify-ok 1             # 无需处理时也发送 OK 通知；默认 0
+--notify-upgrade 1        # 升级成功后发送 Telegram 通知；默认 0
+--skip-post-install-check # 跳过安装/升级后自检
 --allow-best-effort        # 允许尽力支持的发行版
 --send-test                # 安装完成后额外发送测试消息
 --skip-telegram-test       # 跳过 Telegram 预检
@@ -238,10 +240,10 @@ sudo ./install.sh \
 重新运行一键安装器即可升级到最新 release：
 
 ```bash
-curl -fsSL https://xxv.cc/sun.sh | sudo bash -s -- install --non-interactive -y
+curl -fsSL https://xxv.cc/sun.sh | sudo bash -s -- upgrade --non-interactive -y
 ```
 
-如果已安装过 SUN，安装器会自动读取 `/etc/security-update-notify/telegram.env` 和现有 timer 时间；未在命令行或 `--env-file` 中显式覆盖的选项会沿用旧值，因此通常不需要重新填写 Telegram Token / Chat ID。
+如果已安装过 SUN，安装器会自动读取 `/etc/security-update-notify/telegram.env` 和现有 timer 时间；未在命令行或 `--env-file` 中显式覆盖的选项会沿用旧值，因此通常不需要重新填写 Telegram Token / Chat ID。升级前会备份关键文件到 `/var/backups/security-update-notify/<timestamp>`，升级失败会尝试自动回滚。升级后默认运行自检；可用 `--notify-upgrade 1` 在升级成功后发送 Telegram 通知。
 
 ## 重复提醒策略
 
@@ -338,6 +340,7 @@ sudoedit /etc/security-update-notify/telegram.env
 
 ```bash
 security-update-notify --version
+security-update-notify --check-upgrade
 sudo security-update-notify --doctor
 ```
 
@@ -362,6 +365,10 @@ sudo ./uninstall.sh --purge-config
 ```
 
 作为依赖安装的软件包会保留，不会自动卸载。`--purge-config` 会删除 SUN 的配置/状态，并在备份存在时恢复 apt/dnf 自动更新配置。
+
+## Release 签名
+
+发布包始终包含 `.sha256` 校验文件。`package.sh` 支持在存在 GPG 私钥时自动生成 `.tar.gz.asc` detached signature；`sun.sh --verify-signature auto|required|off` 可在下载后校验签名。本仓库包含 release signing public key，若 release 发布了 `.asc`，`auto` 会自动校验；如果没有 `.asc`，`auto` 会回退到 sha256，`required` 会失败。
 
 ## 安全说明
 

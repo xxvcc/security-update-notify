@@ -8,16 +8,23 @@ STATE_DIR="/var/lib/security-update-notify"
 STATE_FILE="$STATE_DIR/last-alert.sha256"
 STATE_TIME_FILE="$STATE_DIR/last-alert.sent_at"
 LOCK_FILE="/run/security-update-notify.lock"
-VERSION="1.4.0"
+VERSION="1.5.0"
+REPO="${SECURITY_UPDATE_NOTIFY_REPO:-xxvcc/security-update-notify}"
 LOG_FILE="/var/log/security-update-notify.log"
 TEST_REBOOT=0
 SEND_OK=0
 NO_DEDUPE=0
 DOCTOR=0
+DOCTOR_SKIP_TELEGRAM=0
+CHECK_UPGRADE=0
+SELF_UPGRADE=0
+UPGRADE_NOTICE=0
+UPGRADE_FROM=""
+UPGRADE_TO=""
 
 usage() {
   cat <<'EOF'
-用法 / Usage: security-update-notify [--test-ok] [--test-reboot] [--no-dedupe] [--doctor] [--version]
+用法 / Usage: security-update-notify [--test-ok] [--test-reboot] [--no-dedupe] [--doctor] [--check-upgrade] [--upgrade] [--version]
 
 检查系统后端的整机重启/服务重启状态，然后发送 Telegram 提醒。
 Checks OS backend reboot/service-restart state, then sends Telegram alerts.
@@ -30,11 +37,78 @@ while [[ $# -gt 0 ]]; do
     --test-reboot) TEST_REBOOT=1; shift ;;
     --no-dedupe) NO_DEDUPE=1; shift ;;
     --doctor) DOCTOR=1; shift ;;
+    --skip-telegram|--skip-telegram-test) DOCTOR_SKIP_TELEGRAM=1; shift ;;
+    --check-upgrade) CHECK_UPGRADE=1; shift ;;
+    --upgrade) SELF_UPGRADE=1; shift ;;
+    --notify-upgrade-event) UPGRADE_NOTICE=1; shift ;;
+    --upgrade-from) [[ -n "${2:-}" ]] || { echo "缺少 --upgrade-from 的值 / Missing value for --upgrade-from" >&2; exit 2; }; UPGRADE_FROM="$2"; shift 2 ;;
+    --upgrade-to) [[ -n "${2:-}" ]] || { echo "缺少 --upgrade-to 的值 / Missing value for --upgrade-to" >&2; exit 2; }; UPGRADE_TO="$2"; shift 2 ;;
     --version) echo "security-update-notify $VERSION"; exit 0 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "未知参数 / Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+version_sort_key() {
+  sed 's/^v//' | awk -F. '{ printf "%08d.%08d.%08d\n", $1+0, $2+0, $3+0 }'
+}
+
+latest_release_version() {
+  python3 - "$REPO" <<'PY'
+import json
+import sys
+import urllib.request
+
+repo = sys.argv[1]
+try:
+    with urllib.request.urlopen(f"https://api.github.com/repos/{repo}/releases/latest", timeout=20) as response:
+        data = json.load(response)
+    print(str(data.get("tag_name", "")).lstrip("v"))
+except Exception as exc:
+    print(exc, file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+is_newer_version() {
+  local current="$1" latest="$2"
+  [[ -n "$current" && -n "$latest" ]] || return 1
+  [[ "$(printf '%s\n%s\n' "$current" "$latest" | version_sort_key | sort -V | tail -1)" != "$(printf '%s\n' "$current" | version_sort_key)" ]]
+}
+
+run_check_upgrade() {
+  local latest
+  echo "当前版本 / Current version: $VERSION"
+  echo "仓库 / Repository: $REPO"
+  if ! latest="$(latest_release_version)"; then
+    echo "无法检查最新版本 / Failed to check latest version" >&2
+    return 1
+  fi
+  echo "最新版本 / Latest version: $latest"
+  if [[ "$latest" == "$VERSION" ]]; then
+    echo "已经是最新版本 / Already up to date"
+    return 0
+  fi
+  if is_newer_version "$VERSION" "$latest"; then
+    echo "可升级 / Upgrade available: $VERSION -> $latest"
+    return 0
+  fi
+  echo "本地版本高于 latest release / Local version is newer than latest release"
+  return 0
+}
+
+if [[ "$CHECK_UPGRADE" -eq 1 ]]; then
+  run_check_upgrade
+  exit $?
+fi
+
+if [[ "$SELF_UPGRADE" -eq 1 ]]; then
+  if [[ "$(id -u)" -eq 0 ]]; then
+    exec bash -c 'curl -fsSL https://xxv.cc/sun.sh | bash -s -- upgrade --non-interactive -y'
+  else
+    exec bash -c 'curl -fsSL https://xxv.cc/sun.sh | sudo bash -s -- upgrade --non-interactive -y'
+  fi
+fi
 
 mkdir -p "$STATE_DIR"
 chmod 0750 "$STATE_DIR" 2>/dev/null || true
@@ -68,7 +142,7 @@ load_config_file() {
     if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
     if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
     case "$key" in
-      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND)
+      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|NOTIFY_UPGRADE|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION)
         printf -v "$key" '%s' "$value"
         ;;
       *) echo "配置键不支持 / Unsupported config key in $file: $key" >&2; return 2 ;;
@@ -265,7 +339,9 @@ run_doctor() {
       ;;
     *) echo "失败：不支持的后端 / FAIL unsupported backend $BACKEND"; ok=0 ;;
   esac
-  if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
+  if [[ "$DOCTOR_SKIP_TELEGRAM" -eq 1 ]]; then
+    echo "跳过：Telegram 联通性检查 / SKIP Telegram connectivity check"
+  elif [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
     echo "正常：Telegram 配置存在 / OK Telegram config present"
     if telegram_get_me >/dev/null; then
       echo "正常：Telegram Bot Token 可用 / OK Telegram bot token works"
@@ -281,6 +357,19 @@ run_doctor() {
 if [[ "$DOCTOR" -eq 1 ]]; then
   run_doctor
   exit $?
+fi
+
+if [[ "$UPGRADE_NOTICE" -eq 1 ]]; then
+  from="${UPGRADE_FROM:-unknown}"
+  to="${UPGRADE_TO:-$VERSION}"
+  zh_msg="✅ SUN 已升级\n\n主机：$HOST${PUBLIC_IP_LINE_ZH}\n版本：$from → $to\n时间：$NOW\n\n升级后自检已完成。"
+  en_msg="✅ SUN upgraded\n\nHost: $HOST${PUBLIC_IP_LINE_EN}\nVersion: $from → $to\nTime: $NOW\n\nPost-upgrade self-check completed."
+  if [[ "${NOTIFY_UPGRADE:-0}" == "1" ]]; then
+    if [[ "$NOTIFY_LANG" == "en" ]]; then msg="$en_msg"; else msg="$zh_msg"; fi
+    msg="${msg//\\n/$'\n'}"
+    telegram_send_message "$msg"
+  fi
+  exit 0
 fi
 
 reboot_required=0

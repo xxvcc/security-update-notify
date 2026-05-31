@@ -9,6 +9,8 @@ set -euo pipefail
 REPO="${SECURITY_UPDATE_NOTIFY_REPO:-xxvcc/security-update-notify}"
 VERSION="${SECURITY_UPDATE_NOTIFY_VERSION:-latest}"
 BASE_URL="${SECURITY_UPDATE_NOTIFY_BASE_URL:-}"
+VERIFY_SIGNATURE="${SECURITY_UPDATE_NOTIFY_VERIFY_SIGNATURE:-auto}"
+RELEASE_SIGNING_FINGERPRINT="${SECURITY_UPDATE_NOTIFY_SIGNING_FINGERPRINT:-C678256ACBFC6491BF5076655F3AE24999921FFC}"
 RUN_MODE="menu"
 INSTALL_ARGS=()
 
@@ -22,7 +24,9 @@ usage() {
   --version VERSION       发布版本，例如 1.1.0；默认 latest / Release version, e.g. 1.1.0. Default: latest
   --repo OWNER/REPO       GitHub 仓库；默认来自脚本配置 / GitHub repo. Default from script config
   --base-url URL          覆盖下载基础 URL / Override download base URL
+  --verify-signature MODE 签名校验模式：auto | required | off / Signature verification: auto | required | off
   install                 下载后运行 install.sh / Run install.sh after download
+  upgrade                 下载后升级并复用已有配置 / Upgrade and reuse existing config
   test                    下载后运行 test.sh / Run test.sh after download
   uninstall               下载后运行 uninstall.sh / Run uninstall.sh after download
   menu                    下载后运行 menu.sh（默认）/ Run menu.sh after download (default)
@@ -79,7 +83,8 @@ while [[ $# -gt 0 ]]; do
     --version) require_arg "$1" "${2:-}"; VERSION="$2"; shift 2 ;;
     --repo) require_arg "$1" "${2:-}"; REPO="$2"; shift 2 ;;
     --base-url) require_arg "$1" "${2:-}"; BASE_URL="$2"; shift 2 ;;
-    install|test|uninstall|menu) RUN_MODE="$1"; shift; INSTALL_ARGS+=("$@"); break ;;
+    --verify-signature) require_arg "$1" "${2:-}"; VERIFY_SIGNATURE="$2"; shift 2 ;;
+    install|upgrade|test|uninstall|menu) RUN_MODE="$1"; shift; INSTALL_ARGS+=("$@"); break ;;
     -h|--help) usage; exit 0 ;;
     *) INSTALL_ARGS+=("$1"); shift ;;
   esac
@@ -118,6 +123,38 @@ verify_checksum "$PKG" "$PKG.sha256"
 safe_extract_tar "$PKG" "$PKG_DIR"
 cd "$PKG_DIR"
 
+verify_signature_if_available() {
+  local sig_url sig_file actual_fpr gpg_home
+  case "$VERIFY_SIGNATURE" in auto|required|off) ;; *) echo "无效签名校验模式 / Invalid signature verification mode: $VERIFY_SIGNATURE" >&2; exit 2 ;; esac
+  [[ "$VERIFY_SIGNATURE" != "off" ]] || return 0
+  sig_url="${URL}.asc"
+  sig_file="$TMP/$PKG.asc"
+  if curl -fsL --retry 2 -o "$sig_file" "$sig_url"; then
+    if command -v gpg >/dev/null 2>&1 && [[ -s files/release-signing.pub.asc ]]; then
+      gpg_home="$TMP/gnupg"
+      mkdir -p "$gpg_home"; chmod 700 "$gpg_home"
+      GNUPGHOME="$gpg_home" gpg --batch --import files/release-signing.pub.asc >/dev/null 2>&1 || true
+      actual_fpr="$(GNUPGHOME="$gpg_home" gpg --batch --with-colons --list-keys 2>/dev/null | awk -F: '$1=="fpr" {print $10; exit}')"
+      if [[ -n "$RELEASE_SIGNING_FINGERPRINT" && "$actual_fpr" != "$RELEASE_SIGNING_FINGERPRINT" ]]; then
+        [[ "$VERIFY_SIGNATURE" != "required" ]] || { echo "签名公钥指纹不匹配 / Signing key fingerprint mismatch" >&2; exit 1; }
+        echo "警告：签名公钥指纹不匹配，继续使用 sha256。/ WARNING: signing key fingerprint mismatch; continuing with sha256." >&2
+        return 0
+      fi
+      if GNUPGHOME="$gpg_home" gpg --batch --verify "$sig_file" "$TMP/$PKG"; then
+        echo "签名校验通过 / Signature verified"
+        return 0
+      fi
+    fi
+    [[ "$VERIFY_SIGNATURE" != "required" ]] || { echo "签名存在但校验失败 / Signature exists but verification failed" >&2; exit 1; }
+    echo "警告：签名存在但无法校验，继续使用 sha256。/ WARNING: signature exists but could not be verified; continuing with sha256." >&2
+    return 0
+  fi
+  [[ "$VERIFY_SIGNATURE" != "required" ]] || { echo "缺少 release 签名 / Release signature is missing" >&2; exit 1; }
+  echo "提示：未找到 release 签名，已完成 sha256 校验。/ Note: no release signature found; sha256 verification completed."
+}
+
+verify_signature_if_available
+
 # 当通过 `curl ... | sudo bash` 调用时，stdin 是脚本流而不是用户终端。
 # 因此只在最终 exec 目标脚本时重定向到 /dev/tty，避免校验后卡住。
 # When invoked as `curl ... | sudo bash`, stdin is the script stream, not the
@@ -126,19 +163,26 @@ cd "$PKG_DIR"
 # hang after checksum verification. Redirect stdin only on the final exec.
 run_target() {
   local script="$1"; shift
+  if [[ "$script" == env ]]; then
+    env "$@"
+    exit $?
+  fi
   if { : < /dev/tty; } 2>/dev/null; then
-    exec "$script" "$@" < /dev/tty
+    "$script" "$@" < /dev/tty
+    exit $?
   fi
   if [[ "$script" == "./menu.sh" && ! -t 0 ]]; then
     echo "菜单需要交互式终端，但当前不可用。/ No interactive terminal is available for the menu." >&2
     echo "请使用非交互模式，例如：bash sun.sh install --non-interactive -y ... / Run a non-interactive mode, for example: bash sun.sh install --non-interactive -y ..." >&2
     exit 2
   fi
-  exec "$script" "$@"
+  "$script" "$@"
+  exit $?
 }
 
 case "$RUN_MODE" in
   menu) run_target ./menu.sh "${INSTALL_ARGS[@]}" ;;
+  upgrade) SECURITY_UPDATE_NOTIFY_UPGRADE=1 run_target env SECURITY_UPDATE_NOTIFY_UPGRADE=1 ./install.sh "${INSTALL_ARGS[@]}" ;;
   install) run_target ./install.sh "${INSTALL_ARGS[@]}" ;;
   test) exec ./test.sh "${INSTALL_ARGS[@]}" ;;
   uninstall) run_target ./uninstall.sh "${INSTALL_ARGS[@]}" ;;

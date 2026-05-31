@@ -2,6 +2,7 @@
 dist/
 *.tar.gz
 *.tar.gz.sha256
+*.tar.gz.asc
 
 # Local/runtime files must never be committed
 .env

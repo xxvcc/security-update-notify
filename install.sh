@@ -12,6 +12,8 @@ DEDUP_MODE="${DEDUP_MODE:-}"
 DEDUP_INTERVAL_DAYS="${DEDUP_INTERVAL_DAYS:-}"
 NOTIFY_LANG="${NOTIFY_LANG:-}"
 BACKEND="${BACKEND:-}"
+CONFIG_VERSION="${CONFIG_VERSION:-}"
+NOTIFY_UPGRADE="${NOTIFY_UPGRADE:-}"
 SEND_TEST=0
 SKIP_TELEGRAM_TEST=0
 NON_INTERACTIVE=0
@@ -20,6 +22,15 @@ ALLOW_BEST_EFFORT=0
 NOTIFY_OK="${NOTIFY_OK:-}"
 CONFIG_FILE="/etc/security-update-notify/telegram.env"
 TIMER_FILE="/etc/systemd/system/security-update-notify.timer"
+SERVICE_FILE="/etc/systemd/system/security-update-notify.service"
+BIN_FILE="/usr/local/sbin/security-update-notify"
+LOGROTATE_FILE="/etc/logrotate.d/security-update-notify"
+BACKUP_ROOT="/var/backups/security-update-notify"
+BACKUP_DIR=""
+ROLLBACK_DONE=0
+POST_INSTALL_CHECK=1
+IN_UPGRADE="${SECURITY_UPDATE_NOTIFY_UPGRADE:-0}"
+OLD_VERSION="unknown"
 EXISTING_CONFIG_LOADED=0
 EXISTING_TIMER_LOADED=0
 ENV_FILE=""
@@ -41,6 +52,7 @@ usage() {
   --public-ip IP               手动指定通知中的公网 IP / Manually set public IP in notifications
   --include-public-ip BOOL     是否在通知中显示公网 IP，默认 1 / Show public IP in notifications, default 1
   --notify-ok BOOL             无需处理时是否也发送 OK 通知，默认 0 / Send OK notification when no action is needed, default 0
+  --notify-upgrade BOOL        升级成功后是否发送通知，默认 0 / Send notification after successful upgrade, default 0
   --dedup-mode MODE            always | daily | interval
   --dedup-interval-days N      mode=interval 时使用，默认 3 / Used when mode=interval, default 3
   --notify-lang LANG           Telegram 通知语言：zh 中文 | en English，默认 zh / Telegram notification language: zh Chinese | en English, default zh
@@ -48,6 +60,7 @@ usage() {
   --allow-best-effort          允许尽力支持的发行版 / Permit best-effort distro versions
   --send-test                  安装后额外发送测试消息 / Send additional test message after install
   --skip-telegram-test         跳过安装前 Telegram token/chat 校验 / Skip pre-install Telegram token/chat validation
+  --skip-post-install-check    跳过安装/升级后的自检 / Skip post-install self-check
   --non-interactive            缺少必需选项时直接失败 / Fail if required options are missing
   -y, --yes                    安装软件包前不再询问 / Do not prompt before installing packages
   -h, --help                   显示帮助 / Show help
@@ -74,10 +87,10 @@ load_env_file() {
     if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
     if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
     case "$key" in
-      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|CHECK_TIME|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND)
+      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|CHECK_TIME|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION)
         printf -v "$key" '%s' "$value"
         ;;
-      SEND_TEST|SKIP_TELEGRAM_TEST|NON_INTERACTIVE|ASSUME_YES|ALLOW_BEST_EFFORT|NOTIFY_OK)
+      SEND_TEST|SKIP_TELEGRAM_TEST|NON_INTERACTIVE|ASSUME_YES|ALLOW_BEST_EFFORT|NOTIFY_OK|NOTIFY_UPGRADE|POST_INSTALL_CHECK)
         lower="${value,,}"
         [[ "$lower" =~ ^(0|1|true|false|yes|no)$ ]] || { echo "$key 在 $file 中的布尔值无效 / Invalid boolean for $key in $file" >&2; exit 2; }
         case "$lower" in 1|true|yes) printf -v "$key" '%s' 1 ;; *) printf -v "$key" '%s' 0 ;; esac
@@ -116,7 +129,7 @@ load_existing_config_defaults() {
     if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
     if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
     case "$key" in
-      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND)
+      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|NOTIFY_UPGRADE|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION)
         set_config_default "$key" "$value"
         EXISTING_CONFIG_LOADED=1
         ;;
@@ -150,12 +163,14 @@ while [[ $# -gt 0 ]]; do
     --public-ip) require_arg "$1" "${2:-}"; PUBLIC_IP="$2"; shift 2 ;;
     --include-public-ip) require_arg "$1" "${2:-}"; INCLUDE_PUBLIC_IP="$2"; shift 2 ;;
     --notify-ok) require_arg "$1" "${2:-}"; NOTIFY_OK="$2"; shift 2 ;;
+    --notify-upgrade) require_arg "$1" "${2:-}"; NOTIFY_UPGRADE="$2"; shift 2 ;;
     --dedup-mode) require_arg "$1" "${2:-}"; DEDUP_MODE="$2"; shift 2 ;;
     --dedup-interval-days) require_arg "$1" "${2:-}"; DEDUP_INTERVAL_DAYS="$2"; shift 2 ;;
     --notify-lang) require_arg "$1" "${2:-}"; NOTIFY_LANG="$2"; shift 2 ;;
     --backend) require_arg "$1" "${2:-}"; BACKEND="$2"; shift 2 ;;
     --send-test) SEND_TEST=1; shift ;;
     --skip-telegram-test) SKIP_TELEGRAM_TEST=1; shift ;;
+    --skip-post-install-check) POST_INSTALL_CHECK=0; shift ;;
     --allow-best-effort) ALLOW_BEST_EFFORT=1; shift ;;
     --non-interactive) NON_INTERACTIVE=1; shift ;;
     -y|--yes) ASSUME_YES=1; shift ;;
@@ -177,7 +192,7 @@ validate_config_value() {
 }
 validate_config_values() {
   local name value
-  for name in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID HOST_LABEL PUBLIC_IP INCLUDE_PUBLIC_IP NOTIFY_OK DEDUP_MODE DEDUP_INTERVAL_DAYS NOTIFY_LANG BACKEND; do
+  for name in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID HOST_LABEL PUBLIC_IP INCLUDE_PUBLIC_IP NOTIFY_OK NOTIFY_UPGRADE DEDUP_MODE DEDUP_INTERVAL_DAYS NOTIFY_LANG BACKEND CONFIG_VERSION; do
     set +u; value="${!name}"; set -u
     validate_config_value "$name" "$value"
   done
@@ -189,6 +204,73 @@ config_quote() {
   else
     printf "'%s'" "$value"
   fi
+}
+
+current_installed_version() {
+  if [[ -x "$BIN_FILE" ]]; then
+    "$BIN_FILE" --version 2>/dev/null | awk '{print $2; exit}'
+  else
+    printf 'none\n'
+  fi
+}
+
+create_backup() {
+  local ts rel
+  ts="$(date +%Y%m%d%H%M%S)"
+  BACKUP_DIR="$BACKUP_ROOT/$ts"
+  install -d -m 0750 "$BACKUP_DIR"
+  : >"$BACKUP_DIR/manifest"
+  for rel in \
+    usr/local/sbin/security-update-notify \
+    etc/security-update-notify/telegram.env \
+    etc/systemd/system/security-update-notify.service \
+    etc/systemd/system/security-update-notify.timer \
+    etc/logrotate.d/security-update-notify \
+    etc/apt/apt.conf.d/20auto-upgrades \
+    etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify \
+    etc/needrestart/conf.d/99-security-update-notify-report-only.conf \
+    etc/dnf/automatic.conf; do
+    if [[ -e "/$rel" ]]; then
+      install -d -m 0750 "$BACKUP_DIR/$(dirname "$rel")"
+      cp -a "/$rel" "$BACKUP_DIR/$rel"
+      printf '%s\n' "$rel" >>"$BACKUP_DIR/manifest"
+    fi
+  done
+  printf '%s\n' "$BACKUP_DIR" >"$BACKUP_ROOT/latest"
+  echo "已创建升级备份 / Backup created: $BACKUP_DIR"
+}
+
+restore_backup() {
+  [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]] || return 0
+  [[ "$ROLLBACK_DONE" -eq 0 ]] || return 0
+  ROLLBACK_DONE=1
+  echo "安装/升级失败，正在从备份回滚。/ Install/upgrade failed; rolling back from backup: $BACKUP_DIR" >&2
+  local rel
+  for rel in \
+    usr/local/sbin/security-update-notify \
+    etc/security-update-notify/telegram.env \
+    etc/systemd/system/security-update-notify.service \
+    etc/systemd/system/security-update-notify.timer \
+    etc/logrotate.d/security-update-notify \
+    etc/apt/apt.conf.d/20auto-upgrades \
+    etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify \
+    etc/needrestart/conf.d/99-security-update-notify-report-only.conf \
+    etc/dnf/automatic.conf; do
+    if [[ -e "$BACKUP_DIR/$rel" ]]; then
+      install -d -m 0755 "$(dirname "/$rel")"
+      cp -a "$BACKUP_DIR/$rel" "/$rel"
+    fi
+  done
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl restart security-update-notify.timer >/dev/null 2>&1 || true
+  echo "已回滚到备份。/ Rolled back to backup: $BACKUP_DIR" >&2
+}
+
+on_error() {
+  local rc=$?
+  trap - ERR
+  restore_backup
+  exit "$rc"
 }
 prompt_secret() {
   local var_name="$1" prompt="$2" current
@@ -298,6 +380,12 @@ EOF
 }
 
 require_root
+OLD_VERSION="$(current_installed_version)"
+if [[ "$OLD_VERSION" != "none" || -e "$CONFIG_FILE" || -e "$TIMER_FILE" || -e "$SERVICE_FILE" ]]; then
+  IN_UPGRADE=1
+  create_backup
+  trap on_error ERR
+fi
 load_existing_config_defaults "$CONFIG_FILE"
 load_existing_timer_default "$TIMER_FILE"
 [[ "$EXISTING_CONFIG_LOADED" -eq 1 ]] && echo "检测到已有配置，升级时将复用未显式覆盖的旧设置。/ Existing config detected; reusing old settings not explicitly overridden."
@@ -308,6 +396,8 @@ load_existing_timer_default "$TIMER_FILE"
 : "${BACKEND:=auto}"
 : "${INCLUDE_PUBLIC_IP:=1}"
 : "${NOTIFY_OK:=0}"
+: "${NOTIFY_UPGRADE:=0}"
+: "${CONFIG_VERSION:=2}"
 [[ -r /etc/os-release ]] || { echo "缺少 /etc/os-release / Missing /etc/os-release" >&2; exit 1; }
 ID=""; VERSION_ID=""; PRETTY_NAME=""
 while IFS= read -r line || [[ -n "$line" ]]; do
@@ -410,6 +500,7 @@ fi
 case "$NOTIFY_LANG" in zh|en) ;; *) echo "无效通知语言 / Invalid notify language: $NOTIFY_LANG (expected zh or en)" >&2; exit 2 ;; esac
 case "${INCLUDE_PUBLIC_IP,,}" in 1|true|yes|on) INCLUDE_PUBLIC_IP=1 ;; 0|false|no|off) INCLUDE_PUBLIC_IP=0 ;; *) echo "无效 INCLUDE_PUBLIC_IP / Invalid INCLUDE_PUBLIC_IP: $INCLUDE_PUBLIC_IP (expected 0 or 1)" >&2; exit 2 ;; esac
 case "${NOTIFY_OK,,}" in 1|true|yes|on) NOTIFY_OK=1 ;; 0|false|no|off) NOTIFY_OK=0 ;; *) echo "无效 NOTIFY_OK / Invalid NOTIFY_OK: $NOTIFY_OK (expected 0 or 1)" >&2; exit 2 ;; esac
+case "${NOTIFY_UPGRADE,,}" in 1|true|yes|on) NOTIFY_UPGRADE=1 ;; 0|false|no|off) NOTIFY_UPGRADE=0 ;; *) echo "无效 NOTIFY_UPGRADE / Invalid NOTIFY_UPGRADE: $NOTIFY_UPGRADE (expected 0 or 1)" >&2; exit 2 ;; esac
 prompt_text CHECK_TIME "每日检查时间 HH:MM / Daily check time HH:MM" "09:00"
 if [[ -z "$DEDUP_MODE" ]]; then
   if [[ "$NON_INTERACTIVE" -eq 1 ]]; then DEDUP_MODE="interval"; else
@@ -521,12 +612,14 @@ umask 077
 {
   echo "# security-update-notify 的 Telegram 通知设置；NOTIFY_LANG 控制发送语言：zh 中文，en English / Telegram notification settings for security-update-notify; NOTIFY_LANG controls the sent language: zh Chinese, en English."
   echo "# 请保持此文件仅 root 可读：它包含 Bot Token / Keep this file root-only: it contains the bot token."
+  printf 'CONFIG_VERSION=%s\n' "$(config_quote "$CONFIG_VERSION")"
   printf 'TELEGRAM_BOT_TOKEN=%s\n' "$(config_quote "$TELEGRAM_BOT_TOKEN")"
   printf 'TELEGRAM_CHAT_ID=%s\n' "$(config_quote "$TELEGRAM_CHAT_ID")"
   printf 'HOST_LABEL=%s\n' "$(config_quote "$HOST_LABEL")"
   printf 'PUBLIC_IP=%s\n' "$(config_quote "$PUBLIC_IP")"
   printf 'INCLUDE_PUBLIC_IP=%s\n' "$(config_quote "$INCLUDE_PUBLIC_IP")"
   printf 'NOTIFY_OK=%s\n' "$(config_quote "$NOTIFY_OK")"
+  printf 'NOTIFY_UPGRADE=%s\n' "$(config_quote "$NOTIFY_UPGRADE")"
   printf 'DEDUP_MODE=%s\n' "$(config_quote "$DEDUP_MODE")"
   printf 'DEDUP_INTERVAL_DAYS=%s\n' "$(config_quote "$DEDUP_INTERVAL_DAYS")"
   printf 'NOTIFY_LANG=%s\n' "$(config_quote "$NOTIFY_LANG")"
@@ -557,9 +650,21 @@ fi
 systemctl enable --now security-update-notify.timer >/dev/null
 
 bash -n /usr/local/sbin/security-update-notify
+if [[ "$POST_INSTALL_CHECK" -eq 1 ]]; then
+  /usr/local/sbin/security-update-notify --version
+  systemd-analyze verify /etc/systemd/system/security-update-notify.service /etc/systemd/system/security-update-notify.timer
+  /usr/local/sbin/security-update-notify --doctor --skip-telegram
+fi
 systemctl list-timers security-update-notify.timer --no-pager
 [[ "$SEND_TEST" -eq 1 ]] && /usr/local/sbin/security-update-notify --test-ok --no-dedupe
 
+if [[ "$IN_UPGRADE" == "1" && "$NOTIFY_UPGRADE" == "1" ]]; then
+  /usr/local/sbin/security-update-notify --notify-upgrade-event --upgrade-from "$OLD_VERSION" --upgrade-to "$(/usr/local/sbin/security-update-notify --version | awk '{print $2; exit}')" || true
+fi
+
+trap - ERR
+
 echo "已安装 security-update-notify。/ Installed security-update-notify."
+[[ -n "$BACKUP_DIR" ]] && echo "升级备份 / Upgrade backup: $BACKUP_DIR"
 echo "配置文件 / Config: /etc/security-update-notify/telegram.env"
 echo "查看定时器 / Timer:  systemctl list-timers security-update-notify.timer"

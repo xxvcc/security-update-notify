@@ -12,6 +12,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIST="$ROOT/dist"
 PKG="security-update-notify-$VERSION"
 WORK="$(mktemp -d)"
+SIGN_RELEASE="${SIGN_RELEASE:-auto}"
+GPG_KEY_ID="${GPG_KEY_ID:-}"
 trap 'rm -rf "$WORK"' EXIT
 
 cd "$ROOT"
@@ -19,7 +21,7 @@ bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security
 
 ALLOW_DIRTY_PACKAGE="${ALLOW_DIRTY_PACKAGE:-0}"
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  if ! git diff --quiet HEAD -- install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify files/needrestart-report-only.conf files/security-update-notify.logrotate files/security-update-notify.service README.md README.en.md CHANGELOG.md LICENSE .env.example; then
+  if ! git diff --quiet HEAD -- install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify files/needrestart-report-only.conf files/security-update-notify.logrotate files/security-update-notify.service README.md README.en.md CHANGELOG.md LICENSE .env.example files/release-signing.pub.asc .github/workflows/ci.yml; then
     if [[ "$ALLOW_DIRTY_PACKAGE" == "1" && -n "${SOURCE_DATE_EPOCH:-}" ]]; then
       echo "警告：由于 ALLOW_DIRTY_PACKAGE=1 且 SOURCE_DATE_EPOCH 已设置，将打包未提交的发布文件改动。/ WARNING: packaging uncommitted tracked release-file changes because ALLOW_DIRTY_PACKAGE=1 and SOURCE_DATE_EPOCH is set." >&2
     else
@@ -39,21 +41,21 @@ fi
 [[ -f files/security-update-notify.logrotate ]] || { echo "缺少 logrotate 文件 / logrotate file missing" >&2; exit 1; }
 
 mkdir -p "$WORK/$PKG/files" "$DIST"
-rm -f "$DIST"/security-update-notify-*.tar.gz "$DIST"/security-update-notify-*.tar.gz.sha256
+rm -f "$DIST"/security-update-notify-*.tar.gz "$DIST"/security-update-notify-*.tar.gz.sha256 "$DIST"/security-update-notify-*.tar.gz.asc
 
 # 只复制明确允许进入发布包的文件，避免未跟踪的本地文件或维护笔记误入 release。
 # Copy only explicitly allowed release files, preventing untracked local files or maintainer notes from leaking into releases.
 for f in .env.example CHANGELOG.md LICENSE README.md README.en.md install.sh menu.sh test.sh uninstall.sh; do
   cp "$ROOT/$f" "$WORK/$PKG/$f"
 done
-for f in needrestart-report-only.conf security-update-notify security-update-notify.logrotate security-update-notify.service; do
+for f in needrestart-report-only.conf release-signing.pub.asc security-update-notify security-update-notify.logrotate security-update-notify.service; do
   cp "$ROOT/files/$f" "$WORK/$PKG/files/$f"
 done
 
 # 规范化可执行权限。
 # Normalize executable permissions.
 chmod 0755 "$WORK/$PKG"/*.sh "$WORK/$PKG/files/security-update-notify"
-chmod 0644 "$WORK/$PKG/.env.example" "$WORK/$PKG/README.md" "$WORK/$PKG/README.en.md" "$WORK/$PKG/CHANGELOG.md" "$WORK/$PKG/LICENSE" "$WORK/$PKG/files/security-update-notify.service" "$WORK/$PKG/files/needrestart-report-only.conf" "$WORK/$PKG/files/security-update-notify.logrotate"
+chmod 0644 "$WORK/$PKG/.env.example" "$WORK/$PKG/README.md" "$WORK/$PKG/README.en.md" "$WORK/$PKG/CHANGELOG.md" "$WORK/$PKG/LICENSE" "$WORK/$PKG/files/security-update-notify.service" "$WORK/$PKG/files/needrestart-report-only.conf" "$WORK/$PKG/files/release-signing.pub.asc" "$WORK/$PKG/files/security-update-notify.logrotate"
 
 # 安全检查：发布包不能包含本地运行配置或状态文件。
 # Safety: release package must not contain local runtime config/state files.
@@ -65,6 +67,7 @@ fi
 
 TAR="$DIST/$PKG.tar.gz"
 SHA="$TAR.sha256"
+SIG="$TAR.asc"
 if [[ -n "${SOURCE_DATE_EPOCH:-}" ]]; then
   SOURCE_EPOCH="$SOURCE_DATE_EPOCH"
 elif git rev-parse --verify "v$VERSION^{}" >/dev/null 2>&1; then
@@ -79,5 +82,19 @@ fi
 tar -C "$WORK" --sort=name --mtime="@$SOURCE_EPOCH" --owner=0 --group=0 --numeric-owner -cf - "$PKG" | gzip -n >"$TAR"
 (cd "$DIST" && sha256sum "$PKG.tar.gz" >"$PKG.tar.gz.sha256")
 
+case "$SIGN_RELEASE" in
+  auto|1|true|yes)
+    if command -v gpg >/dev/null 2>&1 && gpg --list-secret-keys ${GPG_KEY_ID:+"$GPG_KEY_ID"} >/dev/null 2>&1; then
+      gpg --batch --yes --armor --detach-sign ${GPG_KEY_ID:+--local-user "$GPG_KEY_ID"} -o "$SIG" "$TAR"
+    elif [[ "$SIGN_RELEASE" != "auto" ]]; then
+      echo "请求签名但没有可用 GPG 私钥 / Signing requested but no usable GPG secret key was found" >&2
+      exit 1
+    fi
+    ;;
+  0|false|no) ;;
+  *) echo "无效 SIGN_RELEASE / Invalid SIGN_RELEASE: $SIGN_RELEASE" >&2; exit 2 ;;
+esac
+
 printf '已创建 / Created:\n  %s\n  %s\n' "$TAR" "$SHA"
+[[ -f "$SIG" ]] && printf '  %s\n' "$SIG"
 cat "$SHA"

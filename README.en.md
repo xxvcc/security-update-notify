@@ -227,6 +227,8 @@ Common options:
 --public-ip IP             # manually set public IP in notifications; auto-detected at runtime when empty
 --include-public-ip 0      # disable public IP in notifications; default 1
 --notify-ok 1             # send OK notification when no action is needed; default 0
+--notify-upgrade 1        # send Telegram notification after successful upgrade; default 0
+--skip-post-install-check # skip post-install/upgrade self-check
 --allow-best-effort        # allow best-effort distro versions
 --send-test                # send an extra install-complete test message
 --skip-telegram-test       # skip Telegram preflight validation
@@ -238,10 +240,10 @@ Common options:
 Rerun the one-line installer to upgrade to the latest release:
 
 ```bash
-curl -fsSL https://xxv.cc/sun.sh | sudo bash -s -- install --non-interactive -y
+curl -fsSL https://xxv.cc/sun.sh | sudo bash -s -- upgrade --non-interactive -y
 ```
 
-If SUN is already installed, the installer reads `/etc/security-update-notify/telegram.env` and the existing timer time first. Options not explicitly overridden by CLI flags or `--env-file` keep their old values, so you usually do not need to re-enter the Telegram token or chat ID.
+If SUN is already installed, the installer reads `/etc/security-update-notify/telegram.env` and the existing timer time first. Options not explicitly overridden by CLI flags or `--env-file` keep their old values, so you usually do not need to re-enter the Telegram token or chat ID. Before upgrading, key files are backed up to `/var/backups/security-update-notify/<timestamp>`; failed upgrades attempt an automatic rollback. A post-upgrade self-check runs by default; use `--notify-upgrade 1` to send a Telegram notification after a successful upgrade.
 
 ## Duplicate alert modes
 
@@ -338,6 +340,7 @@ Run built-in diagnostics:
 
 ```bash
 security-update-notify --version
+security-update-notify --check-upgrade
 sudo security-update-notify --doctor
 ```
 
@@ -362,6 +365,10 @@ sudo ./uninstall.sh --purge-config
 ```
 
 Packages installed as dependencies are left in place. `--purge-config` removes SUN config/state and restores apt/dnf automatic-update config when a SUN-created backup exists.
+
+## Release signatures
+
+Release packages always include a `.sha256` checksum file. `package.sh` can also create a detached `.tar.gz.asc` signature automatically when a GPG secret key is available. `sun.sh --verify-signature auto|required|off` verifies the signature after download. This repository includes a release signing public key. When a release publishes `.asc`, `auto` verifies it automatically; if no `.asc` is published, `auto` falls back to sha256 and `required` fails.
 
 ## Security notes
 

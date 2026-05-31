@@ -42,14 +42,16 @@ MENU
       echo
       echo "检查选项 / Check options:"
       echo "1) 基础检查或诊断 / Basic check or doctor"
-      echo "2) 发送普通测试消息 / Send normal test message"
-      echo "3) 发送模拟重启提醒（不会真的重启）/ Send simulated reboot alert (does not reboot)"
+      echo "2) 检查是否有新版 / Check for upgrade"
+      echo "3) 发送普通测试消息 / Send normal test message"
+      echo "4) 发送模拟重启提醒（不会真的重启）/ Send simulated reboot alert (does not reboot)"
       echo "0) 返回 / Back"
-      read -r -p "请输入选项 / Enter choice [1/2/3/0]: " t
+      read -r -p "请输入选项 / Enter choice [1/2/3/4/0]: " t
       case "$t" in
         1) exec "$SCRIPT_DIR/test.sh" ;;
-        2) exec "$SCRIPT_DIR/test.sh" --send-test --no-dedupe ;;
-        3) exec "$SCRIPT_DIR/test.sh" --simulate-reboot --no-dedupe ;;
+        2) exec /usr/local/sbin/security-update-notify --check-upgrade ;;
+        3) exec "$SCRIPT_DIR/test.sh" --send-test --no-dedupe ;;
+        4) exec "$SCRIPT_DIR/test.sh" --simulate-reboot --no-dedupe ;;
         0|'') continue ;;
         *) echo "无效选项 / Invalid choice" >&2 ;;
       esac

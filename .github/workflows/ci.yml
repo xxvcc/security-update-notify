@@ -30,13 +30,13 @@ jobs:
           from pathlib import Path
           s = Path('install.sh').read_text()
           start = s.index('load_env_file() {')
-          end = s.index('\nrequire_arg()', start)
+          end = s.index('\nset_config_default()', start)
           harness = '''#!/usr/bin/env bash
           set -euo pipefail
-          CHECK_TIME="09:00"; TELEGRAM_BOT_TOKEN=""; TELEGRAM_CHAT_ID=""; HOST_LABEL=""; PUBLIC_IP=""; INCLUDE_PUBLIC_IP="1"; NOTIFY_OK=""; DEDUP_MODE=""; DEDUP_INTERVAL_DAYS="3"; NOTIFY_LANG="zh"; BACKEND="auto"; SEND_TEST=0; SKIP_TELEGRAM_TEST=0; NON_INTERACTIVE=0; ASSUME_YES=0; ALLOW_BEST_EFFORT=0
+          CHECK_TIME="09:00"; TELEGRAM_BOT_TOKEN=""; TELEGRAM_CHAT_ID=""; HOST_LABEL=""; PUBLIC_IP=""; INCLUDE_PUBLIC_IP="1"; NOTIFY_OK=""; NOTIFY_UPGRADE=""; CONFIG_VERSION=""; DEDUP_MODE=""; DEDUP_INTERVAL_DAYS="3"; NOTIFY_LANG="zh"; BACKEND="auto"; SEND_TEST=0; SKIP_TELEGRAM_TEST=0; NON_INTERACTIVE=0; ASSUME_YES=0; ALLOW_BEST_EFFORT=0; POST_INSTALL_CHECK=1
           ''' + s[start:end] + '''
           load_env_file "$1"
-          printf '%s\n' "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" "$CHECK_TIME" "$NOTIFY_LANG" "$DEDUP_MODE" "$SEND_TEST" "$ALLOW_BEST_EFFORT" "$HOST_LABEL" "$PUBLIC_IP" "$INCLUDE_PUBLIC_IP" "$NOTIFY_OK"
+          printf '%s\n' "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" "$CHECK_TIME" "$NOTIFY_LANG" "$DEDUP_MODE" "$SEND_TEST" "$ALLOW_BEST_EFFORT" "$HOST_LABEL" "$PUBLIC_IP" "$INCLUDE_PUBLIC_IP" "$NOTIFY_OK" "$NOTIFY_UPGRADE" "$CONFIG_VERSION"
           '''
           Path('/tmp/sun-env-harness.sh').write_text(harness)
           PY
@@ -53,6 +53,8 @@ jobs:
           PUBLIC_IP=203.0.113.10
           INCLUDE_PUBLIC_IP=0
           NOTIFY_OK=yes
+          NOTIFY_UPGRADE=true
+          CONFIG_VERSION=2
           EOF
           /tmp/sun-env-harness.sh /tmp/sun.env > /tmp/sun-env.out
           diff -u /tmp/sun-env.out - <<'EOF'
@@ -67,6 +69,8 @@ jobs:
           203.0.113.10
           0
           1
+          1
+          2
           EOF
           if /tmp/sun-env-harness.sh <(echo 'BAD_KEY=x') >/tmp/bad.out 2>/tmp/bad.err; then
             echo "Unexpectedly accepted unknown env key" >&2
@@ -145,8 +149,95 @@ jobs:
           grep -q 'Security update check OK' "$tmp/ok.en.msg"
           ! grep -q '安全更新检查正常' "$tmp/ok.en.msg"
 
+      - name: Existing config reuse regression check
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          s = Path('install.sh').read_text()
+          start = s.index('set_config_default() {')
+          end = s.index('\nrequire_arg()', start)
+          harness = '''#!/usr/bin/env bash
+          set -euo pipefail
+          TELEGRAM_BOT_TOKEN=""; TELEGRAM_CHAT_ID=""; HOST_LABEL=""; PUBLIC_IP=""; INCLUDE_PUBLIC_IP=""; NOTIFY_OK=""; NOTIFY_UPGRADE=""; CONFIG_VERSION=""; DEDUP_MODE=""; DEDUP_INTERVAL_DAYS=""; NOTIFY_LANG=""; BACKEND=""; CHECK_TIME=""
+          EXISTING_CONFIG_LOADED=0; EXISTING_TIMER_LOADED=0
+          ''' + s[start:end] + '''
+          load_existing_config_defaults "$1"
+          load_existing_timer_default "$2"
+          printf '%s\n' "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" "$HOST_LABEL" "$PUBLIC_IP" "$INCLUDE_PUBLIC_IP" "$NOTIFY_OK" "$NOTIFY_UPGRADE" "$CONFIG_VERSION" "$DEDUP_MODE" "$DEDUP_INTERVAL_DAYS" "$NOTIFY_LANG" "$BACKEND" "$CHECK_TIME" "$EXISTING_CONFIG_LOADED" "$EXISTING_TIMER_LOADED"
+          '''
+          Path('/tmp/sun-existing-harness.sh').write_text(harness)
+          PY
+          chmod +x /tmp/sun-existing-harness.sh
+          cat >/tmp/telegram.env <<'EOF'
+          CONFIG_VERSION='2'
+          TELEGRAM_BOT_TOKEN='123456:abc_DEF-ghi'
+          TELEGRAM_CHAT_ID='-100123'
+          HOST_LABEL='old host'
+          PUBLIC_IP='203.0.113.99'
+          INCLUDE_PUBLIC_IP='0'
+          NOTIFY_OK='1'
+          NOTIFY_UPGRADE='1'
+          DEDUP_MODE='daily'
+          DEDUP_INTERVAL_DAYS='7'
+          NOTIFY_LANG='en'
+          BACKEND='apt'
+          FUTURE_KEY='ignored'
+          EOF
+          cat >/tmp/security-update-notify.timer <<'EOF'
+          [Timer]
+          OnCalendar=*-*-* 08:45:00
+          EOF
+          /tmp/sun-existing-harness.sh /tmp/telegram.env /tmp/security-update-notify.timer > /tmp/existing.out
+          diff -u /tmp/existing.out - <<'EOF'
+          123456:abc_DEF-ghi
+          -100123
+          old host
+          203.0.113.99
+          0
+          1
+          1
+          2
+          daily
+          7
+          en
+          apt
+          08:45
+          1
+          1
+          EOF
+
       - name: Package release artifact
         run: ./package.sh
+
+      - name: Smoke install in Debian container
+        run: |
+          docker run --rm -v "$PWD:/src:ro" debian:12 bash -lc '
+            set -euo pipefail
+            apt-get update >/dev/null
+            apt-get install -y systemd python3 ca-certificates >/dev/null
+            mkdir -p /run/systemd/system /etc/systemd/system /usr/local/sbin /etc/security-update-notify /var/lib/security-update-notify /var/log /etc/logrotate.d
+            cat >/usr/local/bin/systemctl <<"EOF"
+          #!/usr/bin/env bash
+          case "$1" in
+            daemon-reload|enable|restart) exit 0 ;;
+            list-timers) echo "security-update-notify.timer mock"; exit 0 ;;
+            is-enabled) exit 0 ;;
+            *) echo "mock systemctl $*"; exit 0 ;;
+          esac
+          EOF
+            chmod +x /usr/local/bin/systemctl
+            cat >/usr/local/bin/systemd-analyze <<"EOF"
+          #!/usr/bin/env bash
+          exit 0
+          EOF
+            chmod +x /usr/local/bin/systemd-analyze
+            cd /src
+            ./install.sh --telegram-token 123456:abc_DEF-ghi --telegram-chat-id -100123 --skip-telegram-test --non-interactive -y --skip-post-install-check
+            /usr/local/sbin/security-update-notify --version | grep "1.5.0"
+            grep -q "CONFIG_VERSION" /etc/security-update-notify/telegram.env
+            ./install.sh --skip-telegram-test --non-interactive -y --skip-post-install-check
+            test -s /var/backups/security-update-notify/latest
+          '
 
       - name: Verify checksum
         run: |
