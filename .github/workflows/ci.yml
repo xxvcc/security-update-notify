@@ -149,6 +149,78 @@ jobs:
           grep -q 'Security update check OK' "$tmp/ok.en.msg"
           ! grep -q '安全更新检查正常' "$tmp/ok.en.msg"
 
+      - name: dnf reboot/restart detection regression check
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          cp files/security-update-notify "$tmp/security-update-notify"
+          sed -i \
+            -e "s|^STATE_DIR=.*|STATE_DIR=\"$tmp/state\"|" \
+            -e "s|^LOCK_FILE=.*|LOCK_FILE=\"$tmp/lock\"|" \
+            -e "s|^LOG_FILE=.*|LOG_FILE=\"$tmp/log\"|" \
+            "$tmp/security-update-notify"
+          chmod +x "$tmp/security-update-notify"
+          mkdir -p "$tmp/bin"
+          cat >"$tmp/bin/python3" <<'EOF'
+          #!/usr/bin/env bash
+          exec /usr/bin/python3 -c 'import os, sys
+          payload = sys.stdin.buffer.read().split(b"\0", 2)
+          text = payload[2].decode("utf-8", "replace") if len(payload) > 2 else ""
+          capture = os.environ.get("CAPTURE")
+          if capture:
+              with open(capture, "w", encoding="utf-8") as fh:
+                  fh.write(text)
+          print("{\"ok\": true}")
+          '
+          EOF
+          chmod +x "$tmp/bin/python3"
+          cat >"$tmp/bin/needs-restarting" <<'EOF'
+          #!/usr/bin/env bash
+          case "${1:-}" in
+            -r) [[ -n "${NR_R_OUT:-}" ]] && printf '%s\n' "$NR_R_OUT"; exit "${NR_R_RC:-0}" ;;
+            -s) [[ -n "${NR_S_OUT:-}" ]] && printf '%s\n' "$NR_S_OUT"; exit 0 ;;
+            *)  [[ -n "${NR_ALL_OUT:-}" ]] && printf '%s\n' "$NR_ALL_OUT"; exit 0 ;;
+          esac
+          EOF
+          chmod +x "$tmp/bin/needs-restarting"
+          printf '#!/usr/bin/env bash\nexit 0\n' >"$tmp/bin/dnf"
+          chmod +x "$tmp/bin/dnf"
+          cat >"$tmp/env.dnf" <<'EOF'
+          TELEGRAM_BOT_TOKEN=fake
+          TELEGRAM_CHAT_ID=fake
+          NOTIFY_LANG=zh
+          BACKEND=dnf
+          INCLUDE_PUBLIC_IP=0
+          EOF
+          run() { PATH="$tmp/bin:$PATH" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env.dnf" "$tmp/security-update-notify" --no-dedupe; }
+
+          # Healthy host: stale-lib processes exist but no services/reboot -> must stay SILENT (noise fix)
+          rm -f "$tmp/a.msg"
+          NR_R_OUT=$'No core libraries or services have been updated since boot-up.\nReboot should not be necessary.' NR_R_RC=0 \
+            NR_S_OUT="" NR_ALL_OUT=$'1234 : /usr/sbin/sshd' CAPTURE="$tmp/a.msg" run >/dev/null
+          test ! -e "$tmp/a.msg"
+
+          # Services need restart -> alert listing services
+          rm -f "$tmp/b.msg"
+          NR_R_OUT=$'Reboot should not be necessary.' NR_R_RC=0 \
+            NR_S_OUT=$'sshd.service\ncrond.service' CAPTURE="$tmp/b.msg" run >/dev/null
+          grep -q 'sshd.service' "$tmp/b.msg"
+          grep -q '建议评估/重启的服务（2 个）' "$tmp/b.msg"
+          grep -q '整机重启：暂不需要' "$tmp/b.msg"
+
+          # Reboot required (rc=1 + message) -> alert with reboot required
+          rm -f "$tmp/c.msg"
+          NR_R_OUT=$'Reboot is required to ensure that your system benefits from these updates.' NR_R_RC=1 \
+            NR_S_OUT="" CAPTURE="$tmp/c.msg" run >/dev/null
+          grep -q '整机重启：需要' "$tmp/c.msg"
+
+          # needs-restarting -r generic error (rc=2, no reboot message) -> must NOT raise a false reboot alert
+          rm -f "$tmp/d.msg"
+          NR_R_OUT='needs-restarting: unexpected error' NR_R_RC=2 \
+            NR_S_OUT="" CAPTURE="$tmp/d.msg" run >/dev/null
+          test ! -e "$tmp/d.msg"
+
       - name: Existing config reuse regression check
         run: |
           python3 - <<'PY'

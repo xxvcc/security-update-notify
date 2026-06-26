@@ -8,8 +8,10 @@ STATE_DIR="/var/lib/security-update-notify"
 STATE_FILE="$STATE_DIR/last-alert.sha256"
 STATE_TIME_FILE="$STATE_DIR/last-alert.sent_at"
 LOCK_FILE="/run/security-update-notify.lock"
-VERSION="1.5.3"
+VERSION="1.6.0"
 REPO="${SECURITY_UPDATE_NOTIFY_REPO:-xxvcc/security-update-notify}"
+RELEASE_SIGNING_FINGERPRINT="${SECURITY_UPDATE_NOTIFY_SIGNING_FINGERPRINT:-C678256ACBFC6491BF5076655F3AE24999921FFC}"
+UPGRADE_ALLOW_UNSIGNED="${SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED:-0}"
 LOG_FILE="/var/log/security-update-notify.log"
 TEST_REBOOT=0
 SEND_OK=0
@@ -102,12 +104,120 @@ if [[ "$CHECK_UPGRADE" -eq 1 ]]; then
   exit $?
 fi
 
-if [[ "$SELF_UPGRADE" -eq 1 ]]; then
-  if [[ "$(id -u)" -eq 0 ]]; then
-    exec bash -c 'curl -fsSL https://xxv.cc/sun.sh | bash -s -- upgrade --non-interactive -y'
+download_release_file() {
+  # 下载发布文件；优先用 curl，缺失时回退到 python3（运行时已硬依赖 python3）。
+  # Download a release file; prefer curl, fall back to python3 (already a hard runtime dependency).
+  local url="$1" dest="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --retry 3 -o "$dest" "$url"
   else
-    exec bash -c 'curl -fsSL https://xxv.cc/sun.sh | sudo bash -s -- upgrade --non-interactive -y'
+    python3 - "$url" "$dest" <<'PY'
+import shutil, sys, urllib.request
+url, dest = sys.argv[1], sys.argv[2]
+with urllib.request.urlopen(url, timeout=60) as response, open(dest, "wb") as fh:
+    shutil.copyfileobj(response, fh)
+PY
   fi
+}
+
+run_self_upgrade() {
+  # 不再把远程脚本 `curl ... | bash` 直接交给 root 执行；改为直接下载 GitHub 发布包，
+  # 校验 sha256，并用本程序内置（pin）的指纹强制校验 GPG 签名（默认 fail-closed），
+  # 通过后才运行已校验包内的 install.sh。
+  # No longer pipe a remote script into root bash. Instead download the GitHub release directly,
+  # verify sha256, and require a GPG signature against the fingerprint pinned in this program
+  # (fail-closed by default); only then run install.sh from the verified package.
+  if [[ "$(id -u)" -ne 0 ]]; then
+    command -v sudo >/dev/null 2>&1 || { echo "升级需要 root 权限 / Root privileges are required to upgrade" >&2; exit 1; }
+    exec sudo "$0" --upgrade
+  fi
+  local c
+  for c in tar sha256sum mktemp python3; do
+    command -v "$c" >/dev/null 2>&1 || { echo "升级需要命令 / Upgrade requires command: $c" >&2; exit 1; }
+  done
+
+  local latest tmp pkg pkgdir url sha_url sig_url expected fpr gpg_home rc
+  if ! latest="$(latest_release_version)"; then
+    echo "无法获取最新版本 / Failed to fetch latest version" >&2
+    exit 1
+  fi
+  [[ "$latest" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]] || { echo "无效的最新版本号 / Invalid latest version: $latest" >&2; exit 1; }
+  if [[ "$latest" != "$VERSION" ]] && ! is_newer_version "$VERSION" "$latest"; then
+    echo "本地版本 $VERSION 高于或等于最新发布 $latest，不自动升级。/ Local version $VERSION is at or above latest release $latest; not upgrading." >&2
+    exit 0
+  fi
+  if [[ "$latest" == "$VERSION" ]]; then
+    echo "已经是最新版本 $VERSION / Already up to date: $VERSION"
+    exit 0
+  fi
+
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  pkg="security-update-notify-${latest}.tar.gz"
+  pkgdir="security-update-notify-${latest}"
+  url="https://github.com/${REPO}/releases/download/v${latest}/${pkg}"
+  sha_url="${url}.sha256"
+  sig_url="${url}.asc"
+
+  echo "正在下载并校验发布包 / Downloading and verifying release: $VERSION -> $latest"
+  download_release_file "$url" "$tmp/$pkg" || { echo "下载发布包失败 / Failed to download release" >&2; exit 1; }
+  download_release_file "$sha_url" "$tmp/$pkg.sha256" || { echo "下载校验文件失败 / Failed to download checksum" >&2; exit 1; }
+
+  expected="$(awk 'NF {print $1; exit}' "$tmp/$pkg.sha256")"
+  [[ "$expected" =~ ^[A-Fa-f0-9]{64}$ ]] || { echo "无效的校验文件 / Invalid checksum file" >&2; exit 1; }
+  ( cd "$tmp" && printf '%s  %s\n' "$expected" "$pkg" | sha256sum -c - ) >/dev/null 2>&1 \
+    || { echo "sha256 校验失败；拒绝升级 / Checksum verification failed; refusing to upgrade" >&2; exit 1; }
+
+  # 安全解包：拒绝路径穿越与非预期顶层目录。
+  # Safe extraction: reject path traversal and unexpected top-level directories.
+  local entry
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    case "$entry" in
+      /*|../*|*/../*|*/..|..) echo "压缩包中存在不安全路径 / Unsafe path in archive: $entry" >&2; exit 1 ;;
+    esac
+    case "$entry" in
+      "$pkgdir"|"$pkgdir/"|"$pkgdir"/*) ;;
+      *) echo "压缩包中存在非预期路径 / Unexpected path in archive: $entry" >&2; exit 1 ;;
+    esac
+  done < <(tar -tzf "$tmp/$pkg")
+  ( cd "$tmp" && tar --no-same-owner -xzf "$pkg" ) || { echo "解包失败 / Extraction failed" >&2; exit 1; }
+
+  # GPG 签名校验：用包内公钥，但强制其指纹等于本程序 pin 的指纹（fail-closed）。
+  # GPG verification: import the bundled key but require its fingerprint to equal the one pinned here (fail-closed).
+  if command -v gpg >/dev/null 2>&1 && download_release_file "$sig_url" "$tmp/$pkg.asc" 2>/dev/null; then
+    [[ -s "$tmp/$pkgdir/files/release-signing.pub.asc" ]] || { echo "发布包缺少签名公钥；拒绝升级 / Release is missing the signing public key; refusing to upgrade" >&2; exit 1; }
+    gpg_home="$tmp/gnupg"
+    mkdir -p "$gpg_home"; chmod 700 "$gpg_home"
+    GNUPGHOME="$gpg_home" gpg --batch --import "$tmp/$pkgdir/files/release-signing.pub.asc" >/dev/null 2>&1 \
+      || { echo "导入签名公钥失败；拒绝升级 / Failed to import signing public key; refusing to upgrade" >&2; exit 1; }
+    fpr="$(GNUPGHOME="$gpg_home" gpg --batch --with-colons --list-keys 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}')"
+    [[ -n "$RELEASE_SIGNING_FINGERPRINT" ]] || { echo "未配置签名指纹；拒绝升级 / No signing fingerprint configured; refusing to upgrade" >&2; exit 1; }
+    [[ "$fpr" == "$RELEASE_SIGNING_FINGERPRINT" ]] || { echo "签名公钥指纹不匹配（期望 $RELEASE_SIGNING_FINGERPRINT，实际 ${fpr:-none}）；拒绝升级 / Signing key fingerprint mismatch; refusing to upgrade" >&2; exit 1; }
+    GNUPGHOME="$gpg_home" gpg --batch --verify "$tmp/$pkg.asc" "$tmp/$pkg" >/dev/null 2>&1 \
+      || { echo "签名校验失败；拒绝升级 / Signature verification failed; refusing to upgrade" >&2; exit 1; }
+    echo "签名校验通过 / Signature verified (${RELEASE_SIGNING_FINGERPRINT})"
+  elif [[ "$UPGRADE_ALLOW_UNSIGNED" == "1" ]]; then
+    echo "警告：未校验 GPG 签名（SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1），仅校验 sha256。/ WARNING: skipping GPG verification (SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1); sha256 only." >&2
+  else
+    echo "缺少 gpg 或发布签名，且未设置 SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1；为安全起见拒绝升级。/ Missing gpg or release signature and SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED is not set; refusing to upgrade for safety." >&2
+    exit 1
+  fi
+
+  [[ -f "$tmp/$pkgdir/install.sh" ]] || { echo "发布包缺少 install.sh / Release is missing install.sh" >&2; exit 1; }
+  chmod 0755 "$tmp/$pkgdir/install.sh" 2>/dev/null || true
+  echo "正在以已校验的发布包升级 / Upgrading from the verified release..."
+  cd "$tmp/$pkgdir" || { echo "进入解包目录失败 / Failed to enter extracted directory" >&2; exit 1; }
+  rc=0
+  SECURITY_UPDATE_NOTIFY_UPGRADE=1 ./install.sh --non-interactive -y || rc=$?
+  cd / || true
+  rm -rf "$tmp"
+  trap - EXIT
+  exit "$rc"
+}
+
+if [[ "$SELF_UPGRADE" -eq 1 ]]; then
+  run_self_upgrade
 fi
 
 mkdir -p "$STATE_DIR"
@@ -408,22 +518,38 @@ check_dnf() {
   if [[ "$TEST_REBOOT" -eq 1 ]]; then
     reboot_required=1
     reboot_pkgs=$'kernel\nTEST-MODE-no-real-reboot'
-    restart_summary=$'needs-restarting -r: Reboot is required to ensure that your system benefits from these updates.\nneeds-restarting:\ntest-service (pid 123)'
+    restart_summary=$'needs-restarting -r:\nReboot is required to ensure that your system benefits from these updates.\n\nneeds-restarting -s:\ntest-service.service'
     restart_attention=1
     return
   fi
   if command -v needs-restarting >/dev/null 2>&1; then
-    local nr_r rc nr_all
+    local nr_r rc nr_svc
     rc=0
     nr_r="$(needs-restarting -r 2>&1)" || rc=$?
-    if [[ "$rc" -ne 0 ]]; then
+    # 优先按 needs-restarting -r 的输出文案判断是否需要整机重启，避免把命令本身的报错
+    # （权限不足、异常退出等任何非零码）误判为“需要重启”。退出码 1 是其表示“需要重启”的
+    # 约定值，仅作为文案无法匹配时的回退；其它非零码视为命令出错，不作为重启信号。
+    # Decide a full reboot from needs-restarting -r's message first, so that command errors
+    # (insufficient privileges, crashes, any non-zero code) are not mistaken for "reboot required".
+    # Exit code 1 is its documented "reboot required" signal and is used only as a fallback when the
+    # message does not match; other non-zero codes are treated as errors, not a reboot signal.
+    if printf '%s\n' "$nr_r" | grep -qiE 'reboot is required'; then
+      reboot_required=1
+    elif printf '%s\n' "$nr_r" | grep -qiE 'reboot should not be necessary|no core libraries'; then
+      reboot_required=0
+    elif [[ "$rc" -eq 1 ]]; then
       reboot_required=1
     fi
-    nr_all="$(needs-restarting 2>&1 || true)"
-    restart_summary="needs-restarting -r:\n${nr_r}\n\nneeds-restarting:\n${nr_all}"
-    if printf '%s\n' "$nr_all" | sed '/^$/d' | grep -q .; then
+    # 只用“需要重启的 systemd 服务”（needs-restarting -s）作为关注信号。裸 needs-restarting 会
+    # 列出所有仍在使用旧库的普通进程，在长期运行的系统上几乎总是非空，会造成每个周期都误报。
+    # Use only systemd services that need restarting (needs-restarting -s) as the attention signal.
+    # Bare needs-restarting lists every process still using an outdated library and is almost always
+    # non-empty on long-running systems, which would otherwise raise a false alert every cycle.
+    nr_svc="$(needs-restarting -s 2>/dev/null | sed '/^$/d' | sort -u || true)"
+    if printf '%s\n' "$nr_svc" | sed '/^$/d' | grep -q .; then
       restart_attention=1
     fi
+    restart_summary="needs-restarting -r:\n${nr_r}\n\nneeds-restarting -s:\n${nr_svc}"
   else
     restart_summary="needs-restarting 命令不存在；请安装 dnf-utils/yum-utils / needs-restarting command not found; install dnf-utils/yum-utils"
   fi
@@ -434,7 +560,7 @@ check_dnf() {
 }
 
 format_restart_summary() {
-  local lang="$1" summary kcur kexp ksta services service_count other_count processes process_count
+  local lang="$1" summary kcur kexp ksta services service_count other_count
   summary="${restart_summary//\\n/$'\n'}"
   case "$BACKEND" in
     apt)
@@ -468,25 +594,25 @@ format_restart_summary() {
       fi
       ;;
     dnf)
-      processes="$(printf '%s\n' "$summary" | awk 'found && NF {print} /^needs-restarting:/{found=1}' | sed -n '1,12p')"
-      process_count="$(printf '%s\n' "$summary" | awk 'found && NF {print} /^needs-restarting:/{found=1}' | wc -l | tr -d ' ')"
+      services="$(printf '%s\n' "$summary" | awk '/^needs-restarting -s:$/{f=1; next} /^needs-restarting/{f=0} f && NF {print}' | sed '/^$/d' | sort -u)"
+      service_count="$(printf '%s\n' "$services" | sed '/^$/d' | wc -l | tr -d ' ')"
       if [[ "$lang" == "en" ]]; then
         [[ "$reboot_required" -eq 1 ]] && printf 'Full reboot: required by needs-restarting -r\n'
-        if [[ -n "$processes" ]]; then
-          printf 'Processes/services to review (%s shown):\n' "$(printf '%s\n' "$processes" | wc -l | tr -d ' ')"
-          printf '%s\n' "$processes" | sed 's/^/• /'
-          [[ "${process_count:-0}" -gt 12 ]] && printf '• ... and %s more\n' "$((process_count - 12))"
-        else
-          printf 'No detailed process list was available. Run needs-restarting on the server for details.\n'
+        if [[ "${service_count:-0}" -gt 0 ]]; then
+          printf 'Services to review/restart (%s):\n' "$service_count"
+          printf '%s\n' "$services" | sed -n '1,12p' | sed 's/^/• /'
+          [[ "$service_count" -gt 12 ]] && printf '• ... and %s more\n' "$((service_count - 12))"
+        elif [[ "$reboot_required" -ne 1 ]]; then
+          printf 'No services were reported as needing a restart. Run needs-restarting on the server for details.\n'
         fi
       else
         [[ "$reboot_required" -eq 1 ]] && printf '整机重启：needs-restarting -r 判断为需要\n'
-        if [[ -n "$processes" ]]; then
-          printf '建议评估的进程/服务（显示 %s 条）：\n' "$(printf '%s\n' "$processes" | wc -l | tr -d ' ')"
-          printf '%s\n' "$processes" | sed 's/^/• /'
-          [[ "${process_count:-0}" -gt 12 ]] && printf '• ……另有 %s 条\n' "$((process_count - 12))"
-        else
-          printf '没有拿到详细进程列表；可在服务器上运行 needs-restarting 查看详情。\n'
+        if [[ "${service_count:-0}" -gt 0 ]]; then
+          printf '建议评估/重启的服务（%s 个）：\n' "$service_count"
+          printf '%s\n' "$services" | sed -n '1,12p' | sed 's/^/• /'
+          [[ "$service_count" -gt 12 ]] && printf '• ……另有 %s 个\n' "$((service_count - 12))"
+        elif [[ "$reboot_required" -ne 1 ]]; then
+          printf '没有服务被报告需要重启；可在服务器上运行 needs-restarting 查看详情。\n'
         fi
       fi
       ;;

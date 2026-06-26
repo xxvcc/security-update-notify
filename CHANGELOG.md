@@ -1,5 +1,14 @@
 # 变更记录
 
+## 1.6.0
+
+- 安全（自升级信任链）：`--upgrade` 不再 `curl https://xxv.cc/sun.sh | bash` 执行未校验的远程脚本。改为直接下载 GitHub 发布包，校验 sha256，并用本程序内置（pin）的指纹强制校验 GPG 签名，**默认 fail-closed**（缺少 gpg/签名即拒绝升级；可用 `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` 显式放行仅 sha256 的升级）。非 root 时改为 `sudo` 重新执行本地受信二进制，而非管道远程脚本。
+  Security (self-upgrade trust chain): `--upgrade` no longer pipes an unverified remote script into root bash. It downloads the GitHub release directly, verifies sha256, and requires a GPG signature against a pinned fingerprint — fail-closed by default.
+- dnf 后端降噪：不再因裸 `needs-restarting` 列出“仍在使用旧库的普通进程”就触发提醒（这类列表在长期运行的系统上几乎总是非空）；改为以 `needs-restarting -s`（需要重启的 systemd 服务）作为关注信号。整机重启判断优先匹配 `needs-restarting -r` 的输出文案，避免把命令报错（任意非零退出码）误判为“需要重启”。
+  dnf backend noise reduction: stop alerting merely because bare `needs-restarting` lists processes using outdated libraries; use `needs-restarting -s` (services) as the attention signal, and detect reboot from the `-r` message rather than from any non-zero exit code.
+- `uninstall.sh --purge-config` 现在会一并删除 `/var/backups/security-update-notify`（其中含 `telegram.env` 的 bot token 副本）与轮转日志。
+  `uninstall.sh --purge-config` now also removes `/var/backups/security-update-notify` (which held bot-token copies) and rotated logs.
+
 ## 1.5.3
 
 - Patch release: fix CI smoke-test shell quoting after the dynamic version check change.
