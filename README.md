@@ -1,6 +1,7 @@
 # security-update-notify
 
 <p align="center">
+  <a href="https://github.com/xxvcc/security-update-notify/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/xxvcc/security-update-notify?style=flat-square&label=release&color=2EA043"></a>
   <img alt="Linux" src="https://img.shields.io/badge/Linux-systemd-1793D1?style=flat-square&logo=linux&logoColor=white">
   <img alt="Debian" src="https://img.shields.io/badge/Debian-12%20%7C%2013-A81D33?style=flat-square&logo=debian&logoColor=white">
   <img alt="Ubuntu" src="https://img.shields.io/badge/Ubuntu-22.04%20%7C%2024.04-E95420?style=flat-square&logo=ubuntu&logoColor=white">
@@ -364,11 +365,13 @@ sudo ./uninstall.sh
 sudo ./uninstall.sh --purge-config
 ```
 
-作为依赖安装的软件包会保留，不会自动卸载。`--purge-config` 会删除 SUN 的配置/状态，并在备份存在时恢复 apt/dnf 自动更新配置。
+作为依赖安装的软件包会保留，不会自动卸载。`--purge-config` 会删除 SUN 的配置/状态、升级备份（其中含 bot token 副本）以及轮转日志，并在备份存在时恢复 apt/dnf 自动更新配置。
 
 ## Release 签名
 
 发布包始终包含 `.sha256` 校验文件。`package.sh` 支持在存在 GPG 私钥时自动生成 `.tar.gz.asc` detached signature；`sun.sh --verify-signature auto|required|off` 可在下载后校验签名。本仓库包含 release signing public key，若 release 发布了 `.asc`，`auto` 会自动校验；如果没有 `.asc`，`auto` 会回退到 sha256，`required` 会失败。
+
+正式发布（打了 `vX.Y.Z` tag 的构建）**强制签名**：`package.sh` 在 tag 指向当前提交时会要求 GPG 签名，没有私钥则构建失败；release 发布后 CI 会用仓库内公钥校验产物的签名与指纹，缺签名/不匹配即让该 release 的检查失败。私钥不进入 CI，仍由维护者离线持有。此外，`security-update-notify --upgrade` 默认 **fail-closed**：直接下载 GitHub 发布包，校验 sha256，并用内置 pin 的指纹强制校验 GPG 签名后才升级（应急可设 `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` 仅按 sha256 升级）。
 
 ## 安全说明
 

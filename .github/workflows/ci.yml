@@ -5,12 +5,15 @@ on:
     branches: [ main, master ]
   pull_request:
   workflow_dispatch:
+  release:
+    types: [ published, edited ]
 
 permissions:
   contents: read
 
 jobs:
   shell-and-package:
+    if: ${{ github.event_name != 'release' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -330,3 +333,49 @@ jobs:
         with:
           name: security-update-notify-dist
           path: dist/*
+
+  verify-signed-release:
+    # 发布 release 后，用仓库内的公钥强制校验该 release 的产物：必须带 .asc、sha256 正确、
+    # 签名公钥指纹等于程序里 pin 的指纹、签名有效。缺签名或不匹配即让 release 的 CI 失败。
+    # 私钥永不进入 CI——这里只用公钥做验证，保持离线签名模型。
+    # After a release is published, verify its assets with the repo's public key: a .asc must be
+    # present, sha256 must match, the signing key fingerprint must equal the one pinned in the
+    # program, and the signature must be valid. Missing/invalid signing fails the release CI.
+    # The private key never enters CI — this only verifies with the public key.
+    if: ${{ github.event_name == 'release' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p rel
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir rel --pattern 'security-update-notify-*.tar.gz*'
+          ls -la rel
+
+      - name: Verify checksum and pinned GPG signature
+        run: |
+          set -euo pipefail
+          pin="$(grep -m1 RELEASE_SIGNING_FINGERPRINT files/security-update-notify | sed -E 's/.*:-([0-9A-Fa-f]{40})\}.*/\1/')"
+          [ -n "$pin" ] || { echo "::error::could not read pinned RELEASE_SIGNING_FINGERPRINT"; exit 1; }
+          cd rel
+          tgz="$(ls security-update-notify-*.tar.gz | grep -vE '\.(sha256|asc)$' | head -1)"
+          [ -n "$tgz" ] || { echo "::error::no release tarball found"; exit 1; }
+          echo "Verifying $tgz against pinned fingerprint $pin"
+          [ -f "$tgz.sha256" ] || { echo "::error::missing $tgz.sha256"; exit 1; }
+          sha256sum -c "$tgz.sha256"
+          [ -f "$tgz.asc" ] || { echo "::error::release $tgz is NOT signed (.asc missing); signing is mandatory"; exit 1; }
+          export GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+          gpg --batch --import ../files/release-signing.pub.asc
+          have="$(gpg --batch --with-colons --list-keys | awk -F: '$1=="fpr"{print $10; exit}')"
+          [ "$have" = "$pin" ] || { echo "::error::repo public key fingerprint ($have) != pinned ($pin)"; exit 1; }
+          gpg --batch --verify "$tgz.asc" "$tgz" || { echo "::error::signature verification failed for $tgz"; exit 1; }
+          echo "OK: $tgz is properly signed by the pinned release key ($pin)"

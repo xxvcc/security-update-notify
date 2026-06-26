@@ -1,5 +1,16 @@
 # 变更记录
 
+## 1.7.0
+
+- 交互体验：安装器、菜单、检查/诊断、卸载等终端交互不再中英文混排。进入时第一步选择语言（中文 / English），之后全部按所选语言单语显示；新增 `--lang zh|en` 参数与 `UI_LANG`/`SUN_LANG` 环境变量。
+  Interactive UX: the installer, menu, check/doctor and uninstall no longer mix Chinese and English. A language is chosen as the first step (zh / en) and all subsequent terminal output is shown in that single language; adds a `--lang zh|en` option and `UI_LANG`/`SUN_LANG` env vars.
+- 所选界面语言同时作为 Telegram 通知语言（`NOTIFY_LANG`）的默认值，去掉安装中重复的“通知语言”提问；仍可用 `--notify-lang` 单独覆盖。
+  The chosen UI language also becomes the default Telegram notification language (`NOTIFY_LANG`), removing the duplicate prompt; `--notify-lang` still overrides it.
+- 发布安全：正式 tag 构建强制签名（`package.sh` 在 `vX.Y.Z` tag 指向当前提交时要求 GPG 签名，无私钥则失败）；release 发布后 CI 用仓库内公钥校验产物的签名与指纹（只验证、不在 CI 内签名，发布私钥保持离线）。
+  Release security: tagged builds require a signature (`package.sh` enforces GPG signing when `vX.Y.Z` points at HEAD), and after a release is published CI verifies the assets' signature and fingerprint with the repo public key (verify-only; the private key stays offline).
+- README 新增动态 release 版本徽章（自动跟随最新 release）。
+  README gains a dynamic release-version badge that tracks the latest release.
+
 ## 1.6.0
 
 - 安全（自升级信任链）：`--upgrade` 不再 `curl https://xxv.cc/sun.sh | bash` 执行未校验的远程脚本。改为直接下载 GitHub 发布包，校验 sha256，并用本程序内置（pin）的指纹强制校验 GPG 签名，**默认 fail-closed**（缺少 gpg/签名即拒绝升级；可用 `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` 显式放行仅 sha256 的升级）。非 root 时改为 `sudo` 重新执行本地受信二进制，而非管道远程脚本。

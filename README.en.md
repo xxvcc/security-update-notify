@@ -1,6 +1,7 @@
 # security-update-notify
 
 <p align="center">
+  <a href="https://github.com/xxvcc/security-update-notify/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/xxvcc/security-update-notify?style=flat-square&label=release&color=2EA043"></a>
   <img alt="Linux" src="https://img.shields.io/badge/Linux-systemd-1793D1?style=flat-square&logo=linux&logoColor=white">
   <img alt="Debian" src="https://img.shields.io/badge/Debian-12%20%7C%2013-A81D33?style=flat-square&logo=debian&logoColor=white">
   <img alt="Ubuntu" src="https://img.shields.io/badge/Ubuntu-22.04%20%7C%2024.04-E95420?style=flat-square&logo=ubuntu&logoColor=white">
@@ -364,11 +365,13 @@ Remove config and state too:
 sudo ./uninstall.sh --purge-config
 ```
 
-Packages installed as dependencies are left in place. `--purge-config` removes SUN config/state and restores apt/dnf automatic-update config when a SUN-created backup exists.
+Packages installed as dependencies are left in place. `--purge-config` removes SUN config/state, upgrade backups (which contain bot-token copies) and rotated logs, and restores apt/dnf automatic-update config when a SUN-created backup exists.
 
 ## Release signatures
 
 Release packages always include a `.sha256` checksum file. `package.sh` can also create a detached `.tar.gz.asc` signature automatically when a GPG secret key is available. `sun.sh --verify-signature auto|required|off` verifies the signature after download. This repository includes a release signing public key. When a release publishes `.asc`, `auto` verifies it automatically; if no `.asc` is published, `auto` falls back to sha256 and `required` fails.
+
+Official releases (builds whose `vX.Y.Z` tag points at the current commit) are **signed-mandatory**: `package.sh` requires a GPG signature for a tagged build and fails without a key, and after a release is published CI verifies the assets' signature and fingerprint against the repo's public key, failing the release checks if a signature is missing or mismatched. The private key never enters CI; it stays offline with the maintainer. In addition, `security-update-notify --upgrade` is **fail-closed** by default: it downloads the GitHub release directly, verifies sha256, and requires a GPG signature against a pinned fingerprint before upgrading (set `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` to upgrade on sha256 only in an emergency).
 
 ## Security notes
 
