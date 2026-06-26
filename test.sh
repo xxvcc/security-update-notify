@@ -1,16 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 双语输出助手：UI_LANG=zh|en 决定终端显示语言（默认 zh）。
+# Bilingual output helper: UI_LANG=zh|en selects the terminal language (default zh).
+m()  { if [ "${UI_LANG:-zh}" = en ]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
+say(){ if [ "${UI_LANG:-zh}" = en ]; then printf '%s\n' "$2"; else printf '%s\n' "$1"; fi; }
+
 SEND_TEST=0; SIMULATE_REBOOT=0; NO_DEDUPE=0
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
-usage(){ cat <<'EOU'
-用法 / Usage: sudo ./test.sh [选项 / options]
-  --send-test        发送普通 OK Telegram 测试消息 / Send a normal OK Telegram test message
-  --simulate-reboot  发送模拟“需要重启”提醒；不会真的重启 / Send a simulated reboot-required alert; does not reboot
-  --no-dedupe        本次测试绕过去重抑制 / Bypass duplicate-alert suppression for this test
-  --verbose          诊断中显示完整 Telegram Chat ID / Show full Telegram chat ID in diagnostics
+usage(){
+  if [ "${UI_LANG:-zh}" = en ]; then
+    cat <<'EOU'
+Usage: sudo ./test.sh [options]
+  --send-test        Send a normal OK Telegram test message
+  --simulate-reboot  Send a simulated reboot-required alert; does not reboot
+  --no-dedupe        Bypass duplicate-alert suppression for this test
+  --verbose          Show full Telegram chat ID in diagnostics
+  --lang zh|en       Terminal language
 EOU
+  else
+    cat <<'EOU'
+用法: sudo ./test.sh [选项]
+  --send-test        发送普通 OK Telegram 测试消息
+  --simulate-reboot  发送模拟“需要重启”提醒；不会真的重启
+  --no-dedupe        本次测试绕过去重抑制
+  --verbose          诊断中显示完整 Telegram Chat ID
+  --lang zh|en       终端语言
+EOU
+  fi
 }
 VERBOSE=0
 while [[ $# -gt 0 ]]; do
@@ -19,13 +37,16 @@ while [[ $# -gt 0 ]]; do
     --simulate-reboot) SIMULATE_REBOOT=1; shift ;;
     --no-dedupe) NO_DEDUPE=1; shift ;;
     --verbose) VERBOSE=1; shift ;;
+    --lang) UI_LANG="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "未知参数 / Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    *) printf '%s\n' "未知参数 / Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
-[[ "$(id -u)" -eq 0 ]] || { echo "请以 root 运行 / Please run as root" >&2; exit 1; }
+UI_LANG="${UI_LANG:-${SUN_LANG:-}}"
+case "${UI_LANG:-}" in zh|en) ;; *) UI_LANG=zh ;; esac
+[[ "$(id -u)" -eq 0 ]] || { say "请以 root 运行" "Please run as root" >&2; exit 1; }
 
-[[ -r /etc/os-release ]] || { echo "错误：无法读取 /etc/os-release / ERROR /etc/os-release not readable" >&2; exit 1; }
+[[ -r /etc/os-release ]] || { say "错误：无法读取 /etc/os-release" "ERROR: /etc/os-release not readable" >&2; exit 1; }
 while IFS= read -r line || [[ -n "$line" ]]; do
   line="${line%$'\r'}"
   case "$line" in
@@ -48,49 +69,51 @@ case "${ID:-}" in
   amzn) BACKEND=dnf; case "${VERSION_ID:-}" in 2023) SUPPORT=best-effort ;; esac ;;
 esac
 
-echo "== 操作系统 / OS =="; sed -n '1,8p' /etc/os-release; echo "支持状态 / Support: $SUPPORT"; echo "后端 / Backend: $BACKEND"; [[ -d /run/systemd/system ]] && echo "systemd: 是 / yes" || echo "systemd: 否 / no"; echo
+say "== 操作系统 ==" "== OS =="; sed -n '1,8p' /etc/os-release; say "支持状态: $SUPPORT" "Support: $SUPPORT"; say "后端: $BACKEND" "Backend: $BACKEND"; [[ -d /run/systemd/system ]] && say "systemd: 是" "systemd: yes" || say "systemd: 否" "systemd: no"; echo
 
-echo "== 软件包 / packages =="
+say "== 软件包 ==" "== packages =="
 if [[ "$BACKEND" == apt ]]; then
-  for pkg in unattended-upgrades needrestart apt-listchanges python3 ca-certificates; do dpkg -s "$pkg" >/dev/null 2>&1 && echo "正常 / OK $pkg $(dpkg-query -W -f='${Version}' "$pkg")" || echo "缺失 / MISSING $pkg"; done
+  for pkg in unattended-upgrades needrestart apt-listchanges python3 ca-certificates; do
+    if dpkg -s "$pkg" >/dev/null 2>&1; then ver="$(dpkg-query -W -f='${Version}' "$pkg")"; say "正常 $pkg $ver" "OK $pkg $ver"; else say "缺失 $pkg" "MISSING $pkg"; fi
+  done
 elif [[ "$BACKEND" == dnf ]]; then
-  for pkg in dnf-automatic python3 ca-certificates yum-utils dnf-utils; do rpm -q "$pkg" >/dev/null 2>&1 && echo "正常 / OK $(rpm -q "$pkg")" || true; done
-  command -v needs-restarting >/dev/null && echo "正常 / OK needs-restarting present" || echo "缺失 / MISSING needs-restarting"
+  for pkg in dnf-automatic python3 ca-certificates yum-utils dnf-utils; do rpm -q "$pkg" >/dev/null 2>&1 && say "正常 $(rpm -q "$pkg")" "OK $(rpm -q "$pkg")" || true; done
+  command -v needs-restarting >/dev/null && say "正常 needs-restarting present" "OK needs-restarting present" || say "缺失 needs-restarting" "MISSING needs-restarting"
 else
-  echo "不支持的后端 / Unsupported backend"
+  say "不支持的后端" "Unsupported backend"
 fi
 echo
 
-echo "== 配置文件 / config files =="
+say "== 配置文件 ==" "== config files =="
 for f in /etc/security-update-notify/telegram.env /usr/local/sbin/security-update-notify /etc/systemd/system/security-update-notify.service /etc/systemd/system/security-update-notify.timer /var/log/security-update-notify.log /etc/logrotate.d/security-update-notify; do
-  [[ -e "$f" ]] && stat -c '正常 / OK %a %U:%G %n' "$f" || echo "缺失 / MISSING $f"
+  [[ -e "$f" ]] && stat -c "$(m '正常 ' 'OK ')%a %U:%G %n" "$f" || say "缺失 $f" "MISSING $f"
 done
-[[ "$BACKEND" == apt ]] && for f in /etc/apt/apt.conf.d/20auto-upgrades /etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify /etc/needrestart/conf.d/99-security-update-notify-report-only.conf; do [[ -e "$f" ]] && stat -c '正常 / OK %a %U:%G %n' "$f" || echo "缺失 / MISSING $f"; done
-[[ "$BACKEND" == dnf && -e /etc/dnf/automatic.conf ]] && stat -c '正常 / OK %a %U:%G %n' /etc/dnf/automatic.conf
+[[ "$BACKEND" == apt ]] && for f in /etc/apt/apt.conf.d/20auto-upgrades /etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify /etc/needrestart/conf.d/99-security-update-notify-report-only.conf; do [[ -e "$f" ]] && stat -c "$(m '正常 ' 'OK ')%a %U:%G %n" "$f" || say "缺失 $f" "MISSING $f"; done
+[[ "$BACKEND" == dnf && -e /etc/dnf/automatic.conf ]] && stat -c "$(m '正常 ' 'OK ')%a %U:%G %n" /etc/dnf/automatic.conf
 echo
 
-echo "== 语法和 systemd / syntax and systemd =="
-bash -n /usr/local/sbin/security-update-notify && echo "正常：脚本语法通过 / OK script syntax"
+say "== 语法和 systemd ==" "== syntax and systemd =="
+bash -n /usr/local/sbin/security-update-notify && say "正常：脚本语法通过" "OK script syntax"
 /usr/local/sbin/security-update-notify --version
-/usr/local/sbin/security-update-notify --doctor --skip-telegram
-systemd-analyze verify /etc/systemd/system/security-update-notify.service /etc/systemd/system/security-update-notify.timer >"$TMP_DIR/systemd-verify.log" 2>&1 && echo "正常：systemd 单元通过 / OK systemd units" || { cat "$TMP_DIR/systemd-verify.log"; exit 1; }
+/usr/local/sbin/security-update-notify --doctor --skip-telegram --lang "$UI_LANG"
+systemd-analyze verify /etc/systemd/system/security-update-notify.service /etc/systemd/system/security-update-notify.timer >"$TMP_DIR/systemd-verify.log" 2>&1 && say "正常：systemd 单元通过" "OK systemd units" || { cat "$TMP_DIR/systemd-verify.log"; exit 1; }
 echo
 
-echo "== 定时器 / timer =="; systemctl is-enabled security-update-notify.timer; systemctl list-timers security-update-notify.timer --no-pager; echo
+say "== 定时器 ==" "== timer =="; systemctl is-enabled security-update-notify.timer; systemctl list-timers security-update-notify.timer --no-pager; echo
 
-echo "== 重启/服务重启检测 / reboot/restart detection =="
+say "== 重启/服务重启检测 ==" "== reboot/restart detection =="
 if [[ "$BACKEND" == apt ]]; then
-  [[ -f /var/run/reboot-required ]] && { echo "REBOOT_REQUIRED / 需要重启=yes"; cat /var/run/reboot-required.pkgs 2>/dev/null || true; } || echo "REBOOT_REQUIRED / 需要重启=no"
+  [[ -f /var/run/reboot-required ]] && { say "需要重启=yes" "REBOOT_REQUIRED=yes"; cat /var/run/reboot-required.pkgs 2>/dev/null || true; } || say "需要重启=no" "REBOOT_REQUIRED=no"
   needrestart -b 2>&1 | sed -n '1,120p' || true
 elif [[ "$BACKEND" == dnf ]]; then
   needs-restarting -r 2>&1 || true
-  needs-restarting 2>&1 | sed -n '1,120p' || true
+  needs-restarting -s 2>&1 | sed -n '1,120p' || true
 fi
 echo
 
 CONFIG=/etc/security-update-notify/telegram.env
 if [[ ! -r "$CONFIG" ]]; then
-  echo "错误：配置文件不可读 / ERROR config file not readable: /etc/security-update-notify/telegram.env" >&2
+  say "错误：配置文件不可读: /etc/security-update-notify/telegram.env" "ERROR: config file not readable: /etc/security-update-notify/telegram.env" >&2
   exit 1
 fi
 
@@ -100,11 +123,11 @@ load_config_file() {
     line="${line%$'\r'}"
     [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
     [[ "$line" == export\ * ]] && line="${line#export }"
-    [[ "$line" == *"="* ]] || { echo "配置行无效 / Invalid config line in $file" >&2; return 2; }
+    [[ "$line" == *"="* ]] || { say "配置行无效: $file" "Invalid config line in $file" >&2; return 2; }
     key="${line%%=*}"
     value="${line#*=}"
     key="${key//[[:space:]]/}"
-    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "配置键无效 / Invalid config key in $file: $key" >&2; return 2; }
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { say "配置键无效: $file: $key" "Invalid config key in $file: $key" >&2; return 2; }
     value="${value#${value%%[![:space:]]*}}"
     value="${value%${value##*[![:space:]]}}"
     if [[ "$value" != \"* && "$value" != \'* ]]; then
@@ -117,7 +140,7 @@ load_config_file() {
       TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|NOTIFY_UPGRADE|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION)
         printf -v "$key" '%s' "$value"
         ;;
-      *) echo "配置键不支持 / Unsupported config key in $file: $key" >&2; return 2 ;;
+      *) say "配置键不支持: $file: $key" "Unsupported config key in $file: $key" >&2; return 2 ;;
     esac
   done <"$file"
 }
@@ -152,30 +175,30 @@ sys.exit(0 if ok else 1)
 '
 }
 
-echo "== Telegram 配置 / telegram config =="
-[[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] && echo "正常：token 已配置（${#TELEGRAM_BOT_TOKEN} 字符）/ OK token present (${#TELEGRAM_BOT_TOKEN} chars)" || echo "缺失：token / MISSING token"
+say "== Telegram 配置 ==" "== telegram config =="
+[[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] && say "正常：token 已配置（${#TELEGRAM_BOT_TOKEN} 字符）" "OK token present (${#TELEGRAM_BOT_TOKEN} chars)" || say "缺失：token" "MISSING token"
 if [[ -n "${TELEGRAM_CHAT_ID:-}" ]]; then
   if [[ "$VERBOSE" -eq 1 ]]; then
-    echo "正常：chat id 已配置 / OK chat id present: ${TELEGRAM_CHAT_ID}"
+    say "正常：chat id 已配置: ${TELEGRAM_CHAT_ID}" "OK chat id present: ${TELEGRAM_CHAT_ID}"
   else
     chat_tail="${TELEGRAM_CHAT_ID: -4}"
-    echo "正常：chat id 已配置 / OK chat id present: ****${chat_tail}"
+    say "正常：chat id 已配置: ****${chat_tail}" "OK chat id present: ****${chat_tail}"
   fi
 else
-  echo "缺失：chat id / MISSING chat id"
+  say "缺失：chat id" "MISSING chat id"
 fi
 if [[ "${INCLUDE_PUBLIC_IP:-1}" =~ ^(1|true|yes|on)$ ]]; then
   if [[ -n "${PUBLIC_IP:-}" ]]; then
-    echo "公网 IP：使用手动配置 / Public IP: using configured value: ${PUBLIC_IP}"
+    say "公网 IP：使用手动配置: ${PUBLIC_IP}" "Public IP: using configured value: ${PUBLIC_IP}"
   else
-    echo "公网 IP：运行时自动获取 / Public IP: auto-detected at runtime"
+    say "公网 IP：运行时自动获取" "Public IP: auto-detected at runtime"
   fi
 else
-  echo "公网 IP：通知中不显示 / Public IP: not shown in notifications"
+  say "公网 IP：通知中不显示" "Public IP: not shown in notifications"
 fi
-telegram_get_me >/dev/null && echo "正常：Telegram Bot Token 可用 / OK Telegram bot token works" || { echo "错误：Telegram getMe 失败 / ERROR Telegram getMe failed" >&2; exit 1; }
+telegram_get_me >/dev/null && say "正常：Telegram Bot Token 可用" "OK Telegram bot token works" || { say "错误：Telegram getMe 失败" "ERROR: Telegram getMe failed" >&2; exit 1; }
 
 args=(); [[ "$NO_DEDUPE" -eq 1 ]] && args+=(--no-dedupe)
-[[ "$SEND_TEST" -eq 1 ]] && { echo "== 发送 OK 测试 / send OK test =="; /usr/local/sbin/security-update-notify --test-ok "${args[@]}"; echo "正常：测试消息已发送 / OK sent test message"; }
-[[ "$SIMULATE_REBOOT" -eq 1 ]] && { echo "== 发送模拟重启提醒 / send simulated reboot alert =="; /usr/local/sbin/security-update-notify --test-reboot "${args[@]}"; echo "正常：模拟重启提醒已发送 / OK sent simulated reboot alert"; }
-echo "所有检查已完成。/ All checks completed."
+[[ "$SEND_TEST" -eq 1 ]] && { say "== 发送 OK 测试 ==" "== send OK test =="; /usr/local/sbin/security-update-notify --test-ok "${args[@]}"; say "正常：测试消息已发送" "OK sent test message"; }
+[[ "$SIMULATE_REBOOT" -eq 1 ]] && { say "== 发送模拟重启提醒 ==" "== send simulated reboot alert =="; /usr/local/sbin/security-update-notify --test-reboot "${args[@]}"; say "正常：模拟重启提醒已发送" "OK sent simulated reboot alert"; }
+say "所有检查已完成。" "All checks completed."

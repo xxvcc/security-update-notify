@@ -82,7 +82,27 @@ fi
 tar -C "$WORK" --sort=name --mtime="@$SOURCE_EPOCH" --owner=0 --group=0 --numeric-owner -cf - "$PKG" | gzip -n >"$TAR"
 (cd "$DIST" && sha256sum "$PKG.tar.gz" >"$PKG.tar.gz.sha256")
 
+# 为某个发布 tag 构建时强制要求签名：若 tag vVERSION 存在且指向当前 HEAD，
+# 把默认 auto 提升为 required，避免不小心发出未签名的正式发布包。
+# Require a signature when building a release tag: if tag vVERSION exists and points at HEAD,
+# promote the default 'auto' to 'required' so an unsigned official release cannot be produced by accident.
+if [[ "$SIGN_RELEASE" == "auto" ]] \
+   && git rev-parse -q --verify "v$VERSION^{commit}" >/dev/null 2>&1 \
+   && [[ "$(git rev-parse -q --verify "v$VERSION^{commit}")" == "$(git rev-parse -q --verify "HEAD^{commit}")" ]]; then
+  SIGN_RELEASE=required
+  echo "检测到发布 tag v$VERSION 指向当前提交，强制要求签名。/ Release tag v$VERSION points at HEAD; a signature is now required."
+fi
+
 case "$SIGN_RELEASE" in
+  required)
+    if command -v gpg >/dev/null 2>&1 && gpg --list-secret-keys ${GPG_KEY_ID:+"$GPG_KEY_ID"} 2>/dev/null | grep -q '^sec'; then
+      gpg --batch --yes --armor --detach-sign ${GPG_KEY_ID:+--local-user "$GPG_KEY_ID"} -o "$SIG" "$TAR"
+      gpg --batch --verify "$SIG" "$TAR" 2>/dev/null || { echo "签名生成后校验失败 / Signature verification failed after signing" >&2; exit 1; }
+    else
+      echo "发布 tag 要求签名但没有可用 GPG 私钥 / A signature is required for this release tag but no usable GPG secret key was found" >&2
+      exit 1
+    fi
+    ;;
   auto|1|true|yes)
     if command -v gpg >/dev/null 2>&1 && gpg --list-secret-keys ${GPG_KEY_ID:+"$GPG_KEY_ID"} 2>/dev/null | grep -q '^sec'; then
       gpg --batch --yes --armor --detach-sign ${GPG_KEY_ID:+--local-user "$GPG_KEY_ID"} -o "$SIG" "$TAR"

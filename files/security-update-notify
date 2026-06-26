@@ -8,7 +8,7 @@ STATE_DIR="/var/lib/security-update-notify"
 STATE_FILE="$STATE_DIR/last-alert.sha256"
 STATE_TIME_FILE="$STATE_DIR/last-alert.sent_at"
 LOCK_FILE="/run/security-update-notify.lock"
-VERSION="1.6.0"
+VERSION="1.7.0"
 REPO="${SECURITY_UPDATE_NOTIFY_REPO:-xxvcc/security-update-notify}"
 RELEASE_SIGNING_FINGERPRINT="${SECURITY_UPDATE_NOTIFY_SIGNING_FINGERPRINT:-C678256ACBFC6491BF5076655F3AE24999921FFC}"
 UPGRADE_ALLOW_UNSIGNED="${SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED:-0}"
@@ -23,14 +23,27 @@ SELF_UPGRADE=0
 UPGRADE_NOTICE=0
 UPGRADE_FROM=""
 UPGRADE_TO=""
+UI_LANG="${UI_LANG:-${SUN_LANG:-}}"
+
+# 双语输出助手：UI_LANG/--lang 优先，否则跟随 NOTIFY_LANG，默认 zh。
+# Bilingual output helper: UI_LANG/--lang first, else follow NOTIFY_LANG, default zh.
+m()  { if [ "${UI_LANG:-${NOTIFY_LANG:-zh}}" = en ]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
+say(){ if [ "${UI_LANG:-${NOTIFY_LANG:-zh}}" = en ]; then printf '%s\n' "$2"; else printf '%s\n' "$1"; fi; }
 
 usage() {
-  cat <<'EOF'
-用法 / Usage: security-update-notify [--test-ok] [--test-reboot] [--no-dedupe] [--doctor] [--check-upgrade] [--upgrade] [--version]
+  if [ "${UI_LANG:-${NOTIFY_LANG:-zh}}" = en ]; then
+    cat <<'EOF'
+Usage: security-update-notify [--test-ok] [--test-reboot] [--no-dedupe] [--doctor] [--check-upgrade] [--upgrade] [--lang zh|en] [--version]
 
-检查系统后端的整机重启/服务重启状态，然后发送 Telegram 提醒。
 Checks OS backend reboot/service-restart state, then sends Telegram alerts.
 EOF
+  else
+    cat <<'EOF'
+用法: security-update-notify [--test-ok] [--test-reboot] [--no-dedupe] [--doctor] [--check-upgrade] [--upgrade] [--lang zh|en] [--version]
+
+检查系统后端的整机重启/服务重启状态，然后发送 Telegram 提醒。
+EOF
+  fi
 }
 
 while [[ $# -gt 0 ]]; do
@@ -43,11 +56,12 @@ while [[ $# -gt 0 ]]; do
     --check-upgrade) CHECK_UPGRADE=1; shift ;;
     --upgrade) SELF_UPGRADE=1; shift ;;
     --notify-upgrade-event) UPGRADE_NOTICE=1; shift ;;
-    --upgrade-from) [[ -n "${2:-}" ]] || { echo "缺少 --upgrade-from 的值 / Missing value for --upgrade-from" >&2; exit 2; }; UPGRADE_FROM="$2"; shift 2 ;;
-    --upgrade-to) [[ -n "${2:-}" ]] || { echo "缺少 --upgrade-to 的值 / Missing value for --upgrade-to" >&2; exit 2; }; UPGRADE_TO="$2"; shift 2 ;;
+    --upgrade-from) [[ -n "${2:-}" ]] || { say "缺少 --upgrade-from 的值" "Missing value for --upgrade-from" >&2; exit 2; }; UPGRADE_FROM="$2"; shift 2 ;;
+    --upgrade-to) [[ -n "${2:-}" ]] || { say "缺少 --upgrade-to 的值" "Missing value for --upgrade-to" >&2; exit 2; }; UPGRADE_TO="$2"; shift 2 ;;
+    --lang) [[ -n "${2:-}" ]] || { say "缺少 --lang 的值" "Missing value for --lang" >&2; exit 2; }; case "$2" in zh|en) UI_LANG="$2" ;; *) say "无效 --lang（应为 zh 或 en）" "Invalid --lang (expected zh or en)" >&2; exit 2 ;; esac; shift 2 ;;
     --version) echo "security-update-notify $VERSION"; exit 0 ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "未知参数 / Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    *) say "未知参数: $1" "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
@@ -80,22 +94,22 @@ is_newer_version() {
 
 run_check_upgrade() {
   local latest
-  echo "当前版本 / Current version: $VERSION"
-  echo "仓库 / Repository: $REPO"
+  say "当前版本: $VERSION" "Current version: $VERSION"
+  say "仓库: $REPO" "Repository: $REPO"
   if ! latest="$(latest_release_version)"; then
-    echo "无法检查最新版本 / Failed to check latest version" >&2
+    say "无法检查最新版本" "Failed to check latest version" >&2
     return 1
   fi
-  echo "最新版本 / Latest version: $latest"
+  say "最新版本: $latest" "Latest version: $latest"
   if [[ "$latest" == "$VERSION" ]]; then
-    echo "已经是最新版本 / Already up to date"
+    say "已经是最新版本" "Already up to date"
     return 0
   fi
   if is_newer_version "$VERSION" "$latest"; then
-    echo "可升级 / Upgrade available: $VERSION -> $latest"
+    say "可升级: $VERSION -> $latest" "Upgrade available: $VERSION -> $latest"
     return 0
   fi
-  echo "本地版本高于 latest release / Local version is newer than latest release"
+  say "本地版本高于 latest release" "Local version is newer than latest release"
   return 0
 }
 
@@ -128,26 +142,27 @@ run_self_upgrade() {
   # verify sha256, and require a GPG signature against the fingerprint pinned in this program
   # (fail-closed by default); only then run install.sh from the verified package.
   if [[ "$(id -u)" -ne 0 ]]; then
-    command -v sudo >/dev/null 2>&1 || { echo "升级需要 root 权限 / Root privileges are required to upgrade" >&2; exit 1; }
+    command -v sudo >/dev/null 2>&1 || { say "升级需要 root 权限" "Root privileges are required to upgrade" >&2; exit 1; }
     exec sudo "$0" --upgrade
   fi
   local c
   for c in tar sha256sum mktemp python3; do
-    command -v "$c" >/dev/null 2>&1 || { echo "升级需要命令 / Upgrade requires command: $c" >&2; exit 1; }
+    command -v "$c" >/dev/null 2>&1 || { say "升级需要命令: $c" "Upgrade requires command: $c" >&2; exit 1; }
   done
 
-  local latest tmp pkg pkgdir url sha_url sig_url expected fpr gpg_home rc
+  local latest tmp pkg pkgdir url sha_url sig_url expected fpr gpg_home rc disp
+  disp="${UI_LANG:-${NOTIFY_LANG:-zh}}"
   if ! latest="$(latest_release_version)"; then
-    echo "无法获取最新版本 / Failed to fetch latest version" >&2
+    say "无法获取最新版本" "Failed to fetch latest version" >&2
     exit 1
   fi
-  [[ "$latest" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]] || { echo "无效的最新版本号 / Invalid latest version: $latest" >&2; exit 1; }
+  [[ "$latest" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]] || { say "无效的最新版本号: $latest" "Invalid latest version: $latest" >&2; exit 1; }
   if [[ "$latest" != "$VERSION" ]] && ! is_newer_version "$VERSION" "$latest"; then
-    echo "本地版本 $VERSION 高于或等于最新发布 $latest，不自动升级。/ Local version $VERSION is at or above latest release $latest; not upgrading." >&2
+    say "本地版本 $VERSION 高于或等于最新发布 $latest，不自动升级。" "Local version $VERSION is at or above latest release $latest; not upgrading." >&2
     exit 0
   fi
   if [[ "$latest" == "$VERSION" ]]; then
-    echo "已经是最新版本 $VERSION / Already up to date: $VERSION"
+    say "已经是最新版本 $VERSION" "Already up to date: $VERSION"
     exit 0
   fi
 
@@ -159,14 +174,14 @@ run_self_upgrade() {
   sha_url="${url}.sha256"
   sig_url="${url}.asc"
 
-  echo "正在下载并校验发布包 / Downloading and verifying release: $VERSION -> $latest"
-  download_release_file "$url" "$tmp/$pkg" || { echo "下载发布包失败 / Failed to download release" >&2; exit 1; }
-  download_release_file "$sha_url" "$tmp/$pkg.sha256" || { echo "下载校验文件失败 / Failed to download checksum" >&2; exit 1; }
+  say "正在下载并校验发布包: $VERSION -> $latest" "Downloading and verifying release: $VERSION -> $latest"
+  download_release_file "$url" "$tmp/$pkg" || { say "下载发布包失败" "Failed to download release" >&2; exit 1; }
+  download_release_file "$sha_url" "$tmp/$pkg.sha256" || { say "下载校验文件失败" "Failed to download checksum" >&2; exit 1; }
 
   expected="$(awk 'NF {print $1; exit}' "$tmp/$pkg.sha256")"
-  [[ "$expected" =~ ^[A-Fa-f0-9]{64}$ ]] || { echo "无效的校验文件 / Invalid checksum file" >&2; exit 1; }
+  [[ "$expected" =~ ^[A-Fa-f0-9]{64}$ ]] || { say "无效的校验文件" "Invalid checksum file" >&2; exit 1; }
   ( cd "$tmp" && printf '%s  %s\n' "$expected" "$pkg" | sha256sum -c - ) >/dev/null 2>&1 \
-    || { echo "sha256 校验失败；拒绝升级 / Checksum verification failed; refusing to upgrade" >&2; exit 1; }
+    || { say "sha256 校验失败；拒绝升级" "Checksum verification failed; refusing to upgrade" >&2; exit 1; }
 
   # 安全解包：拒绝路径穿越与非预期顶层目录。
   # Safe extraction: reject path traversal and unexpected top-level directories.
@@ -174,42 +189,42 @@ run_self_upgrade() {
   while IFS= read -r entry; do
     [[ -n "$entry" ]] || continue
     case "$entry" in
-      /*|../*|*/../*|*/..|..) echo "压缩包中存在不安全路径 / Unsafe path in archive: $entry" >&2; exit 1 ;;
+      /*|../*|*/../*|*/..|..) say "压缩包中存在不安全路径: $entry" "Unsafe path in archive: $entry" >&2; exit 1 ;;
     esac
     case "$entry" in
       "$pkgdir"|"$pkgdir/"|"$pkgdir"/*) ;;
-      *) echo "压缩包中存在非预期路径 / Unexpected path in archive: $entry" >&2; exit 1 ;;
+      *) say "压缩包中存在非预期路径: $entry" "Unexpected path in archive: $entry" >&2; exit 1 ;;
     esac
   done < <(tar -tzf "$tmp/$pkg")
-  ( cd "$tmp" && tar --no-same-owner -xzf "$pkg" ) || { echo "解包失败 / Extraction failed" >&2; exit 1; }
+  ( cd "$tmp" && tar --no-same-owner -xzf "$pkg" ) || { say "解包失败" "Extraction failed" >&2; exit 1; }
 
   # GPG 签名校验：用包内公钥，但强制其指纹等于本程序 pin 的指纹（fail-closed）。
   # GPG verification: import the bundled key but require its fingerprint to equal the one pinned here (fail-closed).
   if command -v gpg >/dev/null 2>&1 && download_release_file "$sig_url" "$tmp/$pkg.asc" 2>/dev/null; then
-    [[ -s "$tmp/$pkgdir/files/release-signing.pub.asc" ]] || { echo "发布包缺少签名公钥；拒绝升级 / Release is missing the signing public key; refusing to upgrade" >&2; exit 1; }
+    [[ -s "$tmp/$pkgdir/files/release-signing.pub.asc" ]] || { say "发布包缺少签名公钥；拒绝升级" "Release is missing the signing public key; refusing to upgrade" >&2; exit 1; }
     gpg_home="$tmp/gnupg"
     mkdir -p "$gpg_home"; chmod 700 "$gpg_home"
     GNUPGHOME="$gpg_home" gpg --batch --import "$tmp/$pkgdir/files/release-signing.pub.asc" >/dev/null 2>&1 \
-      || { echo "导入签名公钥失败；拒绝升级 / Failed to import signing public key; refusing to upgrade" >&2; exit 1; }
+      || { say "导入签名公钥失败；拒绝升级" "Failed to import signing public key; refusing to upgrade" >&2; exit 1; }
     fpr="$(GNUPGHOME="$gpg_home" gpg --batch --with-colons --list-keys 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}')"
-    [[ -n "$RELEASE_SIGNING_FINGERPRINT" ]] || { echo "未配置签名指纹；拒绝升级 / No signing fingerprint configured; refusing to upgrade" >&2; exit 1; }
-    [[ "$fpr" == "$RELEASE_SIGNING_FINGERPRINT" ]] || { echo "签名公钥指纹不匹配（期望 $RELEASE_SIGNING_FINGERPRINT，实际 ${fpr:-none}）；拒绝升级 / Signing key fingerprint mismatch; refusing to upgrade" >&2; exit 1; }
+    [[ -n "$RELEASE_SIGNING_FINGERPRINT" ]] || { say "未配置签名指纹；拒绝升级" "No signing fingerprint configured; refusing to upgrade" >&2; exit 1; }
+    [[ "$fpr" == "$RELEASE_SIGNING_FINGERPRINT" ]] || { say "签名公钥指纹不匹配（期望 $RELEASE_SIGNING_FINGERPRINT，实际 ${fpr:-none}）；拒绝升级" "Signing key fingerprint mismatch; refusing to upgrade" >&2; exit 1; }
     GNUPGHOME="$gpg_home" gpg --batch --verify "$tmp/$pkg.asc" "$tmp/$pkg" >/dev/null 2>&1 \
-      || { echo "签名校验失败；拒绝升级 / Signature verification failed; refusing to upgrade" >&2; exit 1; }
-    echo "签名校验通过 / Signature verified (${RELEASE_SIGNING_FINGERPRINT})"
+      || { say "签名校验失败；拒绝升级" "Signature verification failed; refusing to upgrade" >&2; exit 1; }
+    say "签名校验通过 (${RELEASE_SIGNING_FINGERPRINT})" "Signature verified (${RELEASE_SIGNING_FINGERPRINT})"
   elif [[ "$UPGRADE_ALLOW_UNSIGNED" == "1" ]]; then
-    echo "警告：未校验 GPG 签名（SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1），仅校验 sha256。/ WARNING: skipping GPG verification (SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1); sha256 only." >&2
+    say "警告：未校验 GPG 签名（SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1），仅校验 sha256。" "WARNING: skipping GPG verification (SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1); sha256 only." >&2
   else
-    echo "缺少 gpg 或发布签名，且未设置 SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1；为安全起见拒绝升级。/ Missing gpg or release signature and SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED is not set; refusing to upgrade for safety." >&2
+    say "缺少 gpg 或发布签名，且未设置 SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1；为安全起见拒绝升级。" "Missing gpg or release signature and SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED is not set; refusing to upgrade for safety." >&2
     exit 1
   fi
 
-  [[ -f "$tmp/$pkgdir/install.sh" ]] || { echo "发布包缺少 install.sh / Release is missing install.sh" >&2; exit 1; }
+  [[ -f "$tmp/$pkgdir/install.sh" ]] || { say "发布包缺少 install.sh" "Release is missing install.sh" >&2; exit 1; }
   chmod 0755 "$tmp/$pkgdir/install.sh" 2>/dev/null || true
-  echo "正在以已校验的发布包升级 / Upgrading from the verified release..."
-  cd "$tmp/$pkgdir" || { echo "进入解包目录失败 / Failed to enter extracted directory" >&2; exit 1; }
+  say "正在以已校验的发布包升级..." "Upgrading from the verified release..."
+  cd "$tmp/$pkgdir" || { say "进入解包目录失败" "Failed to enter extracted directory" >&2; exit 1; }
   rc=0
-  SECURITY_UPDATE_NOTIFY_UPGRADE=1 ./install.sh --non-interactive -y || rc=$?
+  SECURITY_UPDATE_NOTIFY_UPGRADE=1 ./install.sh --non-interactive -y --lang "$disp" || rc=$?
   cd / || true
   rm -rf "$tmp"
   trap - EXIT
@@ -238,11 +253,11 @@ load_config_file() {
     line="${line%$'\r'}"
     [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
     [[ "$line" == export\ * ]] && line="${line#export }"
-    [[ "$line" == *"="* ]] || { echo "配置行无效 / Invalid config line in $file" >&2; return 2; }
+    [[ "$line" == *"="* ]] || { say "配置行无效: $file" "Invalid config line in $file" >&2; return 2; }
     key="${line%%=*}"
     value="${line#*=}"
     key="${key//[[:space:]]/}"
-    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "配置键无效 / Invalid config key in $file: $key" >&2; return 2; }
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { say "配置键无效: $file: $key" "Invalid config key in $file: $key" >&2; return 2; }
     value="${value#${value%%[![:space:]]*}}"
     value="${value%${value##*[![:space:]]}}"
     if [[ "$value" != \"* && "$value" != \'* ]]; then
@@ -255,7 +270,7 @@ load_config_file() {
       TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|NOTIFY_UPGRADE|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION)
         printf -v "$key" '%s' "$value"
         ;;
-      *) echo "配置键不支持 / Unsupported config key in $file: $key" >&2; return 2 ;;
+      *) say "配置键不支持: $file: $key" "Unsupported config key in $file: $key" >&2; return 2 ;;
     esac
   done <"$file"
 }
@@ -423,43 +438,43 @@ fi
 run_doctor() {
   local ok=1
   echo "security-update-notify $VERSION"
-  echo "配置文件 / Config: $ENV_FILE"
-  [[ -r "$ENV_FILE" ]] && echo "正常：配置可读 / OK config readable" || { echo "失败：配置不可读 / FAIL config not readable"; ok=0; }
-  echo "后端 / Backend: $BACKEND"
-  echo "主机 / Host: $HOST"
-  [[ "$INCLUDE_PUBLIC_IP" -eq 1 ]] && echo "公网 IP / Public IP: $PUBLIC_IP_VALUE"
-  echo "系统 / OS: $OS"
-  echo "内核 / Kernel: $KERNEL"
+  say "配置文件: $ENV_FILE" "Config: $ENV_FILE"
+  [[ -r "$ENV_FILE" ]] && say "正常：配置可读" "OK config readable" || { say "失败：配置不可读" "FAIL config not readable"; ok=0; }
+  say "后端: $BACKEND" "Backend: $BACKEND"
+  say "主机: $HOST" "Host: $HOST"
+  [[ "$INCLUDE_PUBLIC_IP" -eq 1 ]] && say "公网 IP: $PUBLIC_IP_VALUE" "Public IP: $PUBLIC_IP_VALUE"
+  say "系统: $OS" "OS: $OS"
+  say "内核: $KERNEL" "Kernel: $KERNEL"
   if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
-    echo "正常：systemd 存在 / OK systemd present"
-    systemctl is-enabled security-update-notify.timer >/dev/null 2>&1 && echo "正常：timer 已启用 / OK timer enabled" || { echo "警告：timer 未启用 / WARN timer not enabled"; ok=0; }
+    say "正常：systemd 存在" "OK systemd present"
+    systemctl is-enabled security-update-notify.timer >/dev/null 2>&1 && say "正常：timer 已启用" "OK timer enabled" || { say "警告：timer 未启用" "WARN timer not enabled"; ok=0; }
     systemctl list-timers security-update-notify.timer --no-pager 2>/dev/null || true
   else
-    echo "失败：systemd 不可用 / FAIL systemd unavailable"; ok=0
+    say "失败：systemd 不可用" "FAIL systemd unavailable"; ok=0
   fi
   case "$BACKEND" in
     apt)
-      for c in apt-get dpkg needrestart; do command -v "$c" >/dev/null 2>&1 && echo "正常：命令存在 / OK command $c" || { echo "失败：缺少命令 / FAIL missing command $c"; ok=0; }; done
-      dpkg -s unattended-upgrades >/dev/null 2>&1 && echo "正常：unattended-upgrades 已安装 / OK unattended-upgrades installed" || { echo "失败：缺少 unattended-upgrades / FAIL unattended-upgrades missing"; ok=0; }
+      for c in apt-get dpkg needrestart; do command -v "$c" >/dev/null 2>&1 && say "正常：命令存在 $c" "OK command $c" || { say "失败：缺少命令 $c" "FAIL missing command $c"; ok=0; }; done
+      dpkg -s unattended-upgrades >/dev/null 2>&1 && say "正常：unattended-upgrades 已安装" "OK unattended-upgrades installed" || { say "失败：缺少 unattended-upgrades" "FAIL unattended-upgrades missing"; ok=0; }
       ;;
     dnf)
-      command -v dnf >/dev/null 2>&1 && echo "正常：命令存在 / OK command dnf" || command -v yum >/dev/null 2>&1 && echo "正常：命令存在 / OK command yum" || { echo "失败：缺少 dnf/yum / FAIL missing dnf/yum"; ok=0; }
-      command -v needs-restarting >/dev/null 2>&1 && echo "正常：命令存在 / OK command needs-restarting" || { echo "失败：缺少 needs-restarting / FAIL missing needs-restarting"; ok=0; }
-      systemctl is-enabled dnf-automatic.timer >/dev/null 2>&1 && echo "正常：dnf-automatic.timer 已启用 / OK dnf-automatic.timer enabled" || echo "警告：dnf-automatic.timer 未启用 / WARN dnf-automatic.timer not enabled"
+      command -v dnf >/dev/null 2>&1 && say "正常：命令存在 dnf" "OK command dnf" || command -v yum >/dev/null 2>&1 && say "正常：命令存在 yum" "OK command yum" || { say "失败：缺少 dnf/yum" "FAIL missing dnf/yum"; ok=0; }
+      command -v needs-restarting >/dev/null 2>&1 && say "正常：命令存在 needs-restarting" "OK command needs-restarting" || { say "失败：缺少 needs-restarting" "FAIL missing needs-restarting"; ok=0; }
+      systemctl is-enabled dnf-automatic.timer >/dev/null 2>&1 && say "正常：dnf-automatic.timer 已启用" "OK dnf-automatic.timer enabled" || say "警告：dnf-automatic.timer 未启用" "WARN dnf-automatic.timer not enabled"
       ;;
-    *) echo "失败：不支持的后端 / FAIL unsupported backend $BACKEND"; ok=0 ;;
+    *) say "失败：不支持的后端 $BACKEND" "FAIL unsupported backend $BACKEND"; ok=0 ;;
   esac
   if [[ "$DOCTOR_SKIP_TELEGRAM" -eq 1 ]]; then
-    echo "跳过：Telegram 联通性检查 / SKIP Telegram connectivity check"
+    say "跳过：Telegram 联通性检查" "SKIP Telegram connectivity check"
   elif [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
-    echo "正常：Telegram 配置存在 / OK Telegram config present"
+    say "正常：Telegram 配置存在" "OK Telegram config present"
     if telegram_get_me >/dev/null; then
-      echo "正常：Telegram Bot Token 可用 / OK Telegram bot token works"
+      say "正常：Telegram Bot Token 可用" "OK Telegram bot token works"
     else
-      echo "失败：Telegram getMe 失败 / FAIL Telegram getMe failed"; ok=0
+      say "失败：Telegram getMe 失败" "FAIL Telegram getMe failed"; ok=0
     fi
   else
-    echo "失败：Telegram 配置缺失 / FAIL Telegram config missing"; ok=0
+    say "失败：Telegram 配置缺失" "FAIL Telegram config missing"; ok=0
   fi
   [[ "$ok" -eq 1 ]] || return 1
 }
@@ -622,7 +637,7 @@ format_restart_summary() {
 case "$BACKEND" in
   apt) check_apt ;;
   dnf) check_dnf ;;
-  *) echo "不支持的后端 / Unsupported backend: $BACKEND" >&2; exit 2 ;;
+  *) say "不支持的后端: $BACKEND" "Unsupported backend: $BACKEND" >&2; exit 2 ;;
 esac
 
 if [[ "$reboot_required" -eq 0 && "$restart_attention" -eq 0 ]]; then
@@ -689,7 +704,7 @@ if [[ "$should_send" -eq 0 ]]; then
 fi
 
 if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
-  echo "在 $ENV_FILE 中缺少 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID / Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in $ENV_FILE" >&2
+  say "在 $ENV_FILE 中缺少 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID" "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in $ENV_FILE" >&2
   exit 2
 fi
 
@@ -699,6 +714,6 @@ if telegram_send_message "$msg"; then
   log_event "telegram sent backend=$BACKEND host=$HOST reboot_required=$reboot_required restart_attention=$restart_attention hash=$alert_hash"
 else
   log_event "telegram failed backend=$BACKEND host=$HOST"
-  echo "Telegram 通知发送失败 / Telegram notification failed" >&2
+  say "Telegram 通知发送失败" "Telegram notification failed" >&2
   exit 1
 fi
