@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- 文档：一键安装/升级命令的域名改为专用子域名 `https://sun.xxv.cc`（脚本挂在根路径），替换原 `https://xxv.cc/sun.sh`。
+  Docs: the install/upgrade one-liners now use the dedicated subdomain `https://sun.xxv.cc` (script served at the root path), replacing `https://xxv.cc/sun.sh`.
+
 - 引导脚本 `sun.sh` 纳入语言体系：交互运行时**第一步即提示选择语言**（中文 / English），其自身输出随之单语显示；也支持 `--lang zh|en` 与 `UI_LANG`/`SUN_LANG`。所选语言会传给目标脚本（菜单/安装器因此不再二次提示）；非交互（`--non-interactive`）或无可用终端时不提示，交由目标脚本按默认处理。
   The `sun.sh` bootstrap joins the language system: when run interactively it **prompts for the language as the first step** (zh / en) and renders its own output in that language; it also honors `--lang zh|en` and `UI_LANG`/`SUN_LANG`. The chosen language is passed to the target script (so the menu/installer do not prompt again); it does not prompt when `--non-interactive` is requested or no terminal is available.
 - README（中/英）更新：补充首步语言选择与 `--lang`、已签名的 `security-update-notify --upgrade`，并修正 dnf 检测说明为 `needs-restarting -s`。
