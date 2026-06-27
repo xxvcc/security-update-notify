@@ -132,6 +132,27 @@ case "${UI_LANG:-}" in
 esac
 
 [[ "$(id -u)" -eq 0 ]] || { say "请使用 sudo/root 运行" "Please run with sudo/root" >&2; exit 1; }
+
+# 第一步：交互选择语言。仅当未显式指定语言、有可用终端、且目标不是 --non-interactive 时弹出。
+# 用 `read < /dev/tty` 只读一行终端输入，不影响 bash 继续从 stdin（curl 管道）读取脚本本身。
+# First step: prompt for language interactively. Only when no language was set explicitly, a
+# terminal is available, and the target is not --non-interactive. Reading one line from /dev/tty
+# does not disturb bash reading the script itself from stdin (the curl pipe).
+if [[ -z "${UI_LANG:-}" ]]; then
+  sun_noninteractive=0
+  if [[ "${#INSTALL_ARGS[@]}" -gt 0 ]]; then
+    for a in "${INSTALL_ARGS[@]}"; do [[ "$a" == "--non-interactive" ]] && sun_noninteractive=1; done
+  fi
+  if [[ "$sun_noninteractive" -eq 0 ]] && { : < /dev/tty; } 2>/dev/null; then
+    printf '%s\n' "请选择语言 / Choose a language:"
+    printf '%s\n' "  1) 中文 (default)"
+    printf '%s\n' "  2) English"
+    read -r -p "[1]: " sun_lang_choice < /dev/tty || sun_lang_choice=1
+    case "${sun_lang_choice:-1}" in 2) UI_LANG=en ;; *) UI_LANG=zh ;; esac
+    export UI_LANG
+  fi
+fi
+
 for c in curl tar sha256sum mktemp python3; do command -v "$c" >/dev/null 2>&1 || { say "缺少必需命令: $c" "Missing required command: $c" >&2; exit 1; }; done
 
 [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { say "无效 REPO 格式: $REPO" "Invalid REPO format: $REPO" >&2; exit 2; }
