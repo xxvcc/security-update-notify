@@ -641,7 +641,7 @@ check_dnf() {
 }
 
 format_restart_summary() {
-  local lang="$1" summary kcur kexp ksta services service_count other_count
+  local lang="$1" summary kcur kexp ksta services service_count other_count s_unsupported
   summary="${restart_summary//\\n/$'\n'}"
   case "$BACKEND" in
     apt)
@@ -677,22 +677,26 @@ format_restart_summary() {
     dnf)
       services="$(printf '%s\n' "$summary" | awk '/^needs-restarting -s:$/{f=1; next} /^needs-restarting/{f=0} f && NF {print}' | sed '/^$/d' | sort -u)"
       service_count="$(printf '%s\n' "$services" | sed '/^$/d' | wc -l | tr -d ' ')"
+      s_unsupported=0
+      [[ "$summary" == *"lacks -s"* || "$summary" == *"不支持 -s"* ]] && s_unsupported=1
       if [[ "$lang" == "en" ]]; then
         [[ "$reboot_required" -eq 1 ]] && printf 'Full reboot: required by needs-restarting -r\n'
+        [[ "$s_unsupported" -eq 1 ]] && printf 'Note: this needs-restarting lacks -s; per-service detection unavailable (reboot-only).\n'
         if [[ "${service_count:-0}" -gt 0 ]]; then
           printf 'Services to review/restart (%s):\n' "$service_count"
           printf '%s\n' "$services" | sed -n '1,12p' | sed 's/^/• /'
           [[ "$service_count" -gt 12 ]] && printf '• ... and %s more\n' "$((service_count - 12))"
-        elif [[ "$reboot_required" -ne 1 ]]; then
+        elif [[ "$reboot_required" -ne 1 && "$s_unsupported" -eq 0 ]]; then
           printf 'No services were reported as needing a restart. Run needs-restarting on the server for details.\n'
         fi
       else
         [[ "$reboot_required" -eq 1 ]] && printf '整机重启：needs-restarting -r 判断为需要\n'
+        [[ "$s_unsupported" -eq 1 ]] && printf '提示：此版本 needs-restarting 不支持 -s，无法按服务检测（仅整机重启）。\n'
         if [[ "${service_count:-0}" -gt 0 ]]; then
           printf '建议评估/重启的服务（%s 个）：\n' "$service_count"
           printf '%s\n' "$services" | sed -n '1,12p' | sed 's/^/• /'
           [[ "$service_count" -gt 12 ]] && printf '• ……另有 %s 个\n' "$((service_count - 12))"
-        elif [[ "$reboot_required" -ne 1 ]]; then
+        elif [[ "$reboot_required" -ne 1 && "$s_unsupported" -eq 0 ]]; then
           printf '没有服务被报告需要重启；可在服务器上运行 needs-restarting 查看详情。\n'
         fi
       fi
