@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 双语输出助手：UI_LANG=zh|en 决定终端显示语言（默认 zh）。
-# Bilingual output helper: UI_LANG=zh|en selects the terminal language (default zh).
-m()  { if [ "${UI_LANG:-zh}" = en ]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
-say(){ if [ "${UI_LANG:-zh}" = en ]; then printf '%s\n' "$2"; else printf '%s\n' "$1"; fi; }
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 共用辅助函数：m/say 双语输出、os-release 读取、后端检测。
+# shellcheck source=files/lib.sh
+. "$SCRIPT_DIR/files/lib.sh"
 
 SEND_TEST=0; SIMULATE_REBOOT=0; NO_DEDUPE=0
 TMP_DIR="$(mktemp -d)"
@@ -47,27 +47,9 @@ case "${UI_LANG:-}" in zh|en) ;; *) UI_LANG=zh ;; esac
 [[ "$(id -u)" -eq 0 ]] || { say "请以 root 运行" "Please run as root" >&2; exit 1; }
 
 [[ -r /etc/os-release ]] || { say "错误：无法读取 /etc/os-release" "ERROR: /etc/os-release not readable" >&2; exit 1; }
-while IFS= read -r line || [[ -n "$line" ]]; do
-  line="${line%$'\r'}"
-  case "$line" in
-    ID=*|VERSION_ID=*|PRETTY_NAME=*)
-      key="${line%%=*}"
-      value="${line#*=}"
-      if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
-      if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
-      case "$key" in ID|VERSION_ID|PRETTY_NAME) printf -v "$key" '%s' "$value" ;; esac
-      ;;
-  esac
-done </etc/os-release
-BACKEND="unknown"; SUPPORT="unsupported"
-case "${ID:-}" in
-  debian) BACKEND=apt; case "${VERSION_ID:-}" in 12|13) SUPPORT=supported ;; 11) SUPPORT=best-effort ;; esac ;;
-  ubuntu) BACKEND=apt; case "${VERSION_ID:-}" in 22.04|24.04) SUPPORT=supported ;; 20.04) SUPPORT=best-effort ;; esac ;;
-  rhel|rocky|almalinux) BACKEND=dnf; case "${VERSION_ID%%.*}" in 8|9) SUPPORT=supported ;; esac ;;
-  fedora) BACKEND=dnf; SUPPORT=supported ;;
-  centos) BACKEND=dnf; case "${VERSION_ID%%.*}" in 8|9) SUPPORT=best-effort ;; esac ;;
-  amzn) BACKEND=dnf; case "${VERSION_ID:-}" in 2023) SUPPORT=best-effort ;; esac ;;
-esac
+lib_read_os_release
+lib_detect_backend
+BACKEND="$LIB_BACKEND"; SUPPORT="$LIB_SUPPORT"
 
 say "== 操作系统 ==" "== OS =="; sed -n '1,8p' /etc/os-release; say "支持状态: $SUPPORT" "Support: $SUPPORT"; say "后端: $BACKEND" "Backend: $BACKEND"; [[ -d /run/systemd/system ]] && say "systemd: 是" "systemd: yes" || say "systemd: 否" "systemd: no"; echo
 

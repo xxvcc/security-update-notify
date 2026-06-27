@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 双语输出助手：UI_LANG=zh|en 决定终端显示语言（默认 zh）。
-# Bilingual output helper: UI_LANG=zh|en selects the terminal language (default zh).
-m()  { if [ "${UI_LANG:-zh}" = en ]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
-say(){ if [ "${UI_LANG:-zh}" = en ]; then printf '%s\n' "$2"; else printf '%s\n' "$1"; fi; }
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 共用辅助函数：m/say 双语输出等。
+# shellcheck source=files/lib.sh
+. "$SCRIPT_DIR/files/lib.sh"
 
 PURGE_CONFIG=0
 usage(){ say "用法: sudo ./uninstall.sh [--purge-config] [--lang zh|en]" "Usage: sudo ./uninstall.sh [--purge-config] [--lang zh|en]"; }

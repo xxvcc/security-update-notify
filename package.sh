@@ -21,7 +21,7 @@ bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security
 
 ALLOW_DIRTY_PACKAGE="${ALLOW_DIRTY_PACKAGE:-0}"
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  if ! git diff --quiet HEAD -- install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify files/needrestart-report-only.conf files/security-update-notify.logrotate files/security-update-notify.service README.md README.en.md CHANGELOG.md LICENSE .env.example files/release-signing.pub.asc .github/workflows/ci.yml; then
+  if ! git diff --quiet HEAD -- install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify files/lib.sh files/needrestart-report-only.conf files/security-update-notify.logrotate files/security-update-notify.service README.md README.en.md CHANGELOG.md LICENSE .env.example files/release-signing.pub.asc .github/workflows/ci.yml; then
     if [[ "$ALLOW_DIRTY_PACKAGE" == "1" && -n "${SOURCE_DATE_EPOCH:-}" ]]; then
       echo "警告：由于 ALLOW_DIRTY_PACKAGE=1 且 SOURCE_DATE_EPOCH 已设置，将打包未提交的发布文件改动。/ WARNING: packaging uncommitted tracked release-file changes because ALLOW_DIRTY_PACKAGE=1 and SOURCE_DATE_EPOCH is set." >&2
     else
@@ -39,6 +39,7 @@ fi
 [[ -f files/security-update-notify.service ]] || { echo "缺少 service 文件 / service file missing" >&2; exit 1; }
 [[ -f files/needrestart-report-only.conf ]] || { echo "缺少 needrestart 配置 / needrestart config missing" >&2; exit 1; }
 [[ -f files/security-update-notify.logrotate ]] || { echo "缺少 logrotate 文件 / logrotate file missing" >&2; exit 1; }
+[[ -f files/lib.sh ]] || { echo "缺少 files/lib.sh / files/lib.sh missing" >&2; exit 1; }
 
 mkdir -p "$WORK/$PKG/files" "$DIST"
 rm -f "$DIST"/security-update-notify-*.tar.gz "$DIST"/security-update-notify-*.tar.gz.sha256 "$DIST"/security-update-notify-*.tar.gz.asc
@@ -48,14 +49,14 @@ rm -f "$DIST"/security-update-notify-*.tar.gz "$DIST"/security-update-notify-*.t
 for f in .env.example CHANGELOG.md LICENSE README.md README.en.md install.sh menu.sh test.sh uninstall.sh; do
   cp "$ROOT/$f" "$WORK/$PKG/$f"
 done
-for f in needrestart-report-only.conf release-signing.pub.asc security-update-notify security-update-notify.logrotate security-update-notify.service; do
+for f in lib.sh needrestart-report-only.conf release-signing.pub.asc security-update-notify security-update-notify.logrotate security-update-notify.service; do
   cp "$ROOT/files/$f" "$WORK/$PKG/files/$f"
 done
 
 # 规范化可执行权限。
 # Normalize executable permissions.
 chmod 0755 "$WORK/$PKG"/*.sh "$WORK/$PKG/files/security-update-notify"
-chmod 0644 "$WORK/$PKG/.env.example" "$WORK/$PKG/README.md" "$WORK/$PKG/README.en.md" "$WORK/$PKG/CHANGELOG.md" "$WORK/$PKG/LICENSE" "$WORK/$PKG/files/security-update-notify.service" "$WORK/$PKG/files/needrestart-report-only.conf" "$WORK/$PKG/files/release-signing.pub.asc" "$WORK/$PKG/files/security-update-notify.logrotate"
+chmod 0644 "$WORK/$PKG/.env.example" "$WORK/$PKG/README.md" "$WORK/$PKG/README.en.md" "$WORK/$PKG/CHANGELOG.md" "$WORK/$PKG/LICENSE" "$WORK/$PKG/files/lib.sh" "$WORK/$PKG/files/security-update-notify.service" "$WORK/$PKG/files/needrestart-report-only.conf" "$WORK/$PKG/files/release-signing.pub.asc" "$WORK/$PKG/files/security-update-notify.logrotate"
 
 # 安全检查：发布包不能包含本地运行配置或状态文件。
 # Safety: release package must not contain local runtime config/state files.

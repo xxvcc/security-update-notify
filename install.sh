@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 双语输出助手：UI_LANG=zh|en 决定终端显示语言（默认 zh）。
-# Bilingual output helper: UI_LANG=zh|en selects the terminal language (default zh).
-m()  { if [ "${UI_LANG:-zh}" = en ]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
-say(){ if [ "${UI_LANG:-zh}" = en ]; then printf '%s\n' "$2"; else printf '%s\n' "$1"; fi; }
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 共用辅助函数：m/say 双语输出、os-release 读取、后端检测。
+# shellcheck source=files/lib.sh
+. "$SCRIPT_DIR/files/lib.sh"
 CHECK_TIME="${CHECK_TIME:-}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
@@ -477,29 +475,10 @@ load_existing_timer_default "$TIMER_FILE"
 # does not write back a stale CONFIG_VERSION).
 CONFIG_VERSION=2
 [[ -r /etc/os-release ]] || { say "缺少 /etc/os-release" "Missing /etc/os-release" >&2; exit 1; }
-ID=""; VERSION_ID=""; PRETTY_NAME=""
-while IFS= read -r line || [[ -n "$line" ]]; do
-  line="${line%$'\r'}"
-  case "$line" in
-    ID=*|VERSION_ID=*|PRETTY_NAME=*)
-      key="${line%%=*}"
-      value="${line#*=}"
-      if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
-      if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
-      case "$key" in ID|VERSION_ID|PRETTY_NAME) printf -v "$key" '%s' "$value" ;; esac
-      ;;
-  esac
-done </etc/os-release
-
-SUPPORTED=0; SUPPORT_LABEL="unsupported"; DETECTED_BACKEND="unknown"
-case "${ID:-}" in
-  debian) DETECTED_BACKEND="apt"; case "${VERSION_ID:-}" in 12|13) SUPPORTED=1; SUPPORT_LABEL="supported" ;; 11) SUPPORTED=1; SUPPORT_LABEL="best-effort" ;; esac ;;
-  ubuntu) DETECTED_BACKEND="apt"; case "${VERSION_ID:-}" in 22.04|24.04) SUPPORTED=1; SUPPORT_LABEL="supported" ;; 20.04) SUPPORTED=1; SUPPORT_LABEL="best-effort" ;; esac ;;
-  rhel|rocky|almalinux) DETECTED_BACKEND="dnf"; case "${VERSION_ID%%.*}" in 8|9) SUPPORTED=1; SUPPORT_LABEL="supported" ;; esac ;;
-  fedora) DETECTED_BACKEND="dnf"; SUPPORTED=1; SUPPORT_LABEL="supported" ;;
-  centos) DETECTED_BACKEND="dnf"; case "${VERSION_ID%%.*}" in 8|9) SUPPORTED=1; SUPPORT_LABEL="best-effort" ;; esac ;;
-  amzn) DETECTED_BACKEND="dnf"; case "${VERSION_ID:-}" in 2023) SUPPORTED=1; SUPPORT_LABEL="best-effort" ;; esac ;;
-esac
+lib_read_os_release
+lib_detect_backend
+DETECTED_BACKEND="$LIB_BACKEND"; SUPPORT_LABEL="$LIB_SUPPORT"
+SUPPORTED=0; [[ "$LIB_SUPPORT" != "unsupported" ]] && SUPPORTED=1
 [[ "$BACKEND" == "auto" ]] && BACKEND="$DETECTED_BACKEND"
 case "$BACKEND" in apt|dnf) ;; *) say "无效或不支持的后端: $BACKEND" "Invalid/unsupported backend: $BACKEND" >&2; exit 2 ;; esac
 

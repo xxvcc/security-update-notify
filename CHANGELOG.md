@@ -26,6 +26,8 @@ Fixes and hardening from a comprehensive, adversarially-verified audit.
   systemd unit gains `UMask=0077` and `SystemCallFilter=@system-service`.
 - 打包/CI：`package.sh` 增加 `RELEASE=1` 信号，且只要存在 `vVERSION` tag 即强制签名；CI 的发布校验改为 checkout 对应 tag、校验 40 位指纹、遍历所有 tarball 资产。
   Packaging/CI: `package.sh` adds a `RELEASE=1` signal and requires signing whenever a `vVERSION` tag exists; the release-verify job checks out the released tag, validates the 40-hex fingerprint, and verifies every tarball asset.
+- 内部重构：安装/菜单/测试/卸载脚本共用 `files/lib.sh`（`m`/`say` 双语输出、os-release 读取、后端检测），消除重复；运行时二进制与 `sun.sh` 引导脚本仍刻意自包含。
+  Internal refactor: the install/menu/test/uninstall scripts share `files/lib.sh` (bilingual `m`/`say`, os-release reader, backend detection), removing duplication; the runtime binary and the `sun.sh` bootstrap remain intentionally self-contained.
 - 文档：一键安装/升级命令的域名改为专用子域名 `https://sun.xxv.cc`（脚本挂在根路径），替换原 `https://xxv.cc/sun.sh`。
   Docs: the install/upgrade one-liners now use the dedicated subdomain `https://sun.xxv.cc` (script served at the root path), replacing `https://xxv.cc/sun.sh`.
 
