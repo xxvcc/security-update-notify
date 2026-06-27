@@ -42,6 +42,7 @@ SUN keeps the boring part automatic and makes the human part obvious.
 - **No automatic reboot** — you stay in control of downtime.
 - **Telegram alerts only when action is needed**.
 - **Reboot and service-restart detection** with `needrestart` or `needs-restarting`.
+- **Security-update watchdog**: beyond kernel/service restarts, it watches three commonly-missed things — ① whether the auto-update mechanism itself is unhealthy (timer disabled, last run failed, no successful update for too long, disk nearly full); ② whether security updates are still pending (dnf also counts critical/important); ③ whether the distro's security support is ending or already ended (EOL). A mechanism problem or a past-EOL release triggers an alert; the pending count and an approaching EOL ride along with alerts as info. All three can be turned off in the config.
 - **Single-language UI (Chinese or English)**: the installer, menu and diagnostics pick a language as the first step (Chinese or English, default Chinese) and then render all terminal interaction in that one language — no more mixed zh/en. The choice also becomes the default Telegram alert language, overridable with `--notify-lang`.
 - **Public IP in notifications**: auto-detect the server public IP by default; you can also set it manually or disable it. Auto-detection uses Python's standard library and does not add a `curl` dependency.
 - **Duplicate alert suppression**: once, daily, or every N days.
@@ -259,6 +260,18 @@ If SUN is already installed, the installer reads `/etc/security-update-notify/te
 | `interval` | Send the same alert every N days. Default: `3`. |
 
 `daily` is the default: at most one reminder per day keeps nudging you while a reboot stays pending without spamming. For something quieter use `once` (only once) or `interval` (every N days).
+
+## Security-update watchdog
+
+Beyond reboot/service-restart detection, SUN runs three extra checks by default (all can be disabled in `/etc/security-update-notify/telegram.env`):
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `CHECK_UPDATE_HEALTH` | `1` | Detects whether the auto-update mechanism is healthy: the timer (`apt-daily-upgrade` / `dnf-automatic`) is disabled, the last run failed, no successful update for more than `STALE_UPDATE_DAYS` days, or `/` or `/boot` has less than 200 MB free. Any hit triggers an alert. |
+| `STALE_UPDATE_DAYS` | `7` | Days without a successful automatic security update before it's considered stale; set `0` to disable this sub-check. |
+| `CHECK_EOL` | `1` | Distro end-of-life (EOL) warning: a past-EOL release triggers an alert, an approaching one (within 90 days) is informational. Set `0` if you have extended support such as Ubuntu ESM. |
+
+The pending security-update count is informational — it rides along with alerts and shows in `--doctor`, but does not trigger an alert on its own. Run `security-update-notify --doctor` anytime to see the current state of all three.
 
 ## Installed files
 

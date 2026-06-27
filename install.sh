@@ -24,6 +24,9 @@ NON_INTERACTIVE=0
 ASSUME_YES=0
 ALLOW_BEST_EFFORT=0
 NOTIFY_OK="${NOTIFY_OK:-}"
+CHECK_UPDATE_HEALTH="${CHECK_UPDATE_HEALTH:-}"
+STALE_UPDATE_DAYS="${STALE_UPDATE_DAYS:-}"
+CHECK_EOL="${CHECK_EOL:-}"
 CONFIG_FILE="/etc/security-update-notify/telegram.env"
 TIMER_FILE="/etc/systemd/system/security-update-notify.timer"
 SERVICE_FILE="/etc/systemd/system/security-update-notify.service"
@@ -145,7 +148,7 @@ load_env_file() {
     if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
     if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
     case "$key" in
-      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|CHECK_TIME|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION|UI_LANG)
+      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|CHECK_TIME|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION|UI_LANG|CHECK_UPDATE_HEALTH|STALE_UPDATE_DAYS|CHECK_EOL)
         printf -v "$key" '%s' "$value"
         ;;
       SEND_TEST|SKIP_TELEGRAM_TEST|NON_INTERACTIVE|ASSUME_YES|ALLOW_BEST_EFFORT|NOTIFY_OK|NOTIFY_UPGRADE|POST_INSTALL_CHECK)
@@ -187,7 +190,7 @@ load_existing_config_defaults() {
     if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
     if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
     case "$key" in
-      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|NOTIFY_UPGRADE|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION)
+      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|NOTIFY_UPGRADE|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION|CHECK_UPDATE_HEALTH|STALE_UPDATE_DAYS|CHECK_EOL)
         set_config_default "$key" "$value"
         EXISTING_CONFIG_LOADED=1
         ;;
@@ -252,7 +255,7 @@ validate_config_value() {
 }
 validate_config_values() {
   local name value
-  for name in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID HOST_LABEL PUBLIC_IP INCLUDE_PUBLIC_IP NOTIFY_OK NOTIFY_UPGRADE DEDUP_MODE DEDUP_INTERVAL_DAYS NOTIFY_LANG BACKEND CONFIG_VERSION; do
+  for name in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID HOST_LABEL PUBLIC_IP INCLUDE_PUBLIC_IP NOTIFY_OK NOTIFY_UPGRADE DEDUP_MODE DEDUP_INTERVAL_DAYS NOTIFY_LANG BACKEND CONFIG_VERSION CHECK_UPDATE_HEALTH STALE_UPDATE_DAYS CHECK_EOL; do
     set +u; value="${!name}"; set -u
     validate_config_value "$name" "$value"
   done
@@ -470,6 +473,9 @@ load_existing_timer_default "$TIMER_FILE"
 : "${INCLUDE_PUBLIC_IP:=1}"
 : "${NOTIFY_OK:=0}"
 : "${NOTIFY_UPGRADE:=0}"
+: "${CHECK_UPDATE_HEALTH:=1}"
+: "${STALE_UPDATE_DAYS:=7}"
+: "${CHECK_EOL:=1}"
 # 始终写入安装器当前的配置 schema 版本，不沿用旧值（避免升级后写回过期的 CONFIG_VERSION）。
 # Always write the installer's current config schema version; do not reuse the old one (so an upgrade
 # does not write back a stale CONFIG_VERSION).
@@ -702,6 +708,9 @@ umask 077
   printf 'DEDUP_INTERVAL_DAYS=%s\n' "$(config_quote "$DEDUP_INTERVAL_DAYS")"
   printf 'NOTIFY_LANG=%s\n' "$(config_quote "$NOTIFY_LANG")"
   printf 'BACKEND=%s\n' "$(config_quote "$BACKEND")"
+  printf 'CHECK_UPDATE_HEALTH=%s\n' "$(config_quote "$CHECK_UPDATE_HEALTH")"
+  printf 'STALE_UPDATE_DAYS=%s\n' "$(config_quote "$STALE_UPDATE_DAYS")"
+  printf 'CHECK_EOL=%s\n' "$(config_quote "$CHECK_EOL")"
 } >/etc/security-update-notify/telegram.env
 chmod 600 /etc/security-update-notify/telegram.env
 cat >/etc/systemd/system/security-update-notify.timer <<EOF

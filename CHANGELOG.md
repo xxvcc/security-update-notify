@@ -1,5 +1,20 @@
 # 变更记录
 
+## 1.9.0
+
+安全更新看门狗：在“内核/服务重启”之外，新增三项面向安全更新本身的检测，默认开启，均可在配置中关闭。
+
+Security-update watchdog: three new checks focused on security updates themselves, in addition to kernel/service-restart detection. On by default, all configurable.
+
+- 新增 `CHECK_UPDATE_HEALTH`（默认 `1`）：检测自动更新机制是否健康——定时器（`apt-daily-upgrade` / `dnf-automatic`）被禁用、上次运行失败（`Result != success`）、超过 `STALE_UPDATE_DAYS`（默认 `7`）天没有成功更新、`/` 或 `/boot` 剩余空间不足 200MB；任一命中即触发提醒。
+  Added `CHECK_UPDATE_HEALTH` (default `1`): detects whether the auto-update mechanism is healthy — timer disabled, last run failed, no success for more than `STALE_UPDATE_DAYS` (default `7`) days, or `/`/`/boot` under 200 MB free; any hit triggers an alert.
+- 新增待安装安全更新统计：随提醒与 `--doctor` 一并展示待装的安全更新数量（dnf 另计高危/重要），为信息项，不单独触发提醒。
+  Added a pending-security-update count shown in alerts and `--doctor` (dnf also counts critical/important); informational only, never triggers an alert by itself.
+- 新增 `CHECK_EOL`（默认 `1`）：发行版安全支持终止（EOL）提醒——已过 EOL 触发提醒，临近（90 天内）仅作信息展示；内置 Debian/Ubuntu/RHEL 系/Amazon Linux 的近似 EOL 日期表。
+  Added `CHECK_EOL` (default `1`): distro end-of-life warning — past EOL triggers an alert, approaching (within 90 days) is informational; ships an approximate EOL table for Debian/Ubuntu/RHEL-family/Amazon Linux.
+- 去重哈希纳入机制健康与 EOL 的稳定信号，避免同一状态被反复提醒；`--doctor` 自检新增以上三项的当前状态。
+  The dedup hash now includes the stable health/EOL signals so the same state is not re-alerted; `--doctor` reports the current state of all three.
+
 ## 1.8.1
 
 - 重复提醒模式 `always` 改名为更直白的 `once`（“只提醒一次”）；旧值 `always` 仍兼容接受，升级时安装器会自动迁移为 `once`。
