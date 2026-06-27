@@ -1,5 +1,12 @@
 # 变更记录
 
+## Unreleased
+
+- 引导脚本 `sun.sh` 纳入语言体系：支持 `--lang zh|en` 与 `UI_LANG`/`SUN_LANG`，自身输出按所选语言单语显示；显式指定语言时传递给目标脚本，未指定则仍由菜单照常提示选择。
+  The `sun.sh` bootstrap joins the language system: honors `--lang zh|en` and `UI_LANG`/`SUN_LANG`, renders single-language output, and forwards an explicit language to the target script (otherwise the menu still prompts).
+- README（中/英）更新：补充首步语言选择与 `--lang`、已签名的 `security-update-notify --upgrade`，并修正 dnf 检测说明为 `needs-restarting -s`。
+  README (zh/en): document the first-step language selection and `--lang`, the signed `security-update-notify --upgrade`, and correct the dnf detection note to `needs-restarting -s`.
+
 ## 1.7.0
 
 - 交互体验：安装器、菜单、检查/诊断、卸载等终端交互不再中英文混排。进入时第一步选择语言（中文 / English），之后全部按所选语言单语显示；新增 `--lang zh|en` 参数与 `UI_LANG`/`SUN_LANG` 环境变量。
