@@ -36,7 +36,8 @@ jobs:
           end = s.index('\nset_config_default()', start)
           harness = '''#!/usr/bin/env bash
           set -euo pipefail
-          CHECK_TIME="09:00"; TELEGRAM_BOT_TOKEN=""; TELEGRAM_CHAT_ID=""; HOST_LABEL=""; PUBLIC_IP=""; INCLUDE_PUBLIC_IP="1"; NOTIFY_OK=""; NOTIFY_UPGRADE=""; CONFIG_VERSION=""; DEDUP_MODE=""; DEDUP_INTERVAL_DAYS="3"; NOTIFY_LANG="zh"; BACKEND="auto"; SEND_TEST=0; SKIP_TELEGRAM_TEST=0; NON_INTERACTIVE=0; ASSUME_YES=0; ALLOW_BEST_EFFORT=0; POST_INSTALL_CHECK=1
+          m(){ printf %s "$1"; }; say(){ echo "$1" >&2; }
+          UI_LANG="zh"; CHECK_TIME="09:00"; TELEGRAM_BOT_TOKEN=""; TELEGRAM_CHAT_ID=""; HOST_LABEL=""; PUBLIC_IP=""; INCLUDE_PUBLIC_IP="1"; NOTIFY_OK=""; NOTIFY_UPGRADE=""; CONFIG_VERSION=""; DEDUP_MODE=""; DEDUP_INTERVAL_DAYS="3"; NOTIFY_LANG="zh"; BACKEND="auto"; SEND_TEST=0; SKIP_TELEGRAM_TEST=0; NON_INTERACTIVE=0; ASSUME_YES=0; ALLOW_BEST_EFFORT=0; POST_INSTALL_CHECK=1
           ''' + s[start:end] + '''
           load_env_file "$1"
           printf '%s\n' "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" "$CHECK_TIME" "$NOTIFY_LANG" "$DEDUP_MODE" "$SEND_TEST" "$ALLOW_BEST_EFFORT" "$HOST_LABEL" "$PUBLIC_IP" "$INCLUDE_PUBLIC_IP" "$NOTIFY_OK" "$NOTIFY_UPGRADE" "$CONFIG_VERSION"
@@ -181,6 +182,7 @@ jobs:
           cat >"$tmp/bin/needs-restarting" <<'EOF'
           #!/usr/bin/env bash
           case "${1:-}" in
+            --help) echo '  -r, --reboothint'; echo '  -s, --services    Only report services needing restart'; exit 0 ;;
             -r) [[ -n "${NR_R_OUT:-}" ]] && printf '%s\n' "$NR_R_OUT"; exit "${NR_R_RC:-0}" ;;
             -s) [[ -n "${NR_S_OUT:-}" ]] && printf '%s\n' "$NR_S_OUT"; exit 0 ;;
             *)  [[ -n "${NR_ALL_OUT:-}" ]] && printf '%s\n' "$NR_ALL_OUT"; exit 0 ;;
@@ -347,8 +349,10 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Checkout
+      - name: Checkout the released tag
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
 
       - name: Download release assets
         env:
@@ -363,19 +367,23 @@ jobs:
       - name: Verify checksum and pinned GPG signature
         run: |
           set -euo pipefail
-          pin="$(grep -m1 RELEASE_SIGNING_FINGERPRINT files/security-update-notify | sed -E 's/.*:-([0-9A-Fa-f]{40})\}.*/\1/')"
-          [ -n "$pin" ] || { echo "::error::could not read pinned RELEASE_SIGNING_FINGERPRINT"; exit 1; }
-          cd rel
-          tgz="$(ls security-update-notify-*.tar.gz | grep -vE '\.(sha256|asc)$' | head -1)"
-          [ -n "$tgz" ] || { echo "::error::no release tarball found"; exit 1; }
-          echo "Verifying $tgz against pinned fingerprint $pin"
-          [ -f "$tgz.sha256" ] || { echo "::error::missing $tgz.sha256"; exit 1; }
-          sha256sum -c "$tgz.sha256"
-          [ -f "$tgz.asc" ] || { echo "::error::release $tgz is NOT signed (.asc missing); signing is mandatory"; exit 1; }
+          pin="$(grep -m1 RELEASE_SIGNING_FINGERPRINT files/security-update-notify | sed -E 's/.*:-([0-9A-Fa-f]+)\}.*/\1/')"
+          case "$pin" in *[!0-9A-Fa-f]*|"") echo "::error::could not read a valid pinned RELEASE_SIGNING_FINGERPRINT"; exit 1 ;; esac
+          [ "${#pin}" -eq 40 ] || { echo "::error::pinned fingerprint is not 40 hex chars: '$pin'"; exit 1; }
           export GNUPGHOME="$(mktemp -d)"
           chmod 700 "$GNUPGHOME"
-          gpg --batch --import ../files/release-signing.pub.asc
+          gpg --batch --import files/release-signing.pub.asc
           have="$(gpg --batch --with-colons --list-keys | awk -F: '$1=="fpr"{print $10; exit}')"
           [ "$have" = "$pin" ] || { echo "::error::repo public key fingerprint ($have) != pinned ($pin)"; exit 1; }
-          gpg --batch --verify "$tgz.asc" "$tgz" || { echo "::error::signature verification failed for $tgz"; exit 1; }
-          echo "OK: $tgz is properly signed by the pinned release key ($pin)"
+          cd rel
+          shopt -s nullglob
+          tarballs=( security-update-notify-*.tar.gz )
+          [ "${#tarballs[@]}" -gt 0 ] || { echo "::error::no release tarball found"; exit 1; }
+          for tgz in "${tarballs[@]}"; do
+            echo "Verifying $tgz against pinned fingerprint $pin ..."
+            [ -f "$tgz.sha256" ] || { echo "::error::missing $tgz.sha256"; exit 1; }
+            sha256sum -c "$tgz.sha256"
+            [ -f "$tgz.asc" ] || { echo "::error::release $tgz is NOT signed (.asc missing); signing is mandatory"; exit 1; }
+            gpg --batch --verify "$tgz.asc" "$tgz" || { echo "::error::signature verification failed for $tgz"; exit 1; }
+            echo "OK: $tgz is properly signed by the pinned release key ($pin)"
+          done

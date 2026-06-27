@@ -1,7 +1,31 @@
 # 变更记录
 
-## Unreleased
+## 1.8.0
 
+来自一次全面审计的修复与加固（经对抗式复核确认）。
+
+Fixes and hardening from a comprehensive, adversarially-verified audit.
+
+- 告警降噪（apt 端补齐与 dnf 一致的策略）：不再因 `needrestart` `KSTA=0`（内核状态未知）或 `NEEDRESTART-SESS`（用户会话，含管理员自己的 SSH 登录）误报；关注信号只取需要重启的服务（`SVC`）与真实内核更换。去重哈希改用稳定信号（排除动态公网 IP 与瞬时输出），避免同一状态被反复提醒。
+  Alert-noise reduction (apt now matches the dnf policy): no longer triggered by `needrestart` `KSTA=0` (unknown kernel state) or `NEEDRESTART-SESS` (user sessions, incl. the admin's own SSH login); attention only from services needing restart (`SVC`) and a real kernel change. The dedup hash uses a stable signal (excluding the dynamic public IP and transient output) so the same state is not re-alerted.
+- 版本比较改用 `sort -V`（移除旧的 awk 截断）：正确处理 4 段版本（`1.x.y.z`）与预发布后缀，修复补丁版“永不自动升级”；解析 `tag_name` 只精确去除前导 `v`。
+  Version comparison uses `sort -V` (drops the old awk truncation): handles 4-part versions and pre-release suffixes, fixing patch releases that never auto-upgraded; `tag_name` strips only a leading `v`.
+- 运行时锁定 `LC_ALL=C`，使重启检测的文案匹配与排序在任意系统语言下确定。
+  Pin `LC_ALL=C` at runtime so restart-detection message matching and sorting are deterministic under any system language.
+- `--upgrade` / `--check-upgrade` 在加载配置前也跟随已安装的 `NOTIFY_LANG`；`sudo` 重新执行时传递 `--lang`。
+  `--upgrade` / `--check-upgrade` follow the installed `NOTIFY_LANG` even before config load; `--lang` is passed across the `sudo` re-exec.
+- Telegram 发送：超长消息截断到 4096 上限；对 4xx（429 除外）不再重试。
+  Telegram send: truncate over-long messages to the 4096 cap; do not retry on 4xx (except 429).
+- 发行版识别用 `ID_LIKE` 兜底衍生版（Oracle Linux/CloudLinux 等）；探测 `needs-restarting -s` 支持，老版本回退“仅按整机重启”并给出可见提示。
+  Distro detection falls back to `ID_LIKE` for derivatives (Oracle Linux/CloudLinux); probe `needs-restarting -s` support and degrade to reboot-only with a visible note on older dnf-utils.
+- 安装器：全新安装失败也会回滚（先快照 + ERR trap），回滚会删除本次新建的文件；写任何系统文件前先校验配置；升级始终写入当前 `CONFIG_VERSION`；备份目录设为 `0700` 且只保留最近 3 份（含 token 副本）；`--telegram-token` 提示改用 `--telegram-token-file`。
+  Installer: fresh-install failures now roll back too (snapshot + ERR trap), and rollback removes files this run created; config is validated before any system file is written; upgrades always write the current `CONFIG_VERSION`; backup dirs are `0700` and pruned to the most recent 3 (they hold token copies); `--telegram-token` warns to prefer `--telegram-token-file`.
+- 引导脚本 `sun.sh`：`--verify-signature auto` 在有 gpg 时按 `required` 严格验签（fail-closed，与 `--upgrade` 一致），仅在无 gpg 时退回 sha256；`--base-url` 必须为 https；`upgrade` 模式走统一的 `/dev/tty` 路径。
+  `sun.sh`: `--verify-signature auto` verifies strictly like `required` when gpg is present (fail-closed, matching `--upgrade`), falling back to sha256 only without gpg; `--base-url` must be https; `upgrade` mode uses the unified `/dev/tty` path.
+- systemd 单元新增 `UMask=0077`、`SystemCallFilter=@system-service`。
+  systemd unit gains `UMask=0077` and `SystemCallFilter=@system-service`.
+- 打包/CI：`package.sh` 增加 `RELEASE=1` 信号，且只要存在 `vVERSION` tag 即强制签名；CI 的发布校验改为 checkout 对应 tag、校验 40 位指纹、遍历所有 tarball 资产。
+  Packaging/CI: `package.sh` adds a `RELEASE=1` signal and requires signing whenever a `vVERSION` tag exists; the release-verify job checks out the released tag, validates the 40-hex fingerprint, and verifies every tarball asset.
 - 文档：一键安装/升级命令的域名改为专用子域名 `https://sun.xxv.cc`（脚本挂在根路径），替换原 `https://xxv.cc/sun.sh`。
   Docs: the install/upgrade one-liners now use the dedicated subdomain `https://sun.xxv.cc` (script served at the root path), replacing `https://xxv.cc/sun.sh`.
 

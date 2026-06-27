@@ -33,6 +33,19 @@ BIN_FILE="/usr/local/sbin/security-update-notify"
 LOGROTATE_FILE="/etc/logrotate.d/security-update-notify"
 BACKUP_ROOT="/var/backups/security-update-notify"
 BACKUP_DIR=""
+# 安装/升级会管理（创建或覆盖）的文件——备份与回滚都基于这份清单。
+# Files this installer manages (creates/overwrites) — both backup and rollback use this list.
+MANAGED_PATHS=(
+  usr/local/sbin/security-update-notify
+  etc/security-update-notify/telegram.env
+  etc/systemd/system/security-update-notify.service
+  etc/systemd/system/security-update-notify.timer
+  etc/logrotate.d/security-update-notify
+  etc/apt/apt.conf.d/20auto-upgrades
+  etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify
+  etc/needrestart/conf.d/99-security-update-notify-report-only.conf
+  etc/dnf/automatic.conf
+)
 ROLLBACK_DONE=0
 POST_INSTALL_CHECK=1
 IN_UPGRADE="${SECURITY_UPDATE_NOTIFY_UPGRADE:-0}"
@@ -202,7 +215,7 @@ require_arg() { [[ $# -ge 2 && -n "${2:-}" ]] || { say "缺少 $1 的值" "Missi
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --env-file) require_arg "$1" "${2:-}"; ENV_FILE="$2"; load_env_file "$2"; shift 2 ;;
-    --telegram-token) require_arg "$1" "${2:-}"; TELEGRAM_BOT_TOKEN="$2"; shift 2 ;;
+    --telegram-token) require_arg "$1" "${2:-}"; TELEGRAM_BOT_TOKEN="$2"; say "提示：--telegram-token 会让 token 出现在进程列表(ps)中，自动化建议改用 --telegram-token-file。" "Note: --telegram-token exposes the token in the process list (ps); for automation prefer --telegram-token-file." >&2; shift 2 ;;
     --telegram-token-file) require_arg "$1" "${2:-}"; TELEGRAM_BOT_TOKEN="$(tr -d '\r\n' <"$2")"; shift 2 ;;
     --telegram-chat-id) require_arg "$1" "${2:-}"; TELEGRAM_CHAT_ID="$2"; shift 2 ;;
     --time) require_arg "$1" "${2:-}"; CHECK_TIME="$2"; shift 2 ;;
@@ -267,52 +280,48 @@ create_backup() {
   local ts rel
   ts="$(date +%Y%m%d%H%M%S)"
   BACKUP_DIR="$BACKUP_ROOT/$ts"
-  install -d -m 0750 "$BACKUP_DIR"
+  install -d -m 0700 "$BACKUP_DIR"
   : >"$BACKUP_DIR/manifest"
-  for rel in \
-    usr/local/sbin/security-update-notify \
-    etc/security-update-notify/telegram.env \
-    etc/systemd/system/security-update-notify.service \
-    etc/systemd/system/security-update-notify.timer \
-    etc/logrotate.d/security-update-notify \
-    etc/apt/apt.conf.d/20auto-upgrades \
-    etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify \
-    etc/needrestart/conf.d/99-security-update-notify-report-only.conf \
-    etc/dnf/automatic.conf; do
+  for rel in "${MANAGED_PATHS[@]}"; do
     if [[ -e "/$rel" ]]; then
-      install -d -m 0750 "$BACKUP_DIR/$(dirname "$rel")"
+      install -d -m 0700 "$BACKUP_DIR/$(dirname "$rel")"
       cp -a "/$rel" "$BACKUP_DIR/$rel"
       printf '%s\n' "$rel" >>"$BACKUP_DIR/manifest"
     fi
   done
   printf '%s\n' "$BACKUP_DIR" >"$BACKUP_ROOT/latest"
-  say "已创建升级备份: $BACKUP_DIR" "Backup created: $BACKUP_DIR"
+  # 备份目录含 telegram.env 的 token 副本：设为 0700，并只保留最近 3 份，裁剪更旧的。
+  # Backups hold token copies of telegram.env: keep them 0700 and prune to the most recent 3.
+  local keep=3 old
+  while IFS= read -r old; do [[ -n "$old" ]] && rm -rf "$old"; done < <(
+    find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -printf '%f\n' 2>/dev/null \
+      | sort -r | tail -n "+$((keep+1))" | sed "s|^|$BACKUP_ROOT/|")
+  say "已创建安装/升级前备份: $BACKUP_DIR" "Pre-install/upgrade backup created: $BACKUP_DIR"
 }
 
 restore_backup() {
   [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]] || return 0
   [[ "$ROLLBACK_DONE" -eq 0 ]] || return 0
   ROLLBACK_DONE=1
-  say "安装/升级失败，正在从备份回滚: $BACKUP_DIR" "Install/upgrade failed; rolling back from backup: $BACKUP_DIR" >&2
-  local rel
-  for rel in \
-    usr/local/sbin/security-update-notify \
-    etc/security-update-notify/telegram.env \
-    etc/systemd/system/security-update-notify.service \
-    etc/systemd/system/security-update-notify.timer \
-    etc/logrotate.d/security-update-notify \
-    etc/apt/apt.conf.d/20auto-upgrades \
-    etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify \
-    etc/needrestart/conf.d/99-security-update-notify-report-only.conf \
-    etc/dnf/automatic.conf; do
+  say "安装/升级失败，正在回滚: $BACKUP_DIR" "Install/upgrade failed; rolling back: $BACKUP_DIR" >&2
+  local rel dmode
+  for rel in "${MANAGED_PATHS[@]}"; do
+    case "$rel" in
+      etc/security-update-notify/*) dmode=0750 ;;
+      *) dmode=0755 ;;
+    esac
     if [[ -e "$BACKUP_DIR/$rel" ]]; then
-      install -d -m 0755 "$(dirname "/$rel")"
+      install -d -m "$dmode" "$(dirname "/$rel")"
       cp -a "$BACKUP_DIR/$rel" "/$rel"
+    else
+      # 本次运行新建、备份里没有的文件：删除，避免回滚后留下半新半旧的状态。
+      # File created by this run and absent from the backup: remove it so rollback is clean.
+      rm -f "/$rel"
     fi
   done
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl restart security-update-notify.timer >/dev/null 2>&1 || true
-  say "已回滚到备份: $BACKUP_DIR" "Rolled back to backup: $BACKUP_DIR" >&2
+  say "已回滚: $BACKUP_DIR" "Rolled back: $BACKUP_DIR" >&2
 }
 
 on_error() {
@@ -446,9 +455,12 @@ choose_language
 OLD_VERSION="$(current_installed_version)"
 if [[ "$OLD_VERSION" != "none" || -e "$CONFIG_FILE" || -e "$TIMER_FILE" || -e "$SERVICE_FILE" ]]; then
   IN_UPGRADE=1
-  create_backup
-  trap on_error ERR
 fi
+# 安装前先快照并挂上回滚 trap：失败时恢复已有文件、删除本次新建的文件（全新安装也适用）。
+# Snapshot before any change and arm the rollback trap: on failure restore pre-existing files and
+# remove files this run created (applies to fresh installs too).
+create_backup
+trap on_error ERR
 load_existing_config_defaults "$CONFIG_FILE"
 load_existing_timer_default "$TIMER_FILE"
 [[ "$EXISTING_CONFIG_LOADED" -eq 1 ]] && say "检测到已有配置，升级时将复用未显式覆盖的旧设置。" "Existing config detected; reusing old settings not explicitly overridden."
@@ -460,7 +472,10 @@ load_existing_timer_default "$TIMER_FILE"
 : "${INCLUDE_PUBLIC_IP:=1}"
 : "${NOTIFY_OK:=0}"
 : "${NOTIFY_UPGRADE:=0}"
-: "${CONFIG_VERSION:=2}"
+# 始终写入安装器当前的配置 schema 版本，不沿用旧值（避免升级后写回过期的 CONFIG_VERSION）。
+# Always write the installer's current config schema version; do not reuse the old one (so an upgrade
+# does not write back a stale CONFIG_VERSION).
+CONFIG_VERSION=2
 [[ -r /etc/os-release ]] || { say "缺少 /etc/os-release" "Missing /etc/os-release" >&2; exit 1; }
 ID=""; VERSION_ID=""; PRETTY_NAME=""
 while IFS= read -r line || [[ -n "$line" ]]; do
@@ -596,6 +611,10 @@ fi
 valid_time "$CHECK_TIME" || { say "无效 --time，期望 HH:MM" "Invalid --time, expected HH:MM" >&2; exit 2; }
 if [[ "$SEND_TEST" -eq 0 && "$NON_INTERACTIVE" -ne 1 ]]; then read -r -p "$(m '安装后额外发送 Telegram 测试消息？[y/N]: ' 'Send additional test Telegram message after install? [y/N]: ')" ans; [[ "${ans:-N}" =~ ^[Yy]$ ]] && SEND_TEST=1; fi
 
+# 在写入任何系统文件 / 发送预检消息之前先校验配置值（拒绝换行、引号冲突等）。
+# Validate config values before writing any system file or sending the preflight message.
+validate_config_values
+
 telegram_preflight
 
 install_missing_packages() {
@@ -687,7 +706,6 @@ PY
   fi
 fi
 
-validate_config_values
 umask 077
 {
   echo "# security-update-notify 的 Telegram 通知设置；NOTIFY_LANG 控制发送语言：zh 中文，en English / Telegram notification settings for security-update-notify; NOTIFY_LANG controls the sent language: zh Chinese, en English."

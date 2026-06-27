@@ -15,7 +15,7 @@ fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --lang) UI_LANG="${2:-}"; shift 2 ;;
+    --lang) [[ -n "${2:-}" ]] || { say "缺少 --lang 的值" "Missing value for --lang" >&2; exit 2; }; UI_LANG="$2"; shift 2 ;;
     *) shift ;;
   esac
 done

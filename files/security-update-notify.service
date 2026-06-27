@@ -25,4 +25,7 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=
+UMask=0077
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 ReadWritePaths=/var/lib/security-update-notify /var/log/security-update-notify.log

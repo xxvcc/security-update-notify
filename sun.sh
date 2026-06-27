@@ -128,7 +128,7 @@ done
 case "${UI_LANG:-}" in
   zh|en) export UI_LANG ;;
   "") ;;
-  *) UI_LANG="" ;;
+  *) say "无效语言: ${UI_LANG}（应为 zh 或 en），将忽略" "Invalid language: ${UI_LANG} (expected zh or en), ignoring" >&2; UI_LANG="" ;;
 esac
 
 [[ "$(id -u)" -eq 0 ]] || { say "请使用 sudo/root 运行" "Please run with sudo/root" >&2; exit 1; }
@@ -160,13 +160,16 @@ for c in curl tar sha256sum mktemp python3; do command -v "$c" >/dev/null 2>&1 |
 if [[ "$VERSION" == "latest" ]]; then
   [[ "$REPO" != "YOUR_GITHUB_USER/security-update-notify" ]] || { say "发布前请设置 SECURITY_UPDATE_NOTIFY_REPO 或编辑引导脚本 REPO。" "Set SECURITY_UPDATE_NOTIFY_REPO or edit bootstrap REPO before publishing." >&2; exit 2; }
   api="https://api.github.com/repos/${REPO}/releases/latest"
-  VERSION="$(curl -fsSL "$api" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"].lstrip("v"))')"
+  VERSION="$(curl -fsSL "$api" | python3 -c 'import json,sys; t=json.load(sys.stdin)["tag_name"]; print(t[1:] if t.startswith("v") else t)')"
 fi
 validate_version "$VERSION"
 
 PKG="security-update-notify-${VERSION}.tar.gz"
 PKG_DIR="security-update-notify-${VERSION}"
 if [[ -n "$BASE_URL" ]]; then
+  # 自定义下载源必须是 https（拒绝 http:// / file:// / ftp:// 等明文或本地协议）。
+  # A custom download source must be https (reject http:// / file:// / ftp:// and other plaintext/local schemes).
+  [[ "$BASE_URL" =~ ^https://[A-Za-z0-9.-]+ ]] || { say "--base-url 必须以 https:// 开头: $BASE_URL" "--base-url must start with https://: $BASE_URL" >&2; exit 2; }
   URL="${BASE_URL%/}/${PKG}"
   SHA_URL="${URL}.sha256"
 else
@@ -186,33 +189,35 @@ safe_extract_tar "$PKG" "$PKG_DIR"
 cd "$PKG_DIR"
 
 verify_signature_if_available() {
-  local sig_url sig_file actual_fpr gpg_home
+  local sig_url sig_file actual_fpr gpg_home eff="$VERIFY_SIGNATURE"
   case "$VERIFY_SIGNATURE" in auto|required|off) ;; *) say "无效签名校验模式: $VERIFY_SIGNATURE" "Invalid signature verification mode: $VERIFY_SIGNATURE" >&2; exit 2 ;; esac
-  [[ "$VERIFY_SIGNATURE" != "off" ]] || return 0
+  [[ "$eff" != "off" ]] || return 0
+  # auto：有 gpg 就按 required 严格校验（fail-closed，与已安装程序的 --upgrade 一致）；
+  # 只有在完全没有 gpg 时才退回仅 sha256（最佳努力，给出明确提示）。
+  # auto: with gpg present, verify strictly like 'required' (fail-closed, matching the installed
+  # program's --upgrade); only when gpg is entirely absent fall back to sha256-only (best-effort, noted).
+  if [[ "$eff" == "auto" ]]; then
+    if command -v gpg >/dev/null 2>&1; then
+      eff="required"
+    else
+      say "提示：未安装 gpg，跳过 GPG 签名校验，仅用 sha256（建议安装 gnupg 获得完整校验）。" "Note: gpg not installed; skipping GPG signature verification, sha256 only (install gnupg for full verification)." >&2
+      return 0
+    fi
+  fi
+  # 到这里一律按 required（fail-closed）处理。
+  # From here it is always 'required' (fail-closed).
+  command -v gpg >/dev/null 2>&1 || { say "签名校验需要 gpg" "gpg is required for signature verification" >&2; exit 1; }
   sig_url="${URL}.asc"
   sig_file="$TMP/$PKG.asc"
-  if curl -fsL --retry 2 -o "$sig_file" "$sig_url"; then
-    if command -v gpg >/dev/null 2>&1 && [[ -s files/release-signing.pub.asc ]]; then
-      gpg_home="$TMP/gnupg"
-      mkdir -p "$gpg_home"; chmod 700 "$gpg_home"
-      GNUPGHOME="$gpg_home" gpg --batch --import files/release-signing.pub.asc >/dev/null 2>&1 || true
-      actual_fpr="$(GNUPGHOME="$gpg_home" gpg --batch --with-colons --list-keys 2>/dev/null | awk -F: '$1=="fpr" {print $10; exit}')"
-      if [[ -n "$RELEASE_SIGNING_FINGERPRINT" && "$actual_fpr" != "$RELEASE_SIGNING_FINGERPRINT" ]]; then
-        [[ "$VERIFY_SIGNATURE" != "required" ]] || { say "签名公钥指纹不匹配" "Signing key fingerprint mismatch" >&2; exit 1; }
-        say "警告：签名公钥指纹不匹配，继续使用 sha256。" "WARNING: signing key fingerprint mismatch; continuing with sha256." >&2
-        return 0
-      fi
-      if GNUPGHOME="$gpg_home" gpg --batch --verify "$sig_file" "$TMP/$PKG"; then
-        say "签名校验通过" "Signature verified"
-        return 0
-      fi
-    fi
-    [[ "$VERIFY_SIGNATURE" != "required" ]] || { say "签名存在但校验失败" "Signature exists but verification failed" >&2; exit 1; }
-    say "警告：签名存在但无法校验，继续使用 sha256。" "WARNING: signature exists but could not be verified; continuing with sha256." >&2
-    return 0
-  fi
-  [[ "$VERIFY_SIGNATURE" != "required" ]] || { say "缺少 release 签名" "Release signature is missing" >&2; exit 1; }
-  say "提示：未找到 release 签名，已完成 sha256 校验。" "Note: no release signature found; sha256 verification completed."
+  curl -fsL --retry 2 -o "$sig_file" "$sig_url" || { say "缺少 release 签名；拒绝继续" "Release signature is missing; refusing to continue" >&2; exit 1; }
+  [[ -s files/release-signing.pub.asc ]] || { say "发布包缺少签名公钥；拒绝继续" "Release is missing the signing public key; refusing to continue" >&2; exit 1; }
+  gpg_home="$TMP/gnupg"
+  mkdir -p "$gpg_home"; chmod 700 "$gpg_home"
+  GNUPGHOME="$gpg_home" gpg --batch --import files/release-signing.pub.asc >/dev/null 2>&1 || { say "导入签名公钥失败" "Failed to import signing public key" >&2; exit 1; }
+  actual_fpr="$(GNUPGHOME="$gpg_home" gpg --batch --with-colons --list-keys 2>/dev/null | awk -F: '$1=="fpr" {print $10; exit}')"
+  [[ -n "$RELEASE_SIGNING_FINGERPRINT" && "$actual_fpr" == "$RELEASE_SIGNING_FINGERPRINT" ]] || { say "签名公钥指纹不匹配（期望 $RELEASE_SIGNING_FINGERPRINT，实际 ${actual_fpr:-none}）；拒绝继续" "Signing key fingerprint mismatch (expected $RELEASE_SIGNING_FINGERPRINT, got ${actual_fpr:-none}); refusing to continue" >&2; exit 1; }
+  GNUPGHOME="$gpg_home" gpg --batch --verify "$sig_file" "$TMP/$PKG" >/dev/null 2>&1 || { say "签名校验失败；拒绝继续" "Signature verification failed; refusing to continue" >&2; exit 1; }
+  say "签名校验通过 (${RELEASE_SIGNING_FINGERPRINT})" "Signature verified (${RELEASE_SIGNING_FINGERPRINT})"
 }
 
 verify_signature_if_available
@@ -225,10 +230,6 @@ verify_signature_if_available
 # hang after checksum verification. Redirect stdin only on the final exec.
 run_target() {
   local script="$1"; shift
-  if [[ "$script" == env ]]; then
-    env "$@"
-    exit $?
-  fi
   if { : < /dev/tty; } 2>/dev/null; then
     "$script" "$@" < /dev/tty
     exit $?
@@ -244,7 +245,7 @@ run_target() {
 
 case "$RUN_MODE" in
   menu) run_target ./menu.sh "${INSTALL_ARGS[@]}" ;;
-  upgrade) SECURITY_UPDATE_NOTIFY_UPGRADE=1 run_target env SECURITY_UPDATE_NOTIFY_UPGRADE=1 ./install.sh "${INSTALL_ARGS[@]}" ;;
+  upgrade) export SECURITY_UPDATE_NOTIFY_UPGRADE=1; run_target ./install.sh "${INSTALL_ARGS[@]}" ;;
   install) run_target ./install.sh "${INSTALL_ARGS[@]}" ;;
   test) exec ./test.sh "${INSTALL_ARGS[@]}" ;;
   uninstall) run_target ./uninstall.sh "${INSTALL_ARGS[@]}" ;;

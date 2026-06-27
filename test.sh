@@ -37,7 +37,7 @@ while [[ $# -gt 0 ]]; do
     --simulate-reboot) SIMULATE_REBOOT=1; shift ;;
     --no-dedupe) NO_DEDUPE=1; shift ;;
     --verbose) VERBOSE=1; shift ;;
-    --lang) UI_LANG="${2:-}"; shift 2 ;;
+    --lang) [[ -n "${2:-}" ]] || { say "缺少 --lang 的值" "Missing value for --lang" >&2; exit 2; }; UI_LANG="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) printf '%s\n' "未知参数 / Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac

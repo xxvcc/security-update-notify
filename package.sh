@@ -82,15 +82,23 @@ fi
 tar -C "$WORK" --sort=name --mtime="@$SOURCE_EPOCH" --owner=0 --group=0 --numeric-owner -cf - "$PKG" | gzip -n >"$TAR"
 (cd "$DIST" && sha256sum "$PKG.tar.gz" >"$PKG.tar.gz.sha256")
 
-# 为某个发布 tag 构建时强制要求签名：若 tag vVERSION 存在且指向当前 HEAD，
-# 把默认 auto 提升为 required，避免不小心发出未签名的正式发布包。
-# Require a signature when building a release tag: if tag vVERSION exists and points at HEAD,
-# promote the default 'auto' to 'required' so an unsigned official release cannot be produced by accident.
-if [[ "$SIGN_RELEASE" == "auto" ]] \
-   && git rev-parse -q --verify "v$VERSION^{commit}" >/dev/null 2>&1 \
-   && [[ "$(git rev-parse -q --verify "v$VERSION^{commit}")" == "$(git rev-parse -q --verify "HEAD^{commit}")" ]]; then
-  SIGN_RELEASE=required
-  echo "检测到发布 tag v$VERSION 指向当前提交，强制要求签名。/ Release tag v$VERSION points at HEAD; a signature is now required."
+# 强制要求签名的两种显式/可靠信号：RELEASE=1（与 git 无关，供 CI/发布脚本使用），或本仓库存在
+# 名为 vVERSION 的 tag（无论是否指向 HEAD——既然这个版本已打 tag，就视为正式发布）。
+# 避免“tag 不在 HEAD / git 不可用”时静默退回 auto 而产出未签名的正式包。需本地无签名测试构建时
+# 可显式 SIGN_RELEASE=no 覆盖。
+# Two explicit/reliable signals that force signing: RELEASE=1 (git-independent, for CI/release scripts),
+# or a tag named vVERSION exists in this repo (regardless of whether it points at HEAD — if the version
+# is tagged, treat it as a release). This avoids silently falling back to auto (and an unsigned official
+# tarball) when the tag is not at HEAD or git is unavailable. Override with SIGN_RELEASE=no for an
+# unsigned local test build.
+if [[ "$SIGN_RELEASE" == "auto" ]]; then
+  if [[ "${RELEASE:-0}" == "1" ]]; then
+    SIGN_RELEASE=required
+    echo "RELEASE=1：强制要求签名。/ RELEASE=1: a signature is required."
+  elif git rev-parse -q --verify "v$VERSION^{commit}" >/dev/null 2>&1; then
+    SIGN_RELEASE=required
+    echo "检测到发布 tag v$VERSION，强制要求签名。/ Release tag v$VERSION exists; a signature is required."
+  fi
 fi
 
 case "$SIGN_RELEASE" in

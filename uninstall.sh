@@ -11,7 +11,7 @@ usage(){ say "用法: sudo ./uninstall.sh [--purge-config] [--lang zh|en]" "Usag
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --purge-config) PURGE_CONFIG=1; shift ;;
-    --lang) UI_LANG="${2:-}"; shift 2 ;;
+    --lang) [[ -n "${2:-}" ]] || { say "缺少 --lang 的值" "Missing value for --lang" >&2; exit 2; }; UI_LANG="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) printf '%s\n' "未知参数 / Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac

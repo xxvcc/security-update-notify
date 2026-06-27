@@ -2,13 +2,18 @@
 # 故意不加 -e：后端检测命令（needrestart、needs-restarting）的非零退出码不应中断通知流程。
 # Intentionally omit -e: non-zero exits from backend detection commands must not abort the notification flow.
 set -uo pipefail
+# 固定 locale，让 needrestart/needs-restarting 文案匹配、sort -V、awk/sed 字段解析在任何
+# 系统语言下都确定（仅影响解析；消息正文是原始 UTF-8 字节，不受影响）。
+# Pin the locale so message matching, sort -V and awk/sed field parsing are deterministic under
+# any system language (parsing only; message bodies are raw UTF-8 bytes and are unaffected).
+export LC_ALL=C
 
 ENV_FILE="${SECURITY_UPDATE_NOTIFY_ENV:-/etc/security-update-notify/telegram.env}"
 STATE_DIR="/var/lib/security-update-notify"
 STATE_FILE="$STATE_DIR/last-alert.sha256"
 STATE_TIME_FILE="$STATE_DIR/last-alert.sent_at"
 LOCK_FILE="/run/security-update-notify.lock"
-VERSION="1.7.0"
+VERSION="1.8.0"
 REPO="${SECURITY_UPDATE_NOTIFY_REPO:-xxvcc/security-update-notify}"
 RELEASE_SIGNING_FINGERPRINT="${SECURITY_UPDATE_NOTIFY_SIGNING_FINGERPRINT:-C678256ACBFC6491BF5076655F3AE24999921FFC}"
 UPGRADE_ALLOW_UNSIGNED="${SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED:-0}"
@@ -65,10 +70,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-version_sort_key() {
-  sed 's/^v//' | awk -F. '{ printf "%08d.%08d.%08d\n", $1+0, $2+0, $3+0 }'
-}
-
 latest_release_version() {
   python3 - "$REPO" <<'PY'
 import json
@@ -79,17 +80,23 @@ repo = sys.argv[1]
 try:
     with urllib.request.urlopen(f"https://api.github.com/repos/{repo}/releases/latest", timeout=20) as response:
         data = json.load(response)
-    print(str(data.get("tag_name", "")).lstrip("v"))
+    tag = str(data.get("tag_name", ""))
+    print(tag[1:] if tag.startswith("v") else tag)
 except Exception as exc:
     print(exc, file=sys.stderr)
     sys.exit(1)
 PY
 }
 
+# 判断 $2(latest) 是否严格高于 $1(current)。用 sort -V 处理多段与预发布后缀，
+# 避免旧版 awk %08d 截断把 1.7.0.1 当作等于 1.7.0、或把 4 段版本误判为降级。
+# Whether $2 (latest) is strictly newer than $1 (current). sort -V handles multi-segment and
+# pre-release suffixes, avoiding the old awk %08d truncation that treated 1.7.0.1 as 1.7.0.
 is_newer_version() {
   local current="$1" latest="$2"
   [[ -n "$current" && -n "$latest" ]] || return 1
-  [[ "$(printf '%s\n%s\n' "$current" "$latest" | version_sort_key | sort -V | tail -1)" != "$(printf '%s\n' "$current" | version_sort_key)" ]]
+  [[ "$current" != "$latest" ]] || return 1
+  [[ "$(printf '%s\n%s\n' "$current" "$latest" | sed 's/^v//' | sort -V | tail -1)" == "$(printf '%s\n' "$latest" | sed 's/^v//')" ]]
 }
 
 run_check_upgrade() {
@@ -112,6 +119,14 @@ run_check_upgrade() {
   say "本地版本高于 latest release" "Local version is newer than latest release"
   return 0
 }
+
+# --check-upgrade / --upgrade 在加载完整配置前就退出；若未显式 --lang，则从 env 文件预读
+# NOTIFY_LANG，让这些子命令的显示语言也跟随已安装配置。
+# --check-upgrade / --upgrade exit before the full config load; if no explicit --lang, pre-read
+# NOTIFY_LANG from the env file so these subcommands' display language follows the installed config.
+if [[ -z "${UI_LANG:-}" && -z "${NOTIFY_LANG:-}" && -r "$ENV_FILE" ]]; then
+  NOTIFY_LANG="$(sed -n "s/^[[:space:]]*NOTIFY_LANG[[:space:]]*=[[:space:]]*[\"']\{0,1\}\(zh\|en\)[\"']\{0,1\}.*/\1/p" "$ENV_FILE" 2>/dev/null | head -1 || true)"
+fi
 
 if [[ "$CHECK_UPGRADE" -eq 1 ]]; then
   run_check_upgrade
@@ -141,17 +156,17 @@ run_self_upgrade() {
   # No longer pipe a remote script into root bash. Instead download the GitHub release directly,
   # verify sha256, and require a GPG signature against the fingerprint pinned in this program
   # (fail-closed by default); only then run install.sh from the verified package.
+  local disp; disp="${UI_LANG:-${NOTIFY_LANG:-zh}}"
   if [[ "$(id -u)" -ne 0 ]]; then
     command -v sudo >/dev/null 2>&1 || { say "升级需要 root 权限" "Root privileges are required to upgrade" >&2; exit 1; }
-    exec sudo "$0" --upgrade
+    exec sudo "$0" --upgrade --lang "$disp"
   fi
   local c
   for c in tar sha256sum mktemp python3; do
     command -v "$c" >/dev/null 2>&1 || { say "升级需要命令: $c" "Upgrade requires command: $c" >&2; exit 1; }
   done
 
-  local latest tmp pkg pkgdir url sha_url sig_url expected fpr gpg_home rc disp
-  disp="${UI_LANG:-${NOTIFY_LANG:-zh}}"
+  local latest tmp pkg pkgdir url sha_url sig_url expected fpr gpg_home rc
   if ! latest="$(latest_release_version)"; then
     say "无法获取最新版本" "Failed to fetch latest version" >&2
     exit 1
@@ -307,7 +322,7 @@ sys.exit(0 if ok else 1)
 telegram_send_message() {
   local text="$1"
   printf '%s\0%s\0%s' "${TELEGRAM_BOT_TOKEN:-}" "${TELEGRAM_CHAT_ID:-}" "$text" | python3 -c '
-import json, re, sys, time, urllib.parse, urllib.request
+import json, re, sys, time, urllib.parse, urllib.request, urllib.error
 
 payload = sys.stdin.buffer.read().split(b"\0", 2)
 token = payload[0].decode("utf-8", "replace") if len(payload) > 0 else ""
@@ -319,6 +334,10 @@ if not token or not chat_id:
 if not re.match(r"^\d+:[A-Za-z0-9_-]+$", token):
     print("TELEGRAM_BOT_TOKEN 格式无效 / invalid TELEGRAM_BOT_TOKEN format", file=sys.stderr)
     sys.exit(2)
+# Telegram sendMessage 上限约 4096 字符；超长则截断，避免必然失败。
+# Telegram sendMessage caps around 4096 chars; truncate over-long bodies to avoid a guaranteed failure.
+if len(text) > 4096:
+    text = text[:4000] + "\n…(truncated)"
 
 url = f"https://api.telegram.org/bot{token}/sendMessage"
 data = urllib.parse.urlencode({
@@ -338,7 +357,15 @@ for attempt in range(3):
             ok = False
         if ok:
             sys.exit(0)
+        # API returned ok=false (bad chat id / bot blocked / etc.) — not transient, do not retry.
         last_error = body
+        break
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")
+        last_error = "HTTP " + str(exc.code) + ": " + body[:300]
+        # Only 429 (rate limit) and 5xx are worth retrying; other 4xx are permanent.
+        if exc.code not in (429, 500, 502, 503, 504):
+            break
     except Exception as exc:
         last_error = str(exc)
     if attempt < 2:
@@ -397,18 +424,20 @@ if [[ "$INCLUDE_PUBLIC_IP" -eq 1 ]]; then
   PUBLIC_IP_LINE_EN="\nPublic IP: $PUBLIC_IP_VALUE"
 fi
 OS_RELEASE_ID=""
+OS_RELEASE_ID_LIKE=""
 OS_RELEASE_PRETTY_NAME="unknown"
 if [[ -r /etc/os-release ]]; then
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
     case "$line" in
-      ID=*|PRETTY_NAME=*)
+      ID=*|ID_LIKE=*|PRETTY_NAME=*)
         key="${line%%=*}"
         value="${line#*=}"
         if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
         if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
         case "$key" in
           ID) OS_RELEASE_ID="$value" ;;
+          ID_LIKE) OS_RELEASE_ID_LIKE="$value" ;;
           PRETTY_NAME) OS_RELEASE_PRETTY_NAME="$value" ;;
         esac
         ;;
@@ -423,15 +452,18 @@ NOTIFY_LANG="${NOTIFY_LANG:-zh}"
 case "$NOTIFY_LANG" in zh|en) ;; *) NOTIFY_LANG="zh" ;; esac
 
 if [[ "$BACKEND" == "auto" ]]; then
-  if [[ -n "$OS_RELEASE_ID" ]]; then
-    case "$OS_RELEASE_ID" in
-      debian|ubuntu) BACKEND="apt" ;;
-      rhel|rocky|almalinux|fedora|centos) BACKEND="dnf" ;;
-      amzn) BACKEND="dnf" ;;
-      *) BACKEND="unknown" ;;
+  case "${OS_RELEASE_ID:-}" in
+    debian|ubuntu) BACKEND="apt" ;;
+    rhel|rocky|almalinux|fedora|centos|amzn) BACKEND="dnf" ;;
+    *) BACKEND="unknown" ;;
+  esac
+  # 衍生发行版（Oracle Linux、CloudLinux 等）精确 ID 未命中时，用 ID_LIKE 兜底。
+  # Fall back to ID_LIKE for derivatives (Oracle Linux, CloudLinux, ...) when the exact ID does not match.
+  if [[ "$BACKEND" == "unknown" && -n "$OS_RELEASE_ID_LIKE" ]]; then
+    case " $OS_RELEASE_ID_LIKE " in
+      *" debian "*|*" ubuntu "*) BACKEND="apt" ;;
+      *" rhel "*|*" fedora "*|*" centos "*) BACKEND="dnf" ;;
     esac
-  else
-    BACKEND="unknown"
   fi
 fi
 
@@ -501,6 +533,7 @@ reboot_required=0
 reboot_pkgs=""
 restart_attention=0
 restart_summary=""
+restart_signal=""
 update_summary=""
 
 check_apt() {
@@ -516,14 +549,27 @@ check_apt() {
     reboot_pkgs="$(cat /var/run/reboot-required.pkgs 2>/dev/null | sed '/^$/d' | sort -u)"
   fi
   if command -v needrestart >/dev/null 2>&1; then
-    restart_summary="$(needrestart -b 2>&1 || true)"
+    # 只取 stdout（批处理字段）；stderr 的瞬时告警不进摘要/哈希，避免污染去重。
+    # Take stdout only (batch fields); stderr's transient warnings stay out of the summary/hash.
+    restart_summary="$(needrestart -b 2>/dev/null || true)"
     local kcur kexp ksta
     kcur="$(printf '%s\n' "$restart_summary" | awk -F': ' '/^NEEDRESTART-KCUR:/{print $2; exit}')"
     kexp="$(printf '%s\n' "$restart_summary" | awk -F': ' '/^NEEDRESTART-KEXP:/{print $2; exit}')"
     ksta="$(printf '%s\n' "$restart_summary" | awk -F': ' '/^NEEDRESTART-KSTA:/{print $2; exit}')"
+    # 关注信号只取：内核确实更换（KCUR!=KEXP）、KSTA 为 2/3（ABI/版本升级待重启），以及
+    # 需要重启的 systemd 服务（SVC）。不再因 KSTA=0（未知）或 SESS/AUX（用户会话，含管理员
+    # 自己的 SSH 登录）误报——这些只在摘要里作信息展示。与 dnf 端 needs-restarting -s 的策略一致。
+    # Attention only from: a real kernel change (KCUR!=KEXP), KSTA 2/3 (ABI/version upgrade pending),
+    # and systemd services needing restart (SVC). No longer triggered by KSTA=0 (unknown) or SESS/AUX
+    # (user sessions incl. the admin's own SSH login) — those are shown in the summary only. Parity
+    # with the dnf needs-restarting -s policy.
     [[ -n "$kcur" && -n "$kexp" && "$kcur" != "$kexp" ]] && restart_attention=1
-    [[ -n "$ksta" && "$ksta" != "1" ]] && restart_attention=1
-    printf '%s\n' "$restart_summary" | grep -Eq '^NEEDRESTART-(SVC|AUX|SESS|UCSTA|UCCUR|UCEXP):' && restart_attention=1
+    [[ "$ksta" == "2" || "$ksta" == "3" ]] && restart_attention=1
+    printf '%s\n' "$restart_summary" | grep -Eq '^NEEDRESTART-SVC:' && restart_attention=1
+    # 去重哈希用的稳定信号：只含决策相关、跨周期稳定的字段（内核 + 服务），不含瞬时输出。
+    # Stable signal for the dedup hash: only decision-relevant, cross-run-stable fields (kernel + services).
+    restart_signal="$(printf 'KCUR=%s\nKEXP=%s\nKSTA=%s\n%s\n' "$kcur" "$kexp" "$ksta" \
+      "$(printf '%s\n' "$restart_summary" | awk -F': ' '/^NEEDRESTART-SVC:/{print $2}' | sed '/^$/d' | sort -u)")"
   else
     restart_summary="needrestart 命令不存在 / needrestart command not found"
   fi
@@ -538,9 +584,16 @@ check_dnf() {
     return
   fi
   if command -v needs-restarting >/dev/null 2>&1; then
-    local nr_r rc nr_svc
+    local nr_r rc nr_svc nr_has_s
     rc=0
     nr_r="$(needs-restarting -r 2>&1)" || rc=$?
+    # 探测本机 needs-restarting 是否支持 -s（仅列服务）。老版 dnf-utils 不支持时，退回“仅按
+    # 整机重启判断”（保守、不误报），并在摘要里给出可见提示，而不是静默丢失服务检测。
+    # Probe whether this needs-restarting supports -s (services only). On older dnf-utils that lack it,
+    # degrade to reboot-only (conservative, no false alerts) with a visible note in the summary,
+    # rather than silently losing service-restart detection.
+    nr_has_s=0
+    needs-restarting --help 2>&1 | grep -q -- '-s' && nr_has_s=1
     # 优先按 needs-restarting -r 的输出文案判断是否需要整机重启，避免把命令本身的报错
     # （权限不足、异常退出等任何非零码）误判为“需要重启”。退出码 1 是其表示“需要重启”的
     # 约定值，仅作为文案无法匹配时的回退；其它非零码视为命令出错，不作为重启信号。
@@ -560,18 +613,31 @@ check_dnf() {
     # Use only systemd services that need restarting (needs-restarting -s) as the attention signal.
     # Bare needs-restarting lists every process still using an outdated library and is almost always
     # non-empty on long-running systems, which would otherwise raise a false alert every cycle.
-    nr_svc="$(needs-restarting -s 2>/dev/null | sed '/^$/d' | sort -u || true)"
+    if [[ "$nr_has_s" -eq 1 ]]; then
+      nr_svc="$(needs-restarting -s 2>/dev/null | sed '/^$/d' | sort -u || true)"
+    else
+      nr_svc=""
+    fi
     if printf '%s\n' "$nr_svc" | sed '/^$/d' | grep -q .; then
       restart_attention=1
     fi
-    restart_summary="needs-restarting -r:\n${nr_r}\n\nneeds-restarting -s:\n${nr_svc}"
+    if [[ "$nr_has_s" -eq 1 ]]; then
+      restart_summary="needs-restarting -r:\n${nr_r}\n\nneeds-restarting -s:\n${nr_svc}"
+    else
+      restart_summary="needs-restarting -r:\n${nr_r}\n\n此版本 needs-restarting 不支持 -s，仅按整机重启判断。/ This needs-restarting lacks -s; reboot-only detection."
+    fi
+    # 稳定去重信号：服务列表（reboot_required 已单独进哈希）。
+    # Stable dedup signal: the service list (reboot_required is hashed separately).
+    restart_signal="$nr_svc"
   else
     restart_summary="needs-restarting 命令不存在；请安装 dnf-utils/yum-utils / needs-restarting command not found; install dnf-utils/yum-utils"
   fi
   if command -v dnf >/dev/null 2>&1; then
     update_summary="$(dnf -q updateinfo list security updates 2>/dev/null | sed -n '1,40p' || true)"
   fi
-  reboot_pkgs="$(printf '%s\n' "$update_summary" | awk '{print $NF}' | sed '/^$/d' | sort -u | sed -n '1,40p')"
+  # 只取像“包名.架构”的行作为相关包，过滤表头/汇总等杂质（$NF 直接取会混入噪声）。
+  # Keep only rows whose last field looks like name.arch (filter header/summary noise that $NF would leak).
+  reboot_pkgs="$(printf '%s\n' "$update_summary" | awk '$NF ~ /\.(x86_64|noarch|aarch64|i686|ppc64le|s390x)$/ {print $NF}' | sed '/^$/d' | sort -u | sed -n '1,40p')"
 }
 
 format_restart_summary() {
@@ -676,7 +742,11 @@ fi
 msg="${msg//\\n/$'\n'}"
 
 
-alert_hash="$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$HOST" "$PUBLIC_IP_VALUE" "$BACKEND" "$NOTIFY_LANG" "$reboot_required" "$reboot_pkgs" "$restart_attention" "$restart_summary" | sha256sum | awk '{print $1}')"
+# 去重哈希只基于决策相关、跨周期稳定的字段：排除 PUBLIC_IP（动态出口 IP 会变）与含瞬时输出
+# 的原始摘要，改用 restart_signal（规范化的内核/服务信号），避免同一状态被反复发送。
+# Dedup hash uses only decision-relevant, cross-run-stable fields: excludes PUBLIC_IP (dynamic egress
+# IP) and the raw summary (transient output), using restart_signal (normalized kernel/service signal).
+alert_hash="$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$HOST" "$BACKEND" "$NOTIFY_LANG" "$reboot_required" "$reboot_pkgs" "$restart_attention" "$restart_signal" | sha256sum | awk '{print $1}')"
 last_hash="$(cat "$STATE_FILE" 2>/dev/null || true)"
 last_sent="$(cat "$STATE_TIME_FILE" 2>/dev/null || echo 0)"
 now_epoch="$(date +%s)"
