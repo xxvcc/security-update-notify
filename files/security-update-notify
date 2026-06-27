@@ -13,7 +13,7 @@ STATE_DIR="/var/lib/security-update-notify"
 STATE_FILE="$STATE_DIR/last-alert.sha256"
 STATE_TIME_FILE="$STATE_DIR/last-alert.sent_at"
 LOCK_FILE="/run/security-update-notify.lock"
-VERSION="1.8.0"
+VERSION="1.8.1"
 REPO="${SECURITY_UPDATE_NOTIFY_REPO:-xxvcc/security-update-notify}"
 RELEASE_SIGNING_FINGERPRINT="${SECURITY_UPDATE_NOTIFY_SIGNING_FINGERPRINT:-C678256ACBFC6491BF5076655F3AE24999921FFC}"
 UPGRADE_ALLOW_UNSIGNED="${SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED:-0}"
@@ -754,13 +754,13 @@ alert_hash="$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$HOST" "$BACKEND" "$NOTIFY_
 last_hash="$(cat "$STATE_FILE" 2>/dev/null || true)"
 last_sent="$(cat "$STATE_TIME_FILE" 2>/dev/null || echo 0)"
 now_epoch="$(date +%s)"
-dedup_mode="${DEDUP_MODE:-interval}"
+dedup_mode="${DEDUP_MODE:-daily}"
 dedup_days="${DEDUP_INTERVAL_DAYS:-3}"
 [[ "$dedup_days" =~ ^[0-9]+$ && "$dedup_days" -ge 1 ]] || dedup_days=3
 should_send=1
 if [[ "$NO_DEDUPE" -ne 1 && "$alert_hash" == "$last_hash" ]]; then
   case "$dedup_mode" in
-    always) should_send=0 ;;
+    once|always) should_send=0 ;;  # always 为旧名，兼容保留 / always kept as a legacy alias for once
     daily)
       last_day="$(date -d "@$last_sent" +%F 2>/dev/null || echo '')"
       today="$(date +%F)"
