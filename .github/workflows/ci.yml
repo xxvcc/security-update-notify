@@ -84,6 +84,7 @@ jobs:
       - name: Notification language regression check
         run: |
           set -euo pipefail
+          export CHECK_UPDATE_HEALTH=0 CHECK_EOL=0 STALE_UPDATE_DAYS=0  # 隔离看门狗 / isolate watchdog from this test
           tmp="$(mktemp -d)"
           trap 'rm -rf "$tmp"' EXIT
           cp files/security-update-notify "$tmp/security-update-notify"
@@ -156,6 +157,7 @@ jobs:
       - name: dnf reboot/restart detection regression check
         run: |
           set -euo pipefail
+          export CHECK_UPDATE_HEALTH=0 CHECK_EOL=0 STALE_UPDATE_DAYS=0  # 隔离看门狗 / isolate watchdog from this test
           tmp="$(mktemp -d)"
           trap 'rm -rf "$tmp"' EXIT
           cp files/security-update-notify "$tmp/security-update-notify"

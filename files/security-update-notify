@@ -13,7 +13,7 @@ STATE_DIR="/var/lib/security-update-notify"
 STATE_FILE="$STATE_DIR/last-alert.sha256"
 STATE_TIME_FILE="$STATE_DIR/last-alert.sent_at"
 LOCK_FILE="/run/security-update-notify.lock"
-VERSION="1.8.1"
+VERSION="1.9.0"
 REPO="${SECURITY_UPDATE_NOTIFY_REPO:-xxvcc/security-update-notify}"
 RELEASE_SIGNING_FINGERPRINT="${SECURITY_UPDATE_NOTIFY_SIGNING_FINGERPRINT:-C678256ACBFC6491BF5076655F3AE24999921FFC}"
 UPGRADE_ALLOW_UNSIGNED="${SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED:-0}"
@@ -282,7 +282,7 @@ load_config_file() {
     if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
     if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
     case "$key" in
-      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|NOTIFY_UPGRADE|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION)
+      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|NOTIFY_UPGRADE|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION|CHECK_UPDATE_HEALTH|STALE_UPDATE_DAYS|CHECK_EOL)
         printf -v "$key" '%s' "$value"
         ;;
       *) say "配置键不支持: $file: $key" "Unsupported config key in $file: $key" >&2; return 2 ;;
@@ -425,12 +425,13 @@ if [[ "$INCLUDE_PUBLIC_IP" -eq 1 ]]; then
 fi
 OS_RELEASE_ID=""
 OS_RELEASE_ID_LIKE=""
+OS_RELEASE_VERSION_ID=""
 OS_RELEASE_PRETTY_NAME="unknown"
 if [[ -r /etc/os-release ]]; then
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
     case "$line" in
-      ID=*|ID_LIKE=*|PRETTY_NAME=*)
+      ID=*|ID_LIKE=*|VERSION_ID=*|PRETTY_NAME=*)
         key="${line%%=*}"
         value="${line#*=}"
         if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
@@ -438,6 +439,7 @@ if [[ -r /etc/os-release ]]; then
         case "$key" in
           ID) OS_RELEASE_ID="$value" ;;
           ID_LIKE) OS_RELEASE_ID_LIKE="$value" ;;
+          VERSION_ID) OS_RELEASE_VERSION_ID="$value" ;;
           PRETTY_NAME) OS_RELEASE_PRETTY_NAME="$value" ;;
         esac
         ;;
@@ -450,6 +452,11 @@ NOW="$(date '+%Y-%m-%d %H:%M:%S %Z')"
 BACKEND="${BACKEND:-auto}"
 NOTIFY_LANG="${NOTIFY_LANG:-zh}"
 case "$NOTIFY_LANG" in zh|en) ;; *) NOTIFY_LANG="zh" ;; esac
+# 安全更新看门狗相关配置（默认全开；可在 telegram.env 关闭/调整）。
+# Security-update watchdog config (on by default; tunable/disable-able in telegram.env).
+CHECK_UPDATE_HEALTH="${CHECK_UPDATE_HEALTH:-1}"   # 1=检测自动更新是否在正常运行 / detect whether auto-updates are healthy
+STALE_UPDATE_DAYS="${STALE_UPDATE_DAYS:-7}"        # 超过该天数没有成功的自动更新即告警；0=关 / stale threshold in days; 0=off
+CHECK_EOL="${CHECK_EOL:-1}"                        # 1=发行版安全支持终止（EOL）告警 / warn on distro end-of-life
 
 if [[ "$BACKEND" == "auto" ]]; then
   case "${OS_RELEASE_ID:-}" in
@@ -466,6 +473,129 @@ if [[ "$BACKEND" == "auto" ]]; then
     esac
   fi
 fi
+
+# ====== 安全更新看门狗：自动更新健康 / 待安装安全更新 / 发行版 EOL ======
+# ====== Security-update watchdog: auto-update health / pending security updates / distro EOL ======
+HEALTH_ATTENTION=0; HEALTH_SIG=""; HEALTH_TXT_ZH=""; HEALTH_TXT_EN=""
+PENDING_SEC_COUNT=0; PENDING_SEC_CRIT=0; PENDING_TXT_ZH=""; PENDING_TXT_EN=""
+EOL_ATTENTION=0; EOL_SIG=""; EOL_TXT_ZH=""; EOL_TXT_EN=""
+
+# 检测自动安全更新机制是否健康：定时器是否启用、上次是否成功、距上次成功是否过久、磁盘是否将满。
+# Detect whether the automatic security-update mechanism is healthy: timer enabled, last run succeeded,
+# not stale, and disk not nearly full.
+check_update_health() {
+  [[ "${CHECK_UPDATE_HEALTH:-1}" == "1" ]] || return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+  local timer svc now last_ts last_epoch res stale_days days mp avail
+  local reasons=()
+  case "$BACKEND" in
+    apt) timer="apt-daily-upgrade.timer"; svc="apt-daily-upgrade.service" ;;
+    dnf) timer="dnf-automatic.timer"; svc="dnf-automatic.service" ;;
+    *) return 0 ;;
+  esac
+  now="$(date +%s)"
+  if ! systemctl is-enabled "$timer" >/dev/null 2>&1; then
+    HEALTH_ATTENTION=1; reasons+=("disabled")
+    HEALTH_TXT_ZH+="• 自动安全更新定时器未启用（$timer）"$'\n'
+    HEALTH_TXT_EN+="• Automatic security-update timer is not enabled ($timer)"$'\n'
+  fi
+  res="$(systemctl show "$svc" -p Result --value 2>/dev/null || true)"
+  if [[ -n "$res" && "$res" != "success" ]]; then
+    HEALTH_ATTENTION=1; reasons+=("failed")
+    HEALTH_TXT_ZH+="• 上次自动更新运行失败（$svc：$res）"$'\n'
+    HEALTH_TXT_EN+="• The last automatic-update run failed ($svc: $res)"$'\n'
+  fi
+  stale_days="${STALE_UPDATE_DAYS:-7}"; [[ "$stale_days" =~ ^[0-9]+$ ]] || stale_days=7
+  if [[ "$stale_days" -gt 0 ]]; then
+    last_ts="$(systemctl show "$svc" -p ExecMainExitTimestamp --value 2>/dev/null || true)"
+    if [[ -n "$last_ts" ]]; then
+      last_epoch="$(date -d "$last_ts" +%s 2>/dev/null || echo 0)"
+      if [[ "$last_epoch" =~ ^[0-9]+$ && "$last_epoch" -gt 0 ]] && (( now - last_epoch > stale_days * 86400 )); then
+        days=$(( (now - last_epoch) / 86400 ))
+        HEALTH_ATTENTION=1; reasons+=("stale")
+        HEALTH_TXT_ZH+="• 已 $days 天没有成功的自动安全更新（阈值 $stale_days 天）"$'\n'
+        HEALTH_TXT_EN+="• No successful automatic security update for $days days (threshold $stale_days)"$'\n'
+      fi
+    fi
+  fi
+  for mp in / /boot; do
+    [[ -d "$mp" ]] || continue
+    avail="$(df -P "$mp" 2>/dev/null | awk 'NR==2{print $4}')"
+    [[ "$avail" =~ ^[0-9]+$ ]] || continue
+    if (( avail < 204800 )); then
+      HEALTH_ATTENTION=1; reasons+=("disk")
+      HEALTH_TXT_ZH+="• $mp 剩余空间不足（$(( avail/1024 )) MB），可能导致更新失败"$'\n'
+      HEALTH_TXT_EN+="• Low free space on $mp ($(( avail/1024 )) MB); updates may fail"$'\n'
+    fi
+  done
+  HEALTH_TXT_ZH="${HEALTH_TXT_ZH%$'\n'}"; HEALTH_TXT_EN="${HEALTH_TXT_EN%$'\n'}"
+  [[ ${#reasons[@]} -gt 0 ]] && HEALTH_SIG="$(printf '%s\n' "${reasons[@]}" | sort -u | tr '\n' ',')"
+}
+
+# 统计仍待安装的安全更新数量（dnf 还区分高危/重要）。仅作信息展示，不单独触发告警。
+# Count pending (not-yet-installed) security updates (dnf also counts critical/important). Informational only.
+collect_security_updates() {
+  local out
+  case "$BACKEND" in
+    dnf)
+      command -v dnf >/dev/null 2>&1 || return 0
+      out="$(dnf -q updateinfo list security 2>/dev/null || true)"
+      PENDING_SEC_COUNT="$(printf '%s\n' "$out" | awk '$NF ~ /\.(x86_64|noarch|aarch64|i686|ppc64le|s390x)$/' | wc -l | tr -d ' ')"
+      PENDING_SEC_CRIT="$(printf '%s\n' "$out" | awk 'tolower($0) ~ /critical/ && $NF ~ /\.(x86_64|noarch|aarch64|i686|ppc64le|s390x)$/' | wc -l | tr -d ' ')"
+      ;;
+    apt)
+      command -v apt-get >/dev/null 2>&1 || return 0
+      out="$(apt-get -s upgrade 2>/dev/null || true)"
+      PENDING_SEC_COUNT="$(printf '%s\n' "$out" | awk '/^Inst / && tolower($0) ~ /security/' | wc -l | tr -d ' ')"
+      ;;
+    *) return 0 ;;
+  esac
+  [[ "$PENDING_SEC_COUNT" =~ ^[0-9]+$ ]] || PENDING_SEC_COUNT=0
+  [[ "$PENDING_SEC_CRIT" =~ ^[0-9]+$ ]] || PENDING_SEC_CRIT=0
+  if [[ "$PENDING_SEC_COUNT" -gt 0 ]]; then
+    if [[ "$PENDING_SEC_CRIT" -gt 0 ]]; then
+      PENDING_TXT_ZH="待安装安全更新：$PENDING_SEC_COUNT 个（其中高危/重要 $PENDING_SEC_CRIT 个）"
+      PENDING_TXT_EN="Pending security updates: $PENDING_SEC_COUNT ($PENDING_SEC_CRIT critical/important)"
+    else
+      PENDING_TXT_ZH="待安装安全更新：$PENDING_SEC_COUNT 个"
+      PENDING_TXT_EN="Pending security updates: $PENDING_SEC_COUNT"
+    fi
+  fi
+}
+
+# 各发行版“安全支持终止”近似日期（best-effort，需随时间维护；Fedora 生命周期短，故意不列）。
+# Approximate security end-of-life per release (best-effort; maintain over time; Fedora intentionally omitted).
+eol_date_for() {
+  local id="$1" ver="$2" major="${2%%.*}"
+  case "$id" in
+    debian) case "$ver" in 11) echo 2026-08-31 ;; 12) echo 2028-06-30 ;; 13) echo 2030-06-30 ;; esac ;;
+    ubuntu) case "$ver" in 20.04) echo 2025-05-31 ;; 22.04) echo 2027-06-01 ;; 24.04) echo 2029-05-31 ;; esac ;;
+    rhel|rocky|almalinux|ol|cloudlinux|centos) case "$major" in 8) echo 2029-05-31 ;; 9) echo 2032-05-31 ;; esac ;;
+    amzn) case "$ver" in 2023) echo 2028-03-15 ;; esac ;;
+  esac
+}
+
+# 发行版安全支持即将/已经终止时告警（已过 EOL=触发告警；临近=仅信息，避免提前数月反复打扰）。
+# Warn when distro security support is ending/ended (past EOL triggers an alert; approaching is informational).
+check_eol() {
+  [[ "${CHECK_EOL:-1}" == "1" ]] || return 0
+  local eol now eol_epoch days warn_days=90
+  eol="$(eol_date_for "${OS_RELEASE_ID:-}" "${OS_RELEASE_VERSION_ID:-}")"
+  [[ -n "$eol" ]] || return 0
+  now="$(date +%s)"
+  eol_epoch="$(date -d "$eol" +%s 2>/dev/null || echo 0)"
+  [[ "$eol_epoch" =~ ^[0-9]+$ && "$eol_epoch" -gt 0 ]] || return 0
+  if (( now > eol_epoch )); then
+    EOL_ATTENTION=1; EOL_SIG="past"
+    EOL_TXT_ZH="⛔ 本系统的安全支持已于 $eol 终止，将不再收到安全更新，请尽快规划升级发行版。"
+    EOL_TXT_EN="⛔ Security support for this release ended on $eol; it no longer receives security updates. Plan a distro upgrade."
+  elif (( eol_epoch - now < warn_days * 86400 )); then
+    days=$(( (eol_epoch - now) / 86400 ))
+    EOL_SIG="soon"
+    EOL_TXT_ZH="⚠️ 本系统的安全支持将于 $eol 终止（约剩 $days 天），请规划升级。"
+    EOL_TXT_EN="⚠️ Security support for this release ends on $eol (~$days days left). Plan an upgrade."
+  fi
+}
 
 run_doctor() {
   local ok=1
@@ -507,6 +637,28 @@ run_doctor() {
     fi
   else
     say "失败：Telegram 配置缺失" "FAIL Telegram config missing"; ok=0
+  fi
+  # 安全更新看门狗：自动更新健康 / 待安装安全更新 / 发行版 EOL。
+  # Security-update watchdog: auto-update health / pending security updates / distro EOL.
+  check_update_health
+  collect_security_updates
+  check_eol
+  if [[ "$HEALTH_ATTENTION" -eq 1 ]]; then
+    say "失败：自动安全更新机制异常" "FAIL automatic security-update mechanism issue"; ok=0
+    say "$HEALTH_TXT_ZH" "$HEALTH_TXT_EN"
+  else
+    say "正常：自动安全更新机制健康" "OK automatic security-update mechanism healthy"
+  fi
+  if [[ "$PENDING_SEC_COUNT" -gt 0 ]]; then
+    say "$PENDING_TXT_ZH" "$PENDING_TXT_EN"
+  else
+    say "正常：当前无待安装的安全更新" "OK no pending security updates"
+  fi
+  if [[ -n "$EOL_TXT_ZH" ]]; then
+    [[ "$EOL_ATTENTION" -eq 1 ]] && ok=0
+    say "$EOL_TXT_ZH" "$EOL_TXT_EN"
+  else
+    say "正常：发行版仍在安全支持期内（或不在 EOL 表中）" "OK release within security support (or not in the EOL table)"
   fi
   [[ "$ok" -eq 1 ]] || return 1
 }
@@ -709,12 +861,31 @@ case "$BACKEND" in
   dnf) check_dnf ;;
   *) say "不支持的后端: $BACKEND" "Unsupported backend: $BACKEND" >&2; exit 2 ;;
 esac
+check_update_health
+collect_security_updates
+check_eol
 
-if [[ "$reboot_required" -eq 0 && "$restart_attention" -eq 0 ]]; then
-  log_event "check ok backend=$BACKEND host=$HOST no_attention=1"
+# 看门狗附加段：自动更新异常、待安装安全更新、EOL（用真实换行，不受后面 \n 转换影响）。
+# Watchdog extra sections (real newlines; unaffected by the later literal-\n conversion).
+extra_zh=""; extra_en=""
+if [[ -n "$HEALTH_TXT_ZH" ]]; then
+  extra_zh+=$'\n\n'"⚠️ 自动安全更新机制异常："$'\n'"$HEALTH_TXT_ZH"
+  extra_en+=$'\n\n'"⚠️ Automatic security-update mechanism problem:"$'\n'"$HEALTH_TXT_EN"
+fi
+if [[ -n "$PENDING_TXT_ZH" ]]; then
+  extra_zh+=$'\n\n'"$PENDING_TXT_ZH"
+  extra_en+=$'\n\n'"$PENDING_TXT_EN"
+fi
+if [[ -n "$EOL_TXT_ZH" ]]; then
+  extra_zh+=$'\n\n'"$EOL_TXT_ZH"
+  extra_en+=$'\n\n'"$EOL_TXT_EN"
+fi
+
+if [[ "$reboot_required" -eq 0 && "$restart_attention" -eq 0 && "$HEALTH_ATTENTION" -eq 0 && "$EOL_ATTENTION" -eq 0 ]]; then
+  log_event "check ok backend=$BACKEND host=$HOST no_attention=1 pending_sec=$PENDING_SEC_COUNT"
   if [[ "$SEND_OK" -eq 1 || "${NOTIFY_OK:-0}" == "1" ]]; then
-    zh_msg="✅ 安全更新检查正常\n\n主机：$HOST${PUBLIC_IP_LINE_ZH}\n系统：$OS\n后端：$BACKEND\n当前内核：$KERNEL\n时间：$NOW\n\n没有发现整机重启或服务/进程重启需要关注的问题。"
-    en_msg="✅ Security update check OK\n\nHost: $HOST${PUBLIC_IP_LINE_EN}\nOS: $OS\nBackend: $BACKEND\nCurrent kernel: $KERNEL\nTime: $NOW\n\nNo reboot or service/process restart requiring attention was detected."
+    zh_msg="✅ 安全更新检查正常\n\n主机：$HOST${PUBLIC_IP_LINE_ZH}\n系统：$OS\n后端：$BACKEND\n当前内核：$KERNEL\n时间：$NOW\n\n没有发现整机重启或服务/进程重启需要关注的问题。${extra_zh}"
+    en_msg="✅ Security update check OK\n\nHost: $HOST${PUBLIC_IP_LINE_EN}\nOS: $OS\nBackend: $BACKEND\nCurrent kernel: $KERNEL\nTime: $NOW\n\nNo reboot or service/process restart requiring attention was detected.${extra_en}"
     if [[ "$NOTIFY_LANG" == "en" ]]; then
       msg="$en_msg"
     else
@@ -735,8 +906,9 @@ else
   rs_en="$(format_restart_summary en | sed -n '1,80p')"
   reboot_text_zh="$([[ "$reboot_required" -eq 1 ]] && echo '需要' || echo '暂不需要')"
   reboot_text_en="$([[ "$reboot_required" -eq 1 ]] && echo 'Required' || echo 'Not required for now')"
-  zh_msg="⚠️ 安全更新后需要处理\n\n主机：$HOST${PUBLIC_IP_LINE_ZH}\n系统：$OS\n后端：$BACKEND\n当前内核：$KERNEL\n时间：$NOW\n\n整机重启：$reboot_text_zh\n相关包/安全更新：\n$pkgs_zh\n\n重启检测摘要：\n$rs_zh\n\n建议：请在方便的维护窗口 SSH 登录该服务器后手动执行 reboot；如只是服务需要重启，可先评估并重启对应服务。"
-  en_msg="⚠️ Security update action required\n\nHost: $HOST${PUBLIC_IP_LINE_EN}\nOS: $OS\nBackend: $BACKEND\nCurrent kernel: $KERNEL\nTime: $NOW\n\nFull reboot: $reboot_text_en\nRelated packages/security updates:\n$pkgs_en\n\nRestart detection summary:\n$rs_en\n\nRecommendation: SSH into this server during a suitable maintenance window and run reboot if a full reboot is required. If only services need restarting, review them first and restart the affected services manually."
+  log_event "alert backend=$BACKEND host=$HOST reboot=$reboot_required svc_attn=$restart_attention health=$HEALTH_ATTENTION eol=$EOL_ATTENTION pending_sec=$PENDING_SEC_COUNT"
+  zh_msg="⚠️ 安全更新后需要处理\n\n主机：$HOST${PUBLIC_IP_LINE_ZH}\n系统：$OS\n后端：$BACKEND\n当前内核：$KERNEL\n时间：$NOW\n\n整机重启：$reboot_text_zh\n相关包/安全更新：\n$pkgs_zh\n\n重启检测摘要：\n$rs_zh${extra_zh}\n\n建议：请在方便的维护窗口 SSH 登录该服务器后手动执行 reboot；如只是服务需要重启，可先评估并重启对应服务。"
+  en_msg="⚠️ Security update action required\n\nHost: $HOST${PUBLIC_IP_LINE_EN}\nOS: $OS\nBackend: $BACKEND\nCurrent kernel: $KERNEL\nTime: $NOW\n\nFull reboot: $reboot_text_en\nRelated packages/security updates:\n$pkgs_en\n\nRestart detection summary:\n$rs_en${extra_en}\n\nRecommendation: SSH into this server during a suitable maintenance window and run reboot if a full reboot is required. If only services need restarting, review them first and restart the affected services manually."
   if [[ "$NOTIFY_LANG" == "en" ]]; then
     msg="$en_msg"
   else
@@ -750,7 +922,7 @@ msg="${msg//\\n/$'\n'}"
 # 的原始摘要，改用 restart_signal（规范化的内核/服务信号），避免同一状态被反复发送。
 # Dedup hash uses only decision-relevant, cross-run-stable fields: excludes PUBLIC_IP (dynamic egress
 # IP) and the raw summary (transient output), using restart_signal (normalized kernel/service signal).
-alert_hash="$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$HOST" "$BACKEND" "$NOTIFY_LANG" "$reboot_required" "$reboot_pkgs" "$restart_attention" "$restart_signal" | sha256sum | awk '{print $1}')"
+alert_hash="$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$HOST" "$BACKEND" "$NOTIFY_LANG" "$reboot_required" "$reboot_pkgs" "$restart_attention" "$restart_signal" "$HEALTH_ATTENTION" "$HEALTH_SIG" "$EOL_ATTENTION" "$EOL_SIG" | sha256sum | awk '{print $1}')"
 last_hash="$(cat "$STATE_FILE" 2>/dev/null || true)"
 last_sent="$(cat "$STATE_TIME_FILE" 2>/dev/null || echo 0)"
 now_epoch="$(date +%s)"
