@@ -42,7 +42,7 @@ SUN keeps the boring part automatic and makes the human part obvious.
 - **No automatic reboot** — you stay in control of downtime.
 - **Telegram alerts only when action is needed**.
 - **Reboot and service-restart detection** with `needrestart` or `needs-restarting`.
-- **Selectable Telegram alert language**: choose Chinese or English during installation. Default: Chinese.
+- **Single-language UI (Chinese or English)**: the installer, menu and diagnostics pick a language as the first step (Chinese or English, default Chinese) and then render all terminal interaction in that one language — no more mixed zh/en. The choice also becomes the default Telegram alert language, overridable with `--notify-lang`.
 - **Public IP in notifications**: auto-detect the server public IP by default; you can also set it manually or disable it. Auto-detection uses Python's standard library and does not add a `curl` dependency.
 - **Duplicate alert suppression**: once, daily, or every N days.
 - **Interactive and non-interactive install/upgrade**: rerunning the installer reuses the existing config.
@@ -151,14 +151,15 @@ cd security-update-notify
 sudo ./install.sh
 ```
 
-The installer will ask for:
+The installer first asks you to choose a UI language (Chinese or English, default Chinese): it sets the language for all subsequent interaction and the default Telegram alert language. It then asks for:
 
 - Telegram Bot Token;
 - Telegram Chat ID;
-- Telegram alert language, default `zh` (Chinese);
 - daily check time, default `09:00`;
 - duplicate-alert behavior;
 - whether to send an extra test message after installation.
+
+To skip the interactive language prompt, pass `--lang zh` or `--lang en`.
 
 Before writing the config, it verifies Telegram with:
 
@@ -225,6 +226,7 @@ Common options:
 --backend dnf              # force dnf backend
 --notify-lang zh           # Telegram alert language: Chinese, default
 --notify-lang en           # Telegram alert language: English
+--lang en                  # terminal interaction language: English (default zh)
 --public-ip IP             # manually set public IP in notifications; auto-detected at runtime when empty
 --include-public-ip 0      # disable public IP in notifications; default 1
 --notify-ok 1             # send OK notification when no action is needed; default 0
@@ -243,6 +245,8 @@ Rerun the one-line installer to upgrade to the latest release:
 ```bash
 curl -fsSL https://xxv.cc/sun.sh | sudo bash -s -- upgrade --non-interactive -y
 ```
+
+Once SUN is installed you can also run `sudo security-update-notify --upgrade` directly: it downloads the latest GitHub release, verifies `.sha256`, and requires a GPG signature against the pinned fingerprint (fail-closed by default — it refuses if the signature is missing) before upgrading.
 
 If SUN is already installed, the installer reads `/etc/security-update-notify/telegram.env` and the existing timer time first. Options not explicitly overridden by CLI flags or `--env-file` keep their old values, so you usually do not need to re-enter the Telegram token or chat ID. Before upgrading, key files are backed up to `/var/backups/security-update-notify/<timestamp>`; failed upgrades attempt an automatic rollback. A post-upgrade self-check runs by default; use `--notify-upgrade 1` to send a Telegram notification after a successful upgrade.
 
@@ -305,8 +309,8 @@ SUN configures or uses:
 
 It checks:
 
-- `needs-restarting -r`
-- `needs-restarting`
+- `needs-restarting -r` (whether a full reboot is required)
+- `needs-restarting -s` (systemd services that need a restart; no longer the raw `needs-restarting` process list, which caused false alerts)
 - `dnf updateinfo list security updates`
 
 If `/etc/dnf/automatic.conf` exists, SUN first saves a timestamped backup, then configures security-only automatic updates; `--purge-config` attempts to restore the newest SUN-created backup.
