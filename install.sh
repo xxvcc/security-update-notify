@@ -71,7 +71,7 @@ Options:
   --include-public-ip BOOL     Show public IP in notifications, default 1
   --notify-ok BOOL             Send OK notification when no action is needed, default 0
   --notify-upgrade BOOL        Send notification after successful upgrade, default 0
-  --dedup-mode MODE            always | daily | interval
+  --dedup-mode MODE            once | daily | interval（默认/default daily；旧名 always=once）
   --dedup-interval-days N      Used when mode=interval, default 3
   --notify-lang LANG           Telegram notification language: zh | en (defaults to --lang)
   --lang LANG                  Terminal language: zh | en, default zh
@@ -99,7 +99,7 @@ EOF
   --include-public-ip BOOL     是否在通知中显示公网 IP，默认 1
   --notify-ok BOOL             无需处理时是否也发送 OK 通知，默认 0
   --notify-upgrade BOOL        升级成功后是否发送通知，默认 0
-  --dedup-mode MODE            always | daily | interval
+  --dedup-mode MODE            once | daily | interval（默认/default daily；旧名 always=once）
   --dedup-interval-days N      mode=interval 时使用，默认 3
   --notify-lang LANG           Telegram 通知语言：zh | en（默认跟随 --lang）
   --lang LANG                  终端语言：zh | en，默认 zh
@@ -573,16 +573,17 @@ case "${NOTIFY_OK,,}" in 1|true|yes|on) NOTIFY_OK=1 ;; 0|false|no|off) NOTIFY_OK
 case "${NOTIFY_UPGRADE,,}" in 1|true|yes|on) NOTIFY_UPGRADE=1 ;; 0|false|no|off) NOTIFY_UPGRADE=0 ;; *) say "无效 NOTIFY_UPGRADE: $NOTIFY_UPGRADE（应为 0 或 1）" "Invalid NOTIFY_UPGRADE: $NOTIFY_UPGRADE (expected 0 or 1)" >&2; exit 2 ;; esac
 prompt_text CHECK_TIME "每日检查时间 HH:MM" "Daily check time HH:MM" "09:00"
 if [[ -z "$DEDUP_MODE" ]]; then
-  if [[ "$NON_INTERACTIVE" -eq 1 ]]; then DEDUP_MODE="interval"; else
+  if [[ "$NON_INTERACTIVE" -eq 1 ]]; then DEDUP_MODE="daily"; else
     say "相同告警重复提醒模式:" "Same-alert reminder mode:"
-    say "  1) always   状态变化前同一告警只提醒一次" "  1) always   same alert only once until state changes"
-    say "  2) daily    同一告警每天最多提醒一次" "  2) daily    same alert once per day"
-    say "  3) interval 同一告警每 N 天提醒一次（推荐）" "  3) interval same alert every N days (recommended)"
-    read -r -p "$(m '请选择 [3]: ' 'Choose [3]: ')" choice
-    case "${choice:-3}" in 1) DEDUP_MODE="always" ;; 2) DEDUP_MODE="daily" ;; 3) DEDUP_MODE="interval" ;; *) say "无效选项" "Invalid choice" >&2; exit 2 ;; esac
+    say "  1) once     状态变化前同一告警只提醒一次" "  1) once     same alert only once until state changes"
+    say "  2) daily    同一告警每天最多提醒一次（推荐）" "  2) daily    same alert once per day (recommended)"
+    say "  3) interval 同一告警每 N 天提醒一次" "  3) interval same alert every N days"
+    read -r -p "$(m '请选择 [2]: ' 'Choose [2]: ')" choice
+    case "${choice:-2}" in 1) DEDUP_MODE="once" ;; 2) DEDUP_MODE="daily" ;; 3) DEDUP_MODE="interval" ;; *) say "无效选项" "Invalid choice" >&2; exit 2 ;; esac
   fi
 fi
-case "$DEDUP_MODE" in always|daily|interval) ;; *) say "无效去重模式: $DEDUP_MODE" "Invalid dedup mode: $DEDUP_MODE" >&2; exit 2 ;; esac
+case "$DEDUP_MODE" in once|always|daily|interval) ;; *) say "无效去重模式: $DEDUP_MODE（应为 once/daily/interval）" "Invalid dedup mode: $DEDUP_MODE (expected once/daily/interval)" >&2; exit 2 ;; esac
+[[ "$DEDUP_MODE" == "always" ]] && DEDUP_MODE="once"  # 把旧值 always 迁移为 once / migrate legacy always -> once
 if [[ "$DEDUP_MODE" == "interval" ]]; then
   if [[ "$DEDUP_INTERVAL_DAYS" == "3" && "$NON_INTERACTIVE" -ne 1 ]]; then read -r -p "$(m '同一告警每 N 天重复提醒 [3]: ' 'Repeat same alert every N days [3]: ')" ans; DEDUP_INTERVAL_DAYS="${ans:-3}"; fi
   [[ "$DEDUP_INTERVAL_DAYS" =~ ^[0-9]+$ ]] && [[ "$DEDUP_INTERVAL_DAYS" -ge 1 ]] || { say "无效间隔天数" "Invalid interval days" >&2; exit 2; }

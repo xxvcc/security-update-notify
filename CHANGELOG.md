@@ -1,5 +1,12 @@
 # 变更记录
 
+## 1.8.1
+
+- 重复提醒模式 `always` 改名为更直白的 `once`（“只提醒一次”）；旧值 `always` 仍兼容接受，升级时安装器会自动迁移为 `once`。
+  Renamed the `always` reminder mode to the clearer `once` ("remind only once"); the old value `always` is still accepted and the installer migrates it to `once` on upgrade.
+- 默认重复提醒模式由 `interval` 改为 `daily`（每天最多提醒一次）；交互安装的默认选项与推荐项也随之改为 `daily`。
+  The default reminder mode changed from `interval` to `daily` (at most once per day); the interactive default/recommended option is now `daily` too.
+
 ## 1.8.0
 
 来自一次全面审计的修复与加固（经对抗式复核确认）。

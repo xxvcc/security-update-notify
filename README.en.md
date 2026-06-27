@@ -254,11 +254,11 @@ If SUN is already installed, the installer reads `/etc/security-update-notify/te
 
 | Mode | Behavior |
 | --- | --- |
-| `always` | Send once for the same alert until the state changes. |
-| `daily` | Send the same alert at most once per day. |
+| `once` | Send once for the same alert until the state changes (was `always`, still accepted). |
+| `daily` | Send the same alert at most once per day (**default / recommended**). |
 | `interval` | Send the same alert every N days. Default: `3`. |
 
-`interval` is the recommended default for production servers: it prevents spam but still reminds you if a reboot stays pending.
+`daily` is the default: at most one reminder per day keeps nudging you while a reboot stays pending without spamming. For something quieter use `once` (only once) or `interval` (every N days).
 
 ## Installed files
 
