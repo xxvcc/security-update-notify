@@ -20,7 +20,7 @@ It uses your distro's native update tools, runs from a systemd timer, and sends 
 ## One-line install
 
 ```bash
-curl -fsSL https://xxv.cc/sun.sh | sudo bash
+curl -fsSL https://sun.xxv.cc | sudo bash
 ```
 
 ---
@@ -140,7 +140,7 @@ For groups, add the bot to the group and make sure it can send messages there.
 Recommended: use the website-hosted bootstrap installer. It downloads the latest GitHub Release, verifies the `.sha256` file, then opens the interactive menu:
 
 ```bash
-curl -fsSL https://xxv.cc/sun.sh | sudo bash
+curl -fsSL https://sun.xxv.cc | sudo bash
 ```
 
 If you prefer running from source:
@@ -243,7 +243,7 @@ Common options:
 Rerun the one-line installer to upgrade to the latest release:
 
 ```bash
-curl -fsSL https://xxv.cc/sun.sh | sudo bash -s -- upgrade --non-interactive -y
+curl -fsSL https://sun.xxv.cc | sudo bash -s -- upgrade --non-interactive -y
 ```
 
 Once SUN is installed you can also run `sudo security-update-notify --upgrade` directly: it downloads the latest GitHub release, verifies `.sha256`, and requires a GPG signature against the pinned fingerprint (fail-closed by default — it refuses if the signature is missing) before upgrading.

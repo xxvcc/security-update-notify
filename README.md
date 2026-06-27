@@ -20,7 +20,7 @@
 ## 一键安装
 
 ```bash
-curl -fsSL https://xxv.cc/sun.sh | sudo bash
+curl -fsSL https://sun.xxv.cc | sudo bash
 ```
 
 ---
@@ -140,7 +140,7 @@ SUN **不会**：
 推荐使用网站引导安装器。它会下载最新 GitHub Release、校验 `.sha256`，然后启动交互式菜单：
 
 ```bash
-curl -fsSL https://xxv.cc/sun.sh | sudo bash
+curl -fsSL https://sun.xxv.cc | sudo bash
 ```
 
 如果你更想从源码运行，也可以：
@@ -243,7 +243,7 @@ sudo ./install.sh \
 重新运行一键安装器即可升级到最新 release：
 
 ```bash
-curl -fsSL https://xxv.cc/sun.sh | sudo bash -s -- upgrade --non-interactive -y
+curl -fsSL https://sun.xxv.cc | sudo bash -s -- upgrade --non-interactive -y
 ```
 
 已安装 SUN 后，也可以直接运行 `sudo security-update-notify --upgrade`：它会下载最新 GitHub 发布包，校验 `.sha256`，并用内置 pin 的指纹强制校验 GPG 签名（默认 fail-closed，缺签名即拒绝）后才升级。
