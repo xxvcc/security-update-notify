@@ -1,5 +1,14 @@
 # 变更记录
 
+## 1.9.2
+
+- 三轮复审安全加固：发布包下载与自升级下载现在限制 curl 只允许 HTTPS 及 HTTPS 重定向；引导脚本、自升级与打包过程的 tar 调用会清理 `TAR_OPTIONS`/压缩工具环境变量，避免本地环境影响归档校验、解包或构建。
+  Three-pass audit hardening: release downloads and self-upgrade downloads now restrict curl to HTTPS and HTTPS redirects only; bootstrap, self-upgrade, and packaging tar calls clear `TAR_OPTIONS`/compression-tool environment variables so local environment cannot affect archive verification, extraction, or builds.
+- 配置校验加固：安装器会校验并规范化 `CHECK_UPDATE_HEALTH`、`CHECK_EOL` 与 `STALE_UPDATE_DAYS`；运行时遇到无效 watchdog 配置时默认保持安全检查开启。
+  Config validation hardening: the installer validates and normalizes `CHECK_UPDATE_HEALTH`, `CHECK_EOL`, and `STALE_UPDATE_DAYS`; runtime defaults invalid watchdog config back to enabled checks.
+- 回滚修复：依赖包安装后若创建了受管默认配置（例如 `/etc/dnf/automatic.conf`），安装器会在写入前补充备份，避免后续失败回滚时误删依赖包默认文件。
+  Rollback fix: if dependency installation creates a managed default config (for example `/etc/dnf/automatic.conf`), the installer captures it before writing SUN config, avoiding accidental deletion during later rollback.
+
 ## 1.9.1
 
 - 安全加固：`sun.sh` 默认改为必须校验 GPG 签名，`auto` 仅作为兼容别名且不再在缺少 gpg/签名时退回 sha256-only；引导脚本与自升级都使用内置公钥和 pin 指纹，并在解包前完成签名校验。

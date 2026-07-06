@@ -15,6 +15,7 @@ WORK="$(mktemp -d)"
 SIGN_RELEASE="${SIGN_RELEASE:-auto}"
 GPG_KEY_ID="${GPG_KEY_ID:-}"
 trap 'rm -rf "$WORK"' EXIT
+tar_clean_env() { env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT tar "$@"; }
 
 cd "$ROOT"
 bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify
@@ -80,7 +81,7 @@ else
   exit 1
 fi
 [[ "$SOURCE_EPOCH" =~ ^[0-9]+$ ]] || { echo "无效 SOURCE_DATE_EPOCH / Invalid SOURCE_DATE_EPOCH: $SOURCE_EPOCH" >&2; exit 1; }
-tar -C "$WORK" --sort=name --mtime="@$SOURCE_EPOCH" --owner=0 --group=0 --numeric-owner -cf - "$PKG" | gzip -n >"$TAR"
+tar_clean_env -C "$WORK" --sort=name --mtime="@$SOURCE_EPOCH" --owner=0 --group=0 --numeric-owner -cf - "$PKG" | env -u GZIP gzip -n >"$TAR"
 (cd "$DIST" && sha256sum "$PKG.tar.gz" >"$PKG.tar.gz.sha256")
 
 # 强制要求签名的两种显式/可靠信号：RELEASE=1（与 git 无关，供 CI/发布脚本使用），或本仓库存在

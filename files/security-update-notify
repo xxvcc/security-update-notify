@@ -13,7 +13,7 @@ STATE_DIR="/var/lib/security-update-notify"
 STATE_FILE="$STATE_DIR/last-alert.sha256"
 STATE_TIME_FILE="$STATE_DIR/last-alert.sent_at"
 LOCK_FILE="/run/security-update-notify.lock"
-VERSION="1.9.1"
+VERSION="1.9.2"
 REPO="xxvcc/security-update-notify"
 RELEASE_SIGNING_FINGERPRINT="C678256ACBFC6491BF5076655F3AE24999921FFC"
 UPGRADE_ALLOW_UNSIGNED="${SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED:-0}"
@@ -138,12 +138,29 @@ download_release_file() {
   # Download a release file; prefer curl, fall back to python3 (already a hard runtime dependency).
   local url="$1" dest="$2"
   if command -v curl >/dev/null 2>&1; then
-    curl -fL --retry 3 -o "$dest" "$url"
+    curl --proto '=https' --proto-redir '=https' -fL --retry 3 -o "$dest" "$url"
   else
     python3 - "$url" "$dest" <<'PY'
-import shutil, sys, urllib.request
+import shutil
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+class HTTPSOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        newurl = urllib.parse.urljoin(req.full_url, newurl)
+        if urllib.parse.urlparse(newurl).scheme != "https":
+            raise urllib.error.URLError(f"refusing non-https redirect to {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
 url, dest = sys.argv[1], sys.argv[2]
-with urllib.request.urlopen(url, timeout=60) as response, open(dest, "wb") as fh:
+if urllib.parse.urlparse(url).scheme != "https":
+    raise SystemExit("refusing non-https release URL")
+opener = urllib.request.build_opener(HTTPSOnlyRedirectHandler)
+with opener.open(url, timeout=60) as response, open(dest, "wb") as fh:
+    if urllib.parse.urlparse(response.geturl()).scheme != "https":
+        raise SystemExit("refusing non-https final release URL")
     shutil.copyfileobj(response, fh)
 PY
   fi
@@ -175,7 +192,7 @@ safe_release_archive() {
       "$topdir"|"$topdir/"|"$topdir"/*) ;;
       *) say "压缩包中存在非预期路径: $entry" "Unexpected path in archive: $entry" >&2; exit 1 ;;
     esac
-  done < <(tar -tzf "$archive")
+  done < <(env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT tar -tzf "$archive")
   while IFS= read -r entry; do
     [[ -n "$entry" ]] || continue
     listing_type="${entry:0:1}"
@@ -183,7 +200,7 @@ safe_release_archive() {
       -|d) ;;
       *) say "压缩包中存在不支持的条目类型: $entry" "Unsupported archive entry type: $entry" >&2; exit 1 ;;
     esac
-  done < <(tar -tzvf "$archive")
+  done < <(env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT tar -tzvf "$archive")
 }
 
 verify_release_signature() {
@@ -215,7 +232,7 @@ run_self_upgrade() {
     exec sudo "$0" --upgrade --lang "$disp"
   fi
   local c
-  for c in tar sha256sum mktemp python3; do
+  for c in tar sha256sum mktemp python3 env; do
     command -v "$c" >/dev/null 2>&1 || { say "升级需要命令: $c" "Upgrade requires command: $c" >&2; exit 1; }
   done
 
@@ -267,7 +284,7 @@ run_self_upgrade() {
   # Safe extraction: reject path traversal, unexpected top-level paths, and special entries
   # such as symlinks, hardlinks and devices.
   safe_release_archive "$tmp/$pkg" "$pkgdir"
-  ( cd "$tmp" && tar --no-same-owner -xzf "$pkg" ) || { say "解包失败" "Extraction failed" >&2; exit 1; }
+  ( cd "$tmp" && env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT tar --no-same-owner -xzf "$pkg" ) || { say "解包失败" "Extraction failed" >&2; exit 1; }
 
   [[ -f "$tmp/$pkgdir/install.sh" ]] || { say "发布包缺少 install.sh" "Release is missing install.sh" >&2; exit 1; }
   chmod 0755 "$tmp/$pkgdir/install.sh" 2>/dev/null || true
@@ -492,6 +509,9 @@ case "$NOTIFY_LANG" in zh|en) ;; *) NOTIFY_LANG="zh" ;; esac
 CHECK_UPDATE_HEALTH="${CHECK_UPDATE_HEALTH:-1}"   # 1=检测自动更新是否在正常运行 / detect whether auto-updates are healthy
 STALE_UPDATE_DAYS="${STALE_UPDATE_DAYS:-7}"        # 超过该天数没有成功的自动更新即告警；0=关 / stale threshold in days; 0=off
 CHECK_EOL="${CHECK_EOL:-1}"                        # 1=发行版安全支持终止（EOL）告警 / warn on distro end-of-life
+case "${CHECK_UPDATE_HEALTH,,}" in 1|true|yes|on) CHECK_UPDATE_HEALTH=1 ;; 0|false|no|off) CHECK_UPDATE_HEALTH=0 ;; *) CHECK_UPDATE_HEALTH=1 ;; esac
+[[ "$STALE_UPDATE_DAYS" =~ ^[0-9]+$ ]] || STALE_UPDATE_DAYS=7
+case "${CHECK_EOL,,}" in 1|true|yes|on) CHECK_EOL=1 ;; 0|false|no|off) CHECK_EOL=0 ;; *) CHECK_EOL=1 ;; esac
 
 if [[ "$BACKEND" == "auto" ]]; then
   case "${OS_RELEASE_ID:-}" in

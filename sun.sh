@@ -69,6 +69,8 @@ EOF
 
 require_arg() { [[ $# -ge 2 && -n "${2:-}" ]] || { say "缺少 $1 的值" "Missing value for $1" >&2; exit 2; }; }
 validate_version() { [[ "$1" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]] || { say "无效版本: $1" "Invalid VERSION: $1" >&2; exit 2; }; }
+curl_https() { curl --proto '=https' --proto-redir '=https' "$@"; }
+tar_clean_env() { env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT tar "$@"; }
 
 verify_checksum() {
   local file="$1" sha_file="$2" expected
@@ -94,7 +96,7 @@ safe_extract_tar() {
         exit 1
         ;;
     esac
-  done < <(tar -tzf "$archive")
+  done < <(tar_clean_env -tzf "$archive")
   while IFS= read -r entry; do
     [[ -n "$entry" ]] || continue
     listing_type="${entry:0:1}"
@@ -105,8 +107,8 @@ safe_extract_tar() {
         exit 1
         ;;
     esac
-  done < <(tar -tzvf "$archive")
-  tar --no-same-owner -xzf "$archive"
+  done < <(tar_clean_env -tzvf "$archive")
+  tar_clean_env --no-same-owner -xzf "$archive"
 }
 
 release_signing_public_key() {
@@ -168,7 +170,7 @@ if [[ -z "${UI_LANG:-}" ]]; then
   fi
 fi
 
-REQUIRED_COMMANDS=(curl tar sha256sum mktemp python3)
+REQUIRED_COMMANDS=(curl tar sha256sum mktemp python3 env)
 [[ "$VERIFY_SIGNATURE" == "off" ]] || REQUIRED_COMMANDS+=(gpg)
 for c in "${REQUIRED_COMMANDS[@]}"; do command -v "$c" >/dev/null 2>&1 || { say "缺少必需命令: $c" "Missing required command: $c" >&2; exit 1; }; done
 
@@ -177,7 +179,7 @@ for c in "${REQUIRED_COMMANDS[@]}"; do command -v "$c" >/dev/null 2>&1 || { say 
 if [[ "$VERSION" == "latest" ]]; then
   [[ "$REPO" != "YOUR_GITHUB_USER/security-update-notify" ]] || { say "发布前请传入 --repo 或编辑引导脚本 REPO。" "Pass --repo or edit bootstrap REPO before publishing." >&2; exit 2; }
   api="https://api.github.com/repos/${REPO}/releases/latest"
-  VERSION="$(curl -fsSL "$api" | python3 -c 'import json,sys; t=json.load(sys.stdin)["tag_name"]; print(t[1:] if t.startswith("v") else t)')"
+  VERSION="$(curl_https -fsSL "$api" | python3 -c 'import json,sys; t=json.load(sys.stdin)["tag_name"]; print(t[1:] if t.startswith("v") else t)')"
 fi
 validate_version "$VERSION"
 
@@ -199,8 +201,8 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 cd "$TMP"
 say "正在下载: $URL" "Downloading: $URL"
-curl -fL --retry 3 -o "$PKG" "$URL"
-curl -fL --retry 3 -o "$PKG.sha256" "$SHA_URL"
+curl_https -fL --retry 3 -o "$PKG" "$URL"
+curl_https -fL --retry 3 -o "$PKG.sha256" "$SHA_URL"
 verify_checksum "$PKG" "$PKG.sha256"
 
 verify_signature_if_available() {
@@ -214,7 +216,7 @@ verify_signature_if_available() {
   command -v gpg >/dev/null 2>&1 || { say "签名校验需要 gpg" "gpg is required for signature verification" >&2; exit 1; }
   sig_url="${URL}.asc"
   sig_file="$TMP/$PKG.asc"
-  curl -fsL --retry 2 -o "$sig_file" "$sig_url" || { say "缺少 release 签名；拒绝继续" "Release signature is missing; refusing to continue" >&2; exit 1; }
+  curl_https -fsL --retry 2 -o "$sig_file" "$sig_url" || { say "缺少 release 签名；拒绝继续" "Release signature is missing; refusing to continue" >&2; exit 1; }
   gpg_home="$TMP/gnupg"
   mkdir -p "$gpg_home"; chmod 700 "$gpg_home"
   release_signing_public_key | GNUPGHOME="$gpg_home" gpg --batch --import >/dev/null 2>&1 || { say "导入签名公钥失败" "Failed to import signing public key" >&2; exit 1; }

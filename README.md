@@ -388,7 +388,7 @@ sudo ./uninstall.sh --purge-config
 
 发布包始终包含 `.sha256` 校验文件。`package.sh` 支持在存在 GPG 私钥时自动生成 `.tar.gz.asc` detached signature；`sun.sh` 默认以 `required` 模式校验签名，`auto` 仅作为兼容别名保留，也会要求 gpg 与 `.asc` 签名同时存在；只有显式传入 `--verify-signature off` 才会跳过签名校验。
 
-正式发布（打了 `vX.Y.Z` tag 的构建）**强制签名**：`package.sh` 在 tag 指向当前提交时会要求 GPG 签名，没有私钥则构建失败；release 发布后 CI 会用仓库内公钥校验产物的签名与指纹，缺签名/不匹配即让该 release 的检查失败。私钥不进入 CI，仍由维护者离线持有。此外，`security-update-notify --upgrade` 默认 **fail-closed**：直接下载 GitHub 发布包，校验 sha256，并在解包前用内置公钥与 pin 指纹强制校验 GPG 签名后才升级（应急可设 `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` 仅按 sha256 升级）。
+正式发布（存在对应 `vX.Y.Z` tag，或显式设置 `RELEASE=1` 的构建）**强制签名**：`package.sh` 会要求 GPG 签名，没有私钥则构建失败；release 发布后 CI 会用仓库内公钥校验产物的签名与指纹，缺签名/不匹配即让该 release 的检查失败。私钥不进入 CI，仍由维护者离线持有。此外，`security-update-notify --upgrade` 默认 **fail-closed**：直接下载 GitHub 发布包，校验 sha256，并在解包前用内置公钥与 pin 指纹强制校验 GPG 签名后才升级（应急可设 `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` 仅按 sha256 升级）。
 
 ## 安全说明
 

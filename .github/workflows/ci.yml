@@ -294,6 +294,11 @@ jobs:
           import re
 
           expected_key = Path('files/release-signing.pub.asc').read_text().strip()
+          assert "--proto '=https' --proto-redir '=https'" in Path('sun.sh').read_text(), 'sun.sh curl must restrict redirects to https'
+          assert "--proto '=https' --proto-redir '=https'" in Path('files/security-update-notify').read_text(), 'self-upgrade curl must restrict redirects to https'
+          assert 'env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT tar' in Path('sun.sh').read_text(), 'sun.sh tar calls must ignore tar option environment'
+          assert 'env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT tar' in Path('files/security-update-notify').read_text(), 'self-upgrade tar calls must ignore tar option environment'
+          assert 'env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT tar' in Path('package.sh').read_text(), 'package.sh tar calls must ignore tar option environment'
           for path in ('files/security-update-notify', 'sun.sh'):
               text = Path(path).read_text()
               match = re.search(r"release_signing_public_key\(\) \{\n  cat <<'EOF'\n(.*?)\nEOF\n\}", text, re.S)
@@ -321,6 +326,18 @@ jobs:
           say(){ printf '%s\n' "$1" >&2; }
           ''' + s[start:end] + '''
           tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+          mkdir -p "$tmp/build/security-update-notify-9.9.9"
+          printf '%s\n' ok > "$tmp/build/security-update-notify-9.9.9/ok.txt"
+          (cd "$tmp/build" && tar -czf "$tmp/good.tar.gz" security-update-notify-9.9.9)
+          cat >"$tmp/pwn" <<EOF
+          #!/usr/bin/env bash
+          touch "$tmp/tar-options-pwned"
+          EOF
+          chmod +x "$tmp/pwn"
+          TAR_OPTIONS="--checkpoint=1 --checkpoint-action=exec=$tmp/pwn" safe_release_archive "$tmp/good.tar.gz" security-update-notify-9.9.9
+          test ! -e "$tmp/tar-options-pwned"
+
+          rm -rf "$tmp/build"
           mkdir -p "$tmp/build/security-update-notify-9.9.9"
           ln -s /etc/passwd "$tmp/build/security-update-notify-9.9.9/bad-link"
           (cd "$tmp/build" && tar -czf "$tmp/bad.tar.gz" security-update-notify-9.9.9)

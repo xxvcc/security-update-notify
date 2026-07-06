@@ -300,6 +300,19 @@ create_backup() {
   say "已创建安装/升级前备份: $BACKUP_DIR" "Pre-install/upgrade backup created: $BACKUP_DIR"
 }
 
+capture_dependency_created_defaults() {
+  [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]] || return 0
+  local rel captured=0
+  for rel in "${MANAGED_PATHS[@]}"; do
+    [[ -e "/$rel" && ! -e "$BACKUP_DIR/$rel" ]] || continue
+    install -d -m 0700 "$BACKUP_DIR/$(dirname "$rel")"
+    cp -a "/$rel" "$BACKUP_DIR/$rel"
+    printf '%s\n' "$rel" >>"$BACKUP_DIR/manifest"
+    captured=1
+  done
+  [[ "$captured" -eq 0 ]] || say "已补充备份依赖包创建的默认配置。" "Captured default config files created by dependencies."
+}
+
 restore_backup() {
   [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]] || return 0
   [[ "$ROLLBACK_DONE" -eq 0 ]] || return 0
@@ -577,6 +590,9 @@ case "$NOTIFY_LANG" in zh|en) ;; *) say "无效通知语言: $NOTIFY_LANG（应�
 case "${INCLUDE_PUBLIC_IP,,}" in 1|true|yes|on) INCLUDE_PUBLIC_IP=1 ;; 0|false|no|off) INCLUDE_PUBLIC_IP=0 ;; *) say "无效 INCLUDE_PUBLIC_IP: $INCLUDE_PUBLIC_IP（应为 0 或 1）" "Invalid INCLUDE_PUBLIC_IP: $INCLUDE_PUBLIC_IP (expected 0 or 1)" >&2; exit 2 ;; esac
 case "${NOTIFY_OK,,}" in 1|true|yes|on) NOTIFY_OK=1 ;; 0|false|no|off) NOTIFY_OK=0 ;; *) say "无效 NOTIFY_OK: $NOTIFY_OK（应为 0 或 1）" "Invalid NOTIFY_OK: $NOTIFY_OK (expected 0 or 1)" >&2; exit 2 ;; esac
 case "${NOTIFY_UPGRADE,,}" in 1|true|yes|on) NOTIFY_UPGRADE=1 ;; 0|false|no|off) NOTIFY_UPGRADE=0 ;; *) say "无效 NOTIFY_UPGRADE: $NOTIFY_UPGRADE（应为 0 或 1）" "Invalid NOTIFY_UPGRADE: $NOTIFY_UPGRADE (expected 0 or 1)" >&2; exit 2 ;; esac
+case "${CHECK_UPDATE_HEALTH,,}" in 1|true|yes|on) CHECK_UPDATE_HEALTH=1 ;; 0|false|no|off) CHECK_UPDATE_HEALTH=0 ;; *) say "无效 CHECK_UPDATE_HEALTH: $CHECK_UPDATE_HEALTH（应为 0 或 1）" "Invalid CHECK_UPDATE_HEALTH: $CHECK_UPDATE_HEALTH (expected 0 or 1)" >&2; exit 2 ;; esac
+[[ "$STALE_UPDATE_DAYS" =~ ^[0-9]+$ ]] || { say "无效 STALE_UPDATE_DAYS: $STALE_UPDATE_DAYS（应为非负整数）" "Invalid STALE_UPDATE_DAYS: $STALE_UPDATE_DAYS (expected a non-negative integer)" >&2; exit 2; }
+case "${CHECK_EOL,,}" in 1|true|yes|on) CHECK_EOL=1 ;; 0|false|no|off) CHECK_EOL=0 ;; *) say "无效 CHECK_EOL: $CHECK_EOL（应为 0 或 1）" "Invalid CHECK_EOL: $CHECK_EOL (expected 0 or 1)" >&2; exit 2 ;; esac
 prompt_text CHECK_TIME "每日检查时间 HH:MM" "Daily check time HH:MM" "09:00"
 if [[ -z "$DEDUP_MODE" ]]; then
   if [[ "$NON_INTERACTIVE" -eq 1 ]]; then DEDUP_MODE="daily"; else
@@ -628,6 +644,7 @@ case "$BACKEND" in
     ;;
 esac
 install_missing_packages
+capture_dependency_created_defaults
 
 install -d -m 0750 /etc/security-update-notify /var/lib/security-update-notify /usr/local/sbin
 touch /var/log/security-update-notify.log
