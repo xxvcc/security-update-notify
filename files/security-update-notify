@@ -13,9 +13,9 @@ STATE_DIR="/var/lib/security-update-notify"
 STATE_FILE="$STATE_DIR/last-alert.sha256"
 STATE_TIME_FILE="$STATE_DIR/last-alert.sent_at"
 LOCK_FILE="/run/security-update-notify.lock"
-VERSION="1.9.0"
-REPO="${SECURITY_UPDATE_NOTIFY_REPO:-xxvcc/security-update-notify}"
-RELEASE_SIGNING_FINGERPRINT="${SECURITY_UPDATE_NOTIFY_SIGNING_FINGERPRINT:-C678256ACBFC6491BF5076655F3AE24999921FFC}"
+VERSION="1.9.1"
+REPO="xxvcc/security-update-notify"
+RELEASE_SIGNING_FINGERPRINT="C678256ACBFC6491BF5076655F3AE24999921FFC"
 UPGRADE_ALLOW_UNSIGNED="${SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED:-0}"
 LOG_FILE="/var/log/security-update-notify.log"
 TEST_REBOOT=0
@@ -149,6 +149,59 @@ PY
   fi
 }
 
+release_signing_public_key() {
+  cat <<'EOF'
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mDMEahvWSxYJKwYBBAHaRw8BAQdA4dw6PpATHy6t/5pPCenY7QgLM0JrrRzmGy+U
+6QCu1Om0RnNlY3VyaXR5LXVwZGF0ZS1ub3RpZnkgcmVsZWFzZSBzaWduaW5nIDxz
+ZWN1cml0eS11cGRhdGUtbm90aWZ5QHh4di5jYz6IkAQTFggAOBYhBMZ4JWrL/GSR
+v1B2ZV864kmZkh/8BQJqG9ZLAhsDBQsJCAcCBhUKCQgLAgQWAgMBAh4BAheAAAoJ
+EF864kmZkh/8cd8BAPJzN0Gwyu18Sks3qp7oUhHGZDgXfomwwcMSRHsMbtYIAPwJ
+/5ACw9n3BkfUYkGs76uTaVHtXEZFmXjNiegzaqkgDQ==
+=AahY
+-----END PGP PUBLIC KEY BLOCK-----
+EOF
+}
+
+safe_release_archive() {
+  local archive="$1" topdir="$2" entry listing_type
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    case "$entry" in
+      /*|../*|*/../*|*/..|..) say "压缩包中存在不安全路径: $entry" "Unsafe path in archive: $entry" >&2; exit 1 ;;
+    esac
+    case "$entry" in
+      "$topdir"|"$topdir/"|"$topdir"/*) ;;
+      *) say "压缩包中存在非预期路径: $entry" "Unexpected path in archive: $entry" >&2; exit 1 ;;
+    esac
+  done < <(tar -tzf "$archive")
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    listing_type="${entry:0:1}"
+    case "$listing_type" in
+      -|d) ;;
+      *) say "压缩包中存在不支持的条目类型: $entry" "Unsupported archive entry type: $entry" >&2; exit 1 ;;
+    esac
+  done < <(tar -tzvf "$archive")
+}
+
+verify_release_signature() {
+  local sig_file="$1" archive="$2" gpg_home fpr
+  [[ -n "$RELEASE_SIGNING_FINGERPRINT" ]] || { say "未配置签名指纹；拒绝升级" "No signing fingerprint configured; refusing to upgrade" >&2; exit 1; }
+  gpg_home="$(mktemp -d)"
+  chmod 700 "$gpg_home"
+  release_signing_public_key | GNUPGHOME="$gpg_home" gpg --batch --import >/dev/null 2>&1 \
+    || { rm -rf "$gpg_home"; say "导入签名公钥失败；拒绝升级" "Failed to import signing public key; refusing to upgrade" >&2; exit 1; }
+  fpr="$(GNUPGHOME="$gpg_home" gpg --batch --with-colons --list-keys 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}')"
+  [[ "$fpr" == "$RELEASE_SIGNING_FINGERPRINT" ]] \
+    || { rm -rf "$gpg_home"; say "签名公钥指纹不匹配（期望 $RELEASE_SIGNING_FINGERPRINT，实际 ${fpr:-none}）；拒绝升级" "Signing key fingerprint mismatch; refusing to upgrade" >&2; exit 1; }
+  GNUPGHOME="$gpg_home" gpg --batch --verify "$sig_file" "$archive" >/dev/null 2>&1 \
+    || { rm -rf "$gpg_home"; say "签名校验失败；拒绝升级" "Signature verification failed; refusing to upgrade" >&2; exit 1; }
+  rm -rf "$gpg_home"
+  say "签名校验通过 (${RELEASE_SIGNING_FINGERPRINT})" "Signature verified (${RELEASE_SIGNING_FINGERPRINT})"
+}
+
 run_self_upgrade() {
   # 不再把远程脚本 `curl ... | bash` 直接交给 root 执行；改为直接下载 GitHub 发布包，
   # 校验 sha256，并用本程序内置（pin）的指纹强制校验 GPG 签名（默认 fail-closed），
@@ -166,7 +219,7 @@ run_self_upgrade() {
     command -v "$c" >/dev/null 2>&1 || { say "升级需要命令: $c" "Upgrade requires command: $c" >&2; exit 1; }
   done
 
-  local latest tmp pkg pkgdir url sha_url sig_url expected fpr gpg_home rc
+  local latest tmp pkg pkgdir url sha_url sig_url expected rc
   if ! latest="$(latest_release_version)"; then
     say "无法获取最新版本" "Failed to fetch latest version" >&2
     exit 1
@@ -198,41 +251,23 @@ run_self_upgrade() {
   ( cd "$tmp" && printf '%s  %s\n' "$expected" "$pkg" | sha256sum -c - ) >/dev/null 2>&1 \
     || { say "sha256 校验失败；拒绝升级" "Checksum verification failed; refusing to upgrade" >&2; exit 1; }
 
-  # 安全解包：拒绝路径穿越与非预期顶层目录。
-  # Safe extraction: reject path traversal and unexpected top-level directories.
-  local entry
-  while IFS= read -r entry; do
-    [[ -n "$entry" ]] || continue
-    case "$entry" in
-      /*|../*|*/../*|*/..|..) say "压缩包中存在不安全路径: $entry" "Unsafe path in archive: $entry" >&2; exit 1 ;;
-    esac
-    case "$entry" in
-      "$pkgdir"|"$pkgdir/"|"$pkgdir"/*) ;;
-      *) say "压缩包中存在非预期路径: $entry" "Unexpected path in archive: $entry" >&2; exit 1 ;;
-    esac
-  done < <(tar -tzf "$tmp/$pkg")
-  ( cd "$tmp" && tar --no-same-owner -xzf "$pkg" ) || { say "解包失败" "Extraction failed" >&2; exit 1; }
-
-  # GPG 签名校验：用包内公钥，但强制其指纹等于本程序 pin 的指纹（fail-closed）。
-  # GPG verification: import the bundled key but require its fingerprint to equal the one pinned here (fail-closed).
+  # GPG 签名校验在解包前完成：公钥内置并 pin 指纹，避免从未验证归档中取信任根。
+  # Verify the GPG signature before extraction: the public key is embedded and fingerprint-pinned,
+  # so the trust root is not read from the unverified archive.
   if command -v gpg >/dev/null 2>&1 && download_release_file "$sig_url" "$tmp/$pkg.asc" 2>/dev/null; then
-    [[ -s "$tmp/$pkgdir/files/release-signing.pub.asc" ]] || { say "发布包缺少签名公钥；拒绝升级" "Release is missing the signing public key; refusing to upgrade" >&2; exit 1; }
-    gpg_home="$tmp/gnupg"
-    mkdir -p "$gpg_home"; chmod 700 "$gpg_home"
-    GNUPGHOME="$gpg_home" gpg --batch --import "$tmp/$pkgdir/files/release-signing.pub.asc" >/dev/null 2>&1 \
-      || { say "导入签名公钥失败；拒绝升级" "Failed to import signing public key; refusing to upgrade" >&2; exit 1; }
-    fpr="$(GNUPGHOME="$gpg_home" gpg --batch --with-colons --list-keys 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}')"
-    [[ -n "$RELEASE_SIGNING_FINGERPRINT" ]] || { say "未配置签名指纹；拒绝升级" "No signing fingerprint configured; refusing to upgrade" >&2; exit 1; }
-    [[ "$fpr" == "$RELEASE_SIGNING_FINGERPRINT" ]] || { say "签名公钥指纹不匹配（期望 $RELEASE_SIGNING_FINGERPRINT，实际 ${fpr:-none}）；拒绝升级" "Signing key fingerprint mismatch; refusing to upgrade" >&2; exit 1; }
-    GNUPGHOME="$gpg_home" gpg --batch --verify "$tmp/$pkg.asc" "$tmp/$pkg" >/dev/null 2>&1 \
-      || { say "签名校验失败；拒绝升级" "Signature verification failed; refusing to upgrade" >&2; exit 1; }
-    say "签名校验通过 (${RELEASE_SIGNING_FINGERPRINT})" "Signature verified (${RELEASE_SIGNING_FINGERPRINT})"
+    verify_release_signature "$tmp/$pkg.asc" "$tmp/$pkg"
   elif [[ "$UPGRADE_ALLOW_UNSIGNED" == "1" ]]; then
     say "警告：未校验 GPG 签名（SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1），仅校验 sha256。" "WARNING: skipping GPG verification (SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1); sha256 only." >&2
   else
     say "缺少 gpg 或发布签名，且未设置 SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1；为安全起见拒绝升级。" "Missing gpg or release signature and SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED is not set; refusing to upgrade for safety." >&2
     exit 1
   fi
+
+  # 安全解包：拒绝路径穿越、非预期顶层目录，以及 symlink/hardlink/device 等特殊条目。
+  # Safe extraction: reject path traversal, unexpected top-level paths, and special entries
+  # such as symlinks, hardlinks and devices.
+  safe_release_archive "$tmp/$pkg" "$pkgdir"
+  ( cd "$tmp" && tar --no-same-owner -xzf "$pkg" ) || { say "解包失败" "Extraction failed" >&2; exit 1; }
 
   [[ -f "$tmp/$pkgdir/install.sh" ]] || { say "发布包缺少 install.sh" "Release is missing install.sh" >&2; exit 1; }
   chmod 0755 "$tmp/$pkgdir/install.sh" 2>/dev/null || true
@@ -486,7 +521,7 @@ EOL_ATTENTION=0; EOL_SIG=""; EOL_TXT_ZH=""; EOL_TXT_EN=""
 check_update_health() {
   [[ "${CHECK_UPDATE_HEALTH:-1}" == "1" ]] || return 0
   command -v systemctl >/dev/null 2>&1 || return 0
-  local timer svc now last_ts last_epoch res stale_days days mp avail
+  local timer svc now last_ts last_epoch last_trigger trigger_epoch res stale_days days mp avail
   local reasons=()
   case "$BACKEND" in
     apt) timer="apt-daily-upgrade.timer"; svc="apt-daily-upgrade.service" ;;
@@ -515,6 +550,17 @@ check_update_health() {
         HEALTH_ATTENTION=1; reasons+=("stale")
         HEALTH_TXT_ZH+="• 已 $days 天没有成功的自动安全更新（阈值 $stale_days 天）"$'\n'
         HEALTH_TXT_EN+="• No successful automatic security update for $days days (threshold $stale_days)"$'\n'
+      fi
+    else
+      last_trigger="$(systemctl show "$timer" -p LastTriggerUSec --value 2>/dev/null || true)"
+      if [[ -n "$last_trigger" && "$last_trigger" != "n/a" ]]; then
+        trigger_epoch="$(date -d "$last_trigger" +%s 2>/dev/null || echo 0)"
+        if [[ "$trigger_epoch" =~ ^[0-9]+$ && "$trigger_epoch" -gt 0 ]] && (( now - trigger_epoch > stale_days * 86400 )); then
+          days=$(( (now - trigger_epoch) / 86400 ))
+          HEALTH_ATTENTION=1; reasons+=("never-success")
+          HEALTH_TXT_ZH+="• 自动安全更新定时器已触发过，但没有成功运行记录（最近触发约 $days 天前）"$'\n'
+          HEALTH_TXT_EN+="• The automatic-update timer has triggered, but no successful run was recorded (last trigger ~${days} days ago)"$'\n'
+        fi
       fi
     fi
   fi
@@ -566,12 +612,20 @@ collect_security_updates() {
 # 各发行版“安全支持终止”近似日期（best-effort，需随时间维护；Fedora 生命周期短，故意不列）。
 # Approximate security end-of-life per release (best-effort; maintain over time; Fedora intentionally omitted).
 eol_date_for() {
-  local id="$1" ver="$2" major="${2%%.*}"
+  local id="$1" ver="$2" pretty="${3:-}" major="${2%%.*}"
   case "$id" in
     debian) case "$ver" in 11) echo 2026-08-31 ;; 12) echo 2028-06-30 ;; 13) echo 2030-06-30 ;; esac ;;
     ubuntu) case "$ver" in 20.04) echo 2025-05-31 ;; 22.04) echo 2027-06-01 ;; 24.04) echo 2029-05-31 ;; esac ;;
-    rhel|rocky|almalinux|ol|cloudlinux|centos) case "$major" in 8) echo 2029-05-31 ;; 9) echo 2032-05-31 ;; esac ;;
-    amzn) case "$ver" in 2023) echo 2028-03-15 ;; esac ;;
+    rhel|rocky|ol|cloudlinux) case "$major" in 8) echo 2029-05-31 ;; 9) echo 2032-05-31 ;; esac ;;
+    almalinux) case "$major" in 8) echo 2029-03-01 ;; 9) echo 2032-05-31 ;; esac ;;
+    centos)
+      if [[ "$pretty" == *"Stream"* ]]; then
+        case "$major" in 8) echo 2024-05-31 ;; 9) echo 2027-05-31 ;; esac
+      else
+        case "$major" in 7) echo 2024-06-30 ;; 8) echo 2021-12-31 ;; esac
+      fi
+      ;;
+    amzn) case "$ver" in 2023) echo 2029-06-30 ;; esac ;;
   esac
 }
 
@@ -580,7 +634,7 @@ eol_date_for() {
 check_eol() {
   [[ "${CHECK_EOL:-1}" == "1" ]] || return 0
   local eol now eol_epoch days warn_days=90
-  eol="$(eol_date_for "${OS_RELEASE_ID:-}" "${OS_RELEASE_VERSION_ID:-}")"
+  eol="$(eol_date_for "${OS_RELEASE_ID:-}" "${OS_RELEASE_VERSION_ID:-}" "${OS_RELEASE_PRETTY_NAME:-}")"
   [[ -n "$eol" ]] || return 0
   now="$(date +%s)"
   eol_epoch="$(date -d "$eol" +%s 2>/dev/null || echo 0)"

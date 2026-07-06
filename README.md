@@ -138,7 +138,7 @@ SUN **不会**：
 
 ### 2. 安装
 
-推荐使用网站引导安装器。它会下载最新 GitHub Release、校验 `.sha256`，然后启动交互式菜单：
+推荐使用网站引导安装器。它会下载最新 GitHub Release、校验 `.sha256` 与 GPG 签名（默认必须通过），然后启动交互式菜单：
 
 ```bash
 curl -fsSL https://sun.xxv.cc | sudo bash
@@ -386,9 +386,9 @@ sudo ./uninstall.sh --purge-config
 
 ## Release 签名
 
-发布包始终包含 `.sha256` 校验文件。`package.sh` 支持在存在 GPG 私钥时自动生成 `.tar.gz.asc` detached signature；`sun.sh --verify-signature auto|required|off` 可在下载后校验签名。本仓库包含 release signing public key，若 release 发布了 `.asc`，`auto` 会自动校验；如果没有 `.asc`，`auto` 会回退到 sha256，`required` 会失败。
+发布包始终包含 `.sha256` 校验文件。`package.sh` 支持在存在 GPG 私钥时自动生成 `.tar.gz.asc` detached signature；`sun.sh` 默认以 `required` 模式校验签名，`auto` 仅作为兼容别名保留，也会要求 gpg 与 `.asc` 签名同时存在；只有显式传入 `--verify-signature off` 才会跳过签名校验。
 
-正式发布（打了 `vX.Y.Z` tag 的构建）**强制签名**：`package.sh` 在 tag 指向当前提交时会要求 GPG 签名，没有私钥则构建失败；release 发布后 CI 会用仓库内公钥校验产物的签名与指纹，缺签名/不匹配即让该 release 的检查失败。私钥不进入 CI，仍由维护者离线持有。此外，`security-update-notify --upgrade` 默认 **fail-closed**：直接下载 GitHub 发布包，校验 sha256，并用内置 pin 的指纹强制校验 GPG 签名后才升级（应急可设 `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` 仅按 sha256 升级）。
+正式发布（打了 `vX.Y.Z` tag 的构建）**强制签名**：`package.sh` 在 tag 指向当前提交时会要求 GPG 签名，没有私钥则构建失败；release 发布后 CI 会用仓库内公钥校验产物的签名与指纹，缺签名/不匹配即让该 release 的检查失败。私钥不进入 CI，仍由维护者离线持有。此外，`security-update-notify --upgrade` 默认 **fail-closed**：直接下载 GitHub 发布包，校验 sha256，并在解包前用内置公钥与 pin 指纹强制校验 GPG 签名后才升级（应急可设 `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` 仅按 sha256 升级）。
 
 ## 安全说明
 
@@ -401,7 +401,7 @@ SUN 的范围刻意保持很小：
 - Telegram 凭据文件仅 root 可读；
 - 尽力支持的发行版必须显式开启。
 
-发布包的 `.sha256` 文件可以防止下载损坏或版本不匹配；如果你的威胁模型包含发布源被攻破，请考虑额外的签名校验流程。
+发布包的 `.sha256` 文件可以防止下载损坏或版本不匹配；如果你的威胁模型包含发布源被攻破，请保持默认签名校验开启，不要使用 `--verify-signature off` 或无签名升级逃生选项。
 
 ## 构建发布包
 

@@ -138,7 +138,7 @@ For groups, add the bot to the group and make sure it can send messages there.
 
 ### 2. Install
 
-Recommended: use the website-hosted bootstrap installer. It downloads the latest GitHub Release, verifies the `.sha256` file, then opens the interactive menu:
+Recommended: use the website-hosted bootstrap installer. It downloads the latest GitHub Release, verifies the `.sha256` file and GPG signature (required by default), then opens the interactive menu:
 
 ```bash
 curl -fsSL https://sun.xxv.cc | sudo bash
@@ -386,9 +386,9 @@ Packages installed as dependencies are left in place. `--purge-config` removes S
 
 ## Release signatures
 
-Release packages always include a `.sha256` checksum file. `package.sh` can also create a detached `.tar.gz.asc` signature automatically when a GPG secret key is available. `sun.sh --verify-signature auto|required|off` verifies the signature after download. This repository includes a release signing public key. When a release publishes `.asc`, `auto` verifies it automatically; if no `.asc` is published, `auto` falls back to sha256 and `required` fails.
+Release packages always include a `.sha256` checksum file. `package.sh` can also create a detached `.tar.gz.asc` signature automatically when a GPG secret key is available. `sun.sh` defaults to `required` signature verification; `auto` is kept only as a compatibility alias and also requires both gpg and the `.asc` signature. Only an explicit `--verify-signature off` skips signature verification.
 
-Official releases (builds whose `vX.Y.Z` tag points at the current commit) are **signed-mandatory**: `package.sh` requires a GPG signature for a tagged build and fails without a key, and after a release is published CI verifies the assets' signature and fingerprint against the repo's public key, failing the release checks if a signature is missing or mismatched. The private key never enters CI; it stays offline with the maintainer. In addition, `security-update-notify --upgrade` is **fail-closed** by default: it downloads the GitHub release directly, verifies sha256, and requires a GPG signature against a pinned fingerprint before upgrading (set `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` to upgrade on sha256 only in an emergency).
+Official releases (builds whose `vX.Y.Z` tag points at the current commit) are **signed-mandatory**: `package.sh` requires a GPG signature for a tagged build and fails without a key, and after a release is published CI verifies the assets' signature and fingerprint against the repo's public key, failing the release checks if a signature is missing or mismatched. The private key never enters CI; it stays offline with the maintainer. In addition, `security-update-notify --upgrade` is **fail-closed** by default: it downloads the GitHub release directly, verifies sha256, and requires a GPG signature against an embedded public key and pinned fingerprint before extracting and upgrading (set `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` to upgrade on sha256 only in an emergency).
 
 ## Security notes
 
@@ -401,7 +401,7 @@ SUN is intentionally narrow:
 - root-only Telegram credential file;
 - explicit opt-in for best-effort distro support.
 
-The release `.sha256` file protects against accidental corruption or version mismatch. It is not a substitute for a signed release if your threat model includes a compromised download source.
+The release `.sha256` file protects against accidental corruption or version mismatch. If your threat model includes a compromised download source, keep the default signature verification enabled and do not use `--verify-signature off` or the unsigned-upgrade escape hatch.
 
 ## Build a release package
 

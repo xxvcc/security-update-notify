@@ -6,11 +6,11 @@ set -euo pipefail
 # 可将此脚本发布到你的网站，例如 https://example.com/install/sun.sh
 # Publish this script on your website, e.g. https://example.com/install/sun.sh
 
-REPO="${SECURITY_UPDATE_NOTIFY_REPO:-xxvcc/security-update-notify}"
-VERSION="${SECURITY_UPDATE_NOTIFY_VERSION:-latest}"
-BASE_URL="${SECURITY_UPDATE_NOTIFY_BASE_URL:-}"
-VERIFY_SIGNATURE="${SECURITY_UPDATE_NOTIFY_VERIFY_SIGNATURE:-auto}"
-RELEASE_SIGNING_FINGERPRINT="${SECURITY_UPDATE_NOTIFY_SIGNING_FINGERPRINT:-C678256ACBFC6491BF5076655F3AE24999921FFC}"
+REPO="xxvcc/security-update-notify"
+VERSION="latest"
+BASE_URL=""
+VERIFY_SIGNATURE="required"
+RELEASE_SIGNING_FINGERPRINT="C678256ACBFC6491BF5076655F3AE24999921FFC"
 UI_LANG="${UI_LANG:-${SUN_LANG:-}}"
 RUN_MODE="menu"
 INSTALL_ARGS=()
@@ -35,7 +35,7 @@ Bootstrap options:
   --version VERSION       Release version, e.g. 1.1.0. Default: latest
   --repo OWNER/REPO       GitHub repo. Default from script config
   --base-url URL          Override download base URL
-  --verify-signature MODE Signature verification: auto | required | off
+  --verify-signature MODE Signature verification: required | auto | off (default: required; auto is a compatibility alias)
   install                 Run install.sh after download
   upgrade                 Upgrade and reuse existing config
   test                    Run test.sh after download
@@ -55,7 +55,7 @@ EOF
   --version VERSION       发布版本，例如 1.1.0；默认 latest
   --repo OWNER/REPO       GitHub 仓库；默认来自脚本配置
   --base-url URL          覆盖下载基础 URL
-  --verify-signature MODE 签名校验模式：auto | required | off
+  --verify-signature MODE 签名校验模式：required | auto | off（默认 required；auto 为兼容别名）
   install                 下载后运行 install.sh
   upgrade                 下载后升级并复用已有配置
   test                    下载后运行 test.sh
@@ -109,6 +109,21 @@ safe_extract_tar() {
   tar --no-same-owner -xzf "$archive"
 }
 
+release_signing_public_key() {
+  cat <<'EOF'
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mDMEahvWSxYJKwYBBAHaRw8BAQdA4dw6PpATHy6t/5pPCenY7QgLM0JrrRzmGy+U
+6QCu1Om0RnNlY3VyaXR5LXVwZGF0ZS1ub3RpZnkgcmVsZWFzZSBzaWduaW5nIDxz
+ZWN1cml0eS11cGRhdGUtbm90aWZ5QHh4di5jYz6IkAQTFggAOBYhBMZ4JWrL/GSR
+v1B2ZV864kmZkh/8BQJqG9ZLAhsDBQsJCAcCBhUKCQgLAgQWAgMBAh4BAheAAAoJ
+EF864kmZkh/8cd8BAPJzN0Gwyu18Sks3qp7oUhHGZDgXfomwwcMSRHsMbtYIAPwJ
+/5ACw9n3BkfUYkGs76uTaVHtXEZFmXjNiegzaqkgDQ==
+=AahY
+-----END PGP PUBLIC KEY BLOCK-----
+EOF
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --lang) require_arg "$1" "${2:-}"; UI_LANG="$2"; shift 2 ;;
@@ -153,12 +168,14 @@ if [[ -z "${UI_LANG:-}" ]]; then
   fi
 fi
 
-for c in curl tar sha256sum mktemp python3; do command -v "$c" >/dev/null 2>&1 || { say "缺少必需命令: $c" "Missing required command: $c" >&2; exit 1; }; done
+REQUIRED_COMMANDS=(curl tar sha256sum mktemp python3)
+[[ "$VERIFY_SIGNATURE" == "off" ]] || REQUIRED_COMMANDS+=(gpg)
+for c in "${REQUIRED_COMMANDS[@]}"; do command -v "$c" >/dev/null 2>&1 || { say "缺少必需命令: $c" "Missing required command: $c" >&2; exit 1; }; done
 
 [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { say "无效 REPO 格式: $REPO" "Invalid REPO format: $REPO" >&2; exit 2; }
 
 if [[ "$VERSION" == "latest" ]]; then
-  [[ "$REPO" != "YOUR_GITHUB_USER/security-update-notify" ]] || { say "发布前请设置 SECURITY_UPDATE_NOTIFY_REPO 或编辑引导脚本 REPO。" "Set SECURITY_UPDATE_NOTIFY_REPO or edit bootstrap REPO before publishing." >&2; exit 2; }
+  [[ "$REPO" != "YOUR_GITHUB_USER/security-update-notify" ]] || { say "发布前请传入 --repo 或编辑引导脚本 REPO。" "Pass --repo or edit bootstrap REPO before publishing." >&2; exit 2; }
   api="https://api.github.com/repos/${REPO}/releases/latest"
   VERSION="$(curl -fsSL "$api" | python3 -c 'import json,sys; t=json.load(sys.stdin)["tag_name"]; print(t[1:] if t.startswith("v") else t)')"
 fi
@@ -173,7 +190,7 @@ if [[ -n "$BASE_URL" ]]; then
   URL="${BASE_URL%/}/${PKG}"
   SHA_URL="${URL}.sha256"
 else
-  [[ "$REPO" != "YOUR_GITHUB_USER/security-update-notify" ]] || { say "发布前请设置 SECURITY_UPDATE_NOTIFY_REPO 或编辑引导脚本 REPO。" "Set SECURITY_UPDATE_NOTIFY_REPO or edit bootstrap REPO before publishing." >&2; exit 2; }
+  [[ "$REPO" != "YOUR_GITHUB_USER/security-update-notify" ]] || { say "发布前请传入 --repo 或编辑引导脚本 REPO。" "Pass --repo or edit bootstrap REPO before publishing." >&2; exit 2; }
   URL="https://github.com/${REPO}/releases/download/v${VERSION}/${PKG}"
   SHA_URL="${URL}.sha256"
 fi
@@ -185,35 +202,22 @@ say "正在下载: $URL" "Downloading: $URL"
 curl -fL --retry 3 -o "$PKG" "$URL"
 curl -fL --retry 3 -o "$PKG.sha256" "$SHA_URL"
 verify_checksum "$PKG" "$PKG.sha256"
-safe_extract_tar "$PKG" "$PKG_DIR"
-cd "$PKG_DIR"
 
 verify_signature_if_available() {
   local sig_url sig_file actual_fpr gpg_home eff="$VERIFY_SIGNATURE"
   case "$VERIFY_SIGNATURE" in auto|required|off) ;; *) say "无效签名校验模式: $VERIFY_SIGNATURE" "Invalid signature verification mode: $VERIFY_SIGNATURE" >&2; exit 2 ;; esac
   [[ "$eff" != "off" ]] || return 0
-  # auto：有 gpg 就按 required 严格校验（fail-closed，与已安装程序的 --upgrade 一致）；
-  # 只有在完全没有 gpg 时才退回仅 sha256（最佳努力，给出明确提示）。
-  # auto: with gpg present, verify strictly like 'required' (fail-closed, matching the installed
-  # program's --upgrade); only when gpg is entirely absent fall back to sha256-only (best-effort, noted).
-  if [[ "$eff" == "auto" ]]; then
-    if command -v gpg >/dev/null 2>&1; then
-      eff="required"
-    else
-      say "提示：未安装 gpg，跳过 GPG 签名校验，仅用 sha256（建议安装 gnupg 获得完整校验）。" "Note: gpg not installed; skipping GPG signature verification, sha256 only (install gnupg for full verification)." >&2
-      return 0
-    fi
-  fi
-  # 到这里一律按 required（fail-closed）处理。
-  # From here it is always 'required' (fail-closed).
+  # auto 作为兼容别名保留，但不再在缺少 gpg/签名时退回 sha256-only。
+  # auto is kept as a compatibility alias, but no longer falls back to sha256-only when
+  # gpg or the signature is missing.
+  [[ "$eff" == "auto" ]] && eff="required"
   command -v gpg >/dev/null 2>&1 || { say "签名校验需要 gpg" "gpg is required for signature verification" >&2; exit 1; }
   sig_url="${URL}.asc"
   sig_file="$TMP/$PKG.asc"
   curl -fsL --retry 2 -o "$sig_file" "$sig_url" || { say "缺少 release 签名；拒绝继续" "Release signature is missing; refusing to continue" >&2; exit 1; }
-  [[ -s files/release-signing.pub.asc ]] || { say "发布包缺少签名公钥；拒绝继续" "Release is missing the signing public key; refusing to continue" >&2; exit 1; }
   gpg_home="$TMP/gnupg"
   mkdir -p "$gpg_home"; chmod 700 "$gpg_home"
-  GNUPGHOME="$gpg_home" gpg --batch --import files/release-signing.pub.asc >/dev/null 2>&1 || { say "导入签名公钥失败" "Failed to import signing public key" >&2; exit 1; }
+  release_signing_public_key | GNUPGHOME="$gpg_home" gpg --batch --import >/dev/null 2>&1 || { say "导入签名公钥失败" "Failed to import signing public key" >&2; exit 1; }
   actual_fpr="$(GNUPGHOME="$gpg_home" gpg --batch --with-colons --list-keys 2>/dev/null | awk -F: '$1=="fpr" {print $10; exit}')"
   [[ -n "$RELEASE_SIGNING_FINGERPRINT" && "$actual_fpr" == "$RELEASE_SIGNING_FINGERPRINT" ]] || { say "签名公钥指纹不匹配（期望 $RELEASE_SIGNING_FINGERPRINT，实际 ${actual_fpr:-none}）；拒绝继续" "Signing key fingerprint mismatch (expected $RELEASE_SIGNING_FINGERPRINT, got ${actual_fpr:-none}); refusing to continue" >&2; exit 1; }
   GNUPGHOME="$gpg_home" gpg --batch --verify "$sig_file" "$TMP/$PKG" >/dev/null 2>&1 || { say "签名校验失败；拒绝继续" "Signature verification failed; refusing to continue" >&2; exit 1; }
@@ -221,6 +225,8 @@ verify_signature_if_available() {
 }
 
 verify_signature_if_available
+safe_extract_tar "$PKG" "$PKG_DIR"
+cd "$PKG_DIR"
 
 # 当通过 `curl ... | sudo bash` 调用时，stdin 是脚本流而不是用户终端。
 # 因此只在最终 exec 目标脚本时重定向到 /dev/tty，避免校验后卡住。

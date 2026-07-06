@@ -1,5 +1,12 @@
 # 变更记录
 
+## 1.9.1
+
+- 安全加固：`sun.sh` 默认改为必须校验 GPG 签名，`auto` 仅作为兼容别名且不再在缺少 gpg/签名时退回 sha256-only；引导脚本与自升级都使用内置公钥和 pin 指纹，并在解包前完成签名校验。
+  Security hardening: `sun.sh` now requires GPG signature verification by default; `auto` is only a compatibility alias and no longer falls back to sha256-only when gpg/signature is missing. Both the bootstrap and self-upgrade paths use an embedded public key plus pinned fingerprint and verify before extraction.
+- 修复安全更新看门狗：CentOS Linux / CentOS Stream 与 Amazon Linux 2023 的 EOL 日期表已修正；自动更新定时器触发过但没有成功运行记录时，不再被误判为健康。
+  Security-update watchdog fixes: correct EOL dates for CentOS Linux / CentOS Stream and Amazon Linux 2023; a timer that has triggered without any recorded successful automatic-update run is no longer treated as healthy.
+
 ## 1.9.0
 
 安全更新看门狗：在“内核/服务重启”之外，新增三项面向安全更新本身的检测，默认开启，均可在配置中关闭。

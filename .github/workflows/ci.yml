@@ -285,6 +285,78 @@ jobs:
           1
           EOF
 
+      - name: Security hardening regression check
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          expected_key = Path('files/release-signing.pub.asc').read_text().strip()
+          for path in ('files/security-update-notify', 'sun.sh'):
+              text = Path(path).read_text()
+              match = re.search(r"release_signing_public_key\(\) \{\n  cat <<'EOF'\n(.*?)\nEOF\n\}", text, re.S)
+              assert match, f"{path}: embedded release signing key missing"
+              assert match.group(1).strip() == expected_key, f"{path}: embedded release signing key drifted"
+              assert 'SECURITY_UPDATE_NOTIFY_SIGNING_FINGERPRINT' not in text, f"{path}: signing fingerprint must not be env-overridable"
+
+          assert 'REPO="xxvcc/security-update-notify"' in Path('files/security-update-notify').read_text()
+          assert 'VERIFY_SIGNATURE="required"' in Path('sun.sh').read_text()
+
+          runtime = Path('files/security-update-notify').read_text()
+          verify_call = runtime.index('verify_release_signature "$tmp/$pkg.asc" "$tmp/$pkg"')
+          extract = runtime.index('tar --no-same-owner -xzf "$pkg"')
+          assert verify_call < extract, 'self-upgrade must verify before extraction'
+          assert 'files/release-signing.pub.asc' not in runtime[runtime.index('run_self_upgrade() {'):extract], 'self-upgrade must not trust a key from the unverified archive'
+          PY
+
+          python3 - <<'PY'
+          from pathlib import Path
+          s = Path('files/security-update-notify').read_text()
+          start = s.index('safe_release_archive() {')
+          end = s.index('\nverify_release_signature()', start)
+          harness = '''#!/usr/bin/env bash
+          set -euo pipefail
+          say(){ printf '%s\n' "$1" >&2; }
+          ''' + s[start:end] + '''
+          tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+          mkdir -p "$tmp/build/security-update-notify-9.9.9"
+          ln -s /etc/passwd "$tmp/build/security-update-notify-9.9.9/bad-link"
+          (cd "$tmp/build" && tar -czf "$tmp/bad.tar.gz" security-update-notify-9.9.9)
+          if ( safe_release_archive "$tmp/bad.tar.gz" security-update-notify-9.9.9 ) 2>"$tmp/safe-archive.err"; then
+            echo "safe_release_archive accepted a symlink entry" >&2
+            exit 1
+          fi
+          grep -Eq '不支持的条目类型|Unsupported archive entry type' "$tmp/safe-archive.err"
+          '''
+          Path('/tmp/sun-archive-harness.sh').write_text(harness)
+          PY
+          chmod +x /tmp/sun-archive-harness.sh
+          /tmp/sun-archive-harness.sh
+
+          python3 - <<'PY'
+          from pathlib import Path
+          s = Path('files/security-update-notify').read_text()
+          start = s.index('eol_date_for() {')
+          end = s.index('\n# 发行版安全支持即将', start)
+          harness = '''#!/usr/bin/env bash
+          set -euo pipefail
+          ''' + s[start:end] + '''
+          check(){ got="$(eol_date_for "$1" "$2" "${3:-}")"; [ "$got" = "$4" ] || { echo "$1 $2 ${3:-}: got '$got', want '$4'" >&2; exit 1; }; }
+          check centos 8 "CentOS Stream 8" 2024-05-31
+          check centos 9 "CentOS Stream 9" 2027-05-31
+          check centos 8 "CentOS Linux 8" 2021-12-31
+          check centos 7 "CentOS Linux 7" 2024-06-30
+          check amzn 2023 "Amazon Linux 2023" 2029-06-30
+          check almalinux 8 "AlmaLinux 8" 2029-03-01
+          check rhel 9 "Red Hat Enterprise Linux 9" 2032-05-31
+          '''
+          Path('/tmp/sun-eol-harness.sh').write_text(harness)
+          PY
+          chmod +x /tmp/sun-eol-harness.sh
+          /tmp/sun-eol-harness.sh
+
       - name: Package release artifact
         run: ./package.sh
 
