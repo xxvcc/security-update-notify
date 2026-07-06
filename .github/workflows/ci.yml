@@ -441,7 +441,7 @@ jobs:
       - name: Verify checksum and pinned GPG signature
         run: |
           set -euo pipefail
-          pin="$(grep -m1 RELEASE_SIGNING_FINGERPRINT files/security-update-notify | sed -E 's/.*:-([0-9A-Fa-f]+)\}.*/\1/')"
+          pin="$(awk -F= '/^RELEASE_SIGNING_FINGERPRINT=/{gsub(/["'\''[:space:]]/, "", $2); print $2; exit}' files/security-update-notify)"
           case "$pin" in *[!0-9A-Fa-f]*|"") echo "::error::could not read a valid pinned RELEASE_SIGNING_FINGERPRINT"; exit 1 ;; esac
           [ "${#pin}" -eq 40 ] || { echo "::error::pinned fingerprint is not 40 hex chars: '$pin'"; exit 1; }
           export GNUPGHOME="$(mktemp -d)"
