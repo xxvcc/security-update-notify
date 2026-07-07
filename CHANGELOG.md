@@ -1,9 +1,9 @@
 # 变更记录
 
-## Unreleased
+## 1.9.3
 
-第四轮安全审计加固（源码修复；发布需由维护者用离线签名密钥重新打包签名）。
-Fourth-pass security-audit hardening (source fixes; a release must be repackaged and signed by the maintainer with the offline signing key).
+第四轮安全审计加固。
+Fourth-pass security-audit hardening.
 
 - 自升级签名不可被剥离降级：`gpg` 可用时签名恒为必需，即使攻击者让 `.asc` 下载失败也一律拒绝，绝不静默退回 sha256-only；`SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` 的 sha256-only 分支仅在本机确实没有 `gpg` 且显式 opt-in 时保留，网络攻击者无法触发。
   Self-upgrade signature can no longer be stripped to force a downgrade: when `gpg` is available a signature is mandatory and a missing `.asc` is refused rather than silently falling back to sha256-only; the `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` sha256-only branch remains only for hosts that genuinely lack `gpg` and explicitly opt in, and cannot be triggered by a network attacker.
