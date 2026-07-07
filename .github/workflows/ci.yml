@@ -309,12 +309,31 @@ jobs:
           assert 'REPO="xxvcc/security-update-notify"' in Path('files/security-update-notify').read_text()
           assert 'VERIFY_SIGNATURE="required"' in Path('sun.sh').read_text()
 
+          # Both pinned fingerprints must be present (40 hex) and identical. sun.sh's pin is otherwise
+          # never validated by push/PR CI (verify-signed-release reads only files/security-update-notify),
+          # so a drifted sun.sh pin would silently break the bootstrap without turning CI red.
+          fprs = {}
+          for path in ('files/security-update-notify', 'sun.sh'):
+              fm = re.search(r'^RELEASE_SIGNING_FINGERPRINT="([0-9A-Fa-f]{40})"', Path(path).read_text(), re.M)
+              assert fm, f'{path}: pinned RELEASE_SIGNING_FINGERPRINT (40 hex) missing'
+              fprs[path] = fm.group(1).upper()
+          assert len(set(fprs.values())) == 1, f'pinned fingerprints differ between files: {fprs}'
+
           runtime = Path('files/security-update-notify').read_text()
           verify_call = runtime.index('verify_release_signature "$tmp/$pkg.asc" "$tmp/$pkg"')
           extract = runtime.index('tar --no-same-owner --no-same-permissions -xzf "$pkg"')
           assert verify_call < extract, 'self-upgrade must verify before extraction'
           assert 'files/release-signing.pub.asc' not in runtime[runtime.index('run_self_upgrade() {'):extract], 'self-upgrade must not trust a key from the unverified archive'
           PY
+
+          # Tie the pinned fingerprint to the ACTUAL embedded public key at push time (verify-signed-release
+          # does this too, but only on release events). Fails if the pin and the shipped key ever diverge.
+          hardening_gpg_home="$(mktemp -d)"
+          GNUPGHOME="$hardening_gpg_home" gpg --batch --import files/release-signing.pub.asc 2>/dev/null
+          key_fpr="$(GNUPGHOME="$hardening_gpg_home" gpg --batch --with-colons --list-keys | awk -F: '$1=="fpr"{print $10; exit}')"
+          pin_fpr="$(awk -F'"' '/^RELEASE_SIGNING_FINGERPRINT=/{print $2; exit}' files/security-update-notify)"
+          [ -n "$key_fpr" ] && [ "$key_fpr" = "$pin_fpr" ] || { echo "::error::embedded public key fingerprint ($key_fpr) != pinned ($pin_fpr)"; exit 1; }
+          echo "pinned fingerprint matches embedded key and both files agree: $pin_fpr"
 
           python3 - <<'PY'
           from pathlib import Path
