@@ -374,6 +374,119 @@ jobs:
           chmod +x /tmp/sun-eol-harness.sh
           /tmp/sun-eol-harness.sh
 
+      - name: Version comparison regression check
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          s = Path('files/security-update-notify').read_text()
+          start = s.index('is_newer_version() {')
+          end = s.index('\nrun_check_upgrade()', start)
+          body = s[start:end]
+          # Guard against reverting to sort -V (ranks 1.0.0-rc1 ABOVE 1.0.0 -> mis-gates rc->final as a downgrade).
+          assert 'sort -V' not in body, 'is_newer_version must not use sort -V (mis-ranks pre-release)'
+          assert 'python3' in body, 'is_newer_version must use the python3 semver comparator'
+          harness = '''#!/usr/bin/env bash
+          set -uo pipefail
+          ''' + body + '''
+          fail=0
+          ck(){ is_newer_version "$1" "$2"; g=$?; if [ "$g" != "$3" ]; then echo "FAIL $1 -> $2 exp=$3 got=$g" >&2; fail=1; fi; }
+          ck 1.0.0-rc1 1.0.0 0
+          ck 1.0.0 1.0.0-rc1 1
+          ck 1.0.0-rc1 1.0.0-rc2 0
+          ck 1.9.3 1.9.4 0
+          ck 1.9.4 1.9.3 1
+          ck 1.9.3 1.9.3 1
+          ck 1.7.0 1.7.0.1 0
+          ck 1.7.0.1 1.7.0 1
+          ck v1.2.3 v1.2.4 0
+          ck 1.9.3 not-a-ver 1
+          ck 1.9.3 1_0.0.0 1
+          exit $fail
+          '''
+          Path('/tmp/sun-vercmp-harness.sh').write_text(harness)
+          PY
+          chmod +x /tmp/sun-vercmp-harness.sh
+          /tmp/sun-vercmp-harness.sh
+
+      - name: State-write atomicity regression check
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          s = Path('files/security-update-notify').read_text()
+          # Guard against reverting to naked '>' redirects (torn/empty state file on ENOSPC/crash).
+          assert 'mktemp "$STATE_DIR/.state.XXXXXX"' in s, 'state write must use mktemp temp files'
+          assert 'mv -f "$state_tmp" "$STATE_FILE"' in s, 'state hash must be committed via atomic rename'
+          assert 'mv -f "$time_tmp" "$STATE_TIME_FILE"' in s, 'state timestamp must be committed via atomic rename'
+          print('state-write source invariants OK')
+          PY
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          cp files/security-update-notify "$tmp/security-update-notify"
+          sed -i \
+            -e "s|^STATE_DIR=.*|STATE_DIR=\"$tmp/state\"|" \
+            -e "s|^LOCK_FILE=.*|LOCK_FILE=\"$tmp/lock\"|" \
+            -e "s|^LOG_FILE=.*|LOG_FILE=\"$tmp/log\"|" \
+            "$tmp/security-update-notify"
+          chmod +x "$tmp/security-update-notify"
+          mkdir -p "$tmp/bin"
+          cat >"$tmp/bin/python3" <<'EOF'
+          #!/usr/bin/env bash
+          exec /usr/bin/python3 -c 'import sys; print("{\"ok\": true}")'
+          EOF
+          chmod +x "$tmp/bin/python3"
+          cat >"$tmp/env" <<'EOF'
+          TELEGRAM_BOT_TOKEN=fake
+          TELEGRAM_CHAT_ID=fake
+          NOTIFY_LANG=zh
+          BACKEND=apt
+          INCLUDE_PUBLIC_IP=0
+          EOF
+          PATH="$tmp/bin:$PATH" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env" "$tmp/security-update-notify" --test-reboot --no-dedupe >/dev/null
+          test -s "$tmp/state/last-alert.sha256"
+          grep -Eq '^[0-9a-f]{64}$' "$tmp/state/last-alert.sha256"
+          grep -Eq '^[0-9]+$' "$tmp/state/last-alert.sent_at"
+          [ "$(find "$tmp/state" -maxdepth 1 -name '.state.*' | wc -l)" -eq 0 ]
+          echo "state written atomically, no leftover temp files"
+
+      - name: Config parser regression check
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          s = Path('files/security-update-notify').read_text()
+          start = s.index('load_config_file() {')
+          end = s.index('\ntelegram_get_me()', start)
+          body = s[start:end]
+          harness = '''#!/usr/bin/env bash
+          set -uo pipefail
+          say(){ :; }
+          ''' + body + '''
+          t="$(mktemp -d)"; trap 'rm -rf "$t" 2>/dev/null || true' EXIT
+          ck(){
+            printf '%s\n' "$2" > "$t/c"
+            HOST_LABEL=""; NOTIFY_OK=""
+            load_config_file "$t/c"; rc=$?
+            if [ "$rc" != "$3" ]; then echo "FAIL[$1] rc exp=$3 got=$rc" >&2; exit 1; fi
+            if [ "$#" -ge 4 ] && [ "${HOST_LABEL:-}" != "$4" ]; then echo "FAIL[$1] HOST_LABEL exp=[$4] got=[${HOST_LABEL:-}]" >&2; exit 1; fi
+          }
+          # fail-OPEN invariant: a quoted value with a trailing inline comment must NOT abort the notifier
+          # (an over-eager "unterminated quote" check would turn a config typo into a total alert outage).
+          ck quoted-plus-comment 'HOST_LABEL="prod" # note' 0
+          ck double-quoted 'HOST_LABEL="my host"' 0 "my host"
+          ck single-quoted "HOST_LABEL='my host'" 0 "my host"
+          ck unquoted-comment 'HOST_LABEL=web1 # prod' 0 "web1"
+          ck embedded-hash 'HOST_LABEL=web#1' 0 "web#1"
+          ck unknown-key 'BAD_KEY=x' 2
+          ck no-equals 'JUSTTEXT' 2
+          echo "config parser OK"
+          '''
+          Path('/tmp/sun-cfg-harness.sh').write_text(harness)
+          PY
+          chmod +x /tmp/sun-cfg-harness.sh
+          /tmp/sun-cfg-harness.sh
+
       - name: Package release artifact
         run: ./package.sh
 

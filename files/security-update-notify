@@ -103,15 +103,74 @@ except Exception as exc:
 PY
 }
 
-# 判断 $2(latest) 是否严格高于 $1(current)。用 sort -V 处理多段与预发布后缀，
-# 避免旧版 awk %08d 截断把 1.7.0.1 当作等于 1.7.0、或把 4 段版本误判为降级。
-# Whether $2 (latest) is strictly newer than $1 (current). sort -V handles multi-segment and
-# pre-release suffixes, avoiding the old awk %08d truncation that treated 1.7.0.1 as 1.7.0.
+# 判断 $2(latest) 是否严格高于 $1(current)。用 python3 做语义化版本比较：数字段逐段比较
+# （缺省段补 0，故 1.7.0.1 > 1.7.0），并按 semver 规则处理预发布后缀（1.0.0 > 1.0.0-rc1）。
+# 注意 sort -V 会把 1.0.0-rc1 排在 1.0.0 之上，从而把 rc→正式版误判为降级——故不再使用。
+# 解析失败一律按“非更新”返回（fail-closed），避免误触发 root 权限下的自升级。
+# Whether $2 (latest) is strictly newer than $1 (current). Uses python3 for semantic version
+# comparison: numeric segments compared pairwise (missing segments = 0, so 1.7.0.1 > 1.7.0) and
+# pre-release suffixes ranked per semver (1.0.0 > 1.0.0-rc1). sort -V ranks 1.0.0-rc1 ABOVE 1.0.0
+# and so mis-gates an rc->final upgrade as a downgrade, which is why it is no longer used here.
+# Any parse failure returns "not newer" (fail-closed) so a malformed version can never trigger
+# the root-run self-upgrade.
 is_newer_version() {
   local current="$1" latest="$2"
   [[ -n "$current" && -n "$latest" ]] || return 1
   [[ "$current" != "$latest" ]] || return 1
-  [[ "$(printf '%s\n%s\n' "$current" "$latest" | sed 's/^v//' | sort -V | tail -1)" == "$(printf '%s\n' "$latest" | sed 's/^v//')" ]]
+  python3 - "$current" "$latest" <<'PY'
+import sys
+
+def parse(v):
+    v = v.strip()
+    if v[:1] == 'v':
+        v = v[1:]
+    v = v.split('+', 1)[0]                     # semver 构建元数据不参与优先级 / build metadata ignored
+    rel, _, pre = v.partition('-')
+    parts = rel.split('.') if rel else ['0']
+    # 仅接受纯 ASCII 数字段；下划线（int('1_0')==10）、Unicode 数字等一律拒绝 -> 上层 fail-closed。
+    # Accept only pure ASCII-digit segments; underscores (int('1_0')==10) and Unicode digits are
+    # rejected so a mis-formatted tag can't parse to a bogus number -> fail-closed upstream.
+    if not all(p.isascii() and p.isdigit() for p in parts):
+        raise ValueError('non-numeric release segment')
+    nums = [int(p) for p in parts]
+    return nums, pre
+
+def cmp_list(a, b):
+    n = max(len(a), len(b))
+    a = a + [0] * (n - len(a))
+    b = b + [0] * (n - len(b))
+    return (a > b) - (a < b)
+
+def cmp_pre(a, b):
+    if a == b:
+        return 0
+    if a == '':                               # 无预发布后缀 > 有预发布后缀 / release outranks pre-release
+        return 1
+    if b == '':
+        return -1
+    ai, bi = a.split('.'), b.split('.')
+    for x, y in zip(ai, bi):
+        if x == y:
+            continue
+        xn, yn = x.isdigit(), y.isdigit()
+        if xn and yn:
+            return (int(x) > int(y)) - (int(x) < int(y))
+        if xn != yn:                          # 数字标识符优先级低于字母标识符 / numeric < alphanumeric
+            return -1 if xn else 1
+        return (x > y) - (x < y)
+    return (len(ai) > len(bi)) - (len(ai) < len(bi))
+
+def compare(v1, v2):
+    r1, p1 = parse(v1)
+    r2, p2 = parse(v2)
+    c = cmp_list(r1, r2)
+    return c if c else cmp_pre(p1, p2)
+
+try:
+    sys.exit(0 if compare(sys.argv[2], sys.argv[1]) > 0 else 1)
+except Exception:
+    sys.exit(1)
+PY
 }
 
 run_check_upgrade() {
@@ -1070,8 +1129,26 @@ if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
 fi
 
 if telegram_send_message "$msg"; then
-  printf '%s\n' "$alert_hash" >"$STATE_FILE"
-  printf '%s\n' "$now_epoch" >"$STATE_TIME_FILE"
+  # 原子写状态：临时文件 + rename，避免崩溃或磁盘满时留下被截断/清空的状态文件（">" 会先截断再写）。
+  # hash 先于时间戳落盘；即便两次 rename 之间崩溃，残留的旧时间戳只会让下次更倾向“发送”，绝不会静默抑制真实告警。
+  # Atomic state write: temp file + rename so a crash/ENOSPC can't leave a truncated/empty state file
+  # ('>' truncates before writing). Hash is committed before the timestamp; a crash between the two
+  # renames leaves an older timestamp, which only biases the next run toward sending, never toward
+  # silently suppressing a real alert.
+  if state_tmp="$(mktemp "$STATE_DIR/.state.XXXXXX" 2>/dev/null)" \
+     && time_tmp="$(mktemp "$STATE_DIR/.state.XXXXXX" 2>/dev/null)" \
+     && printf '%s\n' "$alert_hash" >"$state_tmp" \
+     && printf '%s\n' "$now_epoch" >"$time_tmp" \
+     && mv -f "$state_tmp" "$STATE_FILE" 2>/dev/null \
+     && mv -f "$time_tmp" "$STATE_TIME_FILE" 2>/dev/null; then
+    :
+  else
+    # mktemp/写入/rename 任一步失败（如 STATE_DIR 权限或空间问题）时，清理临时文件并回退到直接写，保持原有行为。
+    # If any step fails (e.g. STATE_DIR perms/space), clean up temp files and fall back to direct writes.
+    rm -f "${state_tmp:-}" "${time_tmp:-}" 2>/dev/null || true
+    printf '%s\n' "$alert_hash" >"$STATE_FILE" 2>/dev/null || true
+    printf '%s\n' "$now_epoch" >"$STATE_TIME_FILE" 2>/dev/null || true
+  fi
   log_event "telegram sent backend=$BACKEND host=$HOST reboot_required=$reboot_required restart_attention=$restart_attention hash=$alert_hash"
 else
   log_event "telegram failed backend=$BACKEND host=$HOST"
