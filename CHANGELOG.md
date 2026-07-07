@@ -1,5 +1,17 @@
 # 变更记录
 
+## 1.9.4
+
+版本比较与状态写入健壮性修复。
+Version-comparison and state-write robustness fixes.
+
+- 自升级版本比较改用语义化比较（`python3`）替换 `sort -V`：`sort -V` 会把预发布号（如 `1.0.0-rc1`）排在正式版 `1.0.0` 之上，导致从 rc 升级到正式版被误判为“降级”而拒绝自升级；解析失败一律按“非更新”处理（fail-closed），数字段仅接受纯 ASCII 数字，畸形 tag 不会被解析成伪数值。多段版本（`1.7.0.1 > 1.7.0`）与预发布优先级仍按预期处理。
+  Self-upgrade version comparison now uses a semantic-version compare (`python3`) instead of `sort -V`: `sort -V` ranks a pre-release such as `1.0.0-rc1` above the release `1.0.0`, so an rc→final upgrade was mis-judged as a downgrade and refused; a parse failure is treated as "not newer" (fail-closed), and numeric segments accept only pure ASCII digits so a malformed tag cannot parse to a bogus number. Multi-segment versions (`1.7.0.1 > 1.7.0`) and pre-release precedence are preserved.
+- 告警去重状态文件改为原子写入（`mktemp` + rename）：`>` 会先截断再写，崩溃或磁盘满时可能留下被截断/清空的状态文件；改为临时文件加原子重命名，且 hash 先于时间戳落盘，中途崩溃只会让下次更倾向“发送”，不会静默抑制真实告警。
+  The alert-dedup state files are now written atomically (`mktemp` + rename): `>` truncates before writing, so a crash or full disk could leave a truncated/empty state file; writes now go through a temp file plus atomic rename, with the hash committed before the timestamp, so a mid-write crash only biases the next run toward sending, never toward silently suppressing a real alert.
+- 新增 CI 回归守卫，锁定上述修复：版本比较表用例（含禁止 `sort -V` 重现的源码断言）、状态原子写不变量、以及配置解析的 fail-open 不变量。
+  Added CI regression guards locking in the above: version-comparison table cases (with a source assertion forbidding a `sort -V` regression), state-write atomicity invariants, and the config-parser fail-open invariant.
+
 ## 1.9.3
 
 第四轮安全审计加固。
