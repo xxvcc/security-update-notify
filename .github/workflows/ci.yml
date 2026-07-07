@@ -311,7 +311,7 @@ jobs:
 
           runtime = Path('files/security-update-notify').read_text()
           verify_call = runtime.index('verify_release_signature "$tmp/$pkg.asc" "$tmp/$pkg"')
-          extract = runtime.index('tar --no-same-owner -xzf "$pkg"')
+          extract = runtime.index('tar --no-same-owner --no-same-permissions -xzf "$pkg"')
           assert verify_call < extract, 'self-upgrade must verify before extraction'
           assert 'files/release-signing.pub.asc' not in runtime[runtime.index('run_self_upgrade() {'):extract], 'self-upgrade must not trust a key from the unverified archive'
           PY

@@ -108,7 +108,9 @@ safe_extract_tar() {
         ;;
     esac
   done < <(tar_clean_env -tzvf "$archive")
-  tar_clean_env --no-same-owner -xzf "$archive"
+  # --no-same-permissions：不从归档恢复 setuid/setgid 等特殊权限位（纵深防御）。
+  # --no-same-permissions: do not restore setuid/setgid/special bits from the archive (defense in depth).
+  tar_clean_env --no-same-owner --no-same-permissions -xzf "$archive"
 }
 
 release_signing_public_key() {
@@ -186,9 +188,12 @@ validate_version "$VERSION"
 PKG="security-update-notify-${VERSION}.tar.gz"
 PKG_DIR="security-update-notify-${VERSION}"
 if [[ -n "$BASE_URL" ]]; then
-  # 自定义下载源必须是 https（拒绝 http:// / file:// / ftp:// 等明文或本地协议）。
-  # A custom download source must be https (reject http:// / file:// / ftp:// and other plaintext/local schemes).
-  [[ "$BASE_URL" =~ ^https://[A-Za-z0-9.-]+ ]] || { say "--base-url 必须以 https:// 开头: $BASE_URL" "--base-url must start with https://: $BASE_URL" >&2; exit 2; }
+  # 自定义下载源必须是干净的 https URL：完整锚定，拒绝 http:// / file:// / ftp:// 等协议，
+  # 且不含 .. 路径穿越片段（正则右端锚定，不再是仅前缀匹配）。
+  # A custom download source must be a clean https URL: fully anchored, rejecting http:// / file:// / ftp://,
+  # and containing no ".." traversal segment (the regex is end-anchored, not just a prefix match).
+  { [[ "$BASE_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]] && [[ "$BASE_URL" != *".."* ]]; } \
+    || { say "--base-url 必须是干净的 https URL（不含 .. 等）: $BASE_URL" "--base-url must be a clean https URL (no ..): $BASE_URL" >&2; exit 2; }
   URL="${BASE_URL%/}/${PKG}"
   SHA_URL="${URL}.sha256"
 else

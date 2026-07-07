@@ -1,5 +1,19 @@
 # 变更记录
 
+## Unreleased
+
+第四轮安全审计加固（源码修复；发布需由维护者用离线签名密钥重新打包签名）。
+Fourth-pass security-audit hardening (source fixes; a release must be repackaged and signed by the maintainer with the offline signing key).
+
+- 自升级签名不可被剥离降级：`gpg` 可用时签名恒为必需，即使攻击者让 `.asc` 下载失败也一律拒绝，绝不静默退回 sha256-only；`SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` 的 sha256-only 分支仅在本机确实没有 `gpg` 且显式 opt-in 时保留，网络攻击者无法触发。
+  Self-upgrade signature can no longer be stripped to force a downgrade: when `gpg` is available a signature is mandatory and a missing `.asc` is refused rather than silently falling back to sha256-only; the `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` sha256-only branch remains only for hosts that genuinely lack `gpg` and explicitly opt in, and cannot be triggered by a network attacker.
+- 版本绑定：自升级解包后核对发布包内声明的 `VERSION` 必须等于请求的 `latest`（在顶层目录名 pin 之外再加一道），防止签名集合内的回滚/版本错配。
+  Version binding: after extraction the self-upgrade checks that the package's declared `VERSION` equals the requested `latest` (in addition to the pinned top-dir name), preventing rollback/version mismatch within the signed set.
+- 解包加固：自升级与 `sun.sh` 的 tar 解包新增 `--no-same-permissions`，不从归档恢复 setuid/setgid 等特殊权限位（纵深防御）。
+  Extraction hardening: self-upgrade and `sun.sh` tar extraction now pass `--no-same-permissions`, not restoring setuid/setgid bits from the archive (defense in depth).
+- 一致性与健壮性：取最新版本号的 API 请求也强制 HTTPS-only 重定向；`--base-url` 校验改为完整锚定并拒绝 `..`；`--doctor` 的 dnf 分支不再误报“yum 存在”；磁盘检查改用 `df -P -k` 消除块大小歧义；日志文件缺失时以 `0640` 创建；EOL 表补充 RHEL 系 10。
+  Consistency/robustness: the latest-version API request also enforces HTTPS-only redirects; `--base-url` validation is fully anchored and rejects `..`; the `--doctor` dnf branch no longer falsely reports "yum present"; the disk check uses `df -P -k` to remove block-size ambiguity; the log file is created `0640` when absent; the EOL table gains RHEL-family 10.
+
 ## 1.9.2
 
 - 三轮复审安全加固：发布包下载与自升级下载现在限制 curl 只允许 HTTPS 及 HTTPS 重定向；引导脚本、自升级与打包过程的 tar 调用会清理 `TAR_OPTIONS`/压缩工具环境变量，避免本地环境影响归档校验、解包或构建。

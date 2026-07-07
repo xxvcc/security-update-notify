@@ -74,11 +74,26 @@ latest_release_version() {
   python3 - "$REPO" <<'PY'
 import json
 import sys
+import urllib.error
+import urllib.parse
 import urllib.request
 
+# 与 download_release_file 保持一致：拒绝任何非 https 的重定向，请求不可被降级到明文。
+# Match download_release_file: refuse any non-https redirect so the request cannot be downgraded to plaintext.
+class HTTPSOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        newurl = urllib.parse.urljoin(req.full_url, newurl)
+        if urllib.parse.urlparse(newurl).scheme != "https":
+            raise urllib.error.URLError(f"refusing non-https redirect to {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
 repo = sys.argv[1]
+url = f"https://api.github.com/repos/{repo}/releases/latest"
+opener = urllib.request.build_opener(HTTPSOnlyRedirectHandler)
 try:
-    with urllib.request.urlopen(f"https://api.github.com/repos/{repo}/releases/latest", timeout=20) as response:
+    with opener.open(url, timeout=20) as response:
+        if urllib.parse.urlparse(response.geturl()).scheme != "https":
+            raise SystemExit("refusing non-https final API URL")
         data = json.load(response)
     tag = str(data.get("tag_name", ""))
     print(tag[1:] if tag.startswith("v") else tag)
@@ -236,7 +251,7 @@ run_self_upgrade() {
     command -v "$c" >/dev/null 2>&1 || { say "升级需要命令: $c" "Upgrade requires command: $c" >&2; exit 1; }
   done
 
-  local latest tmp pkg pkgdir url sha_url sig_url expected rc
+  local latest tmp pkg pkgdir url sha_url sig_url expected rc pkg_version
   if ! latest="$(latest_release_version)"; then
     say "无法获取最新版本" "Failed to fetch latest version" >&2
     exit 1
@@ -271,12 +286,21 @@ run_self_upgrade() {
   # GPG 签名校验在解包前完成：公钥内置并 pin 指纹，避免从未验证归档中取信任根。
   # Verify the GPG signature before extraction: the public key is embedded and fingerprint-pinned,
   # so the trust root is not read from the unverified archive.
-  if command -v gpg >/dev/null 2>&1 && download_release_file "$sig_url" "$tmp/$pkg.asc" 2>/dev/null; then
+  # gpg 可用时，签名恒为必需：即使攻击者故意让 .asc 下载失败（MITM/被控镜像返回 404），也一律
+  # 拒绝，绝不因缺签名而静默降级到 sha256-only（sha256 文件同样由攻击者提供，形同虚设）。
+  # sha256-only 分支只在“本机确实没有 gpg”且运维显式 opt-in 时保留，无法被网络攻击者触发。
+  # When gpg is available a signature is mandatory: even if an attacker makes the .asc download fail
+  # (MITM/compromised mirror returning 404) we refuse, and never silently downgrade to sha256-only
+  # (the sha256 file is attacker-supplied too). The sha256-only branch remains only for hosts that
+  # genuinely lack gpg AND explicitly opt in, so a network attacker cannot trigger a downgrade.
+  if command -v gpg >/dev/null 2>&1; then
+    download_release_file "$sig_url" "$tmp/$pkg.asc" 2>/dev/null \
+      || { say "缺少发布签名（.asc）；gpg 可用时签名为必需，拒绝升级。" "Release signature (.asc) is missing; a signature is mandatory when gpg is available. Refusing to upgrade." >&2; exit 1; }
     verify_release_signature "$tmp/$pkg.asc" "$tmp/$pkg"
   elif [[ "$UPGRADE_ALLOW_UNSIGNED" == "1" ]]; then
-    say "警告：未校验 GPG 签名（SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1），仅校验 sha256。" "WARNING: skipping GPG verification (SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1); sha256 only." >&2
+    say "警告：本机没有 gpg 且已设置 SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1，仅校验 sha256（不推荐）。" "WARNING: gpg is not installed and SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1; sha256-only verification (not recommended)." >&2
   else
-    say "缺少 gpg 或发布签名，且未设置 SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1；为安全起见拒绝升级。" "Missing gpg or release signature and SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED is not set; refusing to upgrade for safety." >&2
+    say "缺少 gpg 且未设置 SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1；为安全起见拒绝升级。" "Missing gpg and SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED is not set; refusing to upgrade for safety." >&2
     exit 1
   fi
 
@@ -284,9 +308,21 @@ run_self_upgrade() {
   # Safe extraction: reject path traversal, unexpected top-level paths, and special entries
   # such as symlinks, hardlinks and devices.
   safe_release_archive "$tmp/$pkg" "$pkgdir"
-  ( cd "$tmp" && env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT tar --no-same-owner -xzf "$pkg" ) || { say "解包失败" "Extraction failed" >&2; exit 1; }
+  # --no-same-permissions：不从归档恢复 setuid/setgid 等特殊权限位（纵深防御：即便签名者被攻破，
+  # 也不会因归档内的权限位而落地 setuid 文件）。
+  # --no-same-permissions: do not restore setuid/setgid/special bits from the archive (defense in depth:
+  # even if the signer were compromised, no setuid file lands via archived permission bits).
+  ( cd "$tmp" && env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT tar --no-same-owner --no-same-permissions -xzf "$pkg" ) || { say "解包失败" "Extraction failed" >&2; exit 1; }
 
   [[ -f "$tmp/$pkgdir/install.sh" ]] || { say "发布包缺少 install.sh" "Release is missing install.sh" >&2; exit 1; }
+  # 版本绑定：已校验发布包内声明的 VERSION 必须等于本次请求的 latest。顶层目录名已由
+  # safe_release_archive pin 到 security-update-notify-<latest>，此处再核对程序内 VERSION，
+  # 双重防止“签名集合内回滚/版本错配”。
+  # Version binding: the verified package's declared VERSION must equal the requested latest. The top-dir
+  # name is already pinned by safe_release_archive; re-checking the in-file VERSION guards against any
+  # rollback/version mismatch within the signed set.
+  pkg_version="$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$tmp/$pkgdir/files/security-update-notify" 2>/dev/null | head -1)"
+  [[ "$pkg_version" == "$latest" ]] || { say "发布包内版本($pkg_version)与请求版本($latest)不一致；拒绝升级。" "Package version ($pkg_version) does not match requested version ($latest); refusing to upgrade." >&2; exit 1; }
   chmod 0755 "$tmp/$pkgdir/install.sh" 2>/dev/null || true
   say "正在以已校验的发布包升级..." "Upgrading from the verified release..."
   cd "$tmp/$pkgdir" || { say "进入解包目录失败" "Failed to enter extracted directory" >&2; exit 1; }
@@ -310,6 +346,9 @@ flock -n 9 || exit 0
 log_event() {
   local line="$1"
   mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+  # 日志不存在时以 0640 创建，避免被删除后按宽松 umask 重建为 world-readable。
+  # Create the log at 0640 when absent so a deleted log is not recreated world-readable under a loose umask.
+  [[ -e "$LOG_FILE" ]] || ( umask 0137; : >"$LOG_FILE" ) 2>/dev/null || true
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$line" >>"$LOG_FILE" 2>/dev/null || true
 }
 
@@ -586,7 +625,7 @@ check_update_health() {
   fi
   for mp in / /boot; do
     [[ -d "$mp" ]] || continue
-    avail="$(df -P "$mp" 2>/dev/null | awk 'NR==2{print $4}')"
+    avail="$(df -P -k "$mp" 2>/dev/null | awk 'NR==2{print $4}')"
     [[ "$avail" =~ ^[0-9]+$ ]] || continue
     if (( avail < 204800 )); then
       HEALTH_ATTENTION=1; reasons+=("disk")
@@ -636,8 +675,8 @@ eol_date_for() {
   case "$id" in
     debian) case "$ver" in 11) echo 2026-08-31 ;; 12) echo 2028-06-30 ;; 13) echo 2030-06-30 ;; esac ;;
     ubuntu) case "$ver" in 20.04) echo 2025-05-31 ;; 22.04) echo 2027-06-01 ;; 24.04) echo 2029-05-31 ;; esac ;;
-    rhel|rocky|ol|cloudlinux) case "$major" in 8) echo 2029-05-31 ;; 9) echo 2032-05-31 ;; esac ;;
-    almalinux) case "$major" in 8) echo 2029-03-01 ;; 9) echo 2032-05-31 ;; esac ;;
+    rhel|rocky|ol|cloudlinux) case "$major" in 8) echo 2029-05-31 ;; 9) echo 2032-05-31 ;; 10) echo 2035-05-31 ;; esac ;;
+    almalinux) case "$major" in 8) echo 2029-03-01 ;; 9) echo 2032-05-31 ;; 10) echo 2035-05-31 ;; esac ;;
     centos)
       if [[ "$pretty" == *"Stream"* ]]; then
         case "$major" in 8) echo 2024-05-31 ;; 9) echo 2027-05-31 ;; esac
@@ -694,7 +733,9 @@ run_doctor() {
       dpkg -s unattended-upgrades >/dev/null 2>&1 && say "正常：unattended-upgrades 已安装" "OK unattended-upgrades installed" || { say "失败：缺少 unattended-upgrades" "FAIL unattended-upgrades missing"; ok=0; }
       ;;
     dnf)
-      command -v dnf >/dev/null 2>&1 && say "正常：命令存在 dnf" "OK command dnf" || command -v yum >/dev/null 2>&1 && say "正常：命令存在 yum" "OK command yum" || { say "失败：缺少 dnf/yum" "FAIL missing dnf/yum"; ok=0; }
+      if command -v dnf >/dev/null 2>&1; then say "正常：命令存在 dnf" "OK command dnf"
+      elif command -v yum >/dev/null 2>&1; then say "正常：命令存在 yum" "OK command yum"
+      else say "失败：缺少 dnf/yum" "FAIL missing dnf/yum"; ok=0; fi
       command -v needs-restarting >/dev/null 2>&1 && say "正常：命令存在 needs-restarting" "OK command needs-restarting" || { say "失败：缺少 needs-restarting" "FAIL missing needs-restarting"; ok=0; }
       systemctl is-enabled dnf-automatic.timer >/dev/null 2>&1 && say "正常：dnf-automatic.timer 已启用" "OK dnf-automatic.timer enabled" || say "警告：dnf-automatic.timer 未启用" "WARN dnf-automatic.timer not enabled"
       ;;
