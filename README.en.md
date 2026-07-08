@@ -15,6 +15,8 @@
 
 It uses your distro's native update tools, runs from a systemd timer, and sends outbound-only Telegram notifications. No dashboard. No agent port. No remote-control bot.
 
+> Since **2.0**, the runtime is a statically-compiled **Go binary**, shipped per architecture (amd64/arm64/386/ppc64le/s390x); unbuilt architectures fall back to the self-contained Bash runtime. The runtime itself needs neither `python3` nor `curl` — only the `install.sh` installer still uses `python3` for its Telegram preflight.
+
 **Languages**: [中文](README.md) | English
 
 ## One-line install
@@ -44,7 +46,7 @@ SUN keeps the boring part automatic and makes the human part obvious.
 - **Reboot and service-restart detection** with `needrestart` or `needs-restarting`.
 - **Security-update watchdog**: beyond kernel/service restarts, it watches three commonly-missed things — ① whether the auto-update mechanism itself is unhealthy (timer disabled, last run failed, no successful update for too long, disk nearly full); ② whether security updates are still pending (dnf also counts critical/important); ③ whether the distro's security support is ending or already ended (EOL). A mechanism problem or a past-EOL release triggers an alert; the pending count and an approaching EOL ride along with alerts as info. All three can be turned off in the config.
 - **Single-language UI (Chinese or English)**: the installer, menu and diagnostics pick a language as the first step (Chinese or English, default Chinese) and then render all terminal interaction in that one language — no more mixed zh/en. The choice also becomes the default Telegram alert language, overridable with `--notify-lang`.
-- **Public IP in notifications**: auto-detect the server public IP by default; you can also set it manually or disable it. Auto-detection uses Python's standard library and does not add a `curl` dependency.
+- **Public IP in notifications**: auto-detect the server public IP by default; you can also set it manually or disable it. Auto-detection is done by the Go runtime with the standard library and adds no `curl`/`python3` dependency.
 - **Duplicate alert suppression**: once, daily, or every N days.
 - **Interactive and non-interactive install/upgrade**: rerunning the installer reuses the existing config.
 - **systemd timer based scheduling**.
