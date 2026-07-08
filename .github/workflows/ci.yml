@@ -29,7 +29,7 @@ jobs:
 
       - name: Shell syntax check
         run: |
-          bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify build/compat-test.sh
+          bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify build/compat-test.sh build/rollback-test.sh
 
       - name: ShellCheck
         run: |
@@ -523,6 +523,12 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/src:ro" debian:12 bash /src/build/compat-test.sh
 
+      - name: Upgrade rollback test (failed upgrade restores previous state)
+        # 在真实容器里：安装成功后，让第二次升级在写完新配置后 systemctl enable 失败，断言 install.sh
+        # 的备份/回滚把配置与二进制恢复到上一状态（保护 fleet 免于半途失败的升级）。
+        run: |
+          docker run --rm -v "$PWD:/src:ro" debian:12 bash /src/build/rollback-test.sh
+
       - name: Smoke install in Debian container
         run: |
           docker run --rm -v "$PWD:/src:ro" debian:12 bash -lc '
@@ -654,6 +660,26 @@ jobs:
             os="${pair%/*}"; arch="${pair#*/}"
             ./build/build.sh "$os" "$arch" "ci" "/tmp/sun-$arch"
             echo "built $pair"
+          done
+
+      - name: Multi-arch runtime golden check (QEMU)
+        # 不只交叉编译，还在 QEMU 下真正 *运行* 各架构二进制，断言其 --test-reboot hash 与 Bash golden
+        # 一致（覆盖 32 位 386、大端 s390x 等；仅编译过不代表运行时正确）。
+        run: |
+          set -euo pipefail
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y qemu-user-static >/dev/null
+          env="$(mktemp)"
+          {
+            echo "TELEGRAM_BOT_TOKEN=123456:fake_TOKEN-value"; echo "TELEGRAM_CHAT_ID=-1"
+            echo "HOST_LABEL=golden-host"; echo "BACKEND=apt"; echo "NOTIFY_LANG=zh"
+            echo "INCLUDE_PUBLIC_IP=0"; echo "CHECK_UPDATE_HEALTH=0"; echo "CHECK_EOL=0"; echo "STALE_UPDATE_DAYS=0"
+          } >"$env"
+          want="$(python3 -c "import json,sys; print({x['name']:x['hash'] for x in json.load(open('internal/golden/testdata/scenarios.json'))}['apt-test-reboot-zh'])")"
+          for arch in arm64 s390x 386 ppc64le; do
+            got="$(SECURITY_UPDATE_NOTIFY_ENV="$env" /tmp/sun-$arch --test-reboot --no-dedupe --dry-run | awk -F'\t' '/^HASH/{print $2}')"
+            [ "$got" = "$want" ] || { echo "::error::$arch runtime hash $got != golden $want"; exit 1; }
+            echo "OK $arch $got"
           done
 
       - name: Reproducible-build gate (double build sha256 equality)
