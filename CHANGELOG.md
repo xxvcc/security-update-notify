@@ -1,5 +1,17 @@
 # 变更记录
 
+## 2.0.1
+
+2.0.0 Go 运行时的两处行为回归修复（在真实主机升级测试中发现）。
+Two behavior regressions in the 2.0.0 Go runtime, found during real-host upgrade testing.
+
+- 恢复运行日志：Go 运行时重新向 `/var/log/security-update-notify.log` 写入运行事件（`check ok`/`silent ok`/`alert`/`dedup suppressed`/`telegram sent`/`telegram failed`），格式、时间戳与 `0640` 权限与 1.9.x 一致，logrotate 照常工作。2.0.0 遗漏了这一日志。
+  Restored operational logging: the Go runtime again writes run events to `/var/log/security-update-notify.log` (`check ok`/`silent ok`/`alert`/`dedup suppressed`/`telegram sent`/`telegram failed`) with the same format, timestamp and `0640` permissions as 1.9.x, so logrotate keeps working. 2.0.0 had dropped this.
+- 不支持的后端（既非 `apt` 也非 `dnf`，例如无法识别的发行版使 `auto` 解析为 unknown）现在与 1.9.x 一样以退出码 2 拒绝，而不是静默继续。
+  An unsupported backend (neither `apt` nor `dnf`, e.g. an unrecognized distro resolving `auto` to unknown) is now rejected with exit code 2 as in 1.9.x, instead of silently proceeding.
+- 新增可选环境变量覆盖运行时路径，便于隔离测试：`SECURITY_UPDATE_NOTIFY_STATE_DIR` / `_LOG_FILE` / `_LOCK_FILE`（默认与原路径一致）。
+  Added optional env overrides for runtime paths to ease isolated testing: `SECURITY_UPDATE_NOTIFY_STATE_DIR` / `_LOG_FILE` / `_LOCK_FILE` (defaults unchanged).
+
 ## 2.0.0
 
 运行时从 Bash + 内嵌 python3 重写为单个静态 Go 二进制；行为逐字节保持一致，已装机器可无缝原地升级。
