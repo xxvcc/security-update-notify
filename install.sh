@@ -652,7 +652,27 @@ chmod 0640 /var/log/security-update-notify.log
 if [[ -d /etc/logrotate.d ]]; then
   install -m 0644 "$SCRIPT_DIR/files/security-update-notify.logrotate" /etc/logrotate.d/security-update-notify
 fi
-install -m 0750 "$SCRIPT_DIR/files/security-update-notify" /usr/local/sbin/security-update-notify
+# 运行时二进制选择（桥）：优先安装本架构的 Go 二进制，缺失则回退到自包含的 bash 运行时
+# （冷门架构兜底）。发布包内 Go 二进制名为 files/security-update-notify-linux-<arch>。
+# Runtime binary selection (bridge): prefer this arch's Go binary, else fall back to the self-contained
+# bash runtime (orphan-arch fallback). Go binaries are shipped as files/security-update-notify-linux-<arch>.
+RUNTIME_IS_GO=0
+case "$(uname -m)" in
+  x86_64|amd64) go_arch=amd64 ;;
+  aarch64|arm64) go_arch=arm64 ;;
+  i386|i486|i586|i686) go_arch=386 ;;
+  ppc64le) go_arch=ppc64le ;;
+  s390x) go_arch=s390x ;;
+  *) go_arch="" ;;
+esac
+if [[ -n "$go_arch" && -f "$SCRIPT_DIR/files/security-update-notify-linux-$go_arch" ]]; then
+  install -m 0755 "$SCRIPT_DIR/files/security-update-notify-linux-$go_arch" /usr/local/sbin/security-update-notify
+  RUNTIME_IS_GO=1
+  say "已安装 Go 运行时二进制（linux-$go_arch）。" "Installed the Go runtime binary (linux-$go_arch)."
+else
+  install -m 0750 "$SCRIPT_DIR/files/security-update-notify" /usr/local/sbin/security-update-notify
+  say "已安装 bash 运行时（无本架构 Go 二进制，回退兜底）。" "Installed the bash runtime (no Go binary for this arch; fallback)."
+fi
 install -m 0644 "$SCRIPT_DIR/files/security-update-notify.service" /etc/systemd/system/security-update-notify.service
 
 if [[ "$BACKEND" == "apt" ]]; then
@@ -753,7 +773,8 @@ elif [[ "$BACKEND" == "dnf" ]]; then
 fi
 systemctl enable --now security-update-notify.timer >/dev/null
 
-bash -n /usr/local/sbin/security-update-notify
+# bash 运行时才做语法检查；Go 二进制不是脚本。
+[[ "$RUNTIME_IS_GO" -eq 1 ]] || bash -n /usr/local/sbin/security-update-notify
 if [[ "$POST_INSTALL_CHECK" -eq 1 ]]; then
   /usr/local/sbin/security-update-notify --version
   systemd-analyze verify /etc/systemd/system/security-update-notify.service /etc/systemd/system/security-update-notify.timer

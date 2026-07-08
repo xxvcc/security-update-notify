@@ -1,0 +1,42 @@
+[
+    {
+        "name": "apt-test-reboot-zh",
+        "hash": "67937ecd9dc8b78bb7bbb248d4ef6ef6ec0ac64ad65de2141dc171faec1803cd",
+        "message": "\u26a0\ufe0f \u5b89\u5168\u66f4\u65b0\u540e\u9700\u8981\u5904\u7406\n\n\u4e3b\u673a\uff1agolden-host\n\u7cfb\u7edf\uff1a<OS>\n\u540e\u7aef\uff1aapt\n\u5f53\u524d\u5185\u6838\uff1a<KERNEL>\n\u65f6\u95f4\uff1a<NOW>\n\n\u6574\u673a\u91cd\u542f\uff1a\u9700\u8981\n\u76f8\u5173\u5305/\u5b89\u5168\u66f4\u65b0\uff1a\nlinux-image-amd64\nTEST-MODE-no-real-reboot\n\n\u91cd\u542f\u68c0\u6d4b\u6458\u8981\uff1a\n\u5185\u6838\uff1a\u5f53\u524d test-current\uff0c\u5efa\u8bae test-expected\n\u5185\u6838\u72b6\u6001\u7801\uff1a3\n\u5efa\u8bae\u8bc4\u4f30/\u91cd\u542f\u7684\u670d\u52a1\uff081 \u4e2a\uff09\uff1a\n\u2022 ssh.service\n\n\u5efa\u8bae\uff1a\u8bf7\u5728\u65b9\u4fbf\u7684\u7ef4\u62a4\u7a97\u53e3 SSH \u767b\u5f55\u8be5\u670d\u52a1\u5668\u540e\u624b\u52a8\u6267\u884c reboot\uff1b\u5982\u53ea\u662f\u670d\u52a1\u9700\u8981\u91cd\u542f\uff0c\u53ef\u5148\u8bc4\u4f30\u5e76\u91cd\u542f\u5bf9\u5e94\u670d\u52a1\u3002"
+    },
+    {
+        "name": "apt-test-reboot-en",
+        "hash": "477c49bf6a5e20342045ec896b0fab762e5c8072cbe247e4480c9c365a2cb8a3",
+        "message": "\u26a0\ufe0f Security update action required\n\nHost: golden-host\nOS: <OS>\nBackend: apt\nCurrent kernel: <KERNEL>\nTime: <NOW>\n\nFull reboot: Required\nRelated packages/security updates:\nlinux-image-amd64\nTEST-MODE-no-real-reboot\n\nRestart detection summary:\nKernel: current test-current, expected test-expected\nKernel status code: 3\nServices to review/restart (1):\n\u2022 ssh.service\n\nRecommendation: SSH into this server during a suitable maintenance window and run reboot if a full reboot is required. If only services need restarting, review them first and restart the affected services manually."
+    },
+    {
+        "name": "dnf-test-reboot-zh",
+        "hash": "ed540b844ca4280bd731166e8c0c3c193038d0b3ae90c241a0ceecaf9f55542b",
+        "message": "\u26a0\ufe0f \u5b89\u5168\u66f4\u65b0\u540e\u9700\u8981\u5904\u7406\n\n\u4e3b\u673a\uff1agolden-host\n\u7cfb\u7edf\uff1a<OS>\n\u540e\u7aef\uff1adnf\n\u5f53\u524d\u5185\u6838\uff1a<KERNEL>\n\u65f6\u95f4\uff1a<NOW>\n\n\u6574\u673a\u91cd\u542f\uff1a\u9700\u8981\n\u76f8\u5173\u5305/\u5b89\u5168\u66f4\u65b0\uff1a\nkernel\nTEST-MODE-no-real-reboot\n\n\u91cd\u542f\u68c0\u6d4b\u6458\u8981\uff1a\n\u6574\u673a\u91cd\u542f\uff1aneeds-restarting -r \u5224\u65ad\u4e3a\u9700\u8981\n\u5efa\u8bae\u8bc4\u4f30/\u91cd\u542f\u7684\u670d\u52a1\uff081 \u4e2a\uff09\uff1a\n\u2022 test-service.service\n\n\u5efa\u8bae\uff1a\u8bf7\u5728\u65b9\u4fbf\u7684\u7ef4\u62a4\u7a97\u53e3 SSH \u767b\u5f55\u8be5\u670d\u52a1\u5668\u540e\u624b\u52a8\u6267\u884c reboot\uff1b\u5982\u53ea\u662f\u670d\u52a1\u9700\u8981\u91cd\u542f\uff0c\u53ef\u5148\u8bc4\u4f30\u5e76\u91cd\u542f\u5bf9\u5e94\u670d\u52a1\u3002"
+    },
+    {
+        "name": "dnf-test-reboot-en",
+        "hash": "fdbaddc3f32fbc35b1564c367a9327b838d22e23b2ebb5a9c3c85e6a78bb0544",
+        "message": "\u26a0\ufe0f Security update action required\n\nHost: golden-host\nOS: <OS>\nBackend: dnf\nCurrent kernel: <KERNEL>\nTime: <NOW>\n\nFull reboot: Required\nRelated packages/security updates:\nkernel\nTEST-MODE-no-real-reboot\n\nRestart detection summary:\nFull reboot: required by needs-restarting -r\nServices to review/restart (1):\n\u2022 test-service.service\n\nRecommendation: SSH into this server during a suitable maintenance window and run reboot if a full reboot is required. If only services need restarting, review them first and restart the affected services manually."
+    },
+    {
+        "name": "apt-needrestart-svc-zh",
+        "hash": "00a3b010b6e4c28057bef281ca8e4241002807c170998e4191466e919aa43415",
+        "message": "\u26a0\ufe0f \u5b89\u5168\u66f4\u65b0\u540e\u9700\u8981\u5904\u7406\n\n\u4e3b\u673a\uff1agolden-host\n\u7cfb\u7edf\uff1a<OS>\n\u540e\u7aef\uff1aapt\n\u5f53\u524d\u5185\u6838\uff1a<KERNEL>\n\u65f6\u95f4\uff1a<NOW>\n\n\u6574\u673a\u91cd\u542f\uff1a\u6682\u4e0d\u9700\u8981\n\u76f8\u5173\u5305/\u5b89\u5168\u66f4\u65b0\uff1a\n\u65e0\n\n\u91cd\u542f\u68c0\u6d4b\u6458\u8981\uff1a\n\u5185\u6838\uff1a\u5f53\u524d 6.1.0-43-amd64\uff0c\u5efa\u8bae 6.1.0-44-amd64\n\u5185\u6838\u72b6\u6001\u7801\uff1a3\n\u5efa\u8bae\u8bc4\u4f30/\u91cd\u542f\u7684\u670d\u52a1\uff082 \u4e2a\uff09\uff1a\n\u2022 nginx.service\n\u2022 ssh.service\n\n\u5efa\u8bae\uff1a\u8bf7\u5728\u65b9\u4fbf\u7684\u7ef4\u62a4\u7a97\u53e3 SSH \u767b\u5f55\u8be5\u670d\u52a1\u5668\u540e\u624b\u52a8\u6267\u884c reboot\uff1b\u5982\u53ea\u662f\u670d\u52a1\u9700\u8981\u91cd\u542f\uff0c\u53ef\u5148\u8bc4\u4f30\u5e76\u91cd\u542f\u5bf9\u5e94\u670d\u52a1\u3002"
+    },
+    {
+        "name": "dnf-services-zh",
+        "hash": "8c8d43128d24bd27372770bb7f3a0e32db6dc87a635568d779cb0ce0f56d1ef6",
+        "message": "\u26a0\ufe0f \u5b89\u5168\u66f4\u65b0\u540e\u9700\u8981\u5904\u7406\n\n\u4e3b\u673a\uff1agolden-host\n\u7cfb\u7edf\uff1a<OS>\n\u540e\u7aef\uff1adnf\n\u5f53\u524d\u5185\u6838\uff1a<KERNEL>\n\u65f6\u95f4\uff1a<NOW>\n\n\u6574\u673a\u91cd\u542f\uff1a\u6682\u4e0d\u9700\u8981\n\u76f8\u5173\u5305/\u5b89\u5168\u66f4\u65b0\uff1a\n\u65e0\n\n\u91cd\u542f\u68c0\u6d4b\u6458\u8981\uff1a\n\u5efa\u8bae\u8bc4\u4f30/\u91cd\u542f\u7684\u670d\u52a1\uff082 \u4e2a\uff09\uff1a\n\u2022 crond.service\n\u2022 sshd.service\n\n\u5efa\u8bae\uff1a\u8bf7\u5728\u65b9\u4fbf\u7684\u7ef4\u62a4\u7a97\u53e3 SSH \u767b\u5f55\u8be5\u670d\u52a1\u5668\u540e\u624b\u52a8\u6267\u884c reboot\uff1b\u5982\u53ea\u662f\u670d\u52a1\u9700\u8981\u91cd\u542f\uff0c\u53ef\u5148\u8bc4\u4f30\u5e76\u91cd\u542f\u5bf9\u5e94\u670d\u52a1\u3002"
+    },
+    {
+        "name": "apt-health-disabled-zh",
+        "hash": "ae008283b2ab451110bf28f19af912054516245260cb9a26ad97c82dc91d4bc4",
+        "message": "\u26a0\ufe0f \u5b89\u5168\u66f4\u65b0\u540e\u9700\u8981\u5904\u7406\n\n\u4e3b\u673a\uff1agolden-host\n\u7cfb\u7edf\uff1a<OS>\n\u540e\u7aef\uff1aapt\n\u5f53\u524d\u5185\u6838\uff1a<KERNEL>\n\u65f6\u95f4\uff1a<NOW>\n\n\u6574\u673a\u91cd\u542f\uff1a\u6682\u4e0d\u9700\u8981\n\u76f8\u5173\u5305/\u5b89\u5168\u66f4\u65b0\uff1a\n\u65e0\n\n\u91cd\u542f\u68c0\u6d4b\u6458\u8981\uff1a\n\u6ca1\u6709\u62ff\u5230\u8be6\u7ec6\u91cd\u542f\u5217\u8868\uff1b\u53ef\u5728\u670d\u52a1\u5668\u4e0a\u8fd0\u884c needrestart -b \u67e5\u770b\u8be6\u60c5\u3002\n\n\u26a0\ufe0f \u81ea\u52a8\u5b89\u5168\u66f4\u65b0\u673a\u5236\u5f02\u5e38\uff1a\n\u2022 \u81ea\u52a8\u5b89\u5168\u66f4\u65b0\u5b9a\u65f6\u5668\u672a\u542f\u7528\uff08apt-daily-upgrade.timer\uff09\n\n\u5efa\u8bae\uff1a\u8bf7\u5728\u65b9\u4fbf\u7684\u7ef4\u62a4\u7a97\u53e3 SSH \u767b\u5f55\u8be5\u670d\u52a1\u5668\u540e\u624b\u52a8\u6267\u884c reboot\uff1b\u5982\u53ea\u662f\u670d\u52a1\u9700\u8981\u91cd\u542f\uff0c\u53ef\u5148\u8bc4\u4f30\u5e76\u91cd\u542f\u5bf9\u5e94\u670d\u52a1\u3002"
+    },
+    {
+        "name": "dnf-ok-pubip-zh",
+        "hash": "7119da3e9c7fd7ed3092c0e6dc6b187e37250b7b4528bd2b3bdd8c0ec26f73b2",
+        "message": "\u2705 \u5b89\u5168\u66f4\u65b0\u68c0\u67e5\u6b63\u5e38\n\n\u4e3b\u673a\uff1agolden-host\n\u516c\u7f51 IP\uff1a203.0.113.10\n\u7cfb\u7edf\uff1a<OS>\n\u540e\u7aef\uff1adnf\n\u5f53\u524d\u5185\u6838\uff1a<KERNEL>\n\u65f6\u95f4\uff1a<NOW>\n\n\u6ca1\u6709\u53d1\u73b0\u6574\u673a\u91cd\u542f\u6216\u670d\u52a1/\u8fdb\u7a0b\u91cd\u542f\u9700\u8981\u5173\u6ce8\u7684\u95ee\u9898\u3002"
+    }
+]

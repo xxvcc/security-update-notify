@@ -59,6 +59,26 @@ done
 chmod 0755 "$WORK/$PKG"/*.sh "$WORK/$PKG/files/security-update-notify"
 chmod 0644 "$WORK/$PKG/.env.example" "$WORK/$PKG/README.md" "$WORK/$PKG/README.en.md" "$WORK/$PKG/CHANGELOG.md" "$WORK/$PKG/LICENSE" "$WORK/$PKG/files/lib.sh" "$WORK/$PKG/files/security-update-notify.service" "$WORK/$PKG/files/needrestart-report-only.conf" "$WORK/$PKG/files/release-signing.pub.asc" "$WORK/$PKG/files/security-update-notify.logrotate"
 
+# 桥：构建并纳入受支持架构的 Go 运行时二进制（install.sh 会优先安装对应架构者，缺失回退 bash 运行时）。
+# 版本注入为本次发布 VERSION；可复现（CGO 关闭、-trimpath、-buildid= 清空；工具链由 go.mod 的
+# toolchain 指令固定）。冷门架构不在此列的，靠包内 bash 运行时兜底，绝不断链。
+# Bridge: build and include the Go runtime binaries for supported arches (install.sh prefers the matching
+# one, falling back to the bash runtime otherwise). Version is injected as this release's VERSION;
+# reproducible (CGO off, -trimpath, empty -buildid; toolchain pinned by go.mod's toolchain directive).
+GO_BRIDGE_ARCHES="${GO_BRIDGE_ARCHES:-amd64 arm64 386 ppc64le s390x}"
+if command -v go >/dev/null 2>&1 && [[ -f "$ROOT/go.mod" ]]; then
+  for arch in $GO_BRIDGE_ARCHES; do
+    CGO_ENABLED=0 GOOS=linux GOARCH="$arch" GOTOOLCHAIN=local \
+      go build -C "$ROOT" -trimpath -buildvcs=false \
+        -ldflags "-s -w -buildid= -X main.Version=$VERSION" \
+        -o "$WORK/$PKG/files/security-update-notify-linux-$arch" ./cmd/security-update-notify
+    chmod 0755 "$WORK/$PKG/files/security-update-notify-linux-$arch"
+  done
+  echo "已纳入 Go 运行时二进制 / Included Go runtime binaries: $GO_BRIDGE_ARCHES"
+else
+  echo "警告：未找到 go 或 go.mod，发布包仅含 bash 运行时。/ WARNING: no go/go.mod; package ships bash runtime only." >&2
+fi
+
 # 安全检查：发布包不能包含本地运行配置或状态文件。
 # Safety: release package must not contain local runtime config/state files.
 if find "$WORK/$PKG" -type f \( -name '.env' -o -name '.env.*' ! -name '.env.example' -o -name 'telegram.env' -o -name '*.log' -o -name 'last-alert*' \) | grep -q .; then

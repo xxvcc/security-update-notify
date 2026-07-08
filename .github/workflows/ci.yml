@@ -19,9 +19,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Go
+        # package.sh 现在会构建并纳入 Go 运行时二进制（桥）；固定 1.26.4 以保证可复现。
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.4'
+          check-latest: false
+          cache: true
+
       - name: Shell syntax check
         run: |
-          bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify
+          bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify build/compat-test.sh
 
       - name: ShellCheck
         run: |
@@ -509,6 +517,12 @@ jobs:
       - name: Package release artifact
         run: ./package.sh
 
+      - name: Bridge upgrade compat test (bash runtime -> Go, config/state preserved, no re-alert)
+        # 在真实 Debian 容器里：先装 bash 运行时，再原地升级到 Go 桥；断言配置/token/告警状态保留、
+        # Go 二进制落地、且安装后的 Go 二进制复刻 Bash 的 golden hash（升级不会全网重复告警）。
+        run: |
+          docker run --rm -v "$PWD:/src:ro" debian:12 bash /src/build/compat-test.sh
+
       - name: Smoke install in Debian container
         run: |
           docker run --rm -v "$PWD:/src:ro" debian:12 bash -lc '
@@ -558,6 +572,92 @@ jobs:
         with:
           name: security-update-notify-dist
           path: dist/*
+
+  go:
+    # Go 端口的门禁：格式/静态检查/竞态测试/交叉编译矩阵/可复现构建。与 shell-and-package 并行，
+    # 发布事件时跳过（发布只跑 verify-signed-release）。GOTOOLCHAIN=local 保证使用固定安装的工具链，
+    # 不因 go.mod 的 toolchain 指令静默下载别的版本（可复现构建的前提）。
+    # Gate for the Go port: format/vet/race-test/cross-compile matrix/reproducible build. Runs in parallel
+    # with shell-and-package, skipped on release events. GOTOOLCHAIN=local pins to the installed toolchain
+    # so the go.mod toolchain directive never silently downloads a different version (a repro prerequisite).
+    if: ${{ github.event_name != 'release' }}
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.4'
+          check-latest: false
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l cmd internal)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on the following files:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Embedded assets drift guard
+        run: |
+          set -euo pipefail
+          diff -u files/release-signing.pub.asc internal/assets/embed/release-signing.pub.asc
+          diff -u files/security-update-notify.service internal/assets/embed/security-update-notify.service
+          diff -u files/needrestart-report-only.conf internal/assets/embed/needrestart-report-only.conf
+          diff -u files/security-update-notify.logrotate internal/assets/embed/security-update-notify.logrotate
+          pin_go="$(grep -oE 'ReleaseSigningFingerprint = "[0-9A-Fa-f]{40}"' internal/assets/assets.go | grep -oE '[0-9A-Fa-f]{40}')"
+          pin_sh="$(awk -F'"' '/^RELEASE_SIGNING_FINGERPRINT=/{print $2; exit}' files/security-update-notify)"
+          [ "$pin_go" = "$pin_sh" ] || { echo "::error::Go pinned fingerprint ($pin_go) != Bash ($pin_sh)"; exit 1; }
+          echo "embedded assets match files/ and fingerprint pins agree: $pin_go"
+
+      - name: go test -race -cover
+        run: go test -race -cover ./...
+
+      - name: End-to-end run-path golden check (compiled binary reproduces Bash hash)
+        run: |
+          set -euo pipefail
+          ./build/build.sh linux amd64 ci /tmp/sun
+          check() { # <golden-scenario> <backend> <lang>
+            env="$(mktemp)"
+            {
+              echo "TELEGRAM_BOT_TOKEN=123456:fake_TOKEN-value"
+              echo "TELEGRAM_CHAT_ID=-100999"
+              echo "HOST_LABEL=golden-host"
+              echo "BACKEND=$2"
+              echo "NOTIFY_LANG=$3"
+              echo "INCLUDE_PUBLIC_IP=0"
+              echo "CHECK_UPDATE_HEALTH=0"
+              echo "CHECK_EOL=0"
+              echo "STALE_UPDATE_DAYS=0"
+            } >"$env"
+            got="$(SECURITY_UPDATE_NOTIFY_ENV="$env" /tmp/sun --test-reboot --no-dedupe --dry-run | awk -F'\t' '/^HASH/{print $2}')"
+            want="$(python3 -c "import json,sys; print({x['name']:x['hash'] for x in json.load(open('internal/golden/testdata/scenarios.json'))}['$1'])")"
+            [ "$got" = "$want" ] || { echo "::error::$1: compiled Go hash $got != Bash golden $want"; exit 1; }
+            echo "OK $1 $got"
+          }
+          check apt-test-reboot-zh apt zh
+          check apt-test-reboot-en apt en
+          check dnf-test-reboot-zh dnf zh
+          check dnf-test-reboot-en dnf en
+
+      - name: Cross-compile matrix
+        run: |
+          set -euo pipefail
+          for pair in linux/amd64 linux/arm64 linux/386 linux/ppc64le linux/s390x; do
+            os="${pair%/*}"; arch="${pair#*/}"
+            ./build/build.sh "$os" "$arch" "ci" "/tmp/sun-$arch"
+            echo "built $pair"
+          done
+
+      - name: Reproducible-build gate (double build sha256 equality)
+        run: ./build/reproducibility-check.sh linux amd64
 
   verify-signed-release:
     # 发布 release 后，用仓库内的公钥强制校验该 release 的产物：必须带 .asc、sha256 正确、
