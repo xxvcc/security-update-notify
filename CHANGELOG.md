@@ -1,5 +1,22 @@
 # 变更记录
 
+## 2.0.0
+
+运行时从 Bash + 内嵌 python3 重写为单个静态 Go 二进制；行为逐字节保持一致，已装机器可无缝原地升级。
+Runtime rewritten from Bash + embedded python3 into a single static Go binary; behavior is byte-identical,
+so installed hosts upgrade in place seamlessly.
+
+- 运行时（`/usr/local/sbin/security-update-notify`）改为 Go 静态二进制：`run`（裸调用）、`--test-ok`、`--test-reboot`、`--no-dedupe`、`--doctor`、`--check-upgrade`、`--upgrade`（自升级）、`--notify-upgrade-event`、`--version`、`--lang` 全部移植。
+  The runtime is now a static Go binary: `run` (bare), `--test-ok`, `--test-reboot`, `--no-dedupe`, `--doctor`, `--check-upgrade`, `--upgrade` (self-upgrade), `--notify-upgrade-event`, `--version`, `--lang` are all ported.
+- **去除 `python3` 与 `curl` 运行时依赖**：所有 HTTP/JSON（GitHub API、Telegram getMe/sendMessage、公网 IP）、sha256、tar 安全解包、语义化版本比较、文件锁、磁盘检查改用 Go 标准库（`net/http`、`crypto/sha256`、`archive/tar`、`syscall`）。签名校验仍委托 `gpg`；`needrestart`/`needs-restarting`/`apt`/`dnf`/`systemctl` 等系统命令仍按需调用。
+  **Dropped the `python3` and `curl` runtime dependencies**: all HTTP/JSON (GitHub API, Telegram getMe/sendMessage, public IP), sha256, safe tar extraction, semantic-version comparison, file locking and disk checks now use the Go standard library. Signature verification still delegates to `gpg`; system commands (`needrestart`/`needs-restarting`/`apt`/`dnf`/`systemctl`) are still invoked as needed.
+- **行为逐字节保持一致**：告警去重哈希、中英文通知正文、`telegram.env` 配置格式、退出码均与 1.9.x 完全一致，从 1.9.x 原地升级不会因实现变化而重复告警。CI 用从真 Bash 运行时捕获的 golden 向量对去重哈希与通知正文做逐字节回归校验，并在容器内验证 bash→Go 升级保留配置/状态且不重复告警。
+  **Byte-identical behavior**: the dedup hash, bilingual (zh/en) notification text, `telegram.env` format and exit codes are unchanged from 1.9.x, so an in-place upgrade does not re-alert. CI diffs the dedup hash and rendered text against golden vectors captured from the real Bash runtime, and verifies in a container that a bash→Go upgrade preserves config/state without re-alerting.
+- **分发（桥）**：同一份可复现、GPG 签名的 tarball 现同时包含各架构的 Go 二进制（amd64/arm64/386/ppc64le/s390x）与原 Bash 运行时。`install.sh` 优先安装本架构的 Go 二进制，未构建的架构自动回退到 Bash 运行时——任何架构都不会失去升级能力。已装的 1.9.x 机器自升级时会拉取本包并平滑换成 Go 二进制。
+  **Distribution (bridge)**: the same reproducible, GPG-signed tarball now ships per-arch Go binaries (amd64/arm64/386/ppc64le/s390x) alongside the original Bash runtime. `install.sh` prefers this arch's Go binary and falls back to the Bash runtime for unbuilt arches — no architecture loses the ability to upgrade. Installed 1.9.x hosts self-upgrade into this package and switch to the Go binary in place.
+- 自升级信任链不变：下载 GitHub 发布包 → 校验 sha256 → 用内置并 pin 指纹的公钥强制校验 GPG 签名（解包前，fail-closed）→ 安全解包（拒绝路径穿越/特殊条目、剥离 setuid）→ 版本绑定 → 由存活的父进程运行已校验包内的 `install.sh` 完成替换。
+  The self-upgrade trust chain is unchanged: download the GitHub release → verify sha256 → mandatory GPG verification against the embedded, fingerprint-pinned key (before extraction, fail-closed) → safe extraction (reject traversal/special entries, strip setuid) → version binding → a surviving parent process runs the verified package's `install.sh` to complete the swap.
+
 ## 1.9.4
 
 版本比较与状态写入健壮性修复。
