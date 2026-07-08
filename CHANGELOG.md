@@ -1,5 +1,15 @@
 # 变更记录
 
+## 2.0.2
+
+文档与测试加固发布；运行时行为与 2.0.1 完全一致（无功能改动）。
+Documentation and test-hardening release; runtime behavior is identical to 2.0.1 (no functional change).
+
+- 修正 README：明确 2.0 起运行时为静态 Go 二进制、按架构分发（未构建架构回退 Bash），并更正"公网 IP 使用 Python 标准库/依赖 python3、curl"的过时说明（运行时不再依赖 python3/curl，仅安装器预检仍用 python3）。
+  Corrected the README: state that since 2.0 the runtime is a static Go binary shipped per architecture (with a Bash fallback), and fix the stale claim that public-IP detection uses Python / that the runtime depends on `python3`/`curl` (the runtime no longer does; only the installer's preflight still uses `python3`).
+- 新增 CI 守卫（不改运行时）：QEMU 下真实执行全部非 amd64 架构（arm64/386/ppc64le/s390x）并校验 golden hash 一致；发布签名 fail-closed（错误密钥/指纹/sha256 一律拒绝）；8 个之外的边缘消息渲染 bash↔Go 逐字节差分；install.sh 升级失败回滚。
+  Added CI guards (no runtime change): actually execute every non-amd64 arch (arm64/386/ppc64le/s390x) under QEMU and check the golden hash matches; release-signature fail-closed (wrong key/fingerprint/sha256 all rejected); byte-for-byte bash↔Go differential for message-rendering edge cases beyond the core 8; install.sh upgrade-failure rollback.
+
 ## 2.0.1
 
 2.0.0 Go 运行时的两处行为回归修复（在真实主机升级测试中发现）。
