@@ -1,5 +1,25 @@
 # 变更记录
 
+## 2.0.3
+
+安全与稳健性加固发布（三轮逐行审计的后续修复；未发现 critical/RCE）。运行时决策与去重哈希对正常输入保持不变。
+Security and robustness hardening release (follow-up to a three-round line-by-line audit; no critical/RCE found). Runtime decisions and the dedup hash are unchanged for normal inputs.
+
+- 安全：网络错误时不再把 Telegram bot token 写入 stderr/journal。token 位于请求 URL 路径中，Go 的 `*url.Error` 会保留路径，此前一次网络错误即泄露 `TELEGRAM_BOT_TOKEN`；现只保留操作名与底层原因。
+  Security: the Telegram bot token no longer leaks to stderr/journal on a network error. The token sits in the request URL path, which Go's `*url.Error` preserves, so any transport error previously exposed `TELEGRAM_BOT_TOKEN`; only the operation and underlying cause are surfaced now.
+- 安全：验签公钥文件含多把公钥时拒绝。指纹 pin 仅校验第一把、而 `gpg --verify` 信任整个 keyring，此前"真key+攻击者key"的文件可绕过 pin（仅 `sun verify-release` 路径；自升级用内置单公钥）。
+  Security: reject a public-key file that holds more than one key. The fingerprint pin only checked the first key while `gpg --verify` trusts the whole keyring, so a real-key+attacker-key file defeated the pin (only the `sun verify-release` path; self-upgrade uses the single embedded key).
+- 安装器：装后自检 `--doctor` 改为咨询式——磁盘将满、发行版已 EOL 等主机环境问题不再回滚一个本身正确的安装；且不再把共享的 `/usr/local/sbin` 收紧到 0750。
+  Installer: the post-install `--doctor` self-check is advisory — low disk or an EOL release no longer rolls back an otherwise-correct install; and the shared `/usr/local/sbin` is no longer retightened to 0750.
+- 稳健性：下载体、Telegram 响应体、子进程输出增加大小上限；获取单实例锁失败时以非零退出，不再无锁裸跑（对齐 Bash `flock -n 9 || exit 0`）。
+  Robustness: bound the download body, Telegram response body and child-process output; a failed single-instance lock now exits non-zero instead of running lock-less (matching the bash `flock -n 9 || exit 0`).
+- 一致性：config/os-release 引号顺序双层剥离、磁盘可用量改用 `f_frsize`（与 `df` 一致）、公网 IP 读到 EOF、语义化版本预发布数字比较防溢出——均与 Bash 运行时逐字节对齐。
+  Consistency: sequential double-then-single quote stripping in config/os-release, disk-available via `f_frsize` (matching `df`), read the public IP to EOF, and an overflow-safe prerelease numeric compare — all aligned byte-for-byte with the bash runtime.
+- 打包/CI：脏树守卫纳入 `cmd/ internal/ go.mod`；tar 目录权限归一以保证可复现；CI 与兼容测试的负向断言改为真正 fail（此前裸 `! grep` 与 `cond && echo` 被 `set -e` 豁免、会放过回归）。`uninstall.sh` 容错 `systemctl daemon-reload`，使 `--purge-config` 仍会删除 token。
+  Packaging/CI: the dirty-tree guard now covers `cmd/ internal/ go.mod`; tar directory modes are normalized for reproducibility; negative assertions in CI and the compat test now hard-fail (a bare `! grep` and `cond && echo` are exempt from `set -e` and silently passed regressions). `uninstall.sh` tolerates a failing `systemctl daemon-reload` so `--purge-config` still removes the token.
+- 文档：更正 README 的出站说明（除 Telegram 外，默认还会向公网 IP 探测服务发起请求、自升级时访问 GitHub），并说明 Bash 回退运行时仍依赖 `python3`。
+  Docs: correct the README egress note (besides Telegram, by default it also queries a public-IP echo service and contacts GitHub on self-upgrade) and clarify that the bash fallback runtime still needs `python3`.
+
 ## 2.0.2
 
 文档与测试加固发布；运行时行为与 2.0.1 完全一致（无功能改动）。
