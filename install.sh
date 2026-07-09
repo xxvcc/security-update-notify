@@ -646,7 +646,10 @@ esac
 install_missing_packages
 capture_dependency_created_defaults
 
-install -d -m 0750 /etc/security-update-notify /var/lib/security-update-notify /usr/local/sbin
+install -d -m 0750 /etc/security-update-notify /var/lib/security-update-notify
+# /usr/local/sbin 是共享的 FHS 目录（标准 0755）：仅在缺失时按 0755 创建，绝不把已存在目录收紧到
+# 0750（那会破坏该目录下其它非 root 可执行文件的访问）。
+[[ -d /usr/local/sbin ]] || install -d -m 0755 /usr/local/sbin
 touch /var/log/security-update-notify.log
 chmod 0640 /var/log/security-update-notify.log
 if [[ -d /etc/logrotate.d ]]; then
@@ -778,7 +781,12 @@ systemctl enable --now security-update-notify.timer >/dev/null
 if [[ "$POST_INSTALL_CHECK" -eq 1 ]]; then
   /usr/local/sbin/security-update-notify --version
   systemd-analyze verify /etc/systemd/system/security-update-notify.service /etc/systemd/system/security-update-notify.timer
-  /usr/local/sbin/security-update-notify --doctor --skip-telegram --lang "$UI_LANG"
+  # --doctor 是咨询性自检：它会因主机环境（磁盘将满、发行版已 EOL 等）而返回非零，这些并不代表
+  # 安装本身失败。故不让它触发 ERR trap 回滚——只打印警告，安装保持完好。
+  if ! /usr/local/sbin/security-update-notify --doctor --skip-telegram --lang "$UI_LANG"; then
+    say "安装已完成，但自检报告了主机环境问题（如磁盘将满或发行版已 EOL）；安装本身完好，请按提示处理环境问题。" \
+        "Install completed, but the self-check reported a host-environment issue (e.g. low disk or an EOL release); the install itself is intact—address the reported condition." >&2
+  fi
 fi
 systemctl list-timers security-update-notify.timer --no-pager
 [[ "$SEND_TEST" -eq 1 ]] && /usr/local/sbin/security-update-notify --test-ok --no-dedupe

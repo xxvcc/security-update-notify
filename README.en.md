@@ -13,9 +13,9 @@
 
 **security-update-notify** — or **SUN** — is a small Linux utility for people who maintain servers and do not want to miss important post-update actions.
 
-It uses your distro's native update tools, runs from a systemd timer, and sends outbound-only Telegram notifications. No dashboard. No agent port. No remote-control bot.
+It uses your distro's native update tools, runs from a systemd timer, and makes outbound-only HTTPS requests: alerts go to the Telegram Bot API; by default it also queries a public-IP echo service (api.ipify.org / ifconfig.me) for the egress IP (disable with `INCLUDE_PUBLIC_IP=0`, or set `PUBLIC_IP` manually); and it contacts GitHub on self-upgrade. No dashboard. No agent port. No remote-control bot.
 
-> Since **2.0**, the runtime is a statically-compiled **Go binary**, shipped per architecture (amd64/arm64/386/ppc64le/s390x); unbuilt architectures fall back to the self-contained Bash runtime. The runtime itself needs neither `python3` nor `curl` — only the `install.sh` installer still uses `python3` for its Telegram preflight.
+> Since **2.0**, the runtime is a statically-compiled **Go binary**, shipped per architecture (amd64/arm64/386/ppc64le/s390x); unbuilt architectures fall back to the self-contained Bash runtime. The **Go binary runtime** needs neither `python3` nor `curl`; the Bash fallback runtime, however, still depends on `python3` (for its Telegram calls and version/date math). The `install.sh` installer also uses `python3` for its Telegram preflight.
 
 **Languages**: [中文](README.md) | English
 
@@ -396,7 +396,7 @@ Official releases (builds for a version with a corresponding `vX.Y.Z` tag, or bu
 
 SUN is intentionally narrow:
 
-- outbound HTTPS to Telegram Bot API only;
+- outbound HTTPS only: alerts to the Telegram Bot API; by default also a public-IP echo service (api.ipify.org / ifconfig.me) for the egress IP (disable with `INCLUDE_PUBLIC_IP=0`); GitHub on self-upgrade. If you lock this down with an egress firewall, allow those destinations or disable the corresponding features;
 - no command receiver;
 - no public HTTP endpoint;
 - no automatic reboot;

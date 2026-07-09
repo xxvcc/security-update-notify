@@ -1,6 +1,7 @@
 package run
 
 import (
+	"io"
 	"net"
 	"os"
 	"strconv"
@@ -201,8 +202,15 @@ func collectDisks() []watchdog.DiskAvail {
 		if err := syscall.Statfs(mp, &st); err != nil {
 			continue
 		}
-		// Bavail 与 Bsize 的类型随架构而异（386/s390x 上 Bsize 是 int32/uint32），一律显式转 int64。
-		availKB := int64(st.Bavail) * int64(st.Bsize) / 1024
+		// 用 f_frsize（碎片/基本块大小）而非 f_bsize：GNU df -P -k（Bash 运行时的取值来源）以
+		// f_bavail * f_frsize 计算可用量，二者在少数 fs（NFS/overlay 等）上不等；用 frsize 保证与
+		// df 一致，从而 Go 与 Bash 的 HEALTH_SIG（去重 hash 字段）不漂移。frsize 为 0 时回退 bsize。
+		// 类型随架构而异（386/s390x），一律显式转 int64。
+		bs := int64(st.Frsize)
+		if bs == 0 {
+			bs = int64(st.Bsize)
+		}
+		availKB := int64(st.Bavail) * bs / 1024
 		out = append(out, watchdog.DiskAvail{Mount: mp, AvailKB: availKB})
 	}
 	return out
@@ -259,10 +267,10 @@ func fetchPublicIP() string {
 		if err != nil {
 			continue
 		}
-		buf := make([]byte, 128)
-		n, _ := resp.Body.Read(buf)
+		// 读到 EOF（上限 128 字节），而非单次 Read：分片响应下单次 Read 可能只拿到半个 IP。
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 128))
 		resp.Body.Close()
-		ip := strings.Fields(strings.TrimSpace(string(buf[:n])))
+		ip := strings.Fields(strings.TrimSpace(string(b)))
 		if len(ip) == 0 {
 			continue
 		}

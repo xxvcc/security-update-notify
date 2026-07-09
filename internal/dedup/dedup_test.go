@@ -97,7 +97,7 @@ func TestStoreRoundTripAndAtomicity(t *testing.T) {
 	}
 	gotH, gotT := s.ReadLast()
 	if gotH != h || gotT != 1737000000 {
-		t.Errorf("readback hash=%q t=%d want %q 1737000000", gotH, gotT, gotT)
+		t.Errorf("readback hash=%q t=%d want %q 1737000000", gotH, gotT, h)
 	}
 	// 状态文件应无尾部多余换行以外的内容，且不留临时文件。
 	raw, _ := os.ReadFile(s.HashFile)

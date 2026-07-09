@@ -41,12 +41,16 @@ func Execute(cfg *config.Config, f DryRunFlags) int {
 		_ = os.Chmod(stateDirPath(), 0o750)
 	}
 	release, acquired, err := lock.Acquire(lockFilePath())
-	if err == nil && !acquired {
-		return 0
+	if err != nil {
+		// 无法获取锁本身即视为失败，不再裸跑：否则与定时器运行并发时会重复告警、竞争状态文件
+		// （复刻 Bash `flock -n 9 || exit 0` 不会静默继续无锁运行）。
+		fmt.Fprintln(os.Stderr, "lock error: "+err.Error())
+		return 1
 	}
-	if release != nil {
-		defer release()
+	if !acquired {
+		return 0 // 已有实例在跑，静默退出
 	}
+	defer release()
 
 	in := Collect(cfg, f.Flags)
 	// 不支持的后端（既非 apt 也非 dnf，例如无法识别的发行版 -> auto=unknown）：复刻运行时的 exit 2。

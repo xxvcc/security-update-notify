@@ -24,7 +24,9 @@ systemctl disable --now security-update-notify.timer 2>/dev/null || true
 rm -f /etc/systemd/system/security-update-notify.service /etc/systemd/system/security-update-notify.timer
 rm -f /etc/logrotate.d/security-update-notify
 rm -f /usr/local/sbin/security-update-notify
-systemctl daemon-reload
+# 加 || true：在无 systemd 总线的环境（容器/降级 init）daemon-reload 会非零退出；若不容错，set -e
+# 会在此中止，使后面的 --purge-config 不执行、telegram.env（含 token）残留磁盘。
+systemctl daemon-reload || true
 
 if [[ "$PURGE_CONFIG" -eq 1 ]]; then
   rm -rf /etc/security-update-notify /var/lib/security-update-notify /etc/logrotate.d/security-update-notify /var/backups/security-update-notify

@@ -72,6 +72,7 @@ func PreReadNotifyLang(envPath string) string {
 	}
 	defer f.Close()
 	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024) // 放宽默认 64KB 行上限，避免超长行使后续行被跳过
 	for sc.Scan() {
 		line := strings.TrimRight(sc.Text(), "\r")
 		if m := preReadRe.FindStringSubmatch(line); m != nil {

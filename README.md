@@ -13,9 +13,9 @@
 
 **security-update-notify**（简称 **SUN**）是一个轻量 Linux 工具，适合维护服务器、VPS 或小型基础设施的人使用。
 
-它使用发行版原生更新机制，通过 systemd timer 定时运行，只向 Telegram Bot API 发起出站 HTTPS 请求。没有 Web 面板，没有常驻控制端口，也不会接收 Telegram 命令。
+它使用发行版原生更新机制，通过 systemd timer 定时运行，只发起出站 HTTPS 请求：提醒发往 Telegram Bot API；默认还会向公网 IP 探测服务（api.ipify.org / ifconfig.me）获取出口 IP（可用 `INCLUDE_PUBLIC_IP=0` 关闭或用 `PUBLIC_IP` 手动指定）；自升级时访问 GitHub。没有 Web 面板，没有常驻控制端口，也不会接收 Telegram 命令。
 
-> 自 **2.0** 起，运行时是一个静态编译的 **Go 二进制**，按架构分发（amd64/arm64/386/ppc64le/s390x）；未构建的架构自动回退到自包含的 Bash 运行时。运行时自身不依赖 `python3` 或 `curl`——仅安装器 `install.sh` 在 Telegram 预检时仍使用 `python3`。
+> 自 **2.0** 起，运行时是一个静态编译的 **Go 二进制**，按架构分发（amd64/arm64/386/ppc64le/s390x）；未构建的架构自动回退到自包含的 Bash 运行时。**Go 二进制运行时**不依赖 `python3` 或 `curl`；而 Bash 回退运行时仍依赖 `python3`（用于 Telegram 调用与版本/日期计算）。安装器 `install.sh` 在 Telegram 预检时也使用 `python3`。
 
 **语言 / Languages**：中文 | [English](README.en.md)
 
@@ -396,7 +396,7 @@ sudo ./uninstall.sh --purge-config
 
 SUN 的范围刻意保持很小：
 
-- 只向 Telegram Bot API 发起出站 HTTPS 请求；
+- 出站仅 HTTPS：提醒发往 Telegram Bot API；默认另向公网 IP 探测服务（api.ipify.org / ifconfig.me）获取出口 IP（`INCLUDE_PUBLIC_IP=0` 可关闭）；自升级时访问 GitHub。若要用出口防火墙收紧，请把这些目的地一并放行或关闭对应功能；
 - 不接收远程命令；
 - 不提供公开 HTTP 入口；
 - 不自动重启；

@@ -11,6 +11,7 @@ package telegram
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,6 +22,21 @@ import (
 )
 
 const defaultBaseURL = "https://api.telegram.org"
+
+// maxRespBytes 限制 Telegram 响应体的读取量，防止（被 MITM/重定向劫持的）超大响应体撑爆内存。
+// 正常 Telegram JSON 仅数百字节，1 MiB 绰绰有余。
+const maxRespBytes = 1 << 20
+
+// sanitizeErr 去掉传输错误里的请求 URL——token 就嵌在 URL 路径（/bot<token>/…）里，
+// Go 的 *url.Error.Error() 只脱敏 userinfo、不脱敏路径，直接 surface 会把 bot token 写进 stderr/journal。
+// 只保留操作名与底层原因（含主机名，但不含 token）。
+func sanitizeErr(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return fmt.Errorf("%s request failed: %v", ue.Op, ue.Err)
+	}
+	return err
+}
 
 // tokenRe 复刻 `^\d+:[A-Za-z0-9_-]+$`。
 var tokenRe = regexp.MustCompile(`^[0-9]+:[A-Za-z0-9_-]+$`)
@@ -66,10 +82,10 @@ func (c *Client) GetMe(ctx context.Context, token string) error {
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return err
+		return sanitizeErr(err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxRespBytes))
 	if !jsonOK(body) {
 		return fmt.Errorf("getMe failed: %s", strings.TrimSpace(string(body)))
 	}
@@ -121,10 +137,10 @@ func (c *Client) attempt(ctx context.Context, endpoint string, form url.Values) 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return true, false, err.Error() // 网络错误 -> 可重试
+		return true, false, sanitizeErr(err).Error() // 网络错误 -> 可重试（已剥离含 token 的 URL）
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxRespBytes))
 	if retryStatus[resp.StatusCode] {
 		return true, false, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncErr(string(body)))
 	}

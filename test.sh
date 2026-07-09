@@ -59,7 +59,7 @@ if [[ "$BACKEND" == apt ]]; then
     if dpkg -s "$pkg" >/dev/null 2>&1; then ver="$(dpkg-query -W -f='${Version}' "$pkg")"; say "正常 $pkg $ver" "OK $pkg $ver"; else say "缺失 $pkg" "MISSING $pkg"; fi
   done
 elif [[ "$BACKEND" == dnf ]]; then
-  for pkg in dnf-automatic python3 ca-certificates yum-utils dnf-utils; do rpm -q "$pkg" >/dev/null 2>&1 && say "正常 $(rpm -q "$pkg")" "OK $(rpm -q "$pkg")" || true; done
+  for pkg in dnf-automatic python3 ca-certificates yum-utils dnf-utils; do if rpm -q "$pkg" >/dev/null 2>&1; then say "正常 $(rpm -q "$pkg")" "OK $(rpm -q "$pkg")"; else say "缺失 $pkg" "MISSING $pkg"; fi; done
   command -v needs-restarting >/dev/null && say "正常 needs-restarting present" "OK needs-restarting present" || say "缺失 needs-restarting" "MISSING needs-restarting"
 else
   say "不支持的后端" "Unsupported backend"
@@ -75,7 +75,13 @@ done
 echo
 
 say "== 语法和 systemd ==" "== syntax and systemd =="
-bash -n /usr/local/sbin/security-update-notify && say "正常：脚本语法通过" "OK script syntax"
+# 安装的运行时可能是 Go 二进制（主运行时）或 bash 脚本（冷门架构兜底）。只有 bash 脚本才做语法检查；
+# 对 Go 二进制跑 bash -n 会报“cannot execute binary file”并跳过 OK 行。按 shebang 判别。
+if [[ -e /usr/local/sbin/security-update-notify ]] && head -c2 /usr/local/sbin/security-update-notify 2>/dev/null | grep -q '#!'; then
+  bash -n /usr/local/sbin/security-update-notify && say "正常：脚本语法通过" "OK script syntax"
+else
+  say "跳过：Go 二进制运行时，无需脚本语法检查" "SKIP Go binary runtime; no script syntax check"
+fi
 /usr/local/sbin/security-update-notify --version
 /usr/local/sbin/security-update-notify --doctor --skip-telegram --lang "$UI_LANG"
 systemd-analyze verify /etc/systemd/system/security-update-notify.service /etc/systemd/system/security-update-notify.timer >"$TMP_DIR/systemd-verify.log" 2>&1 && say "正常：systemd 单元通过" "OK systemd units" || { cat "$TMP_DIR/systemd-verify.log"; exit 1; }

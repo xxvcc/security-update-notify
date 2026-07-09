@@ -22,7 +22,7 @@ bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security
 
 ALLOW_DIRTY_PACKAGE="${ALLOW_DIRTY_PACKAGE:-0}"
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  if ! git diff --quiet HEAD -- install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify files/lib.sh files/needrestart-report-only.conf files/security-update-notify.logrotate files/security-update-notify.service README.md README.en.md CHANGELOG.md LICENSE .env.example files/release-signing.pub.asc .github/workflows/ci.yml; then
+  if ! git diff --quiet HEAD -- install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify files/lib.sh files/needrestart-report-only.conf files/security-update-notify.logrotate files/security-update-notify.service README.md README.en.md CHANGELOG.md LICENSE .env.example files/release-signing.pub.asc .github/workflows/ci.yml cmd internal go.mod; then
     if [[ "$ALLOW_DIRTY_PACKAGE" == "1" && -n "${SOURCE_DATE_EPOCH:-}" ]]; then
       echo "警告：由于 ALLOW_DIRTY_PACKAGE=1 且 SOURCE_DATE_EPOCH 已设置，将打包未提交的发布文件改动。/ WARNING: packaging uncommitted tracked release-file changes because ALLOW_DIRTY_PACKAGE=1 and SOURCE_DATE_EPOCH is set." >&2
     else
@@ -54,8 +54,12 @@ for f in lib.sh needrestart-report-only.conf release-signing.pub.asc security-up
   cp "$ROOT/files/$f" "$WORK/$PKG/files/$f"
 done
 
-# 规范化可执行权限。
-# Normalize executable permissions.
+# 规范化目录与可执行权限。目录权限随构建机 umask 而变（mkdir 用 0777&~umask），若不显式归一，
+# 不同 umask 的构建者会得到不同的目录模式位，破坏 tar 的逐字节可复现（sha256 会变）。
+# Normalize directory and executable permissions. Directory modes otherwise depend on the builder's
+# umask (mkdir uses 0777 & ~umask); without this, builders with different umasks produce byte-different
+# tarballs, breaking reproducibility.
+chmod 0755 "$WORK/$PKG" "$WORK/$PKG/files"
 chmod 0755 "$WORK/$PKG"/*.sh "$WORK/$PKG/files/security-update-notify"
 chmod 0644 "$WORK/$PKG/.env.example" "$WORK/$PKG/README.md" "$WORK/$PKG/README.en.md" "$WORK/$PKG/CHANGELOG.md" "$WORK/$PKG/LICENSE" "$WORK/$PKG/files/lib.sh" "$WORK/$PKG/files/security-update-notify.service" "$WORK/$PKG/files/needrestart-report-only.conf" "$WORK/$PKG/files/release-signing.pub.asc" "$WORK/$PKG/files/security-update-notify.logrotate"
 

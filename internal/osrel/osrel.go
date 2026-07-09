@@ -32,6 +32,8 @@ func Read(path string) OSRelease {
 	}
 	defer f.Close()
 	sc := bufio.NewScanner(f)
+	// 放宽默认 64KB 行上限，避免超长行导致后续行被静默跳过（与 Bash `read -r` 的无界读法一致）。
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for sc.Scan() {
 		line := strings.TrimRight(sc.Text(), "\r")
 		key, val, ok := strings.Cut(line, "=")
@@ -53,12 +55,14 @@ func Read(path string) OSRelease {
 	return o
 }
 
+// unquote 顺序剥离（先双引号再单引号），与 files/lib.sh 与运行时 os-release 解析的两条连续
+// 语句一致：值 "'debian'" 会被剥成 debian（早返回则只剥一层，导致与 Bash 侧 BACKEND 解析分歧）。
 func unquote(v string) string {
 	if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
-		return v[1 : len(v)-1]
+		v = v[1 : len(v)-1]
 	}
 	if len(v) >= 2 && v[0] == '\'' && v[len(v)-1] == '\'' {
-		return v[1 : len(v)-1]
+		v = v[1 : len(v)-1]
 	}
 	return v
 }

@@ -25,6 +25,28 @@ type Result struct {
 	Err    error // 仅在命令无法启动（如未找到）时非空；非零退出不算 Err
 }
 
+// maxCapturedBytes 限制单个流（stdout/stderr）缓冲的字节数，防止被攻破的包源/needrestart 返回
+// 超大输出把 root 进程撑到 OOM。真实输出仅数十 KB；后续 firstNLines 等截断在此之上再收窄。
+const maxCapturedBytes = 8 << 20 // 8 MiB per stream
+
+// capBuffer 是带上限的写入缓冲：达到上限后丢弃多余字节，但始终向子进程声明"已全部写入"，
+// 避免因短写让子进程收到写错误（镜像运行时 `set +e` 的宽松语义）。
+type capBuffer struct {
+	buf bytes.Buffer
+	max int
+}
+
+func (c *capBuffer) Write(p []byte) (int, error) {
+	if rem := c.max - c.buf.Len(); rem > 0 {
+		if len(p) > rem {
+			c.buf.Write(p[:rem])
+		} else {
+			c.buf.Write(p)
+		}
+	}
+	return len(p), nil
+}
+
 // forcedEnv 在当前环境基础上强制 LC_ALL=C（去掉已有的 LC_ALL/LANG 影响，追加权威值）。
 func forcedEnv() []string {
 	env := os.Environ()
@@ -47,11 +69,12 @@ func Run(name string, args ...string) Result {
 func RunContext(ctx context.Context, name string, args ...string) Result {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Env = forcedEnv()
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout := &capBuffer{max: maxCapturedBytes}
+	stderr := &capBuffer{max: maxCapturedBytes}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	err := cmd.Run()
-	res := Result{Stdout: stdout.String(), Stderr: stderr.String()}
+	res := Result{Stdout: stdout.buf.String(), Stderr: stderr.buf.String()}
 	if err == nil {
 		res.Code = 0
 		return res

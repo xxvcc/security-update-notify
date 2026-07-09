@@ -151,16 +151,19 @@ jobs:
           PATH="$tmp/bin:$PATH" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env.ok.zh" CAPTURE="$tmp/ok.zh.msg" "$tmp/security-update-notify" --test-ok --no-dedupe >/dev/null
           PATH="$tmp/bin:$PATH" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env.ok.en" CAPTURE="$tmp/ok.en.msg" "$tmp/security-update-notify" --test-ok --no-dedupe >/dev/null
 
+          # 负向断言用显式 if…exit：`! grep` 会被 set -e 豁免（取反命令），非末尾命中也不中断，
+          # 会让语言串味 / 公网 IP 泄露等回归带绿灯通过。refute 能真正 fail 这一步。
+          refute() { if grep -q "$1" "$2"; then echo "::error::forbidden string '$1' found in $2" >&2; exit 1; fi; }
           grep -q '安全更新后需要处理' "$tmp/alert.zh.msg"
-          ! grep -q 'Security update action required' "$tmp/alert.zh.msg"
-          ! grep -q '公网 IP：' "$tmp/alert.zh.msg"
+          refute 'Security update action required' "$tmp/alert.zh.msg"
+          refute '公网 IP：' "$tmp/alert.zh.msg"
           grep -q 'Security update action required' "$tmp/alert.en.msg"
-          ! grep -q '安全更新后需要处理' "$tmp/alert.en.msg"
+          refute '安全更新后需要处理' "$tmp/alert.en.msg"
           grep -q '安全更新检查正常' "$tmp/ok.zh.msg"
           grep -q '公网 IP：203.0.113.10' "$tmp/ok.zh.msg"
-          ! grep -q 'Security update check OK' "$tmp/ok.zh.msg"
+          refute 'Security update check OK' "$tmp/ok.zh.msg"
           grep -q 'Security update check OK' "$tmp/ok.en.msg"
-          ! grep -q '安全更新检查正常' "$tmp/ok.en.msg"
+          refute '安全更新检查正常' "$tmp/ok.en.msg"
 
       - name: dnf reboot/restart detection regression check
         run: |
@@ -571,7 +574,10 @@ jobs:
           tar -xzf dist/security-update-notify-*.tar.gz -C /tmp/security-update-notify-ci
           find /tmp/security-update-notify-ci -maxdepth 3 -type f -print | sort
           tar -tzf dist/security-update-notify-*.tar.gz | grep '/.env.example$'
-          ! tar -tzf dist/security-update-notify-*.tar.gz | grep -E '/\.env$|/\.env\.(local|production)$'
+          # 负向断言用显式 if…exit（不依赖“恰好是最后一条命令”这一脆弱前提）：发布包绝不能含真实 .env。
+          if tar -tzf dist/security-update-notify-*.tar.gz | grep -E '/\.env$|/\.env\.(local|production)$'; then
+            echo "::error::release package contains a real .env file" >&2; exit 1
+          fi
 
       - name: Upload dist artifact
         uses: actions/upload-artifact@v4

@@ -49,8 +49,14 @@ func downloadOnce(client *http.Client, url, dest string) error {
 		return err
 	}
 	defer f.Close()
-	if _, err := io.Copy(f, resp.Body); err != nil {
+	// 限制落盘字节数，防止（被劫持的）无上限响应体撑满 /tmp 磁盘。发布包实际仅数十 KB；
+	// 与 Extract 的 maxArchiveBytes 同一纵深防御量级，超限即报错。
+	n, err := io.Copy(f, io.LimitReader(resp.Body, maxArchiveBytes+1))
+	if err != nil {
 		return err
+	}
+	if n > maxArchiveBytes {
+		return fmt.Errorf("download exceeds size limit (%d bytes)", maxArchiveBytes)
 	}
 	return f.Sync()
 }

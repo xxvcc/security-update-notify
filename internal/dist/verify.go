@@ -155,11 +155,25 @@ func gpgFingerprint(home string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// keyring 必须恰好含一个公钥。否则一个 “真key 在前 + 攻击者 key 在后” 的多 key 文件会让
+	// 指纹 pin（只匹配第一个 key）通过，而随后的 `gpg --verify` 接受 keyring 中任一 key 的签名——
+	// 即指纹 pin 被绕过。恰好一个主 key 时，pin 与验签指向同一把钥匙。
+	pubCount := 0
+	fpr := ""
 	for _, line := range strings.Split(string(out), "\n") {
 		f := strings.Split(line, ":")
-		if len(f) > 9 && f[0] == "fpr" {
-			return f[9], nil
+		if len(f) > 0 && f[0] == "pub" {
+			pubCount++
+		}
+		if fpr == "" && len(f) > 9 && f[0] == "fpr" {
+			fpr = f[9]
 		}
 	}
-	return "", fmt.Errorf("no fingerprint found in keyring")
+	if pubCount != 1 {
+		return "", fmt.Errorf("expected exactly one signing key in keyring, got %d", pubCount)
+	}
+	if fpr == "" {
+		return "", fmt.Errorf("no fingerprint found in keyring")
+	}
+	return fpr, nil
 }

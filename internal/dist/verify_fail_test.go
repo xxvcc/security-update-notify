@@ -108,6 +108,22 @@ func TestVerifyReleaseFailClosed(t *testing.T) {
 			t.Errorf("VerifyReleaseKey rejected a good signature: %v", err)
 		}
 	}
+	// f) 多 key 绕过：公钥文件 = pin key（在前）+ 攻击者 key（在后），签名由攻击者 key 生成，pin=fpr1。
+	//    指纹 pin 只查第一个 key（=fpr1，匹配），而 gpg --verify 接受 keyring 中任一 key 的签名——
+	//    若不校验“keyring 恰好一把钥匙”，攻击者包会被接受。必须拒绝。
+	asc2 := tarball + ".asc2"
+	if out, err := gpgHome(t, h2, "--armor", "--detach-sign", "-o", asc2, tarball); err != nil {
+		t.Fatalf("sign key2: %v: %s", err, out)
+	}
+	b1, err1 := os.ReadFile(pub1)
+	b2, err2 := os.ReadFile(pub2)
+	if err1 == nil && err2 == nil {
+		multiPub := filepath.Join(dir, "multi.asc")
+		os.WriteFile(multiPub, append(append(append([]byte{}, b1...), '\n'), b2...), 0o644)
+		if err := VerifyRelease(tarball, shaFile, asc2, multiPub, fpr1); err == nil {
+			t.Error("multi-key pubkey file with attacker signature accepted (fingerprint-pin bypass)")
+		}
+	}
 }
 
 func gpgArmorExport(t *testing.T, home, fpr string) ([]byte, error) {

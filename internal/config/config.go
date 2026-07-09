@@ -127,11 +127,13 @@ func parseValue(raw string) string {
 		v = stripInlineComment(v) // value="${value%%[[:space:]]#*}"
 		v = strings.TrimRight(v, cSpace)
 	}
+	// 顺序剥离（先双引号再单引号），与 Bash load_config_file 的两条连续语句一致：
+	// 值 "'x'" 会被剥成 x（若这里用早返回则只剥一层，两运行时读出不同值）。
 	if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
-		return v[1 : len(v)-1]
+		v = v[1 : len(v)-1]
 	}
 	if len(v) >= 2 && v[0] == '\'' && v[len(v)-1] == '\'' {
-		return v[1 : len(v)-1]
+		v = v[1 : len(v)-1]
 	}
 	return v
 }

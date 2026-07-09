@@ -66,6 +66,26 @@ func isASCIIDigits(s string) bool {
 	return true
 }
 
+// cmpNumericStr 比较两个纯十进制数字串的数值（等价 python int() 比较），不经 strconv 故不会溢出：
+// 先去前导零，位数多者更大，位数相同则按字典序。返回 -1/0/1。
+func cmpNumericStr(x, y string) int {
+	x = strings.TrimLeft(x, "0")
+	y = strings.TrimLeft(y, "0")
+	if len(x) != len(y) {
+		if len(x) < len(y) {
+			return -1
+		}
+		return 1
+	}
+	if x < y {
+		return -1
+	}
+	if x > y {
+		return 1
+	}
+	return 0
+}
+
 // cmpRelease 逐段比较，缺省段按 0 补齐（故 1.7.0.1 > 1.7.0）。
 func cmpRelease(a, b []int) int {
 	n := len(a)
@@ -115,15 +135,10 @@ func cmpPre(a, b string) int {
 		}
 		xn, yn := isASCIIDigits(x), isASCIIDigits(y)
 		if xn && yn {
-			xv, _ := strconv.Atoi(x)
-			yv, _ := strconv.Atoi(y)
-			if xv < yv {
-				return -1
-			}
-			if xv > yv {
-				return 1
-			}
-			continue // 数值相等（如 1 vs 01）：视为相等，比下一个标识符
+			// 复刻 python 参考实现 `return (int(x)>int(y))-(int(x)<int(y))`：数字标识符按值比较并
+			// 立即返回（值相等即返回 0，结束整个 pre-release 比较）。用 cmpNumericStr 做任意长度的
+			// 十进制比较，避免 strconv.Atoi 对 >int64 标识符溢出（会把不同大数误判为相等）。
+			return cmpNumericStr(x, y)
 		}
 		if xn != yn { // 数字标识符优先级低于字母标识符 / numeric < alphanumeric
 			if xn {
