@@ -7,10 +7,12 @@ On the first interactive Feishu install or after changing the recipient, a Feish
 
 - 安装闭环：验证提示默认为 `[Y/n]`，可输入 `n` 跳过；非交互安装保持不自动发送，显式 `--send-test` 仍测试所有已配置渠道。
   Installation closure: the verification prompt defaults to `[Y/n]` and can be skipped with `n`; non-interactive installs still send nothing automatically, while explicit `--send-test` continues to test every configured channel.
-- 故障安全：验证失败会触发现有安装事务回滚，并明确提示检查机器人可用范围；临时验证配置只包含飞书渠道和接收标识，不包含 Telegram 凭据或飞书 App Secret。
-  Failure safety: a failed verification triggers the existing transactional rollback and points to bot availability; the temporary verification config contains only the Feishu channel and recipient identity, never Telegram credentials or the Feishu App Secret.
-- 测试：新增首次安装、双通道跳过、纯 Telegram、已有飞书配置、接收人变更、非交互和显式全渠道测试的安装回归覆盖。
-  Tests: add installer regression coverage for first install, dual-channel opt-out, Telegram-only, existing Feishu configuration, recipient changes, non-interactive mode, and explicit all-channel tests.
+- 故障安全：装后测试及 `test.sh` 的显式发送最多等待现有检查释放运行锁 60 秒，超时以退出码 `75` 明确失败，不能把“未发送”误判为成功；升级在任何依赖包写入前禁用并停止旧 timer、跨过运行锁屏障，验证通过后才重新启用。独立安装事务锁会串行化并发安装且不向子进程泄露锁描述符；备份目录通过原子 `mkdir` 保证唯一，保留裁剪始终保护当前事务目录。失败回滚在恢复文件前再次静止 timer/service 并跨过运行锁，再恢复安装前 timer 的 persistent/runtime 启用链接与 active 状态。
+  Failure safety: post-install tests and explicit sends from `test.sh` wait up to 60 seconds for an existing run to release the lock and fail explicitly with exit `75` on timeout, so “not sent” cannot be mistaken for success. Before any dependency-package write, upgrades disable and stop the old timer and cross the runtime-lock barrier; it is re-enabled only after verification succeeds. A separate installer transaction lock serializes concurrent installs without leaking its descriptor to child processes; atomic `mkdir` guarantees unique backup directories, and retention always protects the active transaction. Before restoring files, rollback again quiesces the timer/service and crosses the runtime lock, then restores the pre-install persistent/runtime enablement links and active state.
+- 最小凭据面：临时验证配置只包含飞书渠道和接收标识，不包含 Telegram 凭据或飞书 App Secret。
+  Minimal credential surface: the temporary verification config contains only the Feishu channel and recipient identity, never Telegram credentials or the Feishu App Secret.
+- 测试：新增首次安装、双通道跳过、纯 Telegram、已有飞书配置、接收人变更、非交互、显式全渠道测试、Go/Bash 锁竞争、无锁 dry-run、被忽略构建源拦截，以及 fresh/upgrade timer 状态与时间回拨备份回滚覆盖。
+  Tests: add coverage for first install, dual-channel opt-out, Telegram-only, existing Feishu configuration, recipient changes, non-interactive mode, explicit all-channel tests, Go/Bash lock contention, lock-free dry runs, ignored build-source rejection, and fresh/upgrade timer-state plus clock-rollback backup restoration.
 
 ## 2.2.0
 

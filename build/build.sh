@@ -19,6 +19,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 export CGO_ENABLED=0 GOOS GOARCH GOTOOLCHAIN=local
+export GOFLAGS="" GOWORK=off GOENV=off GO111MODULE=on
+export GOEXPERIMENT="" GOFIPS140=off GOAMD64=v1 GO386=sse2 GOARM64=v8.0 GOPPC64=power8
 go build -trimpath -buildvcs=false \
   -ldflags "-s -w -buildid= -X main.Version=${VERSION}" \
   -o "$OUT" ./cmd/security-update-notify

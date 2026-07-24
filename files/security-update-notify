@@ -9,15 +9,15 @@ set -uo pipefail
 export LC_ALL=C
 
 ENV_FILE="${SECURITY_UPDATE_NOTIFY_ENV:-/etc/security-update-notify/telegram.env}"
-STATE_DIR="/var/lib/security-update-notify"
+STATE_DIR="${SECURITY_UPDATE_NOTIFY_STATE_DIR:-/var/lib/security-update-notify}"
 STATE_FILE="$STATE_DIR/last-alert.sha256"
 STATE_TIME_FILE="$STATE_DIR/last-alert.sent_at"
-LOCK_FILE="/run/security-update-notify.lock"
+LOCK_FILE="${SECURITY_UPDATE_NOTIFY_LOCK_FILE:-/run/security-update-notify.lock}"
 VERSION="2.2.1"
 REPO="xxvcc/security-update-notify"
 RELEASE_SIGNING_FINGERPRINT="C678256ACBFC6491BF5076655F3AE24999921FFC"
 UPGRADE_ALLOW_UNSIGNED="${SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED:-0}"
-LOG_FILE="/var/log/security-update-notify.log"
+LOG_FILE="${SECURITY_UPDATE_NOTIFY_LOG_FILE:-/var/log/security-update-notify.log}"
 TEST_REBOOT=0
 SEND_OK=0
 NO_DEDUPE=0
@@ -30,6 +30,7 @@ SELF_UPGRADE=0
 UPGRADE_NOTICE=0
 UPGRADE_FROM=""
 UPGRADE_TO=""
+LOCK_WAIT_SECONDS=""
 UI_LANG="${UI_LANG:-${SUN_LANG:-}}"
 
 # 双语输出助手：UI_LANG/--lang 优先，否则跟随 NOTIFY_LANG，默认 zh。
@@ -40,15 +41,19 @@ say(){ if [ "${UI_LANG:-${NOTIFY_LANG:-zh}}" = en ]; then printf '%s\n' "$2"; el
 usage() {
   if [ "${UI_LANG:-${NOTIFY_LANG:-zh}}" = en ]; then
     cat <<'EOF'
-Usage: security-update-notify [--test-ok] [--test-reboot] [--no-dedupe] [--doctor] [--check-upgrade] [--upgrade] [--lang zh|en] [--version]
+Usage: security-update-notify [--test-ok] [--test-reboot] [--no-dedupe] [--wait-lock SECONDS] [--doctor] [--check-upgrade] [--upgrade] [--lang zh|en] [--version]
 
 Checks OS backend reboot/service-restart state, then sends configured notifications.
+
+--wait-lock waits for a concurrent run and exits 75 on timeout. Without it, lock contention is a quiet success.
 EOF
   else
     cat <<'EOF'
-用法: security-update-notify [--test-ok] [--test-reboot] [--no-dedupe] [--doctor] [--check-upgrade] [--upgrade] [--lang zh|en] [--version]
+用法: security-update-notify [--test-ok] [--test-reboot] [--no-dedupe] [--wait-lock 秒数] [--doctor] [--check-upgrade] [--upgrade] [--lang zh|en] [--version]
 
 检查系统后端的整机重启/服务重启状态，然后通过已配置渠道发送提醒。
+
+--wait-lock 等待并发检查释放运行锁；超时返回 75。未指定时，锁竞争仍静默成功退出。
 EOF
   fi
 }
@@ -58,6 +63,12 @@ while [[ $# -gt 0 ]]; do
     --test-ok) SEND_OK=1; shift ;;
     --test-reboot) TEST_REBOOT=1; shift ;;
     --no-dedupe) NO_DEDUPE=1; shift ;;
+    --wait-lock)
+      [[ "${2:-}" =~ ^[0-9]{1,4}$ ]] || { say "无效 --wait-lock（应为 0..3600 秒）" "Invalid --wait-lock (expected 0..3600 seconds)" >&2; exit 2; }
+      LOCK_WAIT_SECONDS="$((10#$2))"
+      (( LOCK_WAIT_SECONDS <= 3600 )) || { say "无效 --wait-lock（应为 0..3600 秒）" "Invalid --wait-lock (expected 0..3600 seconds)" >&2; exit 2; }
+      shift 2
+      ;;
     --doctor) DOCTOR=1; shift ;;
     --skip-telegram|--skip-telegram-test) DOCTOR_SKIP_TELEGRAM=1; shift ;;
     --skip-feishu|--skip-feishu-test) DOCTOR_SKIP_FEISHU=1; shift ;;
@@ -403,8 +414,36 @@ fi
 
 mkdir -p "$STATE_DIR"
 chmod 0750 "$STATE_DIR" 2>/dev/null || true
-exec 9>"$LOCK_FILE"
-flock -n 9 || exit 0
+if ! exec 9>"$LOCK_FILE"; then
+  say "无法打开 security-update-notify 运行锁文件: $LOCK_FILE" "Failed to open the security-update-notify lock file: $LOCK_FILE" >&2
+  exit 1
+fi
+if [[ -n "$LOCK_WAIT_SECONDS" ]]; then
+  flock -w "$LOCK_WAIT_SECONDS" -E 75 9
+  lock_rc=$?
+  case "$lock_rc" in
+    0) ;;
+    75)
+      say "等待 security-update-notify 运行锁超时" "Timed out waiting for the security-update-notify lock" >&2
+      exit 75
+      ;;
+    *)
+      say "获取 security-update-notify 运行锁失败" "Failed to acquire the security-update-notify lock" >&2
+      exit 1
+      ;;
+  esac
+else
+  flock -n -E 75 9
+  lock_rc=$?
+  case "$lock_rc" in
+    0) ;;
+    75) exit 0 ;;
+    *)
+      say "获取 security-update-notify 运行锁失败" "Failed to acquire the security-update-notify lock" >&2
+      exit 1
+      ;;
+  esac
+fi
 
 log_event() {
   local line="$1"

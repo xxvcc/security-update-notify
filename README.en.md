@@ -183,7 +183,7 @@ Before writing the config, it performs channel preflight checks:
 
 Results are limited by the Feishu application's directory data scope. If scanning fails or returns no visible employees, the interactive installer can retry, accept a current-app `open_id` manually, or abort. Non-interactive mode requires `--feishu-receive-id` explicitly.
 
-On the first interactive Feishu setup or after changing the recipient, the installer sends a Feishu-only verification message by default to confirm that the selected `open_id` is within the bot availability; enter `n` to skip it. Non-interactive installs send nothing automatically. Explicit `--send-test` or `test.sh --send-test` still tests every configured channel.
+On the first interactive Feishu setup or after changing the recipient, the installer sends a Feishu-only verification message by default to confirm that the selected `open_id` is within the bot availability; enter `n` to skip it. Verification waits up to 60 seconds for an existing check to release the runtime lock and enables the SUN timer only after a confirmed send; a timeout or send failure rolls the install back, so “not sent” cannot be mistaken for success. Non-interactive installs send nothing automatically. Explicit `--send-test` or `test.sh --send-test` still tests every configured channel.
 
 ### 3. Verify
 
@@ -295,7 +295,7 @@ curl -fsSL https://sun.xxv.cc | sudo bash -s -- upgrade --non-interactive -y
 
 Once SUN is installed you can also run `sudo security-update-notify --upgrade` directly: it downloads the latest GitHub release, verifies `.sha256`, and requires a GPG signature against the pinned fingerprint (fail-closed by default — it refuses if the signature is missing) before upgrading.
 
-If SUN is already installed, the installer reads `/etc/security-update-notify/telegram.env` and the existing timer time first. A legacy config without `NOTIFY_CHANNELS` automatically remains `telegram`; options not explicitly overridden keep their old values. Before upgrading, key files are backed up to `/var/backups/security-update-notify/<timestamp>`, but the Feishu App Secret is not copied there; failed upgrades attempt an automatic rollback. A post-upgrade self-check runs by default; use `--notify-upgrade 1` to notify the configured channels after a successful upgrade. Upgrade notices are best-effort: a notification failure never rolls back a completed upgrade, and the whole dual-send is not retried in a way that would duplicate a successful channel.
+If SUN is already installed, the installer reads `/etc/security-update-notify/telegram.env` and the existing timer time first. A legacy config without `NOTIFY_CHANNELS` automatically remains `telegram`; options not explicitly overridden keep their old values. Before upgrading, key files are backed up to `/var/backups/security-update-notify/<timestamp>`, but the Feishu App Secret is not copied there; failed upgrades attempt an automatic rollback and restore the SUN timer's pre-install enablement link and active state. A post-upgrade self-check runs by default; use `--notify-upgrade 1` to notify the configured channels after a successful upgrade. Upgrade notices are best-effort: a notification failure never rolls back a completed upgrade, and the whole dual-send is not retried in a way that would duplicate a successful channel.
 
 ## Duplicate alert modes
 
@@ -463,11 +463,12 @@ From the source checkout:
 ```bash
 bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify \
   build/compat-test.sh build/rollback-test.sh build/bash-feishu-test.sh \
-  build/install-feishu-onboarding-test.sh
+  build/install-feishu-onboarding-test.sh build/runtime-lock-test.sh
 go vet ./...
 go test -race -cover ./...
 build/bash-feishu-test.sh
 build/install-feishu-onboarding-test.sh
+build/runtime-lock-test.sh
 build/compat-test.sh
 build/rollback-test.sh
 ./package.sh

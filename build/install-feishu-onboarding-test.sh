@@ -309,13 +309,21 @@ SH
 chmod +x "$TMP/mock-runtime"
 TEST_BIN_FILE="$TMP/mock-runtime" "$TMP/harness.sh" verify-recipient >"$TMP/verify-success.out"
 grep -Fq '飞书接收人验证成功。' "$TMP/verify-success.out"
-grep -Fxq -- '--test-ok --no-dedupe' "$TMP/verification-args"
+grep -Fxq -- '--test-ok --no-dedupe --wait-lock 60' "$TMP/verification-args"
 grep -Fxq "NOTIFY_CHANNELS='feishu'" "$TMP/verification-captured.env"
+SECURITY_UPDATE_NOTIFY_LOCK_WAIT_SECONDS=0 TEST_BIN_FILE="$TMP/mock-runtime" "$TMP/harness.sh" verify-recipient >"$TMP/verify-zero-wait.out"
+grep -Fxq -- '--test-ok --no-dedupe --wait-lock 0' "$TMP/verification-args"
 if TEST_BIN_FILE="$TMP/mock-runtime" TEST_VERIFY_RC=1 "$TMP/harness.sh" verify-recipient >"$TMP/verify-failure.out" 2>&1; then
   echo "Expected a failed Feishu recipient verification to return non-zero" >&2
   exit 1
 fi
 grep -Fq '飞书接收人验证失败' "$TMP/verify-failure.out"
+set +e
+TEST_BIN_FILE="$TMP/mock-runtime" TEST_VERIFY_RC=75 "$TMP/harness.sh" verify-recipient >"$TMP/verify-lock-timeout.out" 2>&1
+verify_lock_rc=$?
+set -e
+[[ "$verify_lock_rc" -eq 75 ]] || { echo "Expected lock-timeout exit 75, got $verify_lock_rc" >&2; exit 1; }
+grep -Fq '未发送验证消息' "$TMP/verify-lock-timeout.out"
 
 python3 - "$TMP/requests.jsonl" <<'PY'
 import json

@@ -9,23 +9,41 @@ package lock
 import (
 	"os"
 	"syscall"
+	"time"
 )
 
 // Acquire 非阻塞地对 path 加独占 flock。成功返回 release（释放并关闭 fd）与 acquired=true；已被占用
 // 返回 acquired=false（release 为 nil，err 为 nil）；其它错误经 err 返回。
 func Acquire(path string) (release func(), acquired bool, err error) {
+	return AcquireWait(path, 0)
+}
+
+// AcquireWait waits up to timeout for the lock. A zero timeout performs one non-blocking attempt.
+// The caller decides whether a timeout is a quiet no-op or an explicit failure.
+func AcquireWait(path string, timeout time.Duration) (release func(), acquired bool, err error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, false, err
 	}
-	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-	if err == syscall.EWOULDBLOCK {
-		f.Close()
-		return nil, false, nil
-	}
-	if err != nil {
-		f.Close()
-		return nil, false, err
+	deadline := time.Now().Add(timeout)
+	for {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if err != syscall.EWOULDBLOCK {
+			f.Close()
+			return nil, false, err
+		}
+		remaining := time.Until(deadline)
+		if timeout <= 0 || remaining <= 0 {
+			f.Close()
+			return nil, false, nil
+		}
+		if remaining > 100*time.Millisecond {
+			remaining = 100 * time.Millisecond
+		}
+		time.Sleep(remaining)
 	}
 	return func() {
 		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)

@@ -6,11 +6,12 @@
 This is the living design doc for the full Go port. It captures the conclusions of the multi-agent
 analysis (inventory → design → adversarial critique → synthesis); the analysis's own output was ephemeral.
 
-> **Current status (2.2.0):** the Go runtime, signed bridge distribution, self-upgrade path, and all original
+> **Current status (2.2.1):** the Go runtime, signed bridge distribution, self-upgrade path, and all original
 > port phases are complete. Version 2.1.0 added selectable Telegram/Feishu delivery, per-channel dedup state,
 > diagnostics, upgrade notices, and configuration schema v3. Version 2.2.0 adds embedded Feishu Card JSON 2.0
-> while preserving Telegram text and dedup hashes. The historical 2.0.0 release checklist remains below as
-> design history, not as unfinished work.
+> while preserving Telegram text and dedup hashes. Version 2.2.1 closes recipient onboarding with a confirmed
+> post-install Feishu send and hardens runtime-lock/timer rollback behavior. The historical 2.0.0 release
+> checklist remains below as design history, not as unfinished work.
 
 ## 诚实的底线 / Honest bottom line
 
@@ -34,7 +35,7 @@ analysis (inventory → design → adversarial critique → synthesis); the anal
 - **切换时分发单元：版本化“桥” tarball**（内含 install.sh 与含 `VERSION=latest` 字节的运行时文件），
   让已装 Bash 机器的旧自升级链继续工作；不在切换点抛弃 noarch 语义。
 - **install.sh / package.sh / sun.sh 主体：第一刀保持 shell**（特权、测试最全、收益近零）。
-- **桥版本 2.0.0 已发布；当前演进版本为 2.2.0。** 2.1.0 在不改变桥信任链的前提下新增多通知渠道；2.2.0 将飞书展示升级为原生 JSON 2.0 卡片。
+- **桥版本 2.0.0 已发布；当前演进版本为 2.2.1。** 2.1.0 在不改变桥信任链的前提下新增多通知渠道；2.2.0 将飞书展示升级为原生 JSON 2.0 卡片；2.2.1 补齐接收人真实发送验证及锁/timer 回滚安全。
 - **自升级：存活父进程做事务替换**（NOT rename-then-`syscall.Exec`）。
 
 ## Go 架构 / Architecture
@@ -110,9 +111,14 @@ sun.sh        ✅ 保持 shell 引导器；下载、sha256、指纹 pin、GPG �
 - **飞书**：App Secret 只从隐藏输入、systemd credential 或已验证的 root-only 普通文件进入内存；运行时
   使用应用级 `open_id` 单发内嵌 JSON 2.0 卡片，卡片只含静态组件与 `open_url`，不增加回调。交互安装的
   Directory v1 结果只用于人选确认，扫描范围受应用通讯录数据范围限制；更换 App ID 必须重新选择或显式
-  提供接收人，禁止复用旧应用的 `open_id`。首次配置或更换接收人时默认用仅飞书临时配置发送验证消息，
-  失败进入安装事务回滚；非交互安装不自动发送，显式 `--send-test` 才测试全部渠道。Telegram 文本与 11 字段
-  去重哈希均不受卡片展示影响。
+  提供接收人，禁止复用旧应用的 `open_id`。首次配置或更换接收人时默认用仅飞书临时配置发送验证消息；
+  独立安装事务锁会串行化并发安装，且锁描述符不会传给包管理器或装后子进程；升级在首次受管写入
+  （包括最小预检依赖和其它依赖包可能创建的配置）前禁用并停止旧
+  timer、跨过运行锁屏障；测试用 `--wait-lock 60` 等待其它并发检查，超时返回 `75`，验证成功后才重新
+  启用 SUN timer。失败回滚在恢复文件前再次静止 timer/service 并跨过运行锁，再恢复 timer 安装前的
+  persistent/runtime enablement 链接与 active 状态。备份保留逻辑始终保护当前事务目录，即使系统时钟
+  回拨也不会在失败前裁掉回滚源；非交互安装不自动发送，显式 `--send-test` 才测试全部渠道。
+  Telegram 文本与 11 字段去重哈希均不受卡片展示影响。
 - **needs-restarting reboot 判定优先级**：文本 `reboot is required` → 需要；否则
   `reboot should not be necessary|no core libraries` → 不需要；**仅当**上面都不匹配时 `rc==1` → 需要；
   其它非零 rc **不是** reboot 信号。needrestart：任一 `NEEDRESTART-SVC:` 行即触发 attention（`HasPrefix`
@@ -120,8 +126,8 @@ sun.sh        ✅ 保持 shell 引导器；下载、sha256、指纹 pin、GPG �
 - **restart_summary 两种换行制**：apt 携带**真换行**（原始 needrestart -b），dnf 携带**字面 `\n`**；两者都过
   一次 `\n`→换行 的替换。保留谁携带哪种。
 - **退出码**：`0` = 成功/无关注/silent-ok/去重抑制/--version/--help/--check-upgrade/--notify-upgrade-event/
-  锁竞争/非更新；`1` = 任一已配置渠道发送失败/doctor 问题/自升级失败；`2` = 参数/配置错误/发送时缺渠道
-  凭据/不支持后端/缺 flag 值。**裸调用 = run FOREVER**（旧 systemd 单元裸调用二进制直到 daemon-reload）。
+  默认模式锁竞争/非更新；`1` = 任一已配置渠道发送失败/doctor 问题/自升级失败；`2` = 参数/配置错误/发送时缺渠道
+  凭据/不支持后端/缺 flag 值；`75` = 显式 `--wait-lock` 等待超时。**裸调用 = run FOREVER**（旧 systemd 单元裸调用二进制直到 daemon-reload）。
 - **信任链**：pin 指纹 `C678256ACBFC6491BF5076655F3AE24999921FFC`（不可被环境变量覆盖）；验签在解包之前；
   安全解包拒绝绝对路径 / 任何 `..` 段 / 顶层目录之外条目 / 非普通-非目录条目；解包 `--no-same-owner
   --no-same-permissions`；gpg 存在时签名强制（缺 .asc 即拒）；sha256-only 仅当 gpg 确实缺失且显式

@@ -194,4 +194,34 @@ diff -u "$TMP/attempts" - <<'EOF'
 3 interactive 1
 4 interactive 1
 EOF
-echo "Bash Feishu card passed JSON 2.0, plain-text safety/fallback, fixed open_id, and Retry-After checks"
+
+exec 8>"$TMP/runtime.lock"
+flock -n 8
+set +e
+SECURITY_UPDATE_NOTIFY_ENV="$TMP/missing.env" \
+  SECURITY_UPDATE_NOTIFY_STATE_DIR="$TMP/state" \
+  SECURITY_UPDATE_NOTIFY_LOCK_FILE="$TMP/runtime.lock" \
+  SECURITY_UPDATE_NOTIFY_LOG_FILE="$TMP/runtime.log" \
+  UI_LANG=en \
+  "$ROOT/files/security-update-notify" --test-ok --no-dedupe >"$TMP/lock-default.out" 2>&1
+default_lock_rc=$?
+SECURITY_UPDATE_NOTIFY_ENV="$TMP/missing.env" \
+  SECURITY_UPDATE_NOTIFY_STATE_DIR="$TMP/state" \
+  SECURITY_UPDATE_NOTIFY_LOCK_FILE="$TMP/runtime.lock" \
+  SECURITY_UPDATE_NOTIFY_LOG_FILE="$TMP/runtime.log" \
+  UI_LANG=en \
+  "$ROOT/files/security-update-notify" --test-ok --no-dedupe --wait-lock 0 >"$TMP/lock-required.out" 2>&1
+required_lock_rc=$?
+set -e
+[[ "$default_lock_rc" -eq 0 ]]
+[[ "$required_lock_rc" -eq 75 ]]
+grep -Fq 'Timed out waiting for the security-update-notify lock' "$TMP/lock-required.out"
+for invalid_wait in '' 00001 +1 -1 3601 9999 1s; do
+  set +e
+  "$ROOT/files/security-update-notify" --wait-lock "$invalid_wait" >"$TMP/lock-invalid.out" 2>&1
+  invalid_lock_rc=$?
+  set -e
+  [[ "$invalid_lock_rc" -eq 2 ]]
+done
+
+echo "Bash Feishu card passed JSON 2.0, plain-text safety/fallback, lock handling, fixed open_id, and Retry-After checks"

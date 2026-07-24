@@ -17,11 +17,38 @@ import (
 // 用于人工观察与 bash↔Go 差分测试。
 type DryRunFlags struct {
 	Flags
-	DryRun bool
+	DryRun      bool
+	RequireLock bool
+	LockWait    time.Duration
+	LockHeld    bool
+}
+
+// AcquireExecutionLock applies the runtime's public lock contract. Default contention is a quiet success;
+// an explicit wait timeout returns 75; lock filesystem or flock failures return 1.
+func AcquireExecutionLock(require bool, wait time.Duration) (release func(), acquired bool, exitCode int) {
+	var err error
+	if require {
+		release, acquired, err = lock.AcquireWait(lockFilePath(), wait)
+	} else {
+		release, acquired, err = lock.Acquire(lockFilePath())
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "lock error: "+err.Error())
+		return nil, false, 1
+	}
+	if !acquired {
+		if require {
+			fmt.Fprintln(os.Stderr, "Timed out waiting for the security-update-notify lock")
+			return nil, false, 75
+		}
+		return nil, false, 0
+	}
+	return release, true, 0
 }
 
 // Execute 跑完整的 检查→通知→去重→落盘 流程，返回进程退出码。复刻运行时末尾的决策、日志事件与退出码：
-// 0=成功/无关注/静默OK/去重抑制/锁竞争；1=发送失败；2=缺 token/chat。
+// 0=成功/无关注/静默OK/去重抑制/默认模式下的锁竞争；1=发送失败；2=配置错误；
+// 75=显式 --wait-lock 超时（安装器据此拒绝把“未发送”误判为验证成功）。
 func Execute(cfg *config.Config, f DryRunFlags) int {
 	if f.DryRun {
 		out := Assemble(Collect(cfg, f.Flags))
@@ -41,17 +68,13 @@ func Execute(cfg *config.Config, f DryRunFlags) int {
 	if err := os.MkdirAll(stateDirPath(), 0o750); err == nil {
 		_ = os.Chmod(stateDirPath(), 0o750)
 	}
-	release, acquired, err := lock.Acquire(lockFilePath())
-	if err != nil {
-		// 无法获取锁本身即视为失败，不再裸跑：否则与定时器运行并发时会重复告警、竞争状态文件
-		// （复刻 Bash `flock -n 9 || exit 0` 不会静默继续无锁运行）。
-		fmt.Fprintln(os.Stderr, "lock error: "+err.Error())
-		return 1
+	if !f.LockHeld {
+		release, acquired, exitCode := AcquireExecutionLock(f.RequireLock, f.LockWait)
+		if !acquired {
+			return exitCode
+		}
+		defer release()
 	}
-	if !acquired {
-		return 0 // 已有实例在跑，静默退出
-	}
-	defer release()
 
 	in := Collect(cfg, f.Flags)
 	// 不支持的后端（既非 apt 也非 dnf，例如无法识别的发行版 -> auto=unknown）：复刻运行时的 exit 2。

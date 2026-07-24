@@ -183,7 +183,7 @@ sudo ./install.sh
 
 扫描结果受飞书应用“通讯录数据范围”限制。扫描失败或没有可见员工时，交互安装器允许重试、手动输入当前应用下的 `open_id`，或中止安装；非交互模式必须显式提供 `--feishu-receive-id`。
 
-首次交互配置飞书或更换接收人时，安装器默认发送一条仅飞书的验证消息，用于确认所选 `open_id` 位于机器人的可用范围内；输入 `n` 可跳过。非交互安装不会自动发送。显式使用 `--send-test` 或 `test.sh --send-test` 仍会测试全部已配置渠道。
+首次交互配置飞书或更换接收人时，安装器默认发送一条仅飞书的验证消息，用于确认所选 `open_id` 位于机器人的可用范围内；输入 `n` 可跳过。验证会等待现有检查释放运行锁（最多 60 秒），确认发送成功后才启用 SUN timer；超时或发送失败都会回滚，不能把“未发送”误判为成功。非交互安装不会自动发送。显式使用 `--send-test` 或 `test.sh --send-test` 仍会测试全部已配置渠道。
 
 ### 3. 验证
 
@@ -295,7 +295,7 @@ curl -fsSL https://sun.xxv.cc | sudo bash -s -- upgrade --non-interactive -y
 
 已安装 SUN 后，也可以直接运行 `sudo security-update-notify --upgrade`：它会下载最新 GitHub 发布包，校验 `.sha256`，并用内置 pin 的指纹强制校验 GPG 签名（默认 fail-closed，缺签名即拒绝）后才升级。
 
-如果已安装过 SUN，安装器会自动读取 `/etc/security-update-notify/telegram.env` 和现有 timer 时间；旧配置没有 `NOTIFY_CHANNELS` 时自动按 `telegram` 处理，未显式覆盖的选项继续沿用。升级前会备份关键文件到 `/var/backups/security-update-notify/<timestamp>`，但飞书 App Secret 不进入该备份；升级失败会尝试自动回滚。升级后默认运行自检；可用 `--notify-upgrade 1` 向已配置渠道发送升级通知。升级通知采用 best-effort 语义，不会因通知失败回滚已经完成的升级，也不会整体重试双发而重复已成功渠道。
+如果已安装过 SUN，安装器会自动读取 `/etc/security-update-notify/telegram.env` 和现有 timer 时间；旧配置没有 `NOTIFY_CHANNELS` 时自动按 `telegram` 处理，未显式覆盖的选项继续沿用。升级前会备份关键文件到 `/var/backups/security-update-notify/<timestamp>`，但飞书 App Secret 不进入该备份；升级失败会尝试自动回滚，并恢复 SUN timer 安装前的启用链接与 active 状态。升级后默认运行自检；可用 `--notify-upgrade 1` 向已配置渠道发送升级通知。升级通知采用 best-effort 语义，不会因通知失败回滚已经完成的升级，也不会整体重试双发而重复已成功渠道。
 
 ## 重复提醒策略
 
@@ -463,11 +463,12 @@ SUN 的范围刻意保持很小：
 ```bash
 bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify \
   build/compat-test.sh build/rollback-test.sh build/bash-feishu-test.sh \
-  build/install-feishu-onboarding-test.sh
+  build/install-feishu-onboarding-test.sh build/runtime-lock-test.sh
 go vet ./...
 go test -race -cover ./...
 build/bash-feishu-test.sh
 build/install-feishu-onboarding-test.sh
+build/runtime-lock-test.sh
 build/compat-test.sh
 build/rollback-test.sh
 ./package.sh

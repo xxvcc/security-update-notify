@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER_BASHPID="$BASHPID"
+INSTALLER_ARGS=("$@")
 # 共用辅助函数：m/say 双语输出、os-release 读取、后端检测。
 # shellcheck source=files/lib.sh
 . "$SCRIPT_DIR/files/lib.sh"
@@ -50,8 +51,22 @@ FEISHU_CREDENTIAL_FILE="$FEISHU_CREDENTIAL_DIR/feishu-app-secret"
 FEISHU_ENCRYPTED_CREDENTIAL="/etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred"
 FEISHU_CREDENTIAL_DROPIN="/etc/systemd/system/security-update-notify.service.d/credentials.conf"
 TIMER_FILE="/etc/systemd/system/security-update-notify.timer"
+TIMER_ENABLE_LINK="/etc/systemd/system/timers.target.wants/security-update-notify.timer"
+TIMER_RUNTIME_ENABLE_LINK="/run/systemd/system/timers.target.wants/security-update-notify.timer"
 SERVICE_FILE="/etc/systemd/system/security-update-notify.service"
 BIN_FILE="/usr/local/sbin/security-update-notify"
+RUNTIME_LOCK_FILE="${SECURITY_UPDATE_NOTIFY_LOCK_FILE:-/run/security-update-notify.lock}"
+INSTALL_LOCK_FILE="${SECURITY_UPDATE_NOTIFY_INSTALL_LOCK_FILE:-/run/security-update-notify.install.lock}"
+INSTALL_LOCK_WRAPPED=0
+INSTALL_LOCK_MARKER_CLEANUP=""
+if [[ "${SECURITY_UPDATE_NOTIFY_INSTALL_LOCK_HELD:-0}" == "1" \
+      && "${SECURITY_UPDATE_NOTIFY_INSTALL_LOCK_MARKER:-}" =~ ^/run/security-update-notify\.install\.[A-Za-z0-9]+$ \
+      && -f "$SECURITY_UPDATE_NOTIFY_INSTALL_LOCK_MARKER" && ! -L "$SECURITY_UPDATE_NOTIFY_INSTALL_LOCK_MARKER" \
+      && "$(stat -c %u "$SECURITY_UPDATE_NOTIFY_INSTALL_LOCK_MARKER" 2>/dev/null || printf x)" == "0" ]]; then
+  printf 'acquired\n' >"$SECURITY_UPDATE_NOTIFY_INSTALL_LOCK_MARKER"
+  INSTALL_LOCK_WRAPPED=1
+  unset SECURITY_UPDATE_NOTIFY_INSTALL_LOCK_HELD SECURITY_UPDATE_NOTIFY_INSTALL_LOCK_MARKER
+fi
 LOGROTATE_FILE="/etc/logrotate.d/security-update-notify"
 BACKUP_ROOT="/var/backups/security-update-notify"
 BACKUP_DIR=""
@@ -63,6 +78,8 @@ MANAGED_PATHS=(
   etc/systemd/system/security-update-notify.service
   etc/systemd/system/security-update-notify.service.d/credentials.conf
   etc/systemd/system/security-update-notify.timer
+  "${TIMER_ENABLE_LINK#/}"
+  "${TIMER_RUNTIME_ENABLE_LINK#/}"
   etc/logrotate.d/security-update-notify
   etc/apt/apt.conf.d/20auto-upgrades
   etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify
@@ -81,7 +98,14 @@ FEISHU_CREDENTIAL_CHANGED=0
 OLD_FEISHU_CREDENTIAL_KIND="none"
 OLD_FEISHU_SECRET=""
 OLD_FEISHU_ENCRYPTED_BACKUP=""
-cleanup() { [[ -z "$TMP_DIR" ]] || rm -rf "$TMP_DIR"; }
+TIMER_STATE_CAPTURED=0
+TIMER_WAS_ACTIVE=0
+TIMER_ENABLEMENT_STATE="unknown"
+TRANSACTION_ACTIVE=0
+cleanup() {
+  [[ -z "$TMP_DIR" ]] || rm -rf "$TMP_DIR"
+  [[ -z "$INSTALL_LOCK_MARKER_CLEANUP" ]] || rm -f "$INSTALL_LOCK_MARKER_CLEANUP"
+}
 trap cleanup EXIT
 
 usage() {
@@ -445,7 +469,7 @@ feishu_secret_to_stdout() {
 }
 
 feishu_scan_directory() {
-  local output_file="$1" error_file="$2"
+  local output_file="$1" error_file="$2" rc
   local base_url="${FEISHU_API_BASE_URL:-https://open.feishu.cn}"
   if { printf '%s\0' "$FEISHU_APP_ID"; feishu_secret_to_stdout; printf '\0%s' "$base_url"; } | python3 -c '
 import json
@@ -604,11 +628,13 @@ try:
 except Exception as exc:
     print(str(exc), file=sys.stderr)
     sys.exit(1)
-' >"$output_file" 2>"$error_file"; then
+  ' >"$output_file" 2>"$error_file"; then
     FEISHU_AUTH_VALIDATED=1
     return 0
+  else
+    rc=$?
   fi
-  return 1
+  return "$rc"
 }
 
 feishu_render_directory_users() {
@@ -785,15 +811,33 @@ write_feishu_recipient_test_config() {
 
 verify_feishu_recipient_after_install() {
   TMP_DIR="${TMP_DIR:-$(mktemp -d)}"
-  local test_config="$TMP_DIR/feishu-recipient-test.env"
+  local test_config="$TMP_DIR/feishu-recipient-test.env" lock_wait rc
+  lock_wait="$(post_install_lock_wait_seconds)"
   write_feishu_recipient_test_config "$test_config"
   say "正在发送飞书接收人验证消息..." "Sending the Feishu recipient verification message..."
-  if ! SECURITY_UPDATE_NOTIFY_ENV="$test_config" "$BIN_FILE" --test-ok --no-dedupe; then
+  if SECURITY_UPDATE_NOTIFY_ENV="$test_config" "$BIN_FILE" --test-ok --no-dedupe --wait-lock "$lock_wait"; then
+    say "飞书接收人验证成功。" "Feishu recipient verification succeeded."
+    return 0
+  else
+    rc=$?
+  fi
+  if [[ "$rc" -eq 75 ]]; then
+    say "飞书接收人验证等待现有检查结束超时，未发送验证消息。安装将回滚。" \
+        "Feishu recipient verification timed out waiting for an existing check; no verification message was sent. The install will roll back." >&2
+  else
     say "飞书接收人验证失败；请确认用户位于机器人的可用范围内。安装将回滚。" \
         "Feishu recipient verification failed. Confirm that the user is within the bot availability. The install will roll back." >&2
-    return 1
   fi
-  say "飞书接收人验证成功。" "Feishu recipient verification succeeded."
+  return "$rc"
+}
+
+post_install_lock_wait_seconds() {
+  local value="${SECURITY_UPDATE_NOTIFY_LOCK_WAIT_SECONDS:-60}"
+  if [[ "$value" =~ ^[0-9]{1,4}$ ]] && (( 10#$value <= 3600 )); then
+    printf '%s\n' "$((10#$value))"
+  else
+    printf '60\n'
+  fi
 }
 
 snapshot_feishu_credential() {
@@ -891,14 +935,117 @@ current_installed_version() {
   fi
 }
 
+snapshot_timer_runtime_state() {
+  TIMER_STATE_CAPTURED=1
+  TIMER_WAS_ACTIVE=0
+  TIMER_ENABLEMENT_STATE="unknown"
+  command -v systemctl >/dev/null 2>&1 || return 0
+  TIMER_ENABLEMENT_STATE="$(systemctl is-enabled security-update-notify.timer 2>/dev/null || true)"
+  [[ -n "$TIMER_ENABLEMENT_STATE" ]] || TIMER_ENABLEMENT_STATE="unknown"
+  systemctl is-active --quiet security-update-notify.timer >/dev/null 2>&1 && TIMER_WAS_ACTIVE=1
+  return 0
+}
+
+acquire_installer_lock() {
+  [[ "$INSTALL_LOCK_WRAPPED" -eq 0 ]] || return 0
+  local rc marker ran=0
+  marker="$(mktemp /run/security-update-notify.install.XXXXXX)" || {
+    say "无法创建安装事务锁握手文件。" "Cannot create the installer-lock handshake file." >&2
+    return 1
+  }
+  chmod 0600 "$marker"
+  INSTALL_LOCK_MARKER_CLEANUP="$marker"
+  set +e
+  env UI_LANG="$UI_LANG" \
+    SECURITY_UPDATE_NOTIFY_INSTALL_LOCK_HELD=1 \
+    SECURITY_UPDATE_NOTIFY_INSTALL_LOCK_MARKER="$marker" \
+    flock -n -E 75 -o "$INSTALL_LOCK_FILE" bash "$SCRIPT_DIR/install.sh" "$@"
+  rc=$?
+  set -e
+  [[ -s "$marker" ]] && ran=1
+  rm -f "$marker"
+  INSTALL_LOCK_MARKER_CLEANUP=""
+  if [[ "$ran" -eq 1 ]]; then
+    exit "$rc"
+  fi
+  if [[ "$rc" -eq 75 ]]; then
+    say "另一个 security-update-notify 安装或升级事务正在运行，请稍后重试。" \
+        "Another security-update-notify install or upgrade transaction is running; retry later." >&2
+    return 75
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    return 0
+  fi
+  say "获取安装事务锁失败: $INSTALL_LOCK_FILE" \
+      "Failed to acquire the installer transaction lock: $INSTALL_LOCK_FILE" >&2
+  return 1
+}
+
+quiesce_existing_timer() {
+  [[ "$IN_UPGRADE" -eq 1 ]] || return 0
+  local lock_wait lock_fd lock_rc
+  lock_wait="$(post_install_lock_wait_seconds)"
+  if [[ -e "$TIMER_FILE" || -L "$TIMER_FILE" ]]; then
+    systemctl disable --now security-update-notify.timer
+  fi
+  if ! exec {lock_fd}>"$RUNTIME_LOCK_FILE"; then
+    say "无法打开运行锁文件，不能安全开始升级: $RUNTIME_LOCK_FILE" \
+        "Cannot open the runtime lock file; refusing to start an unsafe upgrade: $RUNTIME_LOCK_FILE" >&2
+    return 1
+  fi
+  if flock -w "$lock_wait" -E 75 "$lock_fd"; then
+    lock_rc=0
+  else
+    lock_rc=$?
+  fi
+  # Hold the runtime lock while cancelling any service job that the old timer queued just before it was
+  # disabled. A queued oneshot then cannot begin against files being replaced after this barrier.
+  if [[ "$lock_rc" -eq 0 && ( -e "$SERVICE_FILE" || -L "$SERVICE_FILE" ) ]]; then
+    if ! systemctl stop security-update-notify.service; then
+      lock_rc=1
+    fi
+  fi
+  exec {lock_fd}>&-
+  case "$lock_rc" in
+    0) return 0 ;;
+    75)
+      say "等待现有 security-update-notify 检查结束超时，升级尚未修改配置。" \
+          "Timed out waiting for the existing security-update-notify run; no upgrade configuration was changed." >&2
+      return 75
+      ;;
+    *)
+      say "获取 security-update-notify 运行锁失败，不能安全开始升级。" \
+          "Failed to acquire the security-update-notify lock; refusing to start an unsafe upgrade." >&2
+      return 1
+      ;;
+  esac
+}
+
 create_backup() {
-  local ts rel
+  local ts rel suffix=0 candidate current_name
+  snapshot_timer_runtime_state
+  install -d -m 0700 "$BACKUP_ROOT"
   ts="$(date +%Y%m%d%H%M%S)"
-  BACKUP_DIR="$BACKUP_ROOT/$ts"
-  install -d -m 0700 "$BACKUP_DIR"
+  while :; do
+    if [[ "$suffix" -eq 0 ]]; then
+      candidate="$BACKUP_ROOT/$ts"
+    else
+      printf -v candidate '%s/%s-%03d' "$BACKUP_ROOT" "$ts" "$suffix"
+    fi
+    if mkdir -m 0700 -- "$candidate" 2>/dev/null; then
+      BACKUP_DIR="$candidate"
+      break
+    fi
+    if [[ ! -e "$candidate" && ! -L "$candidate" ]]; then
+      say "无法原子创建安装备份目录: $candidate" \
+          "Could not atomically create the installer backup directory: $candidate" >&2
+      return 1
+    fi
+    suffix=$((suffix + 1))
+  done
   : >"$BACKUP_DIR/manifest"
   for rel in "${MANAGED_PATHS[@]}"; do
-    if [[ -e "/$rel" ]]; then
+    if [[ -e "/$rel" || -L "/$rel" ]]; then
       install -d -m 0700 "$BACKUP_DIR/$(dirname "$rel")"
       cp -a "/$rel" "$BACKUP_DIR/$rel"
       printf '%s\n' "$rel" >>"$BACKUP_DIR/manifest"
@@ -908,9 +1055,11 @@ create_backup() {
   # 备份目录含 telegram.env 的 token 副本：设为 0700，并只保留最近 3 份，裁剪更旧的。
   # Backups hold token copies of telegram.env: keep them 0700 and prune to the most recent 3.
   local keep=3 old
+  current_name="${BACKUP_DIR##*/}"
   while IFS= read -r old; do [[ -n "$old" ]] && rm -rf "$old"; done < <(
     find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -printf '%f\n' 2>/dev/null \
-      | sort -r | tail -n "+$((keep+1))" | sed "s|^|$BACKUP_ROOT/|")
+      | awk -v current="$current_name" '$0 != current' \
+      | sort -r | tail -n "+$keep" | sed "s|^|$BACKUP_ROOT/|")
   say "已创建安装/升级前备份: $BACKUP_DIR" "Pre-install/upgrade backup created: $BACKUP_DIR"
 }
 
@@ -918,7 +1067,7 @@ capture_dependency_created_defaults() {
   [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]] || return 0
   local rel captured=0
   for rel in "${MANAGED_PATHS[@]}"; do
-    [[ -e "/$rel" && ! -e "$BACKUP_DIR/$rel" ]] || continue
+    [[ ( -e "/$rel" || -L "/$rel" ) && ! -e "$BACKUP_DIR/$rel" && ! -L "$BACKUP_DIR/$rel" ]] || continue
     install -d -m 0700 "$BACKUP_DIR/$(dirname "$rel")"
     cp -a "/$rel" "$BACKUP_DIR/$rel"
     printf '%s\n' "$rel" >>"$BACKUP_DIR/manifest"
@@ -927,30 +1076,91 @@ capture_dependency_created_defaults() {
   [[ "$captured" -eq 0 ]] || say "已补充备份依赖包创建的默认配置。" "Captured default config files created by dependencies."
 }
 
+quiesce_runtime_for_rollback() {
+  local lock_fd lock_rc failed=0
+  if command -v systemctl >/dev/null 2>&1 \
+      && [[ -e "$TIMER_FILE" || -L "$TIMER_FILE" || -L "$TIMER_ENABLE_LINK" \
+            || -L "$TIMER_RUNTIME_ENABLE_LINK" || "$TIMER_WAS_ACTIVE" -eq 1 ]]; then
+    systemctl disable --now security-update-notify.timer >/dev/null 2>&1 || failed=1
+  fi
+  if ! exec {lock_fd}>"$RUNTIME_LOCK_FILE"; then
+    say "回滚无法打开运行锁文件: $RUNTIME_LOCK_FILE" \
+        "Rollback could not open the runtime lock file: $RUNTIME_LOCK_FILE" >&2
+    return 1
+  fi
+  if flock -w 60 -E 75 "$lock_fd"; then
+    lock_rc=0
+  else
+    lock_rc=$?
+  fi
+  if [[ "$lock_rc" -eq 0 && ( -e "$SERVICE_FILE" || -L "$SERVICE_FILE" ) ]]; then
+    systemctl stop security-update-notify.service >/dev/null 2>&1 || failed=1
+  fi
+  exec {lock_fd}>&-
+  if [[ "$lock_rc" -ne 0 ]]; then
+    say "回滚等待现有 security-update-notify 运行结束失败，未恢复受管文件。" \
+        "Rollback could not wait for the existing security-update-notify run; managed files were not restored." >&2
+    return 1
+  fi
+  [[ "$failed" -eq 0 ]]
+}
+
 restore_backup() {
   [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]] || return 0
   [[ "$ROLLBACK_DONE" -eq 0 ]] || return 0
   ROLLBACK_DONE=1
   say "安装/升级失败，正在回滚: $BACKUP_DIR" "Install/upgrade failed; rolling back: $BACKUP_DIR" >&2
-  local rel dmode
+  local rel dmode rc failed=0 current_enablement
+  set +e
+  # Disable the possibly new timer, drain the runtime lock, and cancel any queued oneshot before replacing
+  # its unit/config. The exact pre-install enablement and active state are restored below.
+  quiesce_runtime_for_rollback
+  rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    set -e
+    say "回滚未能完整恢复安装前状态；请立即检查 SUN timer、配置和运行文件。" \
+        "Rollback could not fully restore the pre-install state; inspect the SUN timer, configuration, and runtime files immediately." >&2
+    return 1
+  fi
   for rel in "${MANAGED_PATHS[@]}"; do
     case "$rel" in
       etc/security-update-notify/*) dmode=0750 ;;
       *) dmode=0755 ;;
     esac
-    if [[ -e "$BACKUP_DIR/$rel" ]]; then
-      install -d -m "$dmode" "$(dirname "/$rel")"
-      cp -a "$BACKUP_DIR/$rel" "/$rel"
+    if [[ -e "$BACKUP_DIR/$rel" || -L "$BACKUP_DIR/$rel" ]]; then
+      install -d -m "$dmode" "$(dirname "/$rel")" || failed=1
+      rm -f "/$rel" || failed=1
+      cp -a "$BACKUP_DIR/$rel" "/$rel" || failed=1
     else
       # 本次运行新建、备份里没有的文件：删除，避免回滚后留下半新半旧的状态。
       # File created by this run and absent from the backup: remove it so rollback is clean.
-      rm -f "/$rel"
+      rm -f "/$rel" || failed=1
     fi
   done
-  restore_feishu_credential
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl restart security-update-notify.timer >/dev/null 2>&1 || true
+  restore_feishu_credential || failed=1
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || failed=1
+    if [[ "$TIMER_WAS_ACTIVE" -eq 1 ]]; then
+      systemctl start security-update-notify.timer >/dev/null 2>&1 || failed=1
+    fi
+    if [[ "$TIMER_STATE_CAPTURED" -eq 1 && "$TIMER_ENABLEMENT_STATE" != "unknown" ]]; then
+      current_enablement="$(systemctl is-enabled security-update-notify.timer 2>/dev/null || true)"
+      [[ "$current_enablement" == "$TIMER_ENABLEMENT_STATE" ]] || failed=1
+    fi
+    if systemctl is-active --quiet security-update-notify.timer >/dev/null 2>&1; then
+      [[ "$TIMER_WAS_ACTIVE" -eq 1 ]] || failed=1
+    else
+      [[ "$TIMER_WAS_ACTIVE" -eq 0 ]] || failed=1
+    fi
+  fi
+  set -e
+  if [[ "$failed" -ne 0 ]]; then
+    say "回滚未能完整恢复安装前状态；请立即检查 SUN timer、配置和运行文件。" \
+        "Rollback could not fully restore the pre-install state; inspect the SUN timer, configuration, and runtime files immediately." >&2
+    return 1
+  fi
   say "已回滚: $BACKUP_DIR" "Rolled back: $BACKUP_DIR" >&2
+  return 0
 }
 
 on_error() {
@@ -960,7 +1170,19 @@ on_error() {
     return "$rc"
   fi
   trap - ERR
-  restore_backup
+  if ! restore_backup; then
+    exit 1
+  fi
+  exit "$rc"
+}
+on_exit() {
+  local rc=$?
+  trap - ERR EXIT
+  if [[ "$BASHPID" == "$INSTALLER_BASHPID" && "$rc" -ne 0 \
+        && "${TRANSACTION_ACTIVE:-0}" -eq 1 && "$ROLLBACK_DONE" -eq 0 ]]; then
+    restore_backup || rc=1
+  fi
+  cleanup
   exit "$rc"
 }
 prompt_secret() {
@@ -1199,6 +1421,7 @@ if data.get("code") != 0 or not data.get("tenant_access_token"):
 
 require_root
 choose_language
+acquire_installer_lock "${INSTALLER_ARGS[@]}"
 OLD_VERSION="$(current_installed_version)"
 if [[ "$OLD_VERSION" != "none" || -e "$CONFIG_FILE" || -e "$TIMER_FILE" || -e "$SERVICE_FILE" ]]; then
   IN_UPGRADE=1
@@ -1208,6 +1431,7 @@ fi
 # remove files this run created (applies to fresh installs too).
 create_backup
 trap on_error ERR
+trap on_exit EXIT
 load_existing_config_defaults "$CONFIG_FILE"
 load_existing_timer_default "$TIMER_FILE"
 if [[ "$FEISHU_APP_ID_EXPLICIT" -eq 1 && "$FEISHU_RECEIVE_ID_EXPLICIT" -eq 0 \
@@ -1303,6 +1527,11 @@ say "检测到 ${PRETTY_NAME:-$ID $VERSION_ID} ($SUPPORT_LABEL, backend=$BACKEND
 [[ -d /run/systemd/system ]] || { say "需要 systemd；不支持没有 systemd 的容器。" "systemd is required; containers without systemd are not supported." >&2; exit 1; }
 command -v systemctl >/dev/null || { say "需要 systemctl" "systemctl is required" >&2; exit 1; }
 
+# An upgrade must quiesce the old timer/service before even minimal preflight dependencies can run package
+# manager writes or triggers. From this point, explicit exits are covered by the EXIT rollback trap too.
+TRANSACTION_ACTIVE=1
+quiesce_existing_timer
+
 # 通知渠道预检即使在全新服务器上也需要 python3/CA 根证书。
 # Notification preflight needs python3/CA roots even on fresh servers.
 MINIMAL_PACKAGES=()
@@ -1323,6 +1552,7 @@ case "$BACKEND" in
     fi
     ;;
 esac
+capture_dependency_created_defaults
 
 if channel_selected telegram; then
   prompt_secret TELEGRAM_BOT_TOKEN "Telegram Bot Token" "Telegram Bot Token"
@@ -1525,32 +1755,38 @@ if [[ "$BACKEND" == "apt" ]]; then
 elif [[ "$BACKEND" == "dnf" ]]; then
   systemctl enable --now dnf-automatic.timer >/dev/null 2>&1 || true
 fi
-systemctl enable --now security-update-notify.timer >/dev/null
-
 # bash 运行时才做语法检查；Go 二进制不是脚本。
 [[ "$RUNTIME_IS_GO" -eq 1 ]] || bash -n /usr/local/sbin/security-update-notify
 if [[ "$POST_INSTALL_CHECK" -eq 1 ]]; then
   /usr/local/sbin/security-update-notify --version
   systemd-analyze verify /etc/systemd/system/security-update-notify.service /etc/systemd/system/security-update-notify.timer
-  # --doctor 是咨询性自检：它会因主机环境（磁盘将满、发行版已 EOL 等）而返回非零，这些并不代表
-  # 安装本身失败。故不让它触发 ERR trap 回滚——只打印警告，安装保持完好。
+fi
+if [[ "$VERIFY_FEISHU_RECIPIENT" -eq 1 ]]; then
+  verify_feishu_recipient_after_install
+elif [[ "$SEND_TEST" -eq 1 ]]; then
+  /usr/local/sbin/security-update-notify --test-ok --no-dedupe --wait-lock "$(post_install_lock_wait_seconds)"
+fi
+
+# Enable the project timer only after post-install channel verification succeeds. Upgrades disable and stop the
+# old timer before mutating files, then cross the runtime lock as a barrier, so it cannot fire inside the transaction.
+rm -f "$TIMER_RUNTIME_ENABLE_LINK"
+systemctl enable --now security-update-notify.timer >/dev/null
+if [[ "$POST_INSTALL_CHECK" -eq 1 ]]; then
+  # --doctor is advisory: host findings do not roll a valid install back. It runs after timer activation so the
+  # timer status it reports reflects the completed installation.
   if ! /usr/local/sbin/security-update-notify --doctor --skip-notify --lang "$UI_LANG"; then
     say "安装已完成，但自检报告了主机环境问题（如磁盘将满或发行版已 EOL）；安装本身完好，请按提示处理环境问题。" \
         "Install completed, but the self-check reported a host-environment issue (e.g. low disk or an EOL release); the install itself is intact—address the reported condition." >&2
   fi
 fi
 systemctl list-timers security-update-notify.timer --no-pager
-if [[ "$VERIFY_FEISHU_RECIPIENT" -eq 1 ]]; then
-  verify_feishu_recipient_after_install
-elif [[ "$SEND_TEST" -eq 1 ]]; then
-  /usr/local/sbin/security-update-notify --test-ok --no-dedupe
-fi
 
 if [[ "$IN_UPGRADE" == "1" && "$NOTIFY_UPGRADE" == "1" ]]; then
   /usr/local/sbin/security-update-notify --notify-upgrade-event --upgrade-from "$OLD_VERSION" --upgrade-to "$(/usr/local/sbin/security-update-notify --version | awk '{print $2; exit}')" || true
 fi
 
 trap - ERR
+TRANSACTION_ACTIVE=0
 FEISHU_APP_SECRET=""
 OLD_FEISHU_SECRET=""
 

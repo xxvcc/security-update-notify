@@ -18,12 +18,15 @@ trap 'rm -rf "$WORK"' EXIT
 tar_clean_env() { env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT tar "$@"; }
 
 cd "$ROOT"
-bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify
+bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify \
+  build/compat-test.sh build/rollback-test.sh build/bash-feishu-test.sh \
+  build/install-feishu-onboarding-test.sh build/runtime-lock-test.sh build/reproducibility-check.sh
 
 ALLOW_DIRTY_PACKAGE="${ALLOW_DIRTY_PACKAGE:-0}"
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  RELEASE_PATHS=(install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify files/lib.sh files/needrestart-report-only.conf files/security-update-notify.logrotate files/security-update-notify.service README.md README.en.md CHANGELOG.md LICENSE .env.example files/release-signing.pub.asc .github/workflows/ci.yml cmd internal go.mod)
-  UNTRACKED_RELEASE_FILES="$(git ls-files --others --exclude-standard -- "${RELEASE_PATHS[@]}")"
+  RELEASE_PATHS=(install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify files/lib.sh files/needrestart-report-only.conf files/security-update-notify.logrotate files/security-update-notify.service README.md README.en.md CHANGELOG.md LICENSE .env.example .gitignore files/release-signing.pub.asc .github/workflows/ci.yml build cmd internal go.mod go.sum go.work go.work.sum vendor)
+  # Do not honor ignore rules here: ignored Go/shell sources can still affect builds or release gates.
+  UNTRACKED_RELEASE_FILES="$(git ls-files --others -- "${RELEASE_PATHS[@]}")"
   if ! git diff --quiet HEAD -- "${RELEASE_PATHS[@]}" || [[ -n "$UNTRACKED_RELEASE_FILES" ]]; then
     if [[ "$ALLOW_DIRTY_PACKAGE" == "1" && -n "${SOURCE_DATE_EPOCH:-}" ]]; then
       echo "警告：由于 ALLOW_DIRTY_PACKAGE=1 且 SOURCE_DATE_EPOCH 已设置，将打包未提交的发布文件改动。/ WARNING: packaging uncommitted release-file changes because ALLOW_DIRTY_PACKAGE=1 and SOURCE_DATE_EPOCH is set." >&2
@@ -81,7 +84,8 @@ chmod 0644 "$WORK/$PKG/.env.example" "$WORK/$PKG/README.md" "$WORK/$PKG/README.e
 GO_BRIDGE_ARCHES="${GO_BRIDGE_ARCHES:-amd64 arm64 386 ppc64le s390x}"
 if command -v go >/dev/null 2>&1 && [[ -f "$ROOT/go.mod" ]]; then
   for arch in $GO_BRIDGE_ARCHES; do
-    CGO_ENABLED=0 GOOS=linux GOARCH="$arch" GOTOOLCHAIN=local \
+    CGO_ENABLED=0 GOOS=linux GOARCH="$arch" GOTOOLCHAIN=local GOFLAGS='' GOWORK=off GOENV=off \
+      GO111MODULE=on GOEXPERIMENT='' GOFIPS140=off GOAMD64=v1 GO386=sse2 GOARM64=v8.0 GOPPC64=power8 \
       go build -C "$ROOT" -trimpath -buildvcs=false \
         -ldflags "-s -w -buildid= -X main.Version=$VERSION" \
         -o "$WORK/$PKG/files/security-update-notify-linux-$arch" ./cmd/security-update-notify

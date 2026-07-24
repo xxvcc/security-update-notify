@@ -29,11 +29,11 @@ jobs:
 
       - name: Shell syntax check
         run: |
-          bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify build/compat-test.sh build/rollback-test.sh build/bash-feishu-test.sh build/install-feishu-onboarding-test.sh
+          bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify build/compat-test.sh build/rollback-test.sh build/bash-feishu-test.sh build/install-feishu-onboarding-test.sh build/runtime-lock-test.sh
 
       - name: ShellCheck
         run: |
-          shellcheck -s bash -S warning -e SC2034,SC1091 install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify build/bash-feishu-test.sh build/install-feishu-onboarding-test.sh
+          shellcheck -s bash -S warning -e SC2034,SC1091 install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify build/bash-feishu-test.sh build/install-feishu-onboarding-test.sh build/runtime-lock-test.sh
 
       - name: Dotenv parser regression check
         run: |
@@ -621,6 +621,9 @@ jobs:
       - name: Feishu installer onboarding regression check
         run: build/install-feishu-onboarding-test.sh
 
+      - name: Go/Bash runtime lock contract regression check
+        run: build/runtime-lock-test.sh
+
       - name: Config parser regression check
         run: |
           set -euo pipefail
@@ -662,14 +665,21 @@ jobs:
         run: |
           set -euo pipefail
           probe=internal/package-guard-untracked-probe.go
-          trap 'rm -f "$probe"' EXIT
+          exclude=.git/info/exclude
+          exclude_backup="$(mktemp)"
+          cp "$exclude" "$exclude_backup"
+          trap 'rm -f "$probe"; cp "$exclude_backup" "$exclude"; rm -f "$exclude_backup"' EXIT
+          printf '/%s\n' "$probe" >>"$exclude"
           printf 'package internal\n' >"$probe"
+          git check-ignore -q "$probe"
           if ./package.sh >/tmp/package-untracked.out 2>/tmp/package-untracked.err; then
-            echo "::error::package.sh accepted an untracked Go source file" >&2
+            echo "::error::package.sh accepted an ignored, untracked Go source file" >&2
             exit 1
           fi
           grep -q 'Untracked release-source files' /tmp/package-untracked.err
+          grep -qF "$probe" /tmp/package-untracked.err
           rm -f "$probe"
+          cp "$exclude_backup" "$exclude"
           ./package.sh
 
       - name: Bridge upgrade compat test (bash runtime -> Go, config/state preserved, no re-alert)

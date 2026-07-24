@@ -215,7 +215,7 @@ if [[ "${INCLUDE_PUBLIC_IP:-1}" =~ ^(1|true|yes|on)$ ]]; then
 else
   say "公网 IP：通知中不显示" "Public IP: not shown in notifications"
 fi
-args=(); [[ "$NO_DEDUPE" -eq 1 ]] && args+=(--no-dedupe)
+args=(--wait-lock 60); [[ "$NO_DEDUPE" -eq 1 ]] && args+=(--no-dedupe)
 [[ "$SEND_TEST" -eq 1 ]] && { say "== 发送 OK 测试 ==" "== send OK test =="; /usr/local/sbin/security-update-notify --test-ok "${args[@]}"; say "正常：测试消息已发送" "OK sent test message"; }
 [[ "$SIMULATE_REBOOT" -eq 1 ]] && { say "== 发送模拟重启提醒 ==" "== send simulated reboot alert =="; /usr/local/sbin/security-update-notify --test-reboot "${args[@]}"; say "正常：模拟重启提醒已发送" "OK sent simulated reboot alert"; }
 say "所有检查已完成。" "All checks completed."

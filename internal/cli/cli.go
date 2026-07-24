@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/xxvcc/security-update-notify/internal/config"
 	"github.com/xxvcc/security-update-notify/internal/dist"
@@ -56,6 +57,18 @@ func runMode(ver string, args []string) int {
 			f.NoDedupe = true
 		case "--dry-run":
 			f.DryRun = true
+		case "--wait-lock":
+			value, ok := takeValue(args, &i)
+			if !ok {
+				return 2
+			}
+			seconds, valid := parseWaitLockSeconds(value)
+			if !valid {
+				fmt.Fprintln(os.Stderr, "Invalid --wait-lock (expected 0..3600 seconds)")
+				return 2
+			}
+			f.RequireLock = true
+			f.LockWait = time.Duration(seconds) * time.Second
 		case "--doctor":
 			doctor = true
 		case "--check-upgrade":
@@ -109,6 +122,19 @@ func runMode(ver string, args []string) int {
 		return run.CheckUpgrade(ver, lang)
 	}
 
+	// Dry-run is observational only for the normal Execute path: it never sends, writes state, or takes the
+	// runtime lock. Mode flags still take precedence, so --doctor/--notify-upgrade-event must remain locked
+	// even if --dry-run was also supplied.
+	lockFreeDryRun := f.DryRun && !doctor && !notifyUpgrade
+	if !lockFreeDryRun {
+		release, acquired, exitCode := run.AcquireExecutionLock(f.RequireLock, f.LockWait)
+		if !acquired {
+			return exitCode
+		}
+		defer release()
+		f.LockHeld = true
+	}
+
 	cfg, err := config.Load(envFile())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
@@ -129,6 +155,23 @@ func runMode(ver string, args []string) int {
 	}
 }
 
+func parseWaitLockSeconds(value string) (int, bool) {
+	if len(value) < 1 || len(value) > 4 {
+		return 0, false
+	}
+	seconds := 0
+	for i := 0; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			return 0, false
+		}
+		seconds = seconds*10 + int(value[i]-'0')
+	}
+	if seconds > 3600 {
+		return 0, false
+	}
+	return seconds, true
+}
+
 // takeValue 取下一个参数作为选项值，缺失时报错并返回 false。
 func takeValue(args []string, i *int) (string, bool) {
 	*i++
@@ -147,9 +190,11 @@ func envFile() string {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `Usage: security-update-notify [--test-ok] [--test-reboot] [--no-dedupe] [--dry-run] [--doctor] [--check-upgrade] [--upgrade] [--lang zh|en] [--version]
+	fmt.Fprintln(os.Stderr, `Usage: security-update-notify [--test-ok] [--test-reboot] [--no-dedupe] [--wait-lock SECONDS] [--dry-run] [--doctor] [--check-upgrade] [--upgrade] [--lang zh|en] [--version]
 
 Checks OS backend reboot/service-restart state, then sends configured notifications.
+
+--wait-lock waits for a concurrent run and exits 75 on timeout. Without it, lock contention is a quiet success.
 
 Trust helper subcommands:
   version-newer <current> <latest>
