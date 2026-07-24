@@ -9,10 +9,17 @@ import (
 
 const defaultChannels = "telegram"
 
+// Message carries the channel-neutral text plus an optional Feishu-native card.
+// Telegram always uses Text. Feishu prefers FeishuCard when it is present.
+type Message struct {
+	Text       string
+	FeishuCard []byte
+}
+
 // Sender sends and probes one configured notification channel.
 type Sender interface {
 	Name() string
-	Send(context.Context, string) error
+	Send(context.Context, Message) error
 	Probe(context.Context) error
 }
 

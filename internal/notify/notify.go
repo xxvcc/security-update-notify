@@ -17,22 +17,27 @@ import (
 
 // Message 是渲染一条通知正文所需的全部显示数据（不含决策/hash 逻辑）。
 type Message struct {
-	Alert           bool // true=告警，false=OK
-	Lang            i18n.Lang
-	Host            string
-	IncludePublicIP bool
-	PublicIP        string // PUBLIC_IP_VALUE
-	OS              string
-	Backend         string
-	Kernel          string
-	Now             string
-	RebootRequired  bool
-	RebootPkgs      string // 空 -> 无/None
-	RestartSummary  string // 原始 restart_summary（apt 真换行 / dnf 字面 \n）
+	Alert            bool // true=告警，false=OK
+	Lang             i18n.Lang
+	Version          string
+	Host             string
+	IncludePublicIP  bool
+	PublicIP         string // PUBLIC_IP_VALUE
+	OS               string
+	Backend          string
+	Kernel           string
+	Now              string
+	RebootRequired   bool
+	RestartAttention bool
+	RebootPkgs       string // 空 -> 无/None
+	RestartSummary   string // 原始 restart_summary（apt 真换行 / dnf 字面 \n）
 	// 看门狗附加段（由 watchdog 产出；空则不出现）。
 	HealthTxtZH, HealthTxtEN   string
+	HealthAttention            bool
 	PendingTxtZH, PendingTxtEN string
+	PendingCount               int
 	EolTxtZH, EolTxtEN         string
+	EolAttention               bool
 }
 
 // Render 生成完整正文（无末尾换行）。

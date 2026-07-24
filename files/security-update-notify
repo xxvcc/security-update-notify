@@ -13,7 +13,7 @@ STATE_DIR="/var/lib/security-update-notify"
 STATE_FILE="$STATE_DIR/last-alert.sha256"
 STATE_TIME_FILE="$STATE_DIR/last-alert.sent_at"
 LOCK_FILE="/run/security-update-notify.lock"
-VERSION="2.1.0"
+VERSION="2.2.0"
 REPO="xxvcc/security-update-notify"
 RELEASE_SIGNING_FINGERPRINT="C678256ACBFC6491BF5076655F3AE24999921FFC"
 UPGRADE_ALLOW_UNSIGNED="${SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED:-0}"
@@ -625,10 +625,217 @@ sys.exit(1)
 '
 }
 
+feishu_build_card() {
+  printf '%s\0' "$@" | python3 /dev/fd/3 3<<'PY'
+import json
+import sys
+
+parts = sys.stdin.buffer.read().split(b"\0")
+if parts and parts[-1] == b"":
+    parts.pop()
+if len(parts) != 28:
+    print("invalid Feishu card input", file=sys.stderr)
+    sys.exit(1)
+values = [part.decode("utf-8", "replace") for part in parts]
+(kind, lang, version, alert, host, include_ip, public_ip, os_name, backend, kernel, now,
+ reboot, restart_attention, health_attention, pending_count, eol_attention, packages,
+ restart_zh, restart_en, health_zh, health_en, pending_zh, pending_en, eol_zh, eol_en,
+ fallback, from_version, to_version) = values
+en = lang == "en"
+
+def pick(zh, english):
+    return english if en else zh
+
+def clean(text):
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(ch for ch in text if ch in "\n\t" or (ord(ch) >= 0x20 and ord(ch) != 0x7f)).strip()
+
+def limited(text, maximum):
+    text = clean(text)
+    raw = text.encode("utf-8")
+    if len(raw) <= maximum:
+        return text
+    suffix = pick("\n…（内容已截断）", "\n...(truncated)").encode("utf-8")
+    cut = raw[:max(maximum - len(suffix), 0)]
+    while cut:
+        try:
+            prefix = cut.decode("utf-8")
+            break
+        except UnicodeDecodeError:
+            cut = cut[:-1]
+    else:
+        prefix = ""
+    return prefix.strip() + suffix.decode("utf-8")
+
+def text_tag(text, color):
+    return {"tag": "text_tag", "text": {"tag": "plain_text", "content": text}, "color": color}
+
+def div(content, size="normal", color="default"):
+    return {"tag": "div", "text": {"tag": "plain_text", "content": content,
+                                      "text_size": size, "text_color": color}}
+
+def cell(label, value, color="default"):
+    return {"tag": "column", "width": "weighted", "weight": 1,
+            "background_style": "grey", "padding": "8px", "vertical_spacing": "4px",
+            "elements": [div(label, "normal", "grey"), div(value, "heading", color)]}
+
+def grid(*cells):
+    return {"tag": "column_set", "flex_mode": "bisect", "horizontal_spacing": "8px",
+            "columns": list(cells)}
+
+def divider():
+    return {"tag": "hr"}
+
+def callout(content, color):
+    return {"tag": "column_set", "flex_mode": "stretch", "columns": [
+        {"tag": "column", "width": "weighted", "weight": 1, "background_style": color,
+         "padding": "10px", "elements": [div(content)]}
+    ]}
+
+def docs_button():
+    return {"tag": "button",
+            "text": {"tag": "plain_text", "content": pick("查看 SUN 使用说明", "View SUN documentation")},
+            "type": "default", "width": "default", "size": "medium",
+            "behaviors": [{"type": "open_url", "default_url": "https://github.com/xxvcc/security-update-notify"}]}
+
+def section(elements, title, content, maximum):
+    content = limited(content, maximum)
+    if content:
+        elements.extend([divider(), div(title, "heading"), div(content)])
+
+def make_doc(title, subtitle, theme, summary, tags, elements):
+    return {"schema": "2.0",
+            "config": {"summary": {"content": limited(summary, 240)}, "enable_forward": False,
+                       "update_multi": True, "width_mode": "fill"},
+            "header": {"title": {"tag": "plain_text", "content": title},
+                       "subtitle": {"tag": "plain_text", "content": limited(subtitle, 160)},
+                       "text_tag_list": tags, "template": theme, "padding": "12px 12px 12px 12px"},
+            "body": {"direction": "vertical", "padding": "12px 12px 12px 12px",
+                     "vertical_spacing": "12px", "elements": elements}}
+
+def encode_doc(doc):
+    encoded = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) <= 20 * 1024:
+        return encoded
+    doc["body"] = {"direction": "vertical", "padding": "12px 12px 12px 12px",
+                   "vertical_spacing": "12px",
+                   "elements": [div(limited(fallback, 8000)), docs_button()]}
+    return json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+
+if kind == "upgrade":
+    title = pick("SUN 已升级", "SUN upgraded")
+    version_change = limited(from_version + " → " + to_version, 256)
+    tags = [text_tag("SUN", "blue"), text_tag(version_change, "green")]
+    second_label, second_value = pick("版本", "Version"), version_change
+    if include_ip == "1":
+        second_label, second_value = pick("公网 IP", "Public IP"), limited(public_ip, 256)
+    elements = [grid(cell(pick("主机", "Host"), limited(host, 512)),
+                     cell(second_label, second_value))]
+    if include_ip == "1":
+        elements.append(grid(cell(pick("升级前", "Previous version"), limited(from_version, 128)),
+                             cell(pick("当前版本", "Current version"), limited(to_version, 128), "green")))
+    elements.extend([callout(pick("升级后自检已完成。", "Post-upgrade self-check completed."), "green"),
+                     docs_button()])
+    doc = make_doc(title, now, "blue", title + " · " + host + " · " + version_change, tags, elements)
+    print(encode_doc(doc), end="")
+    sys.exit(0)
+
+is_alert = alert == "1"
+has_health_problem = health_attention == "1"
+has_eol_problem = eol_attention == "1"
+if not is_alert:
+    title, theme = pick("安全更新检查正常", "Security update check OK"), "green"
+elif has_eol_problem:
+    title, theme = pick("发行版安全支持已结束", "Distribution security support ended"), "red"
+elif has_health_problem:
+    title, theme = pick("自动安全更新机制异常", "Automatic security updates need attention"), "red"
+else:
+    title, theme = pick("主机需要安全维护", "Host maintenance required"), "orange"
+
+tags = [text_tag("SUN", "blue")]
+if version.strip():
+    tags.append(text_tag(limited("v" + version.lstrip("v"), 64), "neutral"))
+if int(pending_count or "0") > 0 and len(tags) < 3:
+    tags.append(text_tag(pick("待装 %s" % pending_count, "%s pending" % pending_count), "orange"))
+elif backend.strip() and len(tags) < 3:
+    tags.append(text_tag(limited(backend.upper(), 24), "neutral"))
+
+second_label, second_value = pick("后端", "Backend"), backend
+if include_ip == "1":
+    second_label, second_value = pick("公网 IP", "Public IP"), public_ip
+
+def yes_color(flag, problem_color):
+    return problem_color if flag == "1" else "green"
+
+support_text, support_color = pick("正常", "Supported"), "green"
+eol_text = eol_en if en else eol_zh
+if has_eol_problem:
+    support_text, support_color = pick("已结束", "Ended"), "red"
+elif eol_text.strip():
+    support_text, support_color = pick("即将结束", "Ending soon"), "orange"
+
+elements = [
+    grid(cell(pick("主机", "Host"), limited(host, 512)),
+         cell(second_label, limited(second_value, 256))),
+    grid(cell(pick("系统", "OS"), limited(os_name, 768)),
+         cell(pick("当前内核", "Current kernel"), limited(kernel, 256))),
+    divider(),
+    grid(cell(pick("整机重启", "Full reboot"),
+              pick("需要", "Required") if reboot == "1" else pick("暂不需要", "Not required"),
+              yes_color(reboot, "red")),
+         cell(pick("服务/进程重启", "Service/process restart"),
+              pick("需要处理", "Action needed") if restart_attention == "1" else pick("正常", "Normal"),
+              yes_color(restart_attention, "orange"))),
+    grid(cell(pick("自动更新", "Auto updates"),
+              pick("异常", "Problem") if has_health_problem else pick("正常", "Healthy"),
+              yes_color(health_attention, "red")),
+         cell(pick("安全支持", "Security support"), support_text, support_color))
+]
+
+if is_alert:
+    package_text = packages if packages.strip() else pick("无", "None")
+    section(elements, pick("相关包 / 安全更新", "Related packages / security updates"), package_text, 2500)
+    section(elements, pick("维护详情", "Maintenance details"),
+            restart_en if en else restart_zh, 4500)
+else:
+    elements.append(callout(pick("未发现整机重启或服务、进程重启需要关注的问题。",
+                                  "No reboot or service/process restart requiring attention was detected."), "green"))
+
+section(elements, pick("自动安全更新机制", "Automatic security-update mechanism"),
+        health_en if en else health_zh, 2000)
+section(elements, pick("待安装安全更新", "Pending security updates"),
+        pending_en if en else pending_zh, 2000)
+section(elements, pick("发行版支持状态", "Distribution support status"), eol_text, 1500)
+if is_alert:
+    elements.append(callout(pick(
+        "请在维护窗口 SSH 登录服务器进行处理。需要整机重启时执行 sudo reboot；仅涉及服务时，请先评估再重启对应服务。",
+        "Handle this during a maintenance window over SSH. Run sudo reboot when a full reboot is required; otherwise review and restart only the affected services."), "grey"))
+elements.append(docs_button())
+doc = make_doc(title, now, theme, title + " · " + host, tags, elements)
+print(encode_doc(doc), end="")
+PY
+}
+
+feishu_build_check_card() {
+  local alert="$1" fallback="$2"
+  feishu_build_card check "$NOTIFY_LANG" "$VERSION" "$alert" "$HOST" "$INCLUDE_PUBLIC_IP" \
+    "$PUBLIC_IP_VALUE" "$OS" "$BACKEND" "$KERNEL" "$NOW" "$reboot_required" "$restart_attention" \
+    "$HEALTH_ATTENTION" "$PENDING_SEC_COUNT" "$EOL_ATTENTION" "$reboot_pkgs" "$rs_zh" "$rs_en" \
+    "$HEALTH_TXT_ZH" "$HEALTH_TXT_EN" "$PENDING_TXT_ZH" "$PENDING_TXT_EN" "$EOL_TXT_ZH" \
+    "$EOL_TXT_EN" "$fallback" "" ""
+}
+
+feishu_build_upgrade_card() {
+  local from="$1" to="$2" fallback="$3"
+  feishu_build_card upgrade "$NOTIFY_LANG" "$VERSION" 0 "$HOST" "$INCLUDE_PUBLIC_IP" \
+    "$PUBLIC_IP_VALUE" "$OS" "$BACKEND" "$KERNEL" "$NOW" 0 0 0 0 0 "" "" "" "" "" "" "" \
+    "" "" "$fallback" "$from" "$to"
+}
+
 feishu_send_message() {
-  local text="$1" token
+  local text="$1" card="${2:-}" token
   token="$(feishu_get_token)" || return $?
-  printf '%s\0%s\0%s' "$token" "${FEISHU_RECEIVE_ID:-}" "$text" | python3 -c '
+  printf '%s\0%s\0%s\0%s' "$token" "${FEISHU_RECEIVE_ID:-}" "$text" "$card" | python3 -c '
 import datetime, email.utils, json, os, re, sys, time, urllib.error, urllib.request
 
 def retry_delay(headers):
@@ -646,10 +853,11 @@ def retry_delay(headers):
     except (TypeError, ValueError, OverflowError):
         return 1
 
-parts = sys.stdin.buffer.read().split(b"\0", 2)
+parts = sys.stdin.buffer.read().split(b"\0", 3)
 token = parts[0].decode("utf-8", "replace") if parts else ""
 receive_id = parts[1].decode("utf-8", "replace") if len(parts) > 1 else ""
 text = parts[2].decode("utf-8", "replace") if len(parts) > 2 else ""
+card = parts[3].decode("utf-8", "replace") if len(parts) > 3 else ""
 if not token or not receive_id:
     print("缺少飞书 token 或 open_id / missing Feishu token or open_id", file=sys.stderr)
     sys.exit(2)
@@ -660,7 +868,23 @@ if len(text) > 20000:
     text = text[:19900] + "\n…(truncated)"
 base_url = os.environ.get("SECURITY_UPDATE_NOTIFY_FEISHU_BASE_URL", "https://open.feishu.cn").rstrip("/")
 url = base_url + "/open-apis/im/v1/messages?receive_id_type=open_id"
-payload = json.dumps({"receive_id": receive_id, "msg_type": "text", "content": json.dumps({"text": text}, ensure_ascii=False)}).encode()
+payload = b""
+if card:
+    try:
+        card_doc = json.loads(card)
+        if not isinstance(card_doc, dict) or card_doc.get("schema") != "2.0":
+            raise ValueError("invalid schema")
+        content = json.dumps(card_doc, ensure_ascii=False, separators=(",", ":"))
+        payload = json.dumps({"receive_id": receive_id, "msg_type": "interactive", "content": content},
+                             ensure_ascii=False, separators=(",", ":")).encode()
+        if len(payload) > 30 * 1024:
+            payload = b""
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = b""
+if not payload:
+    payload = json.dumps({"receive_id": receive_id, "msg_type": "text",
+                          "content": json.dumps({"text": text}, ensure_ascii=False)},
+                         ensure_ascii=False, separators=(",", ":")).encode()
 for attempt in range(3):
     delay = 1
     req = urllib.request.Request(url, data=payload, headers={"Authorization": "Bearer " + token, "Content-Type": "application/json; charset=utf-8"}, method="POST")
@@ -700,13 +924,13 @@ channel_configured() {
 send_channel() {
   case "$1" in
     telegram) telegram_send_message "$2" ;;
-    feishu) feishu_send_message "$2" ;;
+    feishu) feishu_send_message "$2" "${3:-}" ;;
     *) return 2 ;;
   esac
 }
 
 send_configured_channels() {
-  local text="$1" channel config_failed=0 send_failed=0
+  local text="$1" card="${2:-}" channel config_failed=0 send_failed=0
   IFS=',' read -r -a selected <<<"$NOTIFY_CHANNELS"
   for channel in "${selected[@]}"; do
     if ! channel_configured "$channel"; then
@@ -714,7 +938,7 @@ send_configured_channels() {
       say "$channel 配置或凭据缺失" "$channel configuration or credential missing" >&2
       continue
     fi
-    if send_channel "$channel" "$text"; then
+    if send_channel "$channel" "$text" "$card"; then
       log_event "$channel sent host=$HOST"
     else
       send_failed=1
@@ -1072,9 +1296,16 @@ if [[ "$UPGRADE_NOTICE" -eq 1 ]]; then
   if [[ "${NOTIFY_UPGRADE:-0}" == "1" ]]; then
     if [[ "$NOTIFY_LANG" == "en" ]]; then msg="$en_msg"; else msg="$zh_msg"; fi
     msg="${msg//\\n/$'\n'}"
+    feishu_card=""
+    if channel_selected feishu; then
+      if ! feishu_card="$(feishu_build_upgrade_card "$from" "$to" "$msg")"; then
+        feishu_card=""
+        log_event "feishu upgrade card render failed; falling back to text host=$HOST"
+      fi
+    fi
     # Upgrade notices are explicitly best-effort: the installer is already complete,
     # and a retry of a partial dual-send would duplicate the successful channel.
-    send_configured_channels "$msg" || true
+    send_configured_channels "$msg" "$feishu_card" || true
   fi
   exit 0
 fi
@@ -1266,6 +1497,7 @@ check_eol
 # 看门狗附加段：自动更新异常、待安装安全更新、EOL（用真实换行，不受后面 \n 转换影响）。
 # Watchdog extra sections (real newlines; unaffected by the later literal-\n conversion).
 extra_zh=""; extra_en=""
+card_alert=0; rs_zh=""; rs_en=""
 if [[ -n "$HEALTH_TXT_ZH" ]]; then
   extra_zh+=$'\n\n'"⚠️ 自动安全更新机制异常："$'\n'"$HEALTH_TXT_ZH"
   extra_en+=$'\n\n'"⚠️ Automatic security-update mechanism problem:"$'\n'"$HEALTH_TXT_EN"
@@ -1294,6 +1526,7 @@ if [[ "$reboot_required" -eq 0 && "$restart_attention" -eq 0 && "$HEALTH_ATTENTI
     exit 0
   fi
 else
+  card_alert=1
   pkgs_zh="无"
   pkgs_en="None"
   if [[ -n "$reboot_pkgs" ]]; then
@@ -1314,6 +1547,13 @@ else
   fi
 fi
 msg="${msg//\\n/$'\n'}"
+feishu_card=""
+if channel_selected feishu; then
+  if ! feishu_card="$(feishu_build_check_card "$card_alert" "$msg")"; then
+    feishu_card=""
+    log_event "feishu check card render failed; falling back to text host=$HOST"
+  fi
+fi
 
 
 # 去重哈希只基于决策相关、跨周期稳定的字段：排除 PUBLIC_IP（动态出口 IP 会变）与含瞬时输出
@@ -1397,7 +1637,7 @@ for channel in "${selected_channels[@]}"; do
     say "$channel 配置或凭据缺失" "$channel configuration or credential missing" >&2
     continue
   fi
-  if send_channel "$channel" "$msg"; then
+  if send_channel "$channel" "$msg" "$feishu_card"; then
     write_channel_state "$channel"
     log_event "$channel sent backend=$BACKEND host=$HOST reboot_required=$reboot_required restart_attention=$restart_attention hash=$alert_hash"
   else

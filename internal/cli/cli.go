@@ -40,6 +40,7 @@ func Main(ver string, args []string) int {
 // runMode 解析运行时 flag 并按模式分发（裸调用 = 运行检查）。
 func runMode(ver string, args []string) int {
 	var f run.DryRunFlags
+	f.Version = ver
 	var doctor, checkUpgrade, selfUpgrade, notifyUpgrade, skipTelegram, skipFeishu, skipNotify bool
 	var uiLang, upgradeFrom, upgradeTo string
 	for i := 0; i < len(args); i++ {

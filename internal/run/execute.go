@@ -74,13 +74,14 @@ func Execute(cfg *config.Config, f DryRunFlags) int {
 			b01(in.Health.Attention), b01(in.EOL.Attention), in.Pending.Count))
 	}
 
-	return deliverChannels(cfg, channels, out.Message, out.Hash(), backend, host,
+	message := delivery.Message{Text: out.Message, FeishuCard: out.FeishuCard}
+	return deliverChannels(cfg, channels, message, out.Hash(), backend, host,
 		in.Restart.RebootRequired, in.Restart.RestartAttention, f.NoDedupe, time.Now().Unix(), senderFor)
 }
 
 type senderFactory func(*config.Config, string) (delivery.Sender, error)
 
-func deliverChannels(cfg *config.Config, channels []string, message, curHash, backend, host string,
+func deliverChannels(cfg *config.Config, channels []string, message delivery.Message, curHash, backend, host string,
 	rebootRequired, restartAttention, noDedupe bool, now int64, factory senderFactory,
 ) int {
 	mode := orDefault(cfg.Get("DEDUP_MODE"), "daily")

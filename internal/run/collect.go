@@ -30,6 +30,7 @@ type Flags struct {
 	TestOK     bool   // --test-ok：无关注时也发 OK
 	NoDedupe   bool   // --no-dedupe
 	Lang       string // --lang（UI_LANG），空表示未指定
+	Version    string // 编译期注入的 SUN 版本，仅用于通知展示
 }
 
 // --test-reboot 的固定摘要（与 check_apt/check_dnf 的测试分支一致）。
@@ -59,6 +60,7 @@ func Collect(cfg *config.Config, f Flags) Input {
 		OS:              orDefault(o.PrettyName, "unknown"),
 		Kernel:          kernelRelease(),
 		Now:             time.Now().Format("2006-01-02 15:04:05 MST"),
+		Version:         f.Version,
 		SendOK:          f.TestOK || cfg.Get("NOTIFY_OK") == "1",
 		NoDedupe:        f.NoDedupe,
 	}

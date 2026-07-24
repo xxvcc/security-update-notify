@@ -1,10 +1,11 @@
-// Package feishu implements tenant-token authentication and plain-text bot delivery.
+// Package feishu implements tenant-token authentication and bot message delivery.
 package feishu
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,14 +18,21 @@ import (
 const defaultBaseURL = "https://open.feishu.cn"
 
 const (
-	maxRespBytes       = 1 << 20
-	maxTextRunes       = 20000
-	truncatedTextRunes = 19900
-	truncationSuffix   = "\n…(truncated)"
+	maxRespBytes        = 1 << 20
+	maxTextRunes        = 20000
+	truncatedTextRunes  = 19900
+	truncationSuffix    = "\n…(truncated)"
+	maxCardRequestBytes = 30 * 1024
 )
 
 var retryStatus = map[int]bool{429: true, 500: true, 502: true, 503: true, 504: true}
 var openIDPattern = regexp.MustCompile(`^ou_[A-Za-z0-9_-]+$`)
+
+var (
+	errInvalidCardJSON = errors.New("invalid Feishu card JSON")
+	errCardSchema      = errors.New("Feishu card schema must be 2.0")
+	errCardTooLarge    = errors.New("Feishu card request exceeds 30 KB")
+)
 
 // Client carries an injectable HTTP client, API base URL, and sleeper for tests.
 type Client struct {
@@ -56,14 +64,7 @@ func (c *Client) Probe(ctx context.Context, appID, appSecret string) error {
 
 // SendText obtains a tenant token and sends one plain-text bot message to an app-scoped open_id.
 func (c *Client) SendText(ctx context.Context, appID, appSecret, receiveID, text string) error {
-	if appID == "" || appSecret == "" || receiveID == "" {
-		return fmt.Errorf("missing Feishu app id, app secret, or receive id")
-	}
-	if !openIDPattern.MatchString(receiveID) {
-		return fmt.Errorf("invalid Feishu open_id")
-	}
-	token, err := c.tenantToken(ctx, appID, appSecret)
-	if err != nil {
+	if err := validateMessageTarget(appID, appSecret, receiveID); err != nil {
 		return err
 	}
 	text = truncateText(text)
@@ -71,16 +72,71 @@ func (c *Client) SendText(ctx context.Context, appID, appSecret, receiveID, text
 	if err != nil {
 		return err
 	}
-	body, err := json.Marshal(map[string]string{
-		"receive_id": receiveID,
-		"msg_type":   "text",
-		"content":    string(content),
-	})
+	body, err := marshalMessageBody(receiveID, "text", content)
+	if err != nil {
+		return err
+	}
+	token, err := c.tenantToken(ctx, appID, appSecret)
 	if err != nil {
 		return err
 	}
 	endpoint := c.base() + "/open-apis/im/v1/messages?receive_id_type=open_id"
 	return c.doJSON(ctx, endpoint, token, body)
+}
+
+// SendCard obtains a tenant token and sends one static Feishu JSON 2.0 card.
+func (c *Client) SendCard(ctx context.Context, appID, appSecret, receiveID string, card []byte) error {
+	if err := validateMessageTarget(appID, appSecret, receiveID); err != nil {
+		return err
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, card); err != nil {
+		return errInvalidCardJSON
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(compact.Bytes(), &doc); err != nil || doc == nil {
+		return errInvalidCardJSON
+	}
+	if schema, _ := doc["schema"].(string); schema != "2.0" {
+		return errCardSchema
+	}
+	body, err := marshalMessageBody(receiveID, "interactive", compact.Bytes())
+	if err != nil {
+		return err
+	}
+	if len(body) > maxCardRequestBytes {
+		return errCardTooLarge
+	}
+	token, err := c.tenantToken(ctx, appID, appSecret)
+	if err != nil {
+		return err
+	}
+	endpoint := c.base() + "/open-apis/im/v1/messages?receive_id_type=open_id"
+	return c.doJSON(ctx, endpoint, token, body)
+}
+
+// IsCardPreflightError reports whether card delivery failed before any Feishu
+// message request was sent, making a plain-text fallback non-duplicating.
+func IsCardPreflightError(err error) bool {
+	return errors.Is(err, errInvalidCardJSON) || errors.Is(err, errCardSchema) || errors.Is(err, errCardTooLarge)
+}
+
+func validateMessageTarget(appID, appSecret, receiveID string) error {
+	if appID == "" || appSecret == "" || receiveID == "" {
+		return fmt.Errorf("missing Feishu app id, app secret, or receive id")
+	}
+	if !openIDPattern.MatchString(receiveID) {
+		return fmt.Errorf("invalid Feishu open_id")
+	}
+	return nil
+}
+
+func marshalMessageBody(receiveID, msgType string, content []byte) ([]byte, error) {
+	return json.Marshal(map[string]string{
+		"receive_id": receiveID,
+		"msg_type":   msgType,
+		"content":    string(content),
+	})
 }
 
 func truncateText(text string) string {

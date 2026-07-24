@@ -37,8 +37,8 @@ type telegramSender struct {
 }
 
 func (s *telegramSender) Name() string { return "telegram" }
-func (s *telegramSender) Send(ctx context.Context, text string) error {
-	return s.client.SendMessage(ctx, s.token, s.chatID, text)
+func (s *telegramSender) Send(ctx context.Context, message delivery.Message) error {
+	return s.client.SendMessage(ctx, s.token, s.chatID, message.Text)
 }
 func (s *telegramSender) Probe(ctx context.Context) error { return s.client.GetMe(ctx, s.token) }
 
@@ -50,8 +50,17 @@ type feishuSender struct {
 }
 
 func (s *feishuSender) Name() string { return "feishu" }
-func (s *feishuSender) Send(ctx context.Context, text string) error {
-	return s.client.SendText(ctx, s.appID, s.appSecret, s.receiveID, text)
+func (s *feishuSender) Send(ctx context.Context, message delivery.Message) error {
+	if len(message.FeishuCard) != 0 {
+		err := s.client.SendCard(ctx, s.appID, s.appSecret, s.receiveID, message.FeishuCard)
+		if err == nil {
+			return nil
+		}
+		if !feishu.IsCardPreflightError(err) {
+			return err
+		}
+	}
+	return s.client.SendText(ctx, s.appID, s.appSecret, s.receiveID, message.Text)
 }
 func (s *feishuSender) Probe(ctx context.Context) error {
 	return s.client.Probe(ctx, s.appID, s.appSecret)

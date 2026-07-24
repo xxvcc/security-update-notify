@@ -1,6 +1,7 @@
 package run
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/xxvcc/security-update-notify/internal/backend"
@@ -72,13 +73,19 @@ func TestAssembleMatchesGolden(t *testing.T) {
 		if out.Message != v.Message {
 			t.Errorf("%s: message mismatch:\n--- got ---\n%s\n--- want ---\n%s", name, out.Message, v.Message)
 		}
+		var card map[string]any
+		if err := json.Unmarshal(out.FeishuCard, &card); err != nil {
+			t.Errorf("%s: invalid Feishu card: %v", name, err)
+		} else if card["schema"] != "2.0" {
+			t.Errorf("%s: Feishu card schema=%v", name, card["schema"])
+		}
 	}
 }
 
 // 无关注且未要求 OK 通知 -> 静默不发。
 func TestAssembleSilentOK(t *testing.T) {
 	out := Assemble(Input{Host: "h", Backend: "dnf", NotifyLang: i18n.ZH, SendOK: false})
-	if out.Attention || out.Send || out.Message != "" {
+	if out.Attention || out.Send || out.Message != "" || len(out.FeishuCard) != 0 {
 		t.Errorf("silent path: attention=%v send=%v msg=%q", out.Attention, out.Send, out.Message)
 	}
 	// 但 hash 仍应可计算（用于状态一致性）。

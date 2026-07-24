@@ -55,6 +55,74 @@ func TestSendText(t *testing.T) {
 	}
 }
 
+func TestSendCard(t *testing.T) {
+	var auth string
+	c, srv, _ := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			io.WriteString(w, `{"code":0,"msg":"ok","tenant_access_token":"tenant-token"}`)
+		case "/open-apis/im/v1/messages":
+			auth = r.Header.Get("Authorization")
+			var envelope map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&envelope); err != nil {
+				t.Fatal(err)
+			}
+			if envelope["receive_id"] != "ou_lanny" || envelope["msg_type"] != "interactive" {
+				t.Fatalf("message envelope=%v", envelope)
+			}
+			var card map[string]any
+			if err := json.Unmarshal([]byte(envelope["content"]), &card); err != nil {
+				t.Fatal(err)
+			}
+			if card["schema"] != "2.0" {
+				t.Fatalf("card=%v", card)
+			}
+			io.WriteString(w, `{"code":0,"msg":"success","data":{}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	defer srv.Close()
+	card := []byte(`{
+  "schema": "2.0",
+  "header": {"title": {"tag": "plain_text", "content": "SUN"}, "template": "green"},
+  "body": {"elements": []}
+}`)
+	if err := c.SendCard(context.Background(), "cli_app", "secret-value", "ou_lanny", card); err != nil {
+		t.Fatal(err)
+	}
+	if auth != "Bearer tenant-token" {
+		t.Errorf("authorization=%q", auth)
+	}
+}
+
+func TestSendCardRejectsInvalidOrOversizedCardBeforeAuth(t *testing.T) {
+	var requests int32
+	c, srv, _ := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	defer srv.Close()
+	for name, tt := range map[string]struct {
+		card    []byte
+		wantErr string
+	}{
+		"invalid JSON": {card: []byte(`{"schema":`), wantErr: "invalid Feishu card JSON"},
+		"wrong schema": {card: []byte(`{"schema":"1.0"}`), wantErr: "Feishu card schema must be 2.0"},
+		"oversized":    {card: []byte(`{"schema":"2.0","body":{"content":"` + strings.Repeat("x", 31*1024) + `"}}`), wantErr: "Feishu card request exceeds 30 KB"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := c.SendCard(context.Background(), "cli_app", "secret-value", "ou_lanny", tt.card)
+			if err == nil || err.Error() != tt.wantErr || !IsCardPreflightError(err) {
+				t.Fatalf("error=%v want local preflight error %q", err, tt.wantErr)
+			}
+		})
+	}
+	if requests != 0 {
+		t.Fatalf("network requests=%d, want 0", requests)
+	}
+}
+
 func TestProbeDoesNotSend(t *testing.T) {
 	var paths []string
 	c, srv, _ := newTestClient(func(w http.ResponseWriter, r *http.Request) {

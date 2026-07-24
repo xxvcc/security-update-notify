@@ -514,13 +514,26 @@ jobs:
           chmod 600 "$tmp/credentials/feishu_app_secret"
           cat >"$tmp/bin/python3" <<'EOF'
           #!/usr/bin/env bash
+          if [[ "${1:-}" == "/dev/fd/3" ]]; then
+            exec /usr/bin/python3 "$@"
+          fi
           exec /usr/bin/python3 -c 'import os, sys
-          parts = sys.stdin.buffer.read().split(b"\0", 2)
+          import json
+          parts = sys.stdin.buffer.read().split(b"\0", 3)
           if len(parts) == 2:
               print("tenant-token", end="")
               sys.exit(0)
           first = parts[0].decode("utf-8", "replace") if parts else ""
           channel = "feishu" if first == "tenant-token" else "telegram"
+          if channel == "feishu":
+              card = json.loads(parts[3].decode("utf-8", "replace")) if len(parts) > 3 else {}
+              if card.get("schema") != "2.0":
+                  sys.exit(1)
+              template = card.get("header", {}).get("template", "")
+              if template not in {"orange", "blue"}:
+                  sys.exit(1)
+              with open(os.environ["CARD_CAPTURE"], "a", encoding="utf-8") as fh:
+                  fh.write(template + "\n")
           with open(os.environ["CAPTURE"], "a", encoding="utf-8") as fh:
               fh.write(channel + "\n")
           if channel == os.environ.get("FAIL_CHANNEL"):
@@ -542,8 +555,9 @@ jobs:
           DEDUP_MODE=once
           EOF
           : >"$tmp/attempts"
+          : >"$tmp/cards"
           set +e
-          PATH="$tmp/bin:$PATH" CAPTURE="$tmp/attempts" FAIL_CHANNEL=feishu \
+          PATH="$tmp/bin:$PATH" CAPTURE="$tmp/attempts" CARD_CAPTURE="$tmp/cards" FAIL_CHANNEL=feishu \
             CREDENTIALS_DIRECTORY="$tmp/credentials" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env" \
             "$tmp/security-update-notify" --test-reboot --no-dedupe >/dev/null 2>&1
           rc=$?
@@ -555,7 +569,7 @@ jobs:
           test ! -e "$tmp/state/last-alert.feishu.sha256"
 
           : >"$tmp/attempts"
-          PATH="$tmp/bin:$PATH" CAPTURE="$tmp/attempts" \
+          PATH="$tmp/bin:$PATH" CAPTURE="$tmp/attempts" CARD_CAPTURE="$tmp/cards" \
             CREDENTIALS_DIRECTORY="$tmp/credentials" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env" \
             "$tmp/security-update-notify" --test-reboot >/dev/null
           test "$(grep -c '^feishu$' "$tmp/attempts")" -eq 1
@@ -568,7 +582,7 @@ jobs:
           rm -rf "$tmp/state"
           : >"$tmp/attempts"
           set +e
-          PATH="$tmp/bin:$PATH" CAPTURE="$tmp/attempts" FAIL_CHANNEL=telegram \
+          PATH="$tmp/bin:$PATH" CAPTURE="$tmp/attempts" CARD_CAPTURE="$tmp/cards" FAIL_CHANNEL=telegram \
             CREDENTIALS_DIRECTORY="$tmp/credentials" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env" \
             "$tmp/security-update-notify" --test-reboot --no-dedupe >/dev/null 2>&1
           rc=$?
@@ -580,7 +594,7 @@ jobs:
           test -s "$tmp/state/last-alert.feishu.sha256"
 
           : >"$tmp/attempts"
-          PATH="$tmp/bin:$PATH" CAPTURE="$tmp/attempts" \
+          PATH="$tmp/bin:$PATH" CAPTURE="$tmp/attempts" CARD_CAPTURE="$tmp/cards" \
             CREDENTIALS_DIRECTORY="$tmp/credentials" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env" \
             "$tmp/security-update-notify" --test-reboot >/dev/null
           test "$(grep -c '^telegram$' "$tmp/attempts")" -eq 1
@@ -592,11 +606,13 @@ jobs:
 
           printf '%s\n' 'NOTIFY_UPGRADE=1' >>"$tmp/env"
           : >"$tmp/attempts"
-          PATH="$tmp/bin:$PATH" CAPTURE="$tmp/attempts" FAIL_CHANNEL=feishu \
+          PATH="$tmp/bin:$PATH" CAPTURE="$tmp/attempts" CARD_CAPTURE="$tmp/cards" FAIL_CHANNEL=feishu \
             CREDENTIALS_DIRECTORY="$tmp/credentials" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env" \
-            "$tmp/security-update-notify" --notify-upgrade-event --upgrade-from 2.0.3 --upgrade-to 2.1.0 >/dev/null 2>&1
+            "$tmp/security-update-notify" --notify-upgrade-event --upgrade-from 2.1.0 --upgrade-to 2.2.0 >/dev/null 2>&1
           test "$(grep -c '^telegram$' "$tmp/attempts")" -eq 1
           test "$(grep -c '^feishu$' "$tmp/attempts")" -eq 1
+          grep -q '^orange$' "$tmp/cards"
+          grep -q '^blue$' "$tmp/cards"
           echo "partial failures are channel-local; upgrade notices are best-effort"
 
       - name: Bash fallback Feishu HTTP client regression check
@@ -643,7 +659,18 @@ jobs:
           /tmp/sun-cfg-harness.sh
 
       - name: Package release artifact
-        run: ./package.sh
+        run: |
+          set -euo pipefail
+          probe=internal/package-guard-untracked-probe.go
+          trap 'rm -f "$probe"' EXIT
+          printf 'package internal\n' >"$probe"
+          if ./package.sh >/tmp/package-untracked.out 2>/tmp/package-untracked.err; then
+            echo "::error::package.sh accepted an untracked Go source file" >&2
+            exit 1
+          fi
+          grep -q 'Untracked release-source files' /tmp/package-untracked.err
+          rm -f "$probe"
+          ./package.sh
 
       - name: Bridge upgrade compat test (bash runtime -> Go, config/state preserved, no re-alert)
         # 在真实 Debian 容器里：先装 bash 运行时，再原地升级到 Go 桥；断言配置/token/告警状态保留、

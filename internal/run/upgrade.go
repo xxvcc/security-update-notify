@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/xxvcc/security-update-notify/internal/config"
+	"github.com/xxvcc/security-update-notify/internal/delivery"
 	"github.com/xxvcc/security-update-notify/internal/dist"
 	"github.com/xxvcc/security-update-notify/internal/httpx"
 	"github.com/xxvcc/security-update-notify/internal/i18n"
@@ -62,7 +63,7 @@ func NotifyUpgradeEvent(cfg *config.Config, ver, from, to string) int {
 	}
 	lang := i18n.NormalizeNotify(orDefault(cfg.Get("NOTIFY_LANG"), "zh"))
 	includeIP, publicIP := resolvePublicIP(cfg)
-	msg := notify.RenderUpgrade(notify.UpgradeMessage{
+	upgradeMessage := notify.UpgradeMessage{
 		Lang:            lang,
 		Host:            hostLabel(cfg),
 		IncludePublicIP: includeIP,
@@ -70,7 +71,11 @@ func NotifyUpgradeEvent(cfg *config.Config, ver, from, to string) int {
 		From:            from,
 		To:              to,
 		Now:             time.Now().Format("2006-01-02 15:04:05 MST"),
-	})
+	}
+	msg := delivery.Message{
+		Text:       notify.RenderUpgrade(upgradeMessage),
+		FeishuCard: notify.RenderFeishuUpgradeCard(upgradeMessage),
+	}
 	channels, err := configuredChannels(cfg)
 	if err != nil {
 		return 0

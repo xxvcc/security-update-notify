@@ -22,11 +22,20 @@ bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security
 
 ALLOW_DIRTY_PACKAGE="${ALLOW_DIRTY_PACKAGE:-0}"
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  if ! git diff --quiet HEAD -- install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify files/lib.sh files/needrestart-report-only.conf files/security-update-notify.logrotate files/security-update-notify.service README.md README.en.md CHANGELOG.md LICENSE .env.example files/release-signing.pub.asc .github/workflows/ci.yml cmd internal go.mod; then
+  RELEASE_PATHS=(install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify files/lib.sh files/needrestart-report-only.conf files/security-update-notify.logrotate files/security-update-notify.service README.md README.en.md CHANGELOG.md LICENSE .env.example files/release-signing.pub.asc .github/workflows/ci.yml cmd internal go.mod)
+  UNTRACKED_RELEASE_FILES="$(git ls-files --others --exclude-standard -- "${RELEASE_PATHS[@]}")"
+  if ! git diff --quiet HEAD -- "${RELEASE_PATHS[@]}" || [[ -n "$UNTRACKED_RELEASE_FILES" ]]; then
     if [[ "$ALLOW_DIRTY_PACKAGE" == "1" && -n "${SOURCE_DATE_EPOCH:-}" ]]; then
-      echo "警告：由于 ALLOW_DIRTY_PACKAGE=1 且 SOURCE_DATE_EPOCH 已设置，将打包未提交的发布文件改动。/ WARNING: packaging uncommitted tracked release-file changes because ALLOW_DIRTY_PACKAGE=1 and SOURCE_DATE_EPOCH is set." >&2
+      echo "警告：由于 ALLOW_DIRTY_PACKAGE=1 且 SOURCE_DATE_EPOCH 已设置，将打包未提交的发布文件改动。/ WARNING: packaging uncommitted release-file changes because ALLOW_DIRTY_PACKAGE=1 and SOURCE_DATE_EPOCH is set." >&2
+      if [[ -n "$UNTRACKED_RELEASE_FILES" ]]; then
+        printf '警告：构建还会使用以下未跟踪发布源文件：\n%s\nWARNING: the build also uses these untracked release-source files:\n%s\n' \
+          "$UNTRACKED_RELEASE_FILES" "$UNTRACKED_RELEASE_FILES" >&2
+      fi
     else
-      echo "拒绝在发布文件存在未提交改动时打包。/ Refusing to package with uncommitted tracked release-file changes." >&2
+      echo "拒绝在发布文件存在未提交改动或未跟踪发布源文件时打包。/ Refusing to package with uncommitted changes or untracked release-source files." >&2
+      if [[ -n "$UNTRACKED_RELEASE_FILES" ]]; then
+        printf '未跟踪发布源文件 / Untracked release-source files:\n%s\n' "$UNTRACKED_RELEASE_FILES" >&2
+      fi
       echo "请先提交发布文件改动，或为本地测试构建设置 ALLOW_DIRTY_PACKAGE=1 和 SOURCE_DATE_EPOCH。/ Commit the release-file changes first, or set ALLOW_DIRTY_PACKAGE=1 with SOURCE_DATE_EPOCH for a local test build." >&2
       exit 1
     fi

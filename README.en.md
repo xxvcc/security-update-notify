@@ -42,7 +42,7 @@ SUN keeps the boring part automatic and makes the human part obvious.
 
 - **Automatic security updates** through official distro mechanisms.
 - **No automatic reboot** — you stay in control of downtime.
-- **Telegram and Feishu, individually or together**: old configs remain Telegram-only; dual delivery keeps separate dedup state, so one failing channel does not repeat the other.
+- **Telegram and Feishu, individually or together**: Telegram keeps compact plain text while Feishu uses native JSON 2.0 cards; old configs remain Telegram-only, and dual delivery keeps separate dedup state so one failing channel does not repeat the other.
 - **Reboot and service-restart detection** with `needrestart` or `needs-restarting`.
 - **Security-update watchdog**: beyond kernel/service restarts, it watches three commonly-missed things — ① whether the auto-update mechanism itself is unhealthy (timer disabled, last run failed, no successful update for too long, disk nearly full); ② whether security updates are still pending (dnf also counts critical/important); ③ whether the distro's security support is ending or already ended (EOL). A mechanism problem or a past-EOL release triggers an alert; the pending count and an approaching EOL ride along with alerts as info. All three can be turned off in the config.
 - **Single-language UI (Chinese or English)**: the installer, menu and diagnostics pick a language as the first step (Chinese or English, default Chinese) and then render all terminal interaction in that one language. The choice also becomes the default notification language, overridable with `--notify-lang`.
@@ -52,7 +52,7 @@ SUN keeps the boring part automatic and makes the human part obvious.
 - **systemd timer based scheduling**.
 - **No inbound network listener**.
 
-Example notification (same body on Telegram and Feishu, `NOTIFY_LANG=en`):
+Telegram text example (`NOTIFY_LANG=en`; Feishu presents the same state as a native card):
 
 ```text
 ⚠️ Security update action required
@@ -76,6 +76,8 @@ Services to review/restart (2):
 
 Recommendation: SSH into this server during a suitable maintenance window and run reboot if a full reboot is required. If only services need restarting, review them first and restart the affected services manually.
 ```
+
+The Feishu channel sends embedded Card JSON 2.0 with `msg_type=interactive`: red for check failures or an EOL distribution, orange for reboot/service maintenance, green for successful tests or healthy state, and blue for SUN upgrades. Cards include host, IP, OS, check time, reboot state, maintenance summary, recommended commands, and a static project-documentation link. They use no tenant `template_id`; the only button opens a URL, so no event subscription, callback service, or extra permission is needed. Feishu 7.20+ fully renders JSON 2.0; older clients show only the card title and an upgrade-client prompt.
 
 ## How it works
 
@@ -146,7 +148,7 @@ Feishu:
 2. Grant `directory:employee:list`, `directory:employee.base.name.name:read`, `directory:employee.base.mobile:read`, and `im:message:send_as_bot`.
 3. Publish the app, include intended recipients in both its availability scope and directory data scope, and record the App ID and App Secret.
 
-During an interactive install, SUN accepts the App ID and a hidden App Secret, then paginates through active employees visible via Directory v1. It shows a numbered “localized Chinese name + mobile tail + `open_id`” list. Only the selected `open_id` is persisted; the name and mobile tail are shown only for human verification. Runtime notifications still send plain text directly to that `open_id` without querying the directory on every run. An `open_id` can differ between Feishu apps and must not be copied across apps; changing the App ID during an upgrade clears the previous recipient and requires a new selection or explicit `open_id`.
+During an interactive install, SUN accepts the App ID and a hidden App Secret, then paginates through active employees visible via Directory v1. It shows a numbered “localized Chinese name + mobile tail + `open_id`” list. Only the selected `open_id` is persisted; the name and mobile tail are shown only for human verification. Runtime notifications send native JSON 2.0 cards directly to that `open_id` without querying the directory on every run. An `open_id` can differ between Feishu apps and must not be copied across apps; changing the App ID during an upgrade clears the previous recipient and requires a new selection or explicit `open_id`.
 
 ### 2. Install
 

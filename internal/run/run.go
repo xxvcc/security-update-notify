@@ -27,6 +27,7 @@ type Input struct {
 	OS              string
 	Kernel          string
 	Now             string
+	Version         string
 
 	Restart backend.RestartState // check_apt/check_dnf 或 --test-reboot 夹具
 	Health  watchdog.Health
@@ -39,10 +40,11 @@ type Input struct {
 
 // Output 是决策结果。
 type Output struct {
-	Fields    dedup.Fields
-	Attention bool   // reboot || restart_attention || health || eol
-	Send      bool   // 是否发送（有关注，或无关注但 SendOK）
-	Message   string // 要发送的正文（Send=false 时为空）
+	Fields     dedup.Fields
+	Attention  bool   // reboot || restart_attention || health || eol
+	Send       bool   // 是否发送（有关注，或无关注但 SendOK）
+	Message    string // 要发送的正文（Send=false 时为空）
+	FeishuCard []byte // 飞书 JSON 2.0 卡片（Send=false 时为空）
 }
 
 // Assemble 复刻运行时末尾的决策与消息组装（files/security-update-notify:1044-1091）：
@@ -69,26 +71,33 @@ func Assemble(in Input) Output {
 		return out // 静默：无关注且不要求 OK 通知
 	}
 	out.Send = true
-	out.Message = notify.Render(notify.Message{
-		Alert:           attention,
-		Lang:            in.NotifyLang,
-		Host:            in.Host,
-		IncludePublicIP: in.IncludePublicIP,
-		PublicIP:        in.PublicIP,
-		OS:              in.OS,
-		Backend:         in.Backend,
-		Kernel:          in.Kernel,
-		Now:             in.Now,
-		RebootRequired:  in.Restart.RebootRequired,
-		RebootPkgs:      in.Restart.RebootPkgs,
-		RestartSummary:  in.Restart.RestartSummary,
-		HealthTxtZH:     in.Health.TxtZH,
-		HealthTxtEN:     in.Health.TxtEN,
-		PendingTxtZH:    in.Pending.TxtZH,
-		PendingTxtEN:    in.Pending.TxtEN,
-		EolTxtZH:        in.EOL.TxtZH,
-		EolTxtEN:        in.EOL.TxtEN,
-	})
+	message := notify.Message{
+		Alert:            attention,
+		Lang:             in.NotifyLang,
+		Version:          in.Version,
+		Host:             in.Host,
+		IncludePublicIP:  in.IncludePublicIP,
+		PublicIP:         in.PublicIP,
+		OS:               in.OS,
+		Backend:          in.Backend,
+		Kernel:           in.Kernel,
+		Now:              in.Now,
+		RebootRequired:   in.Restart.RebootRequired,
+		RestartAttention: in.Restart.RestartAttention,
+		RebootPkgs:       in.Restart.RebootPkgs,
+		RestartSummary:   in.Restart.RestartSummary,
+		HealthTxtZH:      in.Health.TxtZH,
+		HealthTxtEN:      in.Health.TxtEN,
+		HealthAttention:  in.Health.Attention,
+		PendingTxtZH:     in.Pending.TxtZH,
+		PendingTxtEN:     in.Pending.TxtEN,
+		PendingCount:     in.Pending.Count,
+		EolTxtZH:         in.EOL.TxtZH,
+		EolTxtEN:         in.EOL.TxtEN,
+		EolAttention:     in.EOL.Attention,
+	}
+	out.Message = notify.Render(message)
+	out.FeishuCard = notify.RenderFeishuCard(message)
 	return out
 }
 

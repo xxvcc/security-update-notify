@@ -1,5 +1,21 @@
 # 变更记录
 
+## 2.2.0
+
+飞书通知升级为原生 Card JSON 2.0；Telegram 文本、去重哈希和按渠道独立恢复语义保持兼容。
+Upgrades Feishu notifications to native Card JSON 2.0 while preserving Telegram text, dedup hashes, and channel-local recovery semantics.
+
+- 飞书卡片：正常告警、`--test-ok`、`--test-reboot` 与升级成功通知均使用 `msg_type=interactive` 的内嵌 JSON 2.0 卡片；不依赖租户 `template_id` 或 CardKit 实例。
+  Feishu cards: regular alerts, `--test-ok`, `--test-reboot`, and successful-upgrade notices now use embedded JSON 2.0 cards with `msg_type=interactive`; no tenant `template_id` or CardKit instance is required.
+- 状态表达：失败或 EOL 使用红色，需要重启或服务维护使用橙色，测试成功/健康使用绿色，SUN 升级使用蓝色；卡片展示主机、IP、系统、内核、检查时间、重启/服务状态、更新摘要、建议命令和项目文档链接。
+  Status presentation: red for failures or EOL, orange for reboot/service maintenance, green for successful tests or healthy state, and blue for SUN upgrades; cards include host, IP, OS, kernel, check time, reboot/service state, update summary, recommended commands, and project documentation.
+- 渠道兼容：Telegram 正文继续逐字节保持原格式；现有去重哈希、每渠道独立状态及双发部分失败后的单渠道重试不变。旧配置缺少 `NOTIFY_CHANNELS` 时仍默认 Telegram。
+  Channel compatibility: Telegram keeps its byte-identical text body; existing dedup hashes, per-channel state, and single-channel retry after a partial dual-send failure are unchanged. Legacy configs without `NOTIFY_CHANNELS` still default to Telegram.
+- 安全边界：卡片只包含静态展示组件和 `open_url` 文档按钮，不新增事件订阅、回调服务或权限；请求体限制在飞书 30 KB 上限内，超长动态内容安全截断。App Secret 处理方式不变。
+  Security boundary: cards contain only static display components and an `open_url` documentation button, with no event subscription, callback service, or new permission; request bodies remain within Feishu's 30 KB limit and oversized dynamic content is safely truncated. App Secret handling is unchanged.
+- 双运行时与测试：Go 主运行时和 Bash 备用运行时同步实现；新增 JSON/转义/尺寸/颜色、真实请求体、429 重试、升级卡片、双渠道部分失败及卡片降级测试；打包守卫同时拒绝未提交改动与未跟踪发布源文件。飞书客户端 7.20 及以上完整显示 JSON 2.0；旧客户端只显示标题和升级提示。
+  Dual runtimes and tests: both the Go runtime and Bash fallback implement the same card behavior, with coverage for JSON/escaping/size/colors, real request bodies, 429 retries, upgrade cards, partial dual-delivery failure, and fallback behavior; the package guard rejects both uncommitted changes and untracked release-source files. Feishu 7.20+ fully renders JSON 2.0; older clients show only the title and upgrade prompt.
+
 ## 2.1.0
 
 新增 Telegram / 飞书可选通知渠道，并完整覆盖 Go 主运行时、Bash 备用运行时、安装升级、自检和升级通知。
