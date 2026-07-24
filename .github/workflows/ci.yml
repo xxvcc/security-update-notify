@@ -29,11 +29,11 @@ jobs:
 
       - name: Shell syntax check
         run: |
-          bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify build/compat-test.sh build/rollback-test.sh
+          bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify build/compat-test.sh build/rollback-test.sh build/bash-feishu-test.sh build/install-feishu-onboarding-test.sh
 
       - name: ShellCheck
         run: |
-          shellcheck -s bash -S warning -e SC2034,SC1091 install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify
+          shellcheck -s bash -S warning -e SC2034,SC1091 install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify build/bash-feishu-test.sh build/install-feishu-onboarding-test.sh
 
       - name: Dotenv parser regression check
         run: |
@@ -45,10 +45,10 @@ jobs:
           harness = '''#!/usr/bin/env bash
           set -euo pipefail
           m(){ printf %s "$1"; }; say(){ echo "$1" >&2; }
-          UI_LANG="zh"; CHECK_TIME="09:00"; TELEGRAM_BOT_TOKEN=""; TELEGRAM_CHAT_ID=""; HOST_LABEL=""; PUBLIC_IP=""; INCLUDE_PUBLIC_IP="1"; NOTIFY_OK=""; NOTIFY_UPGRADE=""; CONFIG_VERSION=""; DEDUP_MODE=""; DEDUP_INTERVAL_DAYS="3"; NOTIFY_LANG="zh"; BACKEND="auto"; SEND_TEST=0; SKIP_TELEGRAM_TEST=0; NON_INTERACTIVE=0; ASSUME_YES=0; ALLOW_BEST_EFFORT=0; POST_INSTALL_CHECK=1
+          UI_LANG="zh"; CHECK_TIME="09:00"; NOTIFY_CHANNELS=""; TELEGRAM_BOT_TOKEN=""; TELEGRAM_CHAT_ID=""; FEISHU_APP_ID=""; FEISHU_RECEIVE_ID=""; FEISHU_APP_SECRET_FILE=""; FEISHU_APP_ID_EXPLICIT=0; FEISHU_RECEIVE_ID_EXPLICIT=0; HOST_LABEL=""; PUBLIC_IP=""; INCLUDE_PUBLIC_IP="1"; NOTIFY_OK=""; NOTIFY_UPGRADE=""; CONFIG_VERSION=""; DEDUP_MODE=""; DEDUP_INTERVAL_DAYS="3"; NOTIFY_LANG="zh"; BACKEND="auto"; SEND_TEST=0; SKIP_TELEGRAM_TEST=0; SKIP_FEISHU_TEST=0; NON_INTERACTIVE=0; ASSUME_YES=0; ALLOW_BEST_EFFORT=0; POST_INSTALL_CHECK=1
           ''' + s[start:end] + '''
           load_env_file "$1"
-          printf '%s\n' "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" "$CHECK_TIME" "$NOTIFY_LANG" "$DEDUP_MODE" "$SEND_TEST" "$ALLOW_BEST_EFFORT" "$HOST_LABEL" "$PUBLIC_IP" "$INCLUDE_PUBLIC_IP" "$NOTIFY_OK" "$NOTIFY_UPGRADE" "$CONFIG_VERSION"
+          printf '%s\n' "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" "$CHECK_TIME" "$NOTIFY_LANG" "$DEDUP_MODE" "$SEND_TEST" "$ALLOW_BEST_EFFORT" "$HOST_LABEL" "$PUBLIC_IP" "$INCLUDE_PUBLIC_IP" "$NOTIFY_OK" "$NOTIFY_UPGRADE" "$CONFIG_VERSION" "$NOTIFY_CHANNELS" "$FEISHU_APP_ID" "$FEISHU_RECEIVE_ID" "$FEISHU_APP_SECRET_FILE" "$SKIP_FEISHU_TEST"
           '''
           Path('/tmp/sun-env-harness.sh').write_text(harness)
           PY
@@ -66,7 +66,12 @@ jobs:
           INCLUDE_PUBLIC_IP=0
           NOTIFY_OK=yes
           NOTIFY_UPGRADE=true
-          CONFIG_VERSION=2
+          CONFIG_VERSION=3
+          NOTIFY_CHANNELS=telegram,feishu
+          FEISHU_APP_ID=cli_test
+          FEISHU_RECEIVE_ID=ou_lanny
+          FEISHU_APP_SECRET_FILE=/run/secrets/feishu-app-secret
+          SKIP_FEISHU_TEST=true
           EOF
           /tmp/sun-env-harness.sh /tmp/sun.env > /tmp/sun-env.out
           diff -u /tmp/sun-env.out - <<'EOF'
@@ -82,7 +87,12 @@ jobs:
           0
           1
           1
-          2
+          3
+          telegram,feishu
+          cli_test
+          ou_lanny
+          /run/secrets/feishu-app-secret
+          1
           EOF
           if /tmp/sun-env-harness.sh <(echo 'BAD_KEY=x') >/tmp/bad.out 2>/tmp/bad.err; then
             echo "Unexpectedly accepted unknown env key" >&2
@@ -248,20 +258,23 @@ jobs:
           end = s.index('\nrequire_arg()', start)
           harness = '''#!/usr/bin/env bash
           set -euo pipefail
-          TELEGRAM_BOT_TOKEN=""; TELEGRAM_CHAT_ID=""; HOST_LABEL=""; PUBLIC_IP=""; INCLUDE_PUBLIC_IP=""; NOTIFY_OK=""; NOTIFY_UPGRADE=""; CONFIG_VERSION=""; DEDUP_MODE=""; DEDUP_INTERVAL_DAYS=""; NOTIFY_LANG=""; BACKEND=""; CHECK_TIME=""
-          EXISTING_CONFIG_LOADED=0; EXISTING_TIMER_LOADED=0
+          NOTIFY_CHANNELS=""; TELEGRAM_BOT_TOKEN=""; TELEGRAM_CHAT_ID=""; FEISHU_APP_ID=""; FEISHU_RECEIVE_ID=""; HOST_LABEL=""; PUBLIC_IP=""; INCLUDE_PUBLIC_IP=""; NOTIFY_OK=""; NOTIFY_UPGRADE=""; CONFIG_VERSION=""; DEDUP_MODE=""; DEDUP_INTERVAL_DAYS=""; NOTIFY_LANG=""; BACKEND=""; CHECK_TIME=""
+          EXISTING_CONFIG_LOADED=0; EXISTING_TIMER_LOADED=0; EXISTING_FEISHU_APP_ID=""
           ''' + s[start:end] + '''
           load_existing_config_defaults "$1"
           load_existing_timer_default "$2"
-          printf '%s\n' "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" "$HOST_LABEL" "$PUBLIC_IP" "$INCLUDE_PUBLIC_IP" "$NOTIFY_OK" "$NOTIFY_UPGRADE" "$CONFIG_VERSION" "$DEDUP_MODE" "$DEDUP_INTERVAL_DAYS" "$NOTIFY_LANG" "$BACKEND" "$CHECK_TIME" "$EXISTING_CONFIG_LOADED" "$EXISTING_TIMER_LOADED"
+          printf '%s\n' "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" "$HOST_LABEL" "$PUBLIC_IP" "$INCLUDE_PUBLIC_IP" "$NOTIFY_OK" "$NOTIFY_UPGRADE" "$CONFIG_VERSION" "$DEDUP_MODE" "$DEDUP_INTERVAL_DAYS" "$NOTIFY_LANG" "$BACKEND" "$CHECK_TIME" "$EXISTING_CONFIG_LOADED" "$EXISTING_TIMER_LOADED" "$NOTIFY_CHANNELS" "$FEISHU_APP_ID" "$FEISHU_RECEIVE_ID"
           '''
           Path('/tmp/sun-existing-harness.sh').write_text(harness)
           PY
           chmod +x /tmp/sun-existing-harness.sh
           cat >/tmp/telegram.env <<'EOF'
-          CONFIG_VERSION='2'
+          CONFIG_VERSION='3'
+          NOTIFY_CHANNELS='telegram,feishu'
           TELEGRAM_BOT_TOKEN='123456:abc_DEF-ghi'
           TELEGRAM_CHAT_ID='-100123'
+          FEISHU_APP_ID='cli_test'
+          FEISHU_RECEIVE_ID='ou_lanny'
           HOST_LABEL='old host'
           PUBLIC_IP='203.0.113.99'
           INCLUDE_PUBLIC_IP='0'
@@ -286,7 +299,7 @@ jobs:
           0
           1
           1
-          2
+          3
           daily
           7
           en
@@ -294,6 +307,9 @@ jobs:
           08:45
           1
           1
+          telegram,feishu
+          cli_test
+          ou_lanny
           EOF
 
       - name: Security hardening regression check
@@ -480,6 +496,115 @@ jobs:
           [ "$(find "$tmp/state" -maxdepth 1 -name '.state.*' | wc -l)" -eq 0 ]
           echo "state written atomically, no leftover temp files"
 
+      - name: Bash fallback multi-channel partial-failure regression check
+        run: |
+          set -euo pipefail
+          export CHECK_UPDATE_HEALTH=0 CHECK_EOL=0 STALE_UPDATE_DAYS=0
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          cp files/security-update-notify "$tmp/security-update-notify"
+          sed -i \
+            -e "s|^STATE_DIR=.*|STATE_DIR=\"$tmp/state\"|" \
+            -e "s|^LOCK_FILE=.*|LOCK_FILE=\"$tmp/lock\"|" \
+            -e "s|^LOG_FILE=.*|LOG_FILE=\"$tmp/log\"|" \
+            "$tmp/security-update-notify"
+          chmod +x "$tmp/security-update-notify"
+          mkdir -p "$tmp/bin" "$tmp/credentials"
+          printf %s fake-secret >"$tmp/credentials/feishu_app_secret"
+          chmod 600 "$tmp/credentials/feishu_app_secret"
+          cat >"$tmp/bin/python3" <<'EOF'
+          #!/usr/bin/env bash
+          exec /usr/bin/python3 -c 'import os, sys
+          parts = sys.stdin.buffer.read().split(b"\0", 2)
+          if len(parts) == 2:
+              print("tenant-token", end="")
+              sys.exit(0)
+          first = parts[0].decode("utf-8", "replace") if parts else ""
+          channel = "feishu" if first == "tenant-token" else "telegram"
+          with open(os.environ["CAPTURE"], "a", encoding="utf-8") as fh:
+              fh.write(channel + "\n")
+          if channel == os.environ.get("FAIL_CHANNEL"):
+              sys.exit(1)
+          print("{\"ok\": true}")
+          '
+          EOF
+          chmod +x "$tmp/bin/python3"
+          cat >"$tmp/env" <<'EOF'
+          CONFIG_VERSION=3
+          NOTIFY_CHANNELS=telegram,feishu
+          TELEGRAM_BOT_TOKEN=123456:fake
+          TELEGRAM_CHAT_ID=-100123
+          FEISHU_APP_ID=cli_test
+          FEISHU_RECEIVE_ID=ou_lanny
+          NOTIFY_LANG=zh
+          BACKEND=apt
+          INCLUDE_PUBLIC_IP=0
+          DEDUP_MODE=once
+          EOF
+          : >"$tmp/attempts"
+          set +e
+          PATH="$tmp/bin:$PATH" CAPTURE="$tmp/attempts" FAIL_CHANNEL=feishu \
+            CREDENTIALS_DIRECTORY="$tmp/credentials" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env" \
+            "$tmp/security-update-notify" --test-reboot --no-dedupe >/dev/null 2>&1
+          rc=$?
+          set -e
+          test "$rc" -eq 1
+          test "$(grep -c '^telegram$' "$tmp/attempts")" -eq 1
+          test "$(grep -c '^feishu$' "$tmp/attempts")" -eq 1
+          test -s "$tmp/state/last-alert.sha256"
+          test ! -e "$tmp/state/last-alert.feishu.sha256"
+
+          : >"$tmp/attempts"
+          PATH="$tmp/bin:$PATH" CAPTURE="$tmp/attempts" \
+            CREDENTIALS_DIRECTORY="$tmp/credentials" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env" \
+            "$tmp/security-update-notify" --test-reboot >/dev/null
+          test "$(grep -c '^feishu$' "$tmp/attempts")" -eq 1
+          if grep -q '^telegram$' "$tmp/attempts"; then
+            echo "Telegram was repeated after its first successful delivery" >&2
+            exit 1
+          fi
+          test -s "$tmp/state/last-alert.feishu.sha256"
+
+          rm -rf "$tmp/state"
+          : >"$tmp/attempts"
+          set +e
+          PATH="$tmp/bin:$PATH" CAPTURE="$tmp/attempts" FAIL_CHANNEL=telegram \
+            CREDENTIALS_DIRECTORY="$tmp/credentials" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env" \
+            "$tmp/security-update-notify" --test-reboot --no-dedupe >/dev/null 2>&1
+          rc=$?
+          set -e
+          test "$rc" -eq 1
+          test "$(grep -c '^telegram$' "$tmp/attempts")" -eq 1
+          test "$(grep -c '^feishu$' "$tmp/attempts")" -eq 1
+          test ! -e "$tmp/state/last-alert.sha256"
+          test -s "$tmp/state/last-alert.feishu.sha256"
+
+          : >"$tmp/attempts"
+          PATH="$tmp/bin:$PATH" CAPTURE="$tmp/attempts" \
+            CREDENTIALS_DIRECTORY="$tmp/credentials" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env" \
+            "$tmp/security-update-notify" --test-reboot >/dev/null
+          test "$(grep -c '^telegram$' "$tmp/attempts")" -eq 1
+          if grep -q '^feishu$' "$tmp/attempts"; then
+            echo "Feishu was repeated after its first successful delivery" >&2
+            exit 1
+          fi
+          test -s "$tmp/state/last-alert.sha256"
+
+          printf '%s\n' 'NOTIFY_UPGRADE=1' >>"$tmp/env"
+          : >"$tmp/attempts"
+          PATH="$tmp/bin:$PATH" CAPTURE="$tmp/attempts" FAIL_CHANNEL=feishu \
+            CREDENTIALS_DIRECTORY="$tmp/credentials" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env" \
+            "$tmp/security-update-notify" --notify-upgrade-event --upgrade-from 2.0.3 --upgrade-to 2.1.0 >/dev/null 2>&1
+          test "$(grep -c '^telegram$' "$tmp/attempts")" -eq 1
+          test "$(grep -c '^feishu$' "$tmp/attempts")" -eq 1
+          echo "partial failures are channel-local; upgrade notices are best-effort"
+
+      - name: Bash fallback Feishu HTTP client regression check
+        run: build/bash-feishu-test.sh
+
+      - name: Feishu installer onboarding regression check
+        run: build/install-feishu-onboarding-test.sh
+
       - name: Config parser regression check
         run: |
           set -euo pipefail
@@ -534,7 +659,7 @@ jobs:
 
       - name: Smoke install in Debian container
         run: |
-          docker run --rm -v "$PWD:/src:ro" debian:12 bash -lc '
+          docker run --rm -v "$PWD:/src:ro" debian:12 bash -s <<'CONTAINER'
             set -euo pipefail
             apt-get update >/dev/null
             apt-get install -y systemd python3 ca-certificates >/dev/null
@@ -558,10 +683,87 @@ jobs:
             ./install.sh --telegram-token 123456:abc_DEF-ghi --telegram-chat-id -100123 --skip-telegram-test --non-interactive -y --skip-post-install-check
             expected_version="$(grep -E "^VERSION=" files/security-update-notify | head -1 | cut -d\" -f2)"
             /usr/local/sbin/security-update-notify --version | grep "$expected_version"
-            grep -q "CONFIG_VERSION" /etc/security-update-notify/telegram.env
+            grep -q "CONFIG_VERSION='3'" /etc/security-update-notify/telegram.env
+            grep -q "NOTIFY_CHANNELS='telegram'" /etc/security-update-notify/telegram.env
             ./install.sh --skip-telegram-test --non-interactive -y --skip-post-install-check
             test -s /var/backups/security-update-notify/latest
-          '
+
+            secret=ci-feishu-secret-not-in-config
+            printf %s "$secret" >/tmp/feishu-app-secret
+            chmod 600 /tmp/feishu-app-secret
+            ./install.sh --notify-channels feishu --feishu-app-id cli_test --feishu-receive-id ou_lanny \
+              --feishu-app-secret-file /tmp/feishu-app-secret --skip-feishu-test --non-interactive -y --skip-post-install-check
+            grep -q "NOTIFY_CHANNELS='feishu'" /etc/security-update-notify/telegram.env
+            grep -q "FEISHU_APP_ID='cli_test'" /etc/security-update-notify/telegram.env
+            grep -q "FEISHU_RECEIVE_ID='ou_lanny'" /etc/security-update-notify/telegram.env
+            if grep -RqsF "$secret" /etc/security-update-notify/telegram.env /var/backups/security-update-notify; then
+              echo "Feishu App Secret leaked into normal config or upgrade backup" >&2
+              exit 1
+            fi
+            test -s /etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred \
+              || test -s /etc/security-update-notify/credentials/feishu-app-secret
+
+            # 模拟不支持 systemd-creds 的旧环境，验证独立 root-only 0600 回退及卸载清理。
+            systemd_creds_bin="$(command -v systemd-creds)"
+            mv "$systemd_creds_bin" /usr/local/sbin/systemd-creds.disabled
+            secret=ci-feishu-plain-fallback-secret
+            printf %s "$secret" >/tmp/feishu-app-secret
+            chmod 600 /tmp/feishu-app-secret
+            ./install.sh --feishu-app-secret-file /tmp/feishu-app-secret --skip-feishu-test \
+              --non-interactive -y --skip-post-install-check
+            test -s /etc/security-update-notify/credentials/feishu-app-secret
+            test "$(stat -c %a /etc/security-update-notify/credentials/feishu-app-secret)" = 600
+            test ! -e /etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred
+            test ! -e /etc/systemd/system/security-update-notify.service.d/credentials.conf
+            if grep -RqsF "$secret" /etc/security-update-notify/telegram.env /var/backups/security-update-notify; then
+              echo "plaintext fallback secret leaked into normal config or backup" >&2
+              exit 1
+            fi
+
+            # Restore encrypted-credential support and verify the reverse plain -> encrypted switch.
+            mv /usr/local/sbin/systemd-creds.disabled "$systemd_creds_bin"
+            secret=ci-feishu-encrypted-again
+            printf %s "$secret" >/tmp/feishu-app-secret
+            chmod 600 /tmp/feishu-app-secret
+            ./install.sh --feishu-app-secret-file /tmp/feishu-app-secret --skip-feishu-test \
+              --non-interactive -y --skip-post-install-check
+            test -s /etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred
+            test ! -e /etc/security-update-notify/credentials/feishu-app-secret
+            test -s /etc/systemd/system/security-update-notify.service.d/credentials.conf
+
+            # Disabling Feishu removes both credential forms and its systemd drop-in.
+            ./install.sh --notify-channels telegram --skip-telegram-test \
+              --non-interactive -y --skip-post-install-check
+            grep -q "NOTIFY_CHANNELS='telegram'" /etc/security-update-notify/telegram.env
+            test ! -e /etc/security-update-notify/credentials/feishu-app-secret
+            test ! -e /etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred
+            test ! -e /etc/systemd/system/security-update-notify.service.d/credentials.conf
+
+            # Secret sources must be regular root-owned files inaccessible to group/other.
+            reject_secret_source() {
+              set +e
+              ./install.sh --notify-channels feishu --feishu-app-id cli_test --feishu-receive-id ou_lanny \
+                --feishu-app-secret-file "$1" --skip-feishu-test --non-interactive -y --skip-post-install-check \
+                >/tmp/rejected-secret-source.log 2>&1
+              rc=$?
+              set -e
+              test "$rc" -eq 2
+            }
+            printf %s rejected-secret >/tmp/feishu-secret-wide
+            chmod 644 /tmp/feishu-secret-wide
+            reject_secret_source /tmp/feishu-secret-wide
+            printf %s rejected-secret >/tmp/feishu-secret-foreign
+            chmod 600 /tmp/feishu-secret-foreign
+            chown 65534:65534 /tmp/feishu-secret-foreign
+            reject_secret_source /tmp/feishu-secret-foreign
+            ln -s /tmp/feishu-secret-wide /tmp/feishu-secret-link
+            reject_secret_source /tmp/feishu-secret-link
+
+            ./uninstall.sh --purge-config
+            test ! -e /etc/security-update-notify/credentials/feishu-app-secret
+            test ! -e /etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred
+            test ! -e /etc/systemd/system/security-update-notify.service.d/credentials.conf
+          CONTAINER
 
       - name: Verify checksum
         run: |
@@ -577,6 +779,9 @@ jobs:
           # 负向断言用显式 if…exit（不依赖“恰好是最后一条命令”这一脆弱前提）：发布包绝不能含真实 .env。
           if tar -tzf dist/security-update-notify-*.tar.gz | grep -E '/\.env$|/\.env\.(local|production)$'; then
             echo "::error::release package contains a real .env file" >&2; exit 1
+          fi
+          if tar -tzf dist/security-update-notify-*.tar.gz | grep -E '(^|/)(credentials|credstore)(/|$)|feishu-app-secret'; then
+            echo "::error::release package contains a runtime credential path" >&2; exit 1
           fi
 
       - name: Upload dist artifact

@@ -4,15 +4,12 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"time"
 
 	"github.com/xxvcc/security-update-notify/internal/config"
-	"github.com/xxvcc/security-update-notify/internal/httpx"
 	"github.com/xxvcc/security-update-notify/internal/i18n"
 	"github.com/xxvcc/security-update-notify/internal/osrel"
 	"github.com/xxvcc/security-update-notify/internal/sysexec"
 	"github.com/xxvcc/security-update-notify/internal/systemd"
-	"github.com/xxvcc/security-update-notify/internal/telegram"
 )
 
 // DoctorOpts 是 --doctor 的选项。
@@ -20,6 +17,8 @@ type DoctorOpts struct {
 	Version      string
 	Lang         i18n.Lang
 	SkipTelegram bool
+	SkipFeishu   bool
+	SkipNotify   bool
 	EnvPath      string
 }
 
@@ -106,22 +105,32 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 		ok = false
 	}
 
-	token := cfg.Get("TELEGRAM_BOT_TOKEN")
-	chat := cfg.Get("TELEGRAM_CHAT_ID")
-	if opts.SkipTelegram {
-		say(out, lang, "跳过：Telegram 联通性检查", "SKIP Telegram connectivity check")
-	} else if token != "" && chat != "" {
-		say(out, lang, "正常：Telegram 配置存在", "OK Telegram config present")
-		client := &telegram.Client{HTTP: httpx.New(20 * time.Second), BaseURL: os.Getenv(telegramBaseURLEnv)}
-		if client.GetMe(context.Background(), token) == nil {
-			say(out, lang, "正常：Telegram Bot Token 可用", "OK Telegram bot token works")
-		} else {
-			say(out, lang, "失败：Telegram getMe 失败", "FAIL Telegram getMe failed")
-			ok = false
-		}
-	} else {
-		say(out, lang, "失败：Telegram 配置缺失", "FAIL Telegram config missing")
+	channels, err := configuredChannels(cfg)
+	if err != nil {
+		say(out, lang, "失败：通知渠道配置无效", "FAIL invalid notification channel configuration")
 		ok = false
+	} else {
+		for _, name := range channels {
+			label := channelLabel(name)
+			skipped := opts.SkipNotify || (name == "telegram" && opts.SkipTelegram) || (name == "feishu" && opts.SkipFeishu)
+			if skipped {
+				say(out, lang, "跳过："+label+" 联通性检查", "SKIP "+label+" connectivity check")
+				continue
+			}
+			sender, err := senderFor(cfg, name)
+			if err != nil {
+				say(out, lang, "失败："+label+" 配置缺失或不可用", "FAIL "+label+" configuration missing or unavailable")
+				ok = false
+				continue
+			}
+			say(out, lang, "正常："+label+" 配置存在", "OK "+label+" configuration present")
+			if sender.Probe(context.Background()) == nil {
+				say(out, lang, "正常："+label+" 凭据可用", "OK "+label+" credentials work")
+			} else {
+				say(out, lang, "失败："+label+" 凭据校验失败", "FAIL "+label+" credential validation failed")
+				ok = false
+			}
+		}
 	}
 
 	health, pending, eol := collectWatchdog(cfg, be, o)

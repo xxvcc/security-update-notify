@@ -19,7 +19,10 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/watchdog"
 )
 
-const osReleasePath = "/etc/os-release"
+const (
+	osReleasePath      = "/etc/os-release"
+	maxRebootPkgsBytes = 1 << 20
+)
 
 // Flags 是影响采集/决策的运行时标志。
 type Flags struct {
@@ -105,10 +108,7 @@ func testRebootState(be string) backend.RestartState {
 }
 
 func collectAPT() backend.RestartState {
-	pkgs := ""
-	if b, err := os.ReadFile("/var/run/reboot-required.pkgs"); err == nil {
-		pkgs = string(b)
-	}
+	pkgs := readFilePrefix("/var/run/reboot-required.pkgs", maxRebootPkgsBytes)
 	hasNR := sysexec.Look("needrestart")
 	nrb := ""
 	if hasNR {
@@ -120,6 +120,19 @@ func collectAPT() backend.RestartState {
 		HasNeedrestart:       hasNR,
 		NeedrestartB:         nrb,
 	})
+}
+
+func readFilePrefix(path string, limit int64) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, limit))
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 func collectDNF() backend.RestartState {

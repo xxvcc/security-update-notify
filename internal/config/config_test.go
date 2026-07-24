@@ -60,6 +60,7 @@ func TestQuote(t *testing.T) {
 func TestWriteFormat(t *testing.T) {
 	values := map[string]string{
 		"TELEGRAM_BOT_TOKEN": "123456:abc_DEF-ghi", "TELEGRAM_CHAT_ID": "-100123",
+		"NOTIFY_CHANNELS": "telegram,feishu", "FEISHU_APP_ID": "cli_test", "FEISHU_RECEIVE_ID": "ou_lanny",
 		"HOST_LABEL": "prod web", "PUBLIC_IP": "", "INCLUDE_PUBLIC_IP": "1",
 		"NOTIFY_OK": "0", "NOTIFY_UPGRADE": "0", "DEDUP_MODE": "always", "DEDUP_INTERVAL_DAYS": "3",
 		"NOTIFY_LANG": "en", "BACKEND": "apt", "CONFIG_VERSION": "1",
@@ -83,9 +84,9 @@ func TestWriteFormat(t *testing.T) {
 			t.Errorf("line %d = %q, want key %s", i, body[i], k)
 		}
 	}
-	// CONFIG_VERSION 强制为 '2'，DEDUP_MODE always -> once，空 PUBLIC_IP -> ''。
-	if body[0] != "CONFIG_VERSION='2'" {
-		t.Errorf("CONFIG_VERSION line = %q want CONFIG_VERSION='2'", body[0])
+	// CONFIG_VERSION 强制为 '3'，DEDUP_MODE always -> once，空 PUBLIC_IP -> ''。
+	if body[0] != "CONFIG_VERSION='3'" {
+		t.Errorf("CONFIG_VERSION line = %q want CONFIG_VERSION='3'", body[0])
 	}
 	joined := buf.String()
 	if !strings.Contains(joined, "DEDUP_MODE='once'") {
@@ -100,6 +101,7 @@ func TestWriteFormat(t *testing.T) {
 func TestWriteLoadRoundTrip(t *testing.T) {
 	in := map[string]string{
 		"TELEGRAM_BOT_TOKEN": "123456:abc_DEF-ghi", "TELEGRAM_CHAT_ID": "-100123",
+		"NOTIFY_CHANNELS": "telegram,feishu", "FEISHU_APP_ID": "cli_test", "FEISHU_RECEIVE_ID": "ou_lanny",
 		"HOST_LABEL": "it's a host", "PUBLIC_IP": "203.0.113.10", "INCLUDE_PUBLIC_IP": "0",
 		"NOTIFY_OK": "1", "NOTIFY_UPGRADE": "1", "DEDUP_MODE": "always", "DEDUP_INTERVAL_DAYS": "7",
 		"NOTIFY_LANG": "en", "BACKEND": "apt", "CONFIG_VERSION": "1",
@@ -117,7 +119,7 @@ func TestWriteLoadRoundTrip(t *testing.T) {
 	for k, v := range in {
 		want[k] = v
 	}
-	want["CONFIG_VERSION"] = "2"
+	want["CONFIG_VERSION"] = "3"
 	want["DEDUP_MODE"] = "once"
 	for k, w := range want {
 		if got := cfg.Get(k); got != w {

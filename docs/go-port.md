@@ -6,15 +6,19 @@
 This is the living design doc for the full Go port. It captures the conclusions of the multi-agent
 analysis (inventory → design → adversarial critique → synthesis); the analysis's own output was ephemeral.
 
+> **Current status (2.1.0):** the Go runtime, signed bridge distribution, self-upgrade path, and all original
+> port phases are complete. Version 2.1.0 adds selectable Telegram/Feishu delivery, per-channel dedup state,
+> Feishu diagnostics and upgrade notices, and configuration schema v3. The historical 2.0.0 release checklist
+> remains below as design history, not as unfinished work.
+
 ## 诚实的底线 / Honest bottom line
 
 “全 Go”是善意的误称：**~90–95% 的代码进 Go，但背后压着两个搬不走的事实。**
 
 1. **引导信任根必须留在 shell。** `curl -fsSL https://sun.xxv.cc | sudo bash` 在任何可信二进制存在
    *之前*运行——编译产物不可能是被 `curl|bash` 的第一个东西，此刻也没有任何已装组件能验证它。所以
-   `sun.sh` 瘦身为一个 ~40 行 POSIX-sh shim（内嵌公钥 + pin 指纹，shell 到 `sha256sum` + `gpg`）。
-   其**安全 TCB（fetch/sha256/指纹 pin/gpg 验签/安全解包）与今天完全一样**；只有 ~146 行非安全 UX
-   进二进制，并新增按架构探测。**“更小 = 更安全”是错的**，信任边界没变。
+   `sun.sh` 必须继续承担下载和验证引导。它的**安全 TCB（fetch/sha256/指纹 pin/gpg 验签/安全解包）
+   与桥发布时一致**，并负责按架构选择产物。脚本行数不是安全结论，关键是信任边界未扩大。
 2. **`gpg` 与 OS “讲真话的命令” 仍是硬 `exec` 依赖。** needrestart / needs-restarting / apt / dpkg /
    dnf / rpm / systemctl / systemd-analyze / sudo / `hostname -f`（可能还有 `date -d`）无法在纯 Go 里
    忠实复刻——它们*就是*数据源。**“零依赖静态二进制”在 OS 边界上是假的。**
@@ -29,7 +33,7 @@ analysis (inventory → design → adversarial critique → synthesis); the anal
 - **切换时分发单元：版本化“桥” tarball**（内含 install.sh 与含 `VERSION=latest` 字节的运行时文件），
   让已装 Bash 机器的旧自升级链继续工作；不在切换点抛弃 noarch 语义。
 - **install.sh / package.sh / sun.sh 主体：第一刀保持 shell**（特权、测试最全、收益近零）。
-- **版本号：2.0.0，先发 prerelease canary 频道。**
+- **桥版本 2.0.0 已发布；当前演进版本为 2.1.0。** 2.1.0 在不改变桥信任链的前提下新增多通知渠道。
 - **自升级：存活父进程做事务替换**（NOT rename-then-`syscall.Exec`）。
 
 ## Go 架构 / Architecture
@@ -42,13 +46,15 @@ internal/
   version/    ✅ 语义化版本比较（fail-closed）——已从 PoC 迁入
   dist/       ✅ sha256 + pin 指纹 GPG 验签 + tar 安全检查（含解压上限）——已迁入
   golden/     ✅ 从真 Bash 运行时捕获的黄金向量（dedup hash + 归一化正文）——oracle
-  config/     ✅ telegram.env 严格行解析器 + 逐字节复刻 writer（15 键白名单、fail-open/closed 分裂）
+  config/     ✅ telegram.env 严格行解析器 + 逐字节复刻 writer（18 键白名单、schema v3、fail-open/closed 分裂）
+  delivery/   ✅ Telegram / 飞书共同的渠道解析与发送接口；旧配置缺渠道时默认 Telegram
+  feishu/     ✅ tenant token + 应用级 open_id 普通文本发送（rune 截断、3 次重试、限流信号）
   i18n/       ✅ UI_LANG / NOTIFY_LANG 解析（m/say 优先级），LC_ALL=C
-  osrel/      ⏳ os-release 解析 + 后端探测 + 支持分级（替代 lib.sh）
+  osrel/      ✅ os-release 解析 + 后端探测 + 支持分级（替代 lib.sh）
   backend/    ✅ needrestart -b 与 needs-restarting -r/-s 纯解析器（KCUR/KEXP/KSTA/SVC、文本优先 reboot
               判定、-s 能力探测）——单包合并 apt+dnf（原计划分两包，合并更便于共享 helper）
   watchdog/   ✅ 健康 / EOL / pending 纯逻辑（HEALTH_SIG 尾逗号、EOL 表与 ci.yml 一致）
-  dedup/      ✅ 11 字段 sha256 + once/daily/interval + 原子状态写 —— 8/8 golden hash 逐字节通过
+  dedup/      ✅ 11 字段 sha256 + once/daily/interval + 原子状态写 + 渠道独立状态
   notify/     ✅ zh/en 消息模板 + format_restart_summary —— 8/8 golden message 逐字节通过
   telegram/   ✅ GetMe + SendMessage（net/http，rune 截断，3 次重试，只对 429/5xx 重试）—— 干掉 python3
   httpx/      ✅ 一个加固 http.Client（拒绝非 https 初始/跳转/最终 URL）—— 干掉 curl + urllib
@@ -56,21 +62,20 @@ internal/
   sysexec/    ✅ exec 边界：子进程一律 LC_ALL=C；非零退出当数据不致命（镜像 set +e）
   systemd/    ✅ systemctl 查询封装（is-enabled / show -p PROP --value）
   lock/       ✅ flock 单实例锁（非阻塞，抢不到静默退 0）
-  run/        ✅ Assemble（纯，8/8 golden hash+message）+ Collect（IO 采集）+ Execute（锁/去重/发送/落盘）
+  run/        ✅ Assemble + Collect + Execute；按渠道发送、部分失败隔离、doctor 与升级通知均支持双渠道
   cli/        ✅ 子命令分发 + 裸调用=run（--version/--test-*/--no-dedupe/--dry-run/--lang/--doctor/
-              --check-upgrade/--notify-upgrade-event）；仅 --upgrade（自升级）待 Phase 3
+              --check-upgrade/--notify-upgrade-event/--upgrade）
   dist/       ✅ sha256 + pin 指纹 GPG 验签 + tar 安全检查/解包（Extract 剥离 setuid）+ LatestRelease +
               Download（HTTPS-only 重试）+ VerifySHA256 + VerifyReleaseKey（内置公钥）—— 自升级信任链全套
   assets/     ✅ go:embed 公钥 + systemd 单元 + needrestart/logrotate + pin 指纹常量（CI 有 drift guard）
   run/        ✅ + SelfUpgrade（--upgrade：sudo 重执行 → 下载 → 验签(解包前) → 安全解包 → 版本绑定 →
               存活父进程运行 install.sh 完成替换；NOT rename-then-exec）+ Doctor + CheckUpgrade + NotifyUpgradeEvent
-  installer/  🔵 (Phase 4, 可选) install/uninstall/menu/test
-  assets/     🔵 (Phase 2/3) go:embed 公钥/.service/needrestart/logrotate/.env.example + 指纹常量（嵌入位置待定）
+  installer/  ✅ 保持 shell：install/uninstall/menu/test；2.1.0 增加飞书自动选人与独立 credential 生命周期
 build/        ✅ 可复现交叉编译（build.sh）+ 双构建 sha256 门（reproducibility-check.sh）+ 黄金捕获
-sun.sh(瘦身)  🔵 ~40 行 POSIX sh shim（Phase 3）
+sun.sh        ✅ 保持 shell 引导器；下载、sha256、指纹 pin、GPG 验签与安全解包信任边界不变
 ```
 
-✅ 完成 · ⏳ Phase 1/2 · 🔵 后续阶段
+✅ 完成
 
 ## 兼容清单（必须逐字节复刻）/ Compat checklist — MUST reproduce exactly
 
@@ -90,8 +95,9 @@ sun.sh(瘦身)  🔵 ~40 行 POSIX sh shim（Phase 3）
 - **状态回读 `TrimRight` 掉所有尾换行**（Bash `cat` 捕获）；否则每次运行都重发。`last-alert.sha256` =
   64hex+换行，`last-alert.sent_at` = epoch+换行；`STATE_DIR` 0750；临时文件 + rename 原子写，**hash 先于
   时间戳** rename；直写回退显式 0600。
-- **telegram.env 线格式**：15 键固定写序、两行双语头注释、`config_quote`（默认单引号，值含单引号才用双引号，
-  **绝不反斜杠转义**；校验禁止同时含两种引号），强制 `CONFIG_VERSION=2`，`DEDUP_MODE` always→once。
+- **telegram.env 线格式**（文件名为兼容历史保留）：18 键固定写序、两行双语头注释、`config_quote`
+  （默认单引号，值含单引号才用双引号，**绝不反斜杠转义**；校验禁止同时含两种引号），强制
+  `CONFIG_VERSION=3`，旧配置缺 `NOTIFY_CHANNELS` 时按 `telegram`，`DEDUP_MODE` always→once。
   **不要用 `strconv.Quote`/`%q`/JSON**。文件 0600。
 - **配置读取“致命 vs 非致命”分裂**：文件不可读 → 继续（fail-open）；行无 `=` / 键正则不符 / 非白名单键 →
   exit 2（fail-closed）。`NOTIFY_LANG` 归一化为精确 zh/en，否则 zh（hash 字段 3 + 消息语言）。
@@ -100,6 +106,9 @@ sun.sh(瘦身)  🔵 ~40 行 POSIX sh shim（Phase 3）
 - **Telegram**：token 正则 `^\d+:[A-Za-z0-9_-]+$`；4096 截断按 **rune**（`RuneCountInString` → 取前 4000
   rune + `\n…(truncated)`），非字节长度；表单 `chat_id/text/disable_web_page_preview=true`；3 次尝试间隔
   1s；**仅**对 ok=false-break 或 HTTP 429/500/502/503/504 重试。
+- **飞书**：App Secret 只从隐藏输入、systemd credential 或已验证的 root-only 普通文件进入内存；运行时
+  使用应用级 `open_id` 单发普通文本。交互安装的 Directory v1 结果只用于人选确认，扫描范围受应用通讯录
+  数据范围限制；更换 App ID 必须重新选择或显式提供接收人，禁止复用旧应用的 `open_id`。
 - **needs-restarting reboot 判定优先级**：文本 `reboot is required` → 需要；否则
   `reboot should not be necessary|no core libraries` → 不需要；**仅当**上面都不匹配时 `rc==1` → 需要；
   其它非零 rc **不是** reboot 信号。needrestart：任一 `NEEDRESTART-SVC:` 行即触发 attention（`HasPrefix`
@@ -107,8 +116,8 @@ sun.sh(瘦身)  🔵 ~40 行 POSIX sh shim（Phase 3）
 - **restart_summary 两种换行制**：apt 携带**真换行**（原始 needrestart -b），dnf 携带**字面 `\n`**；两者都过
   一次 `\n`→换行 的替换。保留谁携带哪种。
 - **退出码**：`0` = 成功/无关注/silent-ok/去重抑制/--version/--help/--check-upgrade/--notify-upgrade-event/
-  锁竞争/非更新；`1` = telegram 发送失败/doctor 问题/自升级失败；`2` = 参数/配置错误/发送时缺 token 或
-  chat/不支持后端/缺 flag 值。**裸调用 = run FOREVER**（旧 systemd 单元裸调用二进制直到 daemon-reload）。
+  锁竞争/非更新；`1` = 任一已配置渠道发送失败/doctor 问题/自升级失败；`2` = 参数/配置错误/发送时缺渠道
+  凭据/不支持后端/缺 flag 值。**裸调用 = run FOREVER**（旧 systemd 单元裸调用二进制直到 daemon-reload）。
 - **信任链**：pin 指纹 `C678256ACBFC6491BF5076655F3AE24999921FFC`（不可被环境变量覆盖）；验签在解包之前；
   安全解包拒绝绝对路径 / 任何 `..` 段 / 顶层目录之外条目 / 非普通-非目录条目；解包 `--no-same-owner
   --no-same-permissions`；gpg 存在时签名强制（缺 .asc 即拒）；sha256-only 仅当 gpg 确实缺失且显式
@@ -122,14 +131,14 @@ sun.sh(瘦身)  🔵 ~40 行 POSIX sh shim（Phase 3）
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
 | **P0** CI/可复现地基 | 根模块 + 固定工具链；go 门（fmt/vet/race/交叉编译矩阵/双构建 sha256）；黄金向量捕获 | ✅ **完成** |
-| **P1** 纯逻辑核心进 Go | version/config/dedup/i18n/notify/telegram/httpx/osrel/backend + bash↔Go 差分 oracle | ⏳ 进行中 |
+| **P1** 纯逻辑核心进 Go | version/config/dedup/i18n/notify/telegram/httpx/osrel/backend + bash↔Go 差分 oracle | ✅ **完成** |
 | **P2** Go run 路径 + 桥 + 兼容测试 | cli/watchdog/systemd/flock/原子写；桥 tarball（per-arch Go 二进制 + bash 兜底）；bash→Go 升级兼容测试 | ✅ **完成**：run/doctor/check-upgrade/notify-upgrade 全部移植；package.sh 构建全 5 架构（amd64/arm64/386/ppc64le/s390x）Go 二进制入包（tarball 可复现），install.sh 按架构择二进制（缺失回退 bash）；真实容器兼容测试通过（配置/token/状态保留、不重复告警） |
-| **P3** 切 latest + 自升级 | 翻正式版；port dist 自升级（存活父进程事务替换）、签名 manifest 绑定、双向不降级 | 🟢 自升级已实现并实机联网验证（fetch/版本门/验签/解包/版本绑定/存活父进程跑 install.sh）；带真实安装的整包替换在 P2d 兼容测试里验证；“翻正式版”属发布动作 |
-| **P4** (可选，建议后置/不做) | port install.sh/uninstall/menu/test + package.sh | ⬜ **建议不做**：install.sh 770 行特权代码、测试最全、桥已让它安装 Go 二进制；再移植是高爆炸半径换近零收益。保持 shell |
+| **P3** 切 latest + 自升级 | 翻正式版；port dist 自升级（存活父进程事务替换）、签名 manifest 绑定、双向不降级 | ✅ **完成并发布** |
+| **P4** shell 安装面保持 | install.sh/uninstall/menu/test + package.sh | ✅ **有意保持 shell**：特权安装面测试充分，桥已负责安装 Go 二进制；2.1.0 继续在该边界加入飞书 onboarding 与 credential 管理 |
 
-## 如何切 2.0.0 桥发布 / Cutting the 2.0.0 bridge release
+## 2.0.0 桥发布历史清单 / Historical 2.0.0 bridge release checklist
 
-端口本身已完成；“切发布”是维护者的动作（见 [[release-process]]）：
+以下步骤已完成，保留用于解释 2.0.0 的发布设计与信任链：
 
 1. `files/security-update-notify` 里 `VERSION="2.0.0"` + CHANGELOG 加 `## 2.0.0` 段（说明改为 Go 运行时、
    保留 bash 兜底、桥升级不重复告警）；提交 `release: v2.0.0`。

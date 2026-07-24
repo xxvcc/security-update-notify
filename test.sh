@@ -13,19 +13,19 @@ usage(){
   if [ "${UI_LANG:-zh}" = en ]; then
     cat <<'EOU'
 Usage: sudo ./test.sh [options]
-  --send-test        Send a normal OK Telegram test message
+  --send-test        Send a normal OK message to configured channels
   --simulate-reboot  Send a simulated reboot-required alert; does not reboot
   --no-dedupe        Bypass duplicate-alert suppression for this test
-  --verbose          Show full Telegram chat ID in diagnostics
+  --verbose          Show full recipient IDs in diagnostics
   --lang zh|en       Terminal language
 EOU
   else
     cat <<'EOU'
 用法: sudo ./test.sh [选项]
-  --send-test        发送普通 OK Telegram 测试消息
+  --send-test        向已配置渠道发送普通 OK 测试消息
   --simulate-reboot  发送模拟“需要重启”提醒；不会真的重启
   --no-dedupe        本次测试绕过去重抑制
-  --verbose          诊断中显示完整 Telegram Chat ID
+  --verbose          诊断中显示完整接收人 ID
   --lang zh|en       终端语言
 EOU
   fi
@@ -83,7 +83,7 @@ else
   say "跳过：Go 二进制运行时，无需脚本语法检查" "SKIP Go binary runtime; no script syntax check"
 fi
 /usr/local/sbin/security-update-notify --version
-/usr/local/sbin/security-update-notify --doctor --skip-telegram --lang "$UI_LANG"
+/usr/local/sbin/security-update-notify --doctor --lang "$UI_LANG"
 systemd-analyze verify /etc/systemd/system/security-update-notify.service /etc/systemd/system/security-update-notify.timer >"$TMP_DIR/systemd-verify.log" 2>&1 && say "正常：systemd 单元通过" "OK systemd units" || { cat "$TMP_DIR/systemd-verify.log"; exit 1; }
 echo
 
@@ -125,7 +125,7 @@ load_config_file() {
     if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
     if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
     case "$key" in
-      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|NOTIFY_UPGRADE|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION|CHECK_UPDATE_HEALTH|STALE_UPDATE_DAYS|CHECK_EOL)
+      NOTIFY_CHANNELS|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|FEISHU_APP_ID|FEISHU_RECEIVE_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|NOTIFY_UPGRADE|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION|CHECK_UPDATE_HEALTH|STALE_UPDATE_DAYS|CHECK_EOL)
         printf -v "$key" '%s' "$value"
         ;;
       *) say "配置键不支持: $file: $key" "Unsupported config key in $file: $key" >&2; return 2 ;;
@@ -134,6 +134,14 @@ load_config_file() {
 }
 
 load_config_file "$CONFIG" || exit $?
+NOTIFY_CHANNELS="${NOTIFY_CHANNELS:-telegram}"
+
+channel_selected() {
+  case ",${NOTIFY_CHANNELS}," in
+    *",$1,"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 telegram_get_me() {
   printf '%s' "${TELEGRAM_BOT_TOKEN:-}" | python3 -c '
@@ -163,17 +171,40 @@ sys.exit(0 if ok else 1)
 '
 }
 
-say "== Telegram 配置 ==" "== telegram config =="
-[[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] && say "正常：token 已配置（${#TELEGRAM_BOT_TOKEN} 字符）" "OK token present (${#TELEGRAM_BOT_TOKEN} chars)" || say "缺失：token" "MISSING token"
-if [[ -n "${TELEGRAM_CHAT_ID:-}" ]]; then
-  if [[ "$VERBOSE" -eq 1 ]]; then
-    say "正常：chat id 已配置: ${TELEGRAM_CHAT_ID}" "OK chat id present: ${TELEGRAM_CHAT_ID}"
+say "== 通知配置 ==" "== notification config =="
+say "渠道: $NOTIFY_CHANNELS" "Channels: $NOTIFY_CHANNELS"
+if channel_selected telegram; then
+  [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] && say "正常：Telegram token 已配置（${#TELEGRAM_BOT_TOKEN} 字符）" "OK Telegram token present (${#TELEGRAM_BOT_TOKEN} chars)" || say "缺失：Telegram token" "MISSING Telegram token"
+  if [[ -n "${TELEGRAM_CHAT_ID:-}" ]]; then
+    if [[ "$VERBOSE" -eq 1 ]]; then
+      say "正常：Telegram chat id 已配置: ${TELEGRAM_CHAT_ID}" "OK Telegram chat id present: ${TELEGRAM_CHAT_ID}"
+    else
+      chat_tail="${TELEGRAM_CHAT_ID: -4}"
+      say "正常：Telegram chat id 已配置: ****${chat_tail}" "OK Telegram chat id present: ****${chat_tail}"
+    fi
   else
-    chat_tail="${TELEGRAM_CHAT_ID: -4}"
-    say "正常：chat id 已配置: ****${chat_tail}" "OK chat id present: ****${chat_tail}"
+    say "缺失：Telegram chat id" "MISSING Telegram chat id"
   fi
-else
-  say "缺失：chat id" "MISSING chat id"
+fi
+if channel_selected feishu; then
+  [[ -n "${FEISHU_APP_ID:-}" ]] && say "正常：飞书 App ID 已配置" "OK Feishu App ID present" || say "缺失：飞书 App ID" "MISSING Feishu App ID"
+  if [[ -n "${FEISHU_RECEIVE_ID:-}" ]]; then
+    if [[ "$VERBOSE" -eq 1 ]]; then
+      say "正常：飞书 open_id 已配置: ${FEISHU_RECEIVE_ID}" "OK Feishu open_id present: ${FEISHU_RECEIVE_ID}"
+    else
+      receive_tail="${FEISHU_RECEIVE_ID: -4}"
+      say "正常：飞书 open_id 已配置: ****${receive_tail}" "OK Feishu open_id present: ****${receive_tail}"
+    fi
+  else
+    say "缺失：飞书 open_id" "MISSING Feishu open_id"
+  fi
+  if [[ -r /etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred ]]; then
+    say "正常：飞书加密 systemd credential 存在" "OK encrypted Feishu systemd credential present"
+  elif [[ -r /etc/security-update-notify/credentials/feishu-app-secret ]]; then
+    say "正常：飞书 root-only 凭据文件存在" "OK root-only Feishu credential file present"
+  else
+    say "缺失：飞书 App Secret 凭据" "MISSING Feishu App Secret credential"
+  fi
 fi
 if [[ "${INCLUDE_PUBLIC_IP:-1}" =~ ^(1|true|yes|on)$ ]]; then
   if [[ -n "${PUBLIC_IP:-}" ]]; then
@@ -184,8 +215,6 @@ if [[ "${INCLUDE_PUBLIC_IP:-1}" =~ ^(1|true|yes|on)$ ]]; then
 else
   say "公网 IP：通知中不显示" "Public IP: not shown in notifications"
 fi
-telegram_get_me >/dev/null && say "正常：Telegram Bot Token 可用" "OK Telegram bot token works" || { say "错误：Telegram getMe 失败" "ERROR: Telegram getMe failed" >&2; exit 1; }
-
 args=(); [[ "$NO_DEDUPE" -eq 1 ]] && args+=(--no-dedupe)
 [[ "$SEND_TEST" -eq 1 ]] && { say "== 发送 OK 测试 ==" "== send OK test =="; /usr/local/sbin/security-update-notify --test-ok "${args[@]}"; say "正常：测试消息已发送" "OK sent test message"; }
 [[ "$SIMULATE_REBOOT" -eq 1 ]] && { say "== 发送模拟重启提醒 ==" "== send simulated reboot alert =="; /usr/local/sbin/security-update-notify --test-reboot "${args[@]}"; say "正常：模拟重启提醒已发送" "OK sent simulated reboot alert"; }

@@ -13,7 +13,7 @@ STATE_DIR="/var/lib/security-update-notify"
 STATE_FILE="$STATE_DIR/last-alert.sha256"
 STATE_TIME_FILE="$STATE_DIR/last-alert.sent_at"
 LOCK_FILE="/run/security-update-notify.lock"
-VERSION="2.0.3"
+VERSION="2.1.0"
 REPO="xxvcc/security-update-notify"
 RELEASE_SIGNING_FINGERPRINT="C678256ACBFC6491BF5076655F3AE24999921FFC"
 UPGRADE_ALLOW_UNSIGNED="${SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED:-0}"
@@ -23,6 +23,8 @@ SEND_OK=0
 NO_DEDUPE=0
 DOCTOR=0
 DOCTOR_SKIP_TELEGRAM=0
+DOCTOR_SKIP_FEISHU=0
+DOCTOR_SKIP_NOTIFY=0
 CHECK_UPGRADE=0
 SELF_UPGRADE=0
 UPGRADE_NOTICE=0
@@ -40,13 +42,13 @@ usage() {
     cat <<'EOF'
 Usage: security-update-notify [--test-ok] [--test-reboot] [--no-dedupe] [--doctor] [--check-upgrade] [--upgrade] [--lang zh|en] [--version]
 
-Checks OS backend reboot/service-restart state, then sends Telegram alerts.
+Checks OS backend reboot/service-restart state, then sends configured notifications.
 EOF
   else
     cat <<'EOF'
 用法: security-update-notify [--test-ok] [--test-reboot] [--no-dedupe] [--doctor] [--check-upgrade] [--upgrade] [--lang zh|en] [--version]
 
-检查系统后端的整机重启/服务重启状态，然后发送 Telegram 提醒。
+检查系统后端的整机重启/服务重启状态，然后通过已配置渠道发送提醒。
 EOF
   fi
 }
@@ -58,6 +60,8 @@ while [[ $# -gt 0 ]]; do
     --no-dedupe) NO_DEDUPE=1; shift ;;
     --doctor) DOCTOR=1; shift ;;
     --skip-telegram|--skip-telegram-test) DOCTOR_SKIP_TELEGRAM=1; shift ;;
+    --skip-feishu|--skip-feishu-test) DOCTOR_SKIP_FEISHU=1; shift ;;
+    --skip-notify|--skip-notify-test) DOCTOR_SKIP_NOTIFY=1; shift ;;
     --check-upgrade) CHECK_UPGRADE=1; shift ;;
     --upgrade) SELF_UPGRADE=1; shift ;;
     --notify-upgrade-event) UPGRADE_NOTICE=1; shift ;;
@@ -432,7 +436,7 @@ load_config_file() {
     if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
     if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
     case "$key" in
-      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|NOTIFY_UPGRADE|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION|CHECK_UPDATE_HEALTH|STALE_UPDATE_DAYS|CHECK_EOL)
+      NOTIFY_CHANNELS|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|FEISHU_APP_ID|FEISHU_RECEIVE_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|NOTIFY_UPGRADE|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION|CHECK_UPDATE_HEALTH|STALE_UPDATE_DAYS|CHECK_EOL)
         printf -v "$key" '%s' "$value"
         ;;
       *) say "配置键不支持: $file: $key" "Unsupported config key in $file: $key" >&2; return 2 ;;
@@ -526,7 +530,204 @@ sys.exit(1)
 '
 }
 
+channel_selected() {
+  case ",${NOTIFY_CHANNELS:-telegram}," in
+    *",$1,"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+normalize_notify_channels() {
+  local raw item has_telegram=0 has_feishu=0
+  local -a items=()
+  raw="${NOTIFY_CHANNELS//[[:space:]]/}"
+  IFS=',' read -r -a items <<<"${raw,,}"
+  for item in "${items[@]}"; do
+    case "$item" in
+      telegram) has_telegram=1 ;;
+      feishu) has_feishu=1 ;;
+      *) say "无效通知渠道: $item" "Invalid notification channel: $item" >&2; return 2 ;;
+    esac
+  done
+  case "$has_telegram$has_feishu" in
+    10) NOTIFY_CHANNELS=telegram ;;
+    01) NOTIFY_CHANNELS=feishu ;;
+    11) NOTIFY_CHANNELS=telegram,feishu ;;
+    *) say "通知渠道不能为空" "Notification channels cannot be empty" >&2; return 2 ;;
+  esac
+}
+
+feishu_secret_to_stdout() {
+  if [[ -n "${CREDENTIALS_DIRECTORY:-}" && -r "$CREDENTIALS_DIRECTORY/feishu_app_secret" ]]; then
+    cat "$CREDENTIALS_DIRECTORY/feishu_app_secret"
+  elif [[ -r /etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred ]] && command -v systemd-creds >/dev/null 2>&1; then
+    systemd-creds decrypt --name=feishu_app_secret /etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred - 2>/dev/null
+  elif [[ -r /etc/security-update-notify/credentials/feishu-app-secret ]]; then
+    cat /etc/security-update-notify/credentials/feishu-app-secret
+  else
+    return 1
+  fi
+}
+
+feishu_get_token() {
+  { printf '%s\0' "${FEISHU_APP_ID:-}"; feishu_secret_to_stdout; } | python3 -c '
+import datetime, email.utils, json, os, sys, time, urllib.error, urllib.request
+
+def retry_delay(headers):
+    raw = (headers.get("Retry-After") or "").strip()
+    try:
+        return min(max(int(raw), 0), 30)
+    except (TypeError, ValueError):
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(raw)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return min(max((when - now).total_seconds(), 0), 30)
+    except (TypeError, ValueError, OverflowError):
+        return 1
+
+parts = sys.stdin.buffer.read().split(b"\0", 1)
+app_id = parts[0].decode("utf-8", "replace") if parts else ""
+secret = parts[1].decode("utf-8", "replace") if len(parts) > 1 else ""
+if not app_id or not secret:
+    print("缺少飞书 App ID 或 App Secret / missing Feishu App ID or App Secret", file=sys.stderr)
+    sys.exit(2)
+payload = json.dumps({"app_id": app_id, "app_secret": secret}).encode()
+base_url = os.environ.get("SECURITY_UPDATE_NOTIFY_FEISHU_BASE_URL", "https://open.feishu.cn").rstrip("/")
+for attempt in range(3):
+    delay = 1
+    req = urllib.request.Request(base_url + "/open-apis/auth/v3/tenant_access_token/internal", data=payload, headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            body = response.read(1048577)
+        if len(body) > 1048576:
+            raise ValueError("response too large")
+        data = json.loads(body)
+        if data.get("code") == 0 and data.get("tenant_access_token"):
+            print(data["tenant_access_token"], end="")
+            sys.exit(0)
+        print(f"Feishu token failed: code={data.get('"'"'code'"'"')}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (429, 500, 502, 503, 504):
+            print(f"Feishu token HTTP {exc.code}", file=sys.stderr)
+            sys.exit(1)
+        delay = retry_delay(exc.headers)
+    except Exception:
+        if attempt == 2:
+            print("Feishu token request failed", file=sys.stderr)
+            sys.exit(1)
+    if attempt < 2:
+        time.sleep(delay)
+sys.exit(1)
+'
+}
+
+feishu_send_message() {
+  local text="$1" token
+  token="$(feishu_get_token)" || return $?
+  printf '%s\0%s\0%s' "$token" "${FEISHU_RECEIVE_ID:-}" "$text" | python3 -c '
+import datetime, email.utils, json, os, re, sys, time, urllib.error, urllib.request
+
+def retry_delay(headers):
+    raw = (headers.get("Retry-After") or "").strip()
+    try:
+        return min(max(int(raw), 0), 30)
+    except (TypeError, ValueError):
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(raw)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return min(max((when - now).total_seconds(), 0), 30)
+    except (TypeError, ValueError, OverflowError):
+        return 1
+
+parts = sys.stdin.buffer.read().split(b"\0", 2)
+token = parts[0].decode("utf-8", "replace") if parts else ""
+receive_id = parts[1].decode("utf-8", "replace") if len(parts) > 1 else ""
+text = parts[2].decode("utf-8", "replace") if len(parts) > 2 else ""
+if not token or not receive_id:
+    print("缺少飞书 token 或 open_id / missing Feishu token or open_id", file=sys.stderr)
+    sys.exit(2)
+if re.fullmatch(r"ou_[A-Za-z0-9_-]+", receive_id) is None:
+    print("飞书接收人必须是 open_id / Feishu recipient must be an open_id", file=sys.stderr)
+    sys.exit(2)
+if len(text) > 20000:
+    text = text[:19900] + "\n…(truncated)"
+base_url = os.environ.get("SECURITY_UPDATE_NOTIFY_FEISHU_BASE_URL", "https://open.feishu.cn").rstrip("/")
+url = base_url + "/open-apis/im/v1/messages?receive_id_type=open_id"
+payload = json.dumps({"receive_id": receive_id, "msg_type": "text", "content": json.dumps({"text": text}, ensure_ascii=False)}).encode()
+for attempt in range(3):
+    delay = 1
+    req = urllib.request.Request(url, data=payload, headers={"Authorization": "Bearer " + token, "Content-Type": "application/json; charset=utf-8"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            body = response.read(1048577)
+        if len(body) > 1048576:
+            raise ValueError("response too large")
+        data = json.loads(body)
+        if data.get("code") == 0:
+            sys.exit(0)
+        print(f"Feishu message failed: code={data.get('"'"'code'"'"')}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (429, 500, 502, 503, 504):
+            print(f"Feishu message HTTP {exc.code}", file=sys.stderr)
+            sys.exit(1)
+        delay = retry_delay(exc.headers)
+    except Exception:
+        if attempt == 2:
+            print("Feishu message request failed", file=sys.stderr)
+            sys.exit(1)
+    if attempt < 2:
+        time.sleep(delay)
+sys.exit(1)
+'
+}
+
+channel_configured() {
+  case "$1" in
+    telegram) [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]] ;;
+    feishu) [[ -n "${FEISHU_APP_ID:-}" && "${FEISHU_RECEIVE_ID:-}" =~ ^ou_[A-Za-z0-9_-]+$ ]] && feishu_secret_to_stdout >/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+send_channel() {
+  case "$1" in
+    telegram) telegram_send_message "$2" ;;
+    feishu) feishu_send_message "$2" ;;
+    *) return 2 ;;
+  esac
+}
+
+send_configured_channels() {
+  local text="$1" channel config_failed=0 send_failed=0
+  IFS=',' read -r -a selected <<<"$NOTIFY_CHANNELS"
+  for channel in "${selected[@]}"; do
+    if ! channel_configured "$channel"; then
+      config_failed=1
+      say "$channel 配置或凭据缺失" "$channel configuration or credential missing" >&2
+      continue
+    fi
+    if send_channel "$channel" "$text"; then
+      log_event "$channel sent host=$HOST"
+    else
+      send_failed=1
+      log_event "$channel failed host=$HOST"
+    fi
+  done
+  [[ "$config_failed" -eq 0 ]] || return 2
+  [[ "$send_failed" -eq 0 ]] || return 1
+}
+
 load_config_file "$ENV_FILE" || exit $?
+NOTIFY_CHANNELS="${NOTIFY_CHANNELS:-telegram}"
+normalize_notify_channels || exit $?
 
 HOST="${HOST_LABEL:-$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown)}"
 INCLUDE_PUBLIC_IP="${INCLUDE_PUBLIC_IP:-1}"
@@ -775,6 +976,7 @@ run_doctor() {
   say "配置文件: $ENV_FILE" "Config: $ENV_FILE"
   [[ -r "$ENV_FILE" ]] && say "正常：配置可读" "OK config readable" || { say "失败：配置不可读" "FAIL config not readable"; ok=0; }
   say "后端: $BACKEND" "Backend: $BACKEND"
+  say "通知渠道: $NOTIFY_CHANNELS" "Notification channels: $NOTIFY_CHANNELS"
   say "主机: $HOST" "Host: $HOST"
   [[ "$INCLUDE_PUBLIC_IP" -eq 1 ]] && say "公网 IP: $PUBLIC_IP_VALUE" "Public IP: $PUBLIC_IP_VALUE"
   say "系统: $OS" "OS: $OS"
@@ -800,17 +1002,37 @@ run_doctor() {
       ;;
     *) say "失败：不支持的后端 $BACKEND" "FAIL unsupported backend $BACKEND"; ok=0 ;;
   esac
-  if [[ "$DOCTOR_SKIP_TELEGRAM" -eq 1 ]]; then
-    say "跳过：Telegram 联通性检查" "SKIP Telegram connectivity check"
-  elif [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
-    say "正常：Telegram 配置存在" "OK Telegram config present"
-    if telegram_get_me >/dev/null; then
-      say "正常：Telegram Bot Token 可用" "OK Telegram bot token works"
-    else
-      say "失败：Telegram getMe 失败" "FAIL Telegram getMe failed"; ok=0
-    fi
+  if [[ "$DOCTOR_SKIP_NOTIFY" -eq 1 ]]; then
+    say "跳过：通知渠道联通性检查" "SKIP notification connectivity checks"
   else
-    say "失败：Telegram 配置缺失" "FAIL Telegram config missing"; ok=0
+    if channel_selected telegram && [[ "$DOCTOR_SKIP_TELEGRAM" -eq 1 ]]; then
+      say "跳过：Telegram 联通性检查" "SKIP Telegram connectivity check"
+    elif channel_selected telegram; then
+      if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
+        say "正常：Telegram 配置存在" "OK Telegram config present"
+        if telegram_get_me >/dev/null; then
+          say "正常：Telegram Bot Token 可用" "OK Telegram bot token works"
+        else
+          say "失败：Telegram getMe 失败" "FAIL Telegram getMe failed"; ok=0
+        fi
+      else
+        say "失败：Telegram 配置缺失" "FAIL Telegram config missing"; ok=0
+      fi
+    fi
+    if channel_selected feishu && [[ "$DOCTOR_SKIP_FEISHU" -eq 1 ]]; then
+      say "跳过：飞书联通性检查" "SKIP Feishu connectivity check"
+    elif channel_selected feishu; then
+      if channel_configured feishu; then
+        say "正常：飞书配置和凭据存在" "OK Feishu config and credential present"
+        if feishu_get_token >/dev/null; then
+          say "正常：飞书 App Secret 可用" "OK Feishu App Secret works"
+        else
+          say "失败：飞书 token 获取失败" "FAIL Feishu token request failed"; ok=0
+        fi
+      else
+        say "失败：飞书配置或凭据缺失" "FAIL Feishu config or credential missing"; ok=0
+      fi
+    fi
   fi
   # 安全更新看门狗：自动更新健康 / 待安装安全更新 / 发行版 EOL。
   # Security-update watchdog: auto-update health / pending security updates / distro EOL.
@@ -850,7 +1072,9 @@ if [[ "$UPGRADE_NOTICE" -eq 1 ]]; then
   if [[ "${NOTIFY_UPGRADE:-0}" == "1" ]]; then
     if [[ "$NOTIFY_LANG" == "en" ]]; then msg="$en_msg"; else msg="$zh_msg"; fi
     msg="${msg//\\n/$'\n'}"
-    telegram_send_message "$msg"
+    # Upgrade notices are explicitly best-effort: the installer is already complete,
+    # and a retry of a partial dual-send would duplicate the successful channel.
+    send_configured_channels "$msg" || true
   fi
   exit 0
 fi
@@ -872,7 +1096,7 @@ check_apt() {
   fi
   if [[ -f /var/run/reboot-required ]]; then
     reboot_required=1
-    reboot_pkgs="$(cat /var/run/reboot-required.pkgs 2>/dev/null | sed '/^$/d' | sort -u)"
+    reboot_pkgs="$(head -c 1048576 /var/run/reboot-required.pkgs 2>/dev/null | sed '/^$/d' | sort -u)"
   fi
   if command -v needrestart >/dev/null 2>&1; then
     # 只取 stdout（批处理字段）；stderr 的瞬时告警不进摘要/哈希，避免污染去重。
@@ -1097,38 +1321,47 @@ msg="${msg//\\n/$'\n'}"
 # Dedup hash uses only decision-relevant, cross-run-stable fields: excludes PUBLIC_IP (dynamic egress
 # IP) and the raw summary (transient output), using restart_signal (normalized kernel/service signal).
 alert_hash="$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$HOST" "$BACKEND" "$NOTIFY_LANG" "$reboot_required" "$reboot_pkgs" "$restart_attention" "$restart_signal" "$HEALTH_ATTENTION" "$HEALTH_SIG" "$EOL_ATTENTION" "$EOL_SIG" | sha256sum | awk '{print $1}')"
-last_hash="$(cat "$STATE_FILE" 2>/dev/null || true)"
-last_sent="$(cat "$STATE_TIME_FILE" 2>/dev/null || echo 0)"
 now_epoch="$(date +%s)"
 dedup_mode="${DEDUP_MODE:-daily}"
 dedup_days="${DEDUP_INTERVAL_DAYS:-3}"
 [[ "$dedup_days" =~ ^[0-9]+$ && "$dedup_days" -ge 1 ]] || dedup_days=3
-should_send=1
-if [[ "$NO_DEDUPE" -ne 1 && "$alert_hash" == "$last_hash" ]]; then
+
+state_paths_for_channel() {
+  case "$1" in
+    telegram)
+      STATE_FILE="$STATE_DIR/last-alert.sha256"
+      STATE_TIME_FILE="$STATE_DIR/last-alert.sent_at"
+      ;;
+    feishu)
+      STATE_FILE="$STATE_DIR/last-alert.feishu.sha256"
+      STATE_TIME_FILE="$STATE_DIR/last-alert.feishu.sent_at"
+      ;;
+  esac
+}
+
+channel_should_send() {
+  local channel="$1" last_hash last_sent last_day today interval_seconds
+  state_paths_for_channel "$channel"
+  last_hash="$(cat "$STATE_FILE" 2>/dev/null || true)"
+  last_sent="$(cat "$STATE_TIME_FILE" 2>/dev/null || echo 0)"
+  [[ "$NO_DEDUPE" -eq 1 || "$alert_hash" != "$last_hash" ]] && return 0
   case "$dedup_mode" in
-    once|always) should_send=0 ;;  # always 为旧名，兼容保留 / always kept as a legacy alias for once
+    once|always) return 1 ;;  # always 为旧名，兼容保留 / always kept as a legacy alias for once
     daily)
       last_day="$(date -d "@$last_sent" +%F 2>/dev/null || echo '')"
       today="$(date +%F)"
-      [[ "$last_day" == "$today" ]] && should_send=0
+      [[ "$last_day" != "$today" ]]
       ;;
     interval|*)
       interval_seconds=$(( dedup_days * 86400 ))
-      if [[ "$last_sent" =~ ^[0-9]+$ ]] && (( now_epoch - last_sent < interval_seconds )); then should_send=0; fi
+      [[ ! "$last_sent" =~ ^[0-9]+$ ]] || (( now_epoch - last_sent >= interval_seconds ))
       ;;
   esac
-fi
-if [[ "$should_send" -eq 0 ]]; then
-  log_event "dedup suppressed backend=$BACKEND host=$HOST mode=$dedup_mode hash=$alert_hash"
-  exit 0
-fi
+}
 
-if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
-  say "在 $ENV_FILE 中缺少 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID" "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in $ENV_FILE" >&2
-  exit 2
-fi
-
-if telegram_send_message "$msg"; then
+write_channel_state() {
+  local channel="$1" state_tmp="" time_tmp=""
+  state_paths_for_channel "$channel"
   # 原子写状态：临时文件 + rename，避免崩溃或磁盘满时留下被截断/清空的状态文件（">" 会先截断再写）。
   # hash 先于时间戳落盘；即便两次 rename 之间崩溃，残留的旧时间戳只会让下次更倾向“发送”，绝不会静默抑制真实告警。
   # Atomic state write: temp file + rename so a crash/ENOSPC can't leave a truncated/empty state file
@@ -1149,9 +1382,30 @@ if telegram_send_message "$msg"; then
     printf '%s\n' "$alert_hash" >"$STATE_FILE" 2>/dev/null || true
     printf '%s\n' "$now_epoch" >"$STATE_TIME_FILE" 2>/dev/null || true
   fi
-  log_event "telegram sent backend=$BACKEND host=$HOST reboot_required=$reboot_required restart_attention=$restart_attention hash=$alert_hash"
-else
-  log_event "telegram failed backend=$BACKEND host=$HOST"
-  say "Telegram 通知发送失败" "Telegram notification failed" >&2
-  exit 1
-fi
+}
+
+config_failed=0
+send_failed=0
+IFS=',' read -r -a selected_channels <<<"$NOTIFY_CHANNELS"
+for channel in "${selected_channels[@]}"; do
+  if ! channel_should_send "$channel"; then
+    log_event "$channel dedup suppressed backend=$BACKEND host=$HOST mode=$dedup_mode hash=$alert_hash"
+    continue
+  fi
+  if ! channel_configured "$channel"; then
+    config_failed=1
+    say "$channel 配置或凭据缺失" "$channel configuration or credential missing" >&2
+    continue
+  fi
+  if send_channel "$channel" "$msg"; then
+    write_channel_state "$channel"
+    log_event "$channel sent backend=$BACKEND host=$HOST reboot_required=$reboot_required restart_attention=$restart_attention hash=$alert_hash"
+  else
+    send_failed=1
+    log_event "$channel failed backend=$BACKEND host=$HOST"
+    say "$channel 通知发送失败" "$channel notification failed" >&2
+  fi
+done
+[[ "$config_failed" -eq 0 ]] || exit 2
+[[ "$send_failed" -eq 0 ]] || exit 1
+exit 0

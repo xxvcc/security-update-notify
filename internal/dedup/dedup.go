@@ -103,6 +103,16 @@ func NewStore(dir string) *Store {
 	}
 }
 
+// NewChannelStore constructs an independent store for a non-legacy channel. Telegram deliberately
+// keeps using NewStore so an upgrade does not forget its existing delivery state and resend alerts.
+func NewChannelStore(dir, channel string) *Store {
+	return &Store{
+		Dir:      dir,
+		HashFile: filepath.Join(dir, "last-alert."+channel+".sha256"),
+		TimeFile: filepath.Join(dir, "last-alert."+channel+".sent_at"),
+	}
+}
+
 // ReadLast 读回上次 hash 与发送时间戳；缺失或非法时分别返回 ""、0。回读会裁掉所有尾部换行
 // （Bash 用 `cat` 捕获，若不裁，Go 会误判为不同 hash 而每次重发）。
 func (s *Store) ReadLast() (hash string, sentAt int64) {

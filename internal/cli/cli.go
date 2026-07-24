@@ -40,7 +40,7 @@ func Main(ver string, args []string) int {
 // runMode 解析运行时 flag 并按模式分发（裸调用 = 运行检查）。
 func runMode(ver string, args []string) int {
 	var f run.DryRunFlags
-	var doctor, checkUpgrade, selfUpgrade, notifyUpgrade, skipTelegram bool
+	var doctor, checkUpgrade, selfUpgrade, notifyUpgrade, skipTelegram, skipFeishu, skipNotify bool
 	var uiLang, upgradeFrom, upgradeTo string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -65,6 +65,10 @@ func runMode(ver string, args []string) int {
 			notifyUpgrade = true
 		case "--skip-telegram", "--skip-telegram-test":
 			skipTelegram = true
+		case "--skip-feishu", "--skip-feishu-test":
+			skipFeishu = true
+		case "--skip-notify", "--skip-notify-test":
+			skipNotify = true
 		case "--lang":
 			var ok bool
 			if uiLang, ok = takeValue(args, &i); !ok {
@@ -113,7 +117,10 @@ func runMode(ver string, args []string) int {
 
 	switch {
 	case doctor:
-		return run.Doctor(cfg, run.DoctorOpts{Version: ver, Lang: displayLang, SkipTelegram: skipTelegram, EnvPath: envFile()})
+		return run.Doctor(cfg, run.DoctorOpts{
+			Version: ver, Lang: displayLang, SkipTelegram: skipTelegram, SkipFeishu: skipFeishu,
+			SkipNotify: skipNotify, EnvPath: envFile(),
+		})
 	case notifyUpgrade:
 		return run.NotifyUpgradeEvent(cfg, ver, upgradeFrom, upgradeTo)
 	default:
@@ -139,10 +146,9 @@ func envFile() string {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `Usage: security-update-notify [--test-ok] [--test-reboot] [--no-dedupe] [--dry-run] [--lang zh|en] [--version]
+	fmt.Fprintln(os.Stderr, `Usage: security-update-notify [--test-ok] [--test-reboot] [--no-dedupe] [--dry-run] [--doctor] [--check-upgrade] [--upgrade] [--lang zh|en] [--version]
 
-Checks OS backend reboot/service-restart state, then sends Telegram alerts.
-(--doctor / --check-upgrade / --upgrade are being ported; see docs/go-port.md)
+Checks OS backend reboot/service-restart state, then sends configured notifications.
 
 Trust helper subcommands:
   version-newer <current> <latest>

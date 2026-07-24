@@ -12,7 +12,6 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/httpx"
 	"github.com/xxvcc/security-update-notify/internal/i18n"
 	"github.com/xxvcc/security-update-notify/internal/notify"
-	"github.com/xxvcc/security-update-notify/internal/telegram"
 	"github.com/xxvcc/security-update-notify/internal/version"
 )
 
@@ -48,7 +47,9 @@ func CheckUpgrade(ver string, lang i18n.Lang) int {
 	return 0
 }
 
-// NotifyUpgradeEvent 复刻 --notify-upgrade-event：仅当 NOTIFY_UPGRADE=1 时发送升级成功通知。始终返回 0。
+// NotifyUpgradeEvent 复刻 --notify-upgrade-event：仅当 NOTIFY_UPGRADE=1 时发送升级成功通知。
+// 升级已经完成，因此通知显式采用 best-effort 语义并始终返回 0，避免部分双发失败后
+// 外部重试整个命令、重复已经成功的渠道。
 func NotifyUpgradeEvent(cfg *config.Config, ver, from, to string) int {
 	if from == "" {
 		from = "unknown"
@@ -70,12 +71,16 @@ func NotifyUpgradeEvent(cfg *config.Config, ver, from, to string) int {
 		To:              to,
 		Now:             time.Now().Format("2006-01-02 15:04:05 MST"),
 	})
-	token := cfg.Get("TELEGRAM_BOT_TOKEN")
-	chat := cfg.Get("TELEGRAM_CHAT_ID")
-	if token == "" || chat == "" {
+	channels, err := configuredChannels(cfg)
+	if err != nil {
 		return 0
 	}
-	client := &telegram.Client{HTTP: httpx.New(30 * time.Second), BaseURL: os.Getenv(telegramBaseURLEnv)}
-	_ = client.SendMessage(context.Background(), token, chat, msg)
+	for _, name := range channels {
+		sender, err := senderFor(cfg, name)
+		if err != nil {
+			continue
+		}
+		_ = sender.Send(context.Background(), msg)
+	}
 	return 0
 }

@@ -22,17 +22,19 @@ import (
 // cSpace 是 C locale 下 [[:space:]] 的字符集，用于值的首尾裁剪与行首空白判定。
 const cSpace = " \t\n\v\f\r"
 
-// whitelist 是运行时 load_config_file 接受的 15 个键（非此集合的合法键 → fail-closed）。
+// whitelist 是运行时 load_config_file 接受的配置键（非此集合的合法键 → fail-closed）。
 var whitelist = map[string]bool{
 	"TELEGRAM_BOT_TOKEN": true, "TELEGRAM_CHAT_ID": true, "HOST_LABEL": true, "PUBLIC_IP": true,
 	"INCLUDE_PUBLIC_IP": true, "NOTIFY_OK": true, "NOTIFY_UPGRADE": true, "DEDUP_MODE": true,
 	"DEDUP_INTERVAL_DAYS": true, "NOTIFY_LANG": true, "BACKEND": true, "CONFIG_VERSION": true,
 	"CHECK_UPDATE_HEALTH": true, "STALE_UPDATE_DAYS": true, "CHECK_EOL": true,
+	"NOTIFY_CHANNELS": true, "FEISHU_APP_ID": true, "FEISHU_RECEIVE_ID": true,
 }
 
 // writeOrder 是安装器写 telegram.env 的固定键序（CONFIG_VERSION 在最前）。逐字节兼容的关键之一。
 var writeOrder = []string{
-	"CONFIG_VERSION", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "HOST_LABEL", "PUBLIC_IP",
+	"CONFIG_VERSION", "NOTIFY_CHANNELS", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+	"FEISHU_APP_ID", "FEISHU_RECEIVE_ID", "HOST_LABEL", "PUBLIC_IP",
 	"INCLUDE_PUBLIC_IP", "NOTIFY_OK", "NOTIFY_UPGRADE", "DEDUP_MODE", "DEDUP_INTERVAL_DAYS",
 	"NOTIFY_LANG", "BACKEND", "CHECK_UPDATE_HEALTH", "STALE_UPDATE_DAYS", "CHECK_EOL",
 }
@@ -159,11 +161,11 @@ func quote(value string) string {
 }
 
 // 两行双语头注释，必须与安装器写出的字节完全一致。
-const header1 = "# security-update-notify 的 Telegram 通知设置；NOTIFY_LANG 控制发送语言：zh 中文，en English / Telegram notification settings for security-update-notify; NOTIFY_LANG controls the sent language: zh Chinese, en English."
-const header2 = "# 请保持此文件仅 root 可读：它包含 Bot Token / Keep this file root-only: it contains the bot token."
+const header1 = "# security-update-notify 通知设置；NOTIFY_CHANNELS 可选 telegram、feishu 或两者 / Notification settings; NOTIFY_CHANNELS may be telegram, feishu, or both."
+const header2 = "# 请保持此文件仅 root 可读；飞书 App Secret 使用独立 systemd/root credential，不写入此文件 / Keep this file root-only; the Feishu App Secret uses a separate systemd/root credential, not this file."
 
-// Write 以安装器的逐字节格式写出 telegram.env：两行头注释 + 15 个键（固定写序、config_quote 引用）。
-// 强制 CONFIG_VERSION=2，并把 DEDUP_MODE 的旧值 always 迁移为 once（与安装器一致）。缺失键写空值。
+// Write 以安装器的逐字节格式写出 telegram.env：两行头注释 + 18 个键（固定写序、config_quote 引用）。
+// 强制 CONFIG_VERSION=3，并把 DEDUP_MODE 的旧值 always 迁移为 once（与安装器一致）。缺失键写空值。
 func Write(w io.Writer, values map[string]string) error {
 	bw := bufio.NewWriter(w)
 	if _, err := fmt.Fprintln(bw, header1); err != nil {
@@ -176,7 +178,11 @@ func Write(w io.Writer, values map[string]string) error {
 		v := values[k]
 		switch k {
 		case "CONFIG_VERSION":
-			v = "2" // 始终写入当前 schema 版本，不沿用旧值
+			v = "3" // 始终写入当前 schema 版本，不沿用旧值
+		case "NOTIFY_CHANNELS":
+			if v == "" {
+				v = "telegram" // 旧配置无此键时保持原有 Telegram 行为
+			}
 		case "DEDUP_MODE":
 			if v == "always" {
 				v = "once" // 迁移旧值

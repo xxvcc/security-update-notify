@@ -22,6 +22,8 @@ case "${UI_LANG:-}" in zh|en) ;; *) UI_LANG=zh ;; esac
 
 systemctl disable --now security-update-notify.timer 2>/dev/null || true
 rm -f /etc/systemd/system/security-update-notify.service /etc/systemd/system/security-update-notify.timer
+rm -f /etc/systemd/system/security-update-notify.service.d/credentials.conf
+rmdir /etc/systemd/system/security-update-notify.service.d 2>/dev/null || true
 rm -f /etc/logrotate.d/security-update-notify
 rm -f /usr/local/sbin/security-update-notify
 # 加 || true：在无 systemd 总线的环境（容器/降级 init）daemon-reload 会非零退出；若不容错，set -e
@@ -30,6 +32,7 @@ systemctl daemon-reload || true
 
 if [[ "$PURGE_CONFIG" -eq 1 ]]; then
   rm -rf /etc/security-update-notify /var/lib/security-update-notify /etc/logrotate.d/security-update-notify /var/backups/security-update-notify
+  rm -f /etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred
   rm -f /var/log/security-update-notify.log /var/log/security-update-notify.log.*
   if [[ -f /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak ]]; then
     cp -a /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak /etc/apt/apt.conf.d/20auto-upgrades
@@ -50,7 +53,7 @@ if [[ "$PURGE_CONFIG" -eq 1 ]]; then
     cp -a "$latest_dnf_backup" /etc/dnf/automatic.conf
     say "已从 $latest_dnf_backup 恢复 /etc/dnf/automatic.conf。" "Restored /etc/dnf/automatic.conf from $latest_dnf_backup."
   fi
-  say "已同时删除配置、状态与升级备份（含 token 副本）；作为依赖安装的软件包已保留。" "Removed config, state, and upgrade backups (which held token copies). Packages installed as dependencies were left in place."
+  say "已同时删除配置、通知凭据、状态与升级备份（含 token 副本）；作为依赖安装的软件包已保留。" "Removed config, notification credentials, state, and upgrade backups (which held token copies). Packages installed as dependencies were left in place."
 fi
 
 say "已卸载 security-update-notify。" "Uninstalled security-update-notify."

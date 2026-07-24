@@ -9,13 +9,9 @@ import (
 
 	"github.com/xxvcc/security-update-notify/internal/config"
 	"github.com/xxvcc/security-update-notify/internal/dedup"
-	"github.com/xxvcc/security-update-notify/internal/httpx"
+	"github.com/xxvcc/security-update-notify/internal/delivery"
 	"github.com/xxvcc/security-update-notify/internal/lock"
-	"github.com/xxvcc/security-update-notify/internal/telegram"
 )
-
-// telegramBaseURLEnv 是仅供测试/差分用的 Telegram API 基址覆盖（生产恒为官方地址）。
-const telegramBaseURLEnv = "SECURITY_UPDATE_NOTIFY_TELEGRAM_BASE_URL"
 
 // DryRunFlags 扩展 Flags：仅计算并打印 hash 与将发送的正文，不加锁、不发送、不写状态、不记日志。
 // 用于人工观察与 bash↔Go 差分测试。
@@ -34,6 +30,11 @@ func Execute(cfg *config.Config, f DryRunFlags) int {
 			fmt.Print(out.Message)
 		}
 		return 0
+	}
+	channels, err := configuredChannels(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Invalid NOTIFY_CHANNELS: "+err.Error())
+		return 2
 	}
 
 	// 单实例锁（与 Bash 一样尽早获取，抢不到说明已有实例在跑，静默退出 0）。
@@ -73,34 +74,65 @@ func Execute(cfg *config.Config, f DryRunFlags) int {
 			b01(in.Health.Attention), b01(in.EOL.Attention), in.Pending.Count))
 	}
 
-	// 去重决策。
-	store := dedup.NewStore(stateDirPath())
-	lastHash, lastSent := store.ReadLast()
-	now := time.Now().Unix()
-	curHash := out.Hash()
-	mode := orDefault(cfg.Get("DEDUP_MODE"), "daily")
-	if !dedup.ShouldSend(f.NoDedupe, curHash, lastHash, lastSent, now, mode, dedupInterval(cfg)) {
-		logEvent(fmt.Sprintf("dedup suppressed backend=%s host=%s mode=%s hash=%s", backend, host, mode, curHash))
-		return 0
-	}
+	return deliverChannels(cfg, channels, out.Message, out.Hash(), backend, host,
+		in.Restart.RebootRequired, in.Restart.RestartAttention, f.NoDedupe, time.Now().Unix(), senderFor)
+}
 
-	token := cfg.Get("TELEGRAM_BOT_TOKEN")
-	chat := cfg.Get("TELEGRAM_CHAT_ID")
-	if token == "" || chat == "" {
-		fmt.Fprintln(os.Stderr, "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+type senderFactory func(*config.Config, string) (delivery.Sender, error)
+
+func deliverChannels(cfg *config.Config, channels []string, message, curHash, backend, host string,
+	rebootRequired, restartAttention, noDedupe bool, now int64, factory senderFactory,
+) int {
+	mode := orDefault(cfg.Get("DEDUP_MODE"), "daily")
+	configFailed := false
+	sendFailed := false
+	type pendingDelivery struct {
+		name   string
+		store  *dedup.Store
+		sender delivery.Sender
+	}
+	var pending []pendingDelivery
+	for _, name := range channels {
+		store := channelStore(name)
+		lastHash, lastSent := store.ReadLast()
+		if !dedup.ShouldSend(noDedupe, curHash, lastHash, lastSent, now, mode, dedupInterval(cfg)) {
+			logEvent(fmt.Sprintf("dedup suppressed channel=%s backend=%s host=%s mode=%s hash=%s", name, backend, host, mode, curHash))
+			continue
+		}
+		sender, err := factory(cfg, name)
+		if err != nil {
+			configFailed = true
+			logEvent(fmt.Sprintf("%s failed backend=%s host=%s reason=config", name, backend, host))
+			fmt.Fprintf(os.Stderr, "%s configuration failed: %v\n", channelLabel(name), err)
+			continue
+		}
+		pending = append(pending, pendingDelivery{name: name, store: store, sender: sender})
+	}
+	for _, item := range pending {
+		if err := item.sender.Send(context.Background(), message); err != nil {
+			sendFailed = true
+			logEvent(fmt.Sprintf("%s failed backend=%s host=%s", item.name, backend, host))
+			fmt.Fprintf(os.Stderr, "%s notification failed: %v\n", channelLabel(item.name), err)
+			continue
+		}
+		_ = item.store.Write(curHash, now)
+		logEvent(fmt.Sprintf("%s sent backend=%s host=%s reboot_required=%s restart_attention=%s hash=%s",
+			item.name, backend, host, b01(rebootRequired), b01(restartAttention), curHash))
+	}
+	if configFailed {
 		return 2
 	}
-
-	client := &telegram.Client{HTTP: httpx.New(30 * time.Second), BaseURL: os.Getenv(telegramBaseURLEnv)}
-	if err := client.SendMessage(context.Background(), token, chat, out.Message); err != nil {
-		logEvent(fmt.Sprintf("telegram failed backend=%s host=%s", backend, host))
-		fmt.Fprintln(os.Stderr, "Telegram notification failed: "+err.Error())
+	if sendFailed {
 		return 1
 	}
-	_ = store.Write(curHash, now)
-	logEvent(fmt.Sprintf("telegram sent backend=%s host=%s reboot_required=%s restart_attention=%s hash=%s",
-		backend, host, b01(in.Restart.RebootRequired), b01(in.Restart.RestartAttention), curHash))
 	return 0
+}
+
+func channelStore(name string) *dedup.Store {
+	if name == "telegram" {
+		return dedup.NewStore(stateDirPath())
+	}
+	return dedup.NewChannelStore(stateDirPath(), name)
 }
 
 func dedupInterval(cfg *config.Config) int {

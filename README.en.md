@@ -9,13 +9,13 @@
   <img alt="License" src="https://img.shields.io/badge/License-MIT-green?style=flat-square">
 </p>
 
-> Install security updates automatically. Get a clean Telegram alert only when a reboot or service restart needs your attention.
+> Install security updates automatically. Get a clean Telegram and/or Feishu alert only when a reboot or service restart needs your attention.
 
 **security-update-notify** — or **SUN** — is a small Linux utility for people who maintain servers and do not want to miss important post-update actions.
 
-It uses your distro's native update tools, runs from a systemd timer, and makes outbound-only HTTPS requests: alerts go to the Telegram Bot API; by default it also queries a public-IP echo service (api.ipify.org / ifconfig.me) for the egress IP (disable with `INCLUDE_PUBLIC_IP=0`, or set `PUBLIC_IP` manually); and it contacts GitHub on self-upgrade. No dashboard. No agent port. No remote-control bot.
+It uses your distro's native update tools, runs from a systemd timer, and makes outbound-only HTTPS requests: alerts go to the Telegram Bot API and/or Feishu Open Platform as configured; by default it also queries a public-IP echo service (api.ipify.org / ifconfig.me) for the egress IP (disable with `INCLUDE_PUBLIC_IP=0`, or set `PUBLIC_IP` manually); and it contacts GitHub on self-upgrade. No dashboard. No agent port. No remote-control bot.
 
-> Since **2.0**, the runtime is a statically-compiled **Go binary**, shipped per architecture (amd64/arm64/386/ppc64le/s390x); unbuilt architectures fall back to the self-contained Bash runtime. The **Go binary runtime** needs neither `python3` nor `curl`; the Bash fallback runtime, however, still depends on `python3` (for its Telegram calls and version/date math). The `install.sh` installer also uses `python3` for its Telegram preflight.
+> Since **2.0**, the runtime is a statically-compiled **Go binary**, shipped per architecture (amd64/arm64/386/ppc64le/s390x); unbuilt architectures fall back to the self-contained Bash runtime. The **Go binary runtime** needs neither `python3` nor `curl`; the Bash fallback runtime still depends on `python3` (for notification APIs and version/date math). The `install.sh` installer also uses `python3` for channel preflight checks.
 
 **Languages**: [中文](README.md) | English
 
@@ -42,17 +42,17 @@ SUN keeps the boring part automatic and makes the human part obvious.
 
 - **Automatic security updates** through official distro mechanisms.
 - **No automatic reboot** — you stay in control of downtime.
-- **Telegram alerts only when action is needed**.
+- **Telegram and Feishu, individually or together**: old configs remain Telegram-only; dual delivery keeps separate dedup state, so one failing channel does not repeat the other.
 - **Reboot and service-restart detection** with `needrestart` or `needs-restarting`.
 - **Security-update watchdog**: beyond kernel/service restarts, it watches three commonly-missed things — ① whether the auto-update mechanism itself is unhealthy (timer disabled, last run failed, no successful update for too long, disk nearly full); ② whether security updates are still pending (dnf also counts critical/important); ③ whether the distro's security support is ending or already ended (EOL). A mechanism problem or a past-EOL release triggers an alert; the pending count and an approaching EOL ride along with alerts as info. All three can be turned off in the config.
-- **Single-language UI (Chinese or English)**: the installer, menu and diagnostics pick a language as the first step (Chinese or English, default Chinese) and then render all terminal interaction in that one language — no more mixed zh/en. The choice also becomes the default Telegram alert language, overridable with `--notify-lang`.
+- **Single-language UI (Chinese or English)**: the installer, menu and diagnostics pick a language as the first step (Chinese or English, default Chinese) and then render all terminal interaction in that one language. The choice also becomes the default notification language, overridable with `--notify-lang`.
 - **Public IP in notifications**: auto-detect the server public IP by default; you can also set it manually or disable it. Auto-detection is done by the Go runtime with the standard library and adds no `curl`/`python3` dependency.
 - **Duplicate alert suppression**: once, daily, or every N days.
 - **Interactive and non-interactive install/upgrade**: rerunning the installer reuses the existing config.
 - **systemd timer based scheduling**.
 - **No inbound network listener**.
 
-Example Telegram alert (`NOTIFY_LANG=en`):
+Example notification (same body on Telegram and Feishu, `NOTIFY_LANG=en`):
 
 ```text
 ⚠️ Security update action required
@@ -88,15 +88,15 @@ SUN systemd timer
     ↓
 check post-update reboot / service-restart state
     ↓
-send Telegram message only if attention is required
+send to configured channels only if attention is required
 ```
 
 SUN does **not**:
 
 - reboot the server;
 - expose a web service;
-- accept Telegram commands;
-- use Telegram polling or webhooks;
+- accept Telegram or Feishu commands;
+- use Telegram polling/webhooks or Feishu event callbacks;
 - open any inbound port.
 
 ## Supported systems
@@ -129,7 +129,9 @@ These require `--allow-best-effort`:
 
 ## Quick start
 
-### 1. Create a Telegram bot
+### 1. Prepare notification channels
+
+Telegram:
 
 1. Open Telegram and talk to [@BotFather](https://t.me/BotFather).
 2. Create a bot and copy the bot token.
@@ -137,6 +139,14 @@ These require `--allow-best-effort`:
 4. Get your target chat ID.
 
 For groups, add the bot to the group and make sure it can send messages there.
+
+Feishu:
+
+1. Create a custom enterprise app in Feishu Open Platform and enable its bot.
+2. Grant `directory:employee:list`, `directory:employee.base.name.name:read`, `directory:employee.base.mobile:read`, and `im:message:send_as_bot`.
+3. Publish the app, include intended recipients in both its availability scope and directory data scope, and record the App ID and App Secret.
+
+During an interactive install, SUN accepts the App ID and a hidden App Secret, then paginates through active employees visible via Directory v1. It shows a numbered “localized Chinese name + mobile tail + `open_id`” list. Only the selected `open_id` is persisted; the name and mobile tail are shown only for human verification. Runtime notifications still send plain text directly to that `open_id` without querying the directory on every run. An `open_id` can differ between Feishu apps and must not be copied across apps; changing the App ID during an upgrade clears the previous recipient and requires a new selection or explicit `open_id`.
 
 ### 2. Install
 
@@ -154,20 +164,24 @@ cd security-update-notify
 sudo ./install.sh
 ```
 
-The installer first asks you to choose a UI language (Chinese or English, default Chinese): it sets the language for all subsequent interaction and the default Telegram alert language. It then asks for:
+The installer first asks for a UI language (Chinese or English, default Chinese), then lets you select Telegram, Feishu, or both. It asks for the matching channel credentials:
 
-- Telegram Bot Token;
-- Telegram Chat ID;
+- Telegram Bot Token / Chat ID; and/or
+- Feishu App ID / hidden App Secret, followed by a recipient choice from the automatic scan;
 - daily check time, default `09:00`;
 - duplicate-alert behavior;
 - whether to send an extra test message after installation.
 
 To skip the interactive language prompt, pass `--lang zh` or `--lang en`.
 
-Before writing the config, it verifies Telegram with:
+Before writing the config, it performs channel preflight checks:
 
-- `getMe` for the bot token;
-- `sendMessage` for the chat ID and bot permissions.
+- Telegram: `getMe` validates the bot token, then `sendMessage` validates the chat ID and permission;
+- Feishu: obtains a `tenant_access_token` and scans active employees in the application's directory scope. If an `open_id` was supplied explicitly, it performs only the application-credential preflight. No message is sent during installation preflight.
+
+Results are limited by the Feishu application's directory data scope. If scanning fails or returns no visible employees, the interactive installer can retry, accept a current-app `open_id` manually, or abort. Non-interactive mode requires `--feishu-receive-id` explicitly.
+
+Feishu receives a real test message only when you explicitly use `--send-test` or `test.sh --send-test`. Verify that the configured `open_id` is the intended recipient first.
 
 ### 3. Verify
 
@@ -185,6 +199,7 @@ Useful for provisioning scripts:
 
 ```bash
 sudo ./install.sh \
+  --notify-channels telegram \
   --telegram-token '123456:ABC...' \
   --telegram-chat-id 'CHAT_ID' \
   --time '09:00' \
@@ -196,6 +211,27 @@ sudo ./install.sh \
   --non-interactive \
   -y
 ```
+
+For non-interactive Feishu installation, provide the App Secret through a separate root-only source file. Do not put it in `.env` or on the command line:
+
+```bash
+sudo install -m 600 /dev/null /root/.security-update-notify-feishu-secret
+sudoedit /root/.security-update-notify-feishu-secret
+
+sudo ./install.sh \
+  --notify-channels feishu \
+  --feishu-app-id 'cli_xxx' \
+  --feishu-receive-id 'ou_xxx' \
+  --feishu-app-secret-file /root/.security-update-notify-feishu-secret \
+  --non-interactive \
+  -y
+```
+
+The App Secret source must be a root-owned regular file, not a symlink, with no group or other access (`0600` recommended). The installer validates these conditions and detects replacement during path validation before reading it.
+
+The installer stores the App Secret as an encrypted systemd credential when available. Older systemd versions fall back to a separate root-only `0600` file. Neither form enters the normal config or upgrade backups.
+
+After a successful install and credential check, remove the source file unless it is a stable entry point maintained by an external secret manager. This avoids retaining an unnecessary plaintext copy of the App Secret.
 
 For safer automation, use a local `.env` file so the token does not appear in shell history or process lists:
 
@@ -224,20 +260,26 @@ Common options:
 
 ```bash
 --env-file FILE            # read install config from dotenv-style file, recommended for automation
+--notify-channels LIST      # telegram | feishu | telegram,feishu
 --telegram-token-file FILE # read Telegram Bot Token from file
+--feishu-app-id APP_ID      # Feishu application App ID
+--feishu-receive-id OPEN_ID # explicit recipient override; required non-interactively
+--feishu-app-secret-file F  # read App Secret from a separate file
 --backend apt              # force apt backend
 --backend dnf              # force dnf backend
---notify-lang zh           # Telegram alert language: Chinese, default
---notify-lang en           # Telegram alert language: English
+--notify-lang zh           # notification language: Chinese, default
+--notify-lang en           # notification language: English
 --lang en                  # terminal interaction language: English (default zh)
 --public-ip IP             # manually set public IP in notifications; auto-detected at runtime when empty
 --include-public-ip 0      # disable public IP in notifications; default 1
 --notify-ok 1             # send OK notification when no action is needed; default 0
---notify-upgrade 1        # send Telegram notification after successful upgrade; default 0
+--notify-upgrade 1        # notify configured channels after successful upgrade; default 0
 --skip-post-install-check # skip post-install/upgrade self-check
 --allow-best-effort        # allow best-effort distro versions
 --send-test                # send an extra install-complete test message
 --skip-telegram-test       # skip Telegram preflight validation
+--skip-feishu-test         # skip separate credential preflight; selection still scans if needed
+--skip-notify-test         # skip all channel preflight validation
 ```
 
 
@@ -251,7 +293,7 @@ curl -fsSL https://sun.xxv.cc | sudo bash -s -- upgrade --non-interactive -y
 
 Once SUN is installed you can also run `sudo security-update-notify --upgrade` directly: it downloads the latest GitHub release, verifies `.sha256`, and requires a GPG signature against the pinned fingerprint (fail-closed by default — it refuses if the signature is missing) before upgrading.
 
-If SUN is already installed, the installer reads `/etc/security-update-notify/telegram.env` and the existing timer time first. Options not explicitly overridden by CLI flags or `--env-file` keep their old values, so you usually do not need to re-enter the Telegram token or chat ID. Before upgrading, key files are backed up to `/var/backups/security-update-notify/<timestamp>`; failed upgrades attempt an automatic rollback. A post-upgrade self-check runs by default; use `--notify-upgrade 1` to send a Telegram notification after a successful upgrade.
+If SUN is already installed, the installer reads `/etc/security-update-notify/telegram.env` and the existing timer time first. A legacy config without `NOTIFY_CHANNELS` automatically remains `telegram`; options not explicitly overridden keep their old values. Before upgrading, key files are backed up to `/var/backups/security-update-notify/<timestamp>`, but the Feishu App Secret is not copied there; failed upgrades attempt an automatic rollback. A post-upgrade self-check runs by default; use `--notify-upgrade 1` to notify the configured channels after a successful upgrade. Upgrade notices are best-effort: a notification failure never rolls back a completed upgrade, and the whole dual-send is not retried in a way that would duplicate a successful channel.
 
 ## Duplicate alert modes
 
@@ -262,6 +304,8 @@ If SUN is already installed, the installer reads `/etc/security-update-notify/te
 | `interval` | Send the same alert every N days. Default: `3`. |
 
 `daily` is the default: at most one reminder per day keeps nudging you while a reboot stays pending without spamming. For something quieter use `once` (only once) or `interval` (every N days).
+
+With dual delivery, each channel has independent state. If Telegram succeeds and Feishu fails, the next run retries only Feishu instead of repeating Telegram.
 
 ## Security-update watchdog
 
@@ -281,19 +325,22 @@ The pending security-update count is informational — it rides along with alert
 /usr/local/sbin/security-update-notify
 /etc/security-update-notify/telegram.env
 /etc/systemd/system/security-update-notify.service
+/etc/systemd/system/security-update-notify.service.d/credentials.conf  # encrypted Feishu credential
 /etc/systemd/system/security-update-notify.timer
+/etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred # newer systemd
+/etc/security-update-notify/credentials/feishu-app-secret              # older-systemd fallback
 /etc/logrotate.d/security-update-notify
 /var/lib/security-update-notify/
 /var/log/security-update-notify.log
 ```
 
-Telegram credentials and notification options are stored in:
+Notification options, the Telegram Bot Token, Feishu App ID, and recipient `open_id` are stored in:
 
 ```text
 /etc/security-update-notify/telegram.env
 ```
 
-The installer writes it as root-only (`0600`).
+The installer writes it as root-only (`0600`). The Feishu App Secret is never written there: it uses an encrypted systemd credential when available, or a separate root-only `0600` file on older systemd. Normal upgrade backups do not copy the App Secret.
 
 ## Backend details
 
@@ -349,12 +396,14 @@ Run a check now:
 sudo systemctl start security-update-notify.service
 ```
 
-Change Telegram alert language after installation:
+Change the notification language after installation:
 
 ```bash
 sudoedit /etc/security-update-notify/telegram.env
 # Set NOTIFY_LANG=zh (Chinese) or NOTIFY_LANG=en (English)
 ```
+
+Rerun the installer to change channels, the Feishu app, or its recipient. The installer validates the App ID/app-scoped `open_id` binding and creates, migrates, or removes the App Secret credential; do not bypass those steps by editing only `NOTIFY_CHANNELS`.
 
 Run built-in diagnostics:
 
@@ -384,7 +433,7 @@ Remove config and state too:
 sudo ./uninstall.sh --purge-config
 ```
 
-Packages installed as dependencies are left in place. `--purge-config` removes SUN config/state, upgrade backups (which contain bot-token copies) and rotated logs, and restores apt/dnf automatic-update config when a SUN-created backup exists.
+Packages installed as dependencies are left in place. `--purge-config` removes SUN config, Telegram/Feishu credentials, state, upgrade backups (which may contain bot-token copies) and rotated logs, and restores apt/dnf automatic-update config when a SUN-created backup exists.
 
 ## Release signatures
 
@@ -396,11 +445,11 @@ Official releases (builds for a version with a corresponding `vX.Y.Z` tag, or bu
 
 SUN is intentionally narrow:
 
-- outbound HTTPS only: alerts to the Telegram Bot API; by default also a public-IP echo service (api.ipify.org / ifconfig.me) for the egress IP (disable with `INCLUDE_PUBLIC_IP=0`); GitHub on self-upgrade. If you lock this down with an egress firewall, allow those destinations or disable the corresponding features;
+- outbound HTTPS only: alerts to the Telegram Bot API and/or `open.feishu.cn` as configured; by default also a public-IP echo service (api.ipify.org / ifconfig.me) for the egress IP (disable with `INCLUDE_PUBLIC_IP=0`); GitHub on self-upgrade. If you lock this down with an egress firewall, allow those destinations or disable the corresponding features;
 - no command receiver;
 - no public HTTP endpoint;
 - no automatic reboot;
-- root-only Telegram credential file;
+- root-only normal notification config; the Feishu App Secret uses a separate systemd/root credential and never enters normal config, command lines, logs, or upgrade backups;
 - explicit opt-in for best-effort distro support.
 
 The release `.sha256` file protects against accidental corruption or version mismatch. If your threat model includes a compromised download source, keep the default signature verification enabled and do not use `--verify-signature off` or the unsigned-upgrade escape hatch.
@@ -410,10 +459,20 @@ The release `.sha256` file protects against accidental corruption or version mis
 From the source checkout:
 
 ```bash
-bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify
+bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify \
+  build/compat-test.sh build/rollback-test.sh build/bash-feishu-test.sh \
+  build/install-feishu-onboarding-test.sh
+go vet ./...
+go test -race -cover ./...
+build/bash-feishu-test.sh
+build/install-feishu-onboarding-test.sh
+build/compat-test.sh
+build/rollback-test.sh
 ./package.sh
 cd dist && sha256sum -c security-update-notify-*.tar.gz.sha256
 ```
+
+`build/compat-test.sh` and `build/rollback-test.sh` use Docker. The remaining commands use the project's declared Go toolchain and local shell tooling.
 
 Generated files:
 

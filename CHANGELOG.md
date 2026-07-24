@@ -1,5 +1,25 @@
 # 变更记录
 
+## 2.1.0
+
+新增 Telegram / 飞书可选通知渠道，并完整覆盖 Go 主运行时、Bash 备用运行时、安装升级、自检和升级通知。
+Adds selectable Telegram / Feishu notification channels across the Go runtime, Bash fallback, installation/upgrades, diagnostics, and upgrade notifications.
+
+- 通知渠道：新增 `NOTIFY_CHANNELS=telegram|feishu|telegram,feishu`；旧配置缺少该项时仍默认为 Telegram，无需手工迁移。飞书固定使用应用级 `open_id` 单发普通文本。
+  Notification channels: add `NOTIFY_CHANNELS=telegram|feishu|telegram,feishu`; legacy configs without it remain Telegram-only with no manual migration. Feishu sends plain text to an app-scoped `open_id` only.
+- 安装选人：交互安装在输入飞书 App ID / Secret 后，通过 Directory v1 分页扫描应用可见的在职员工，显示中文名、手机号尾号和 `open_id` 供编号选择；只持久化选中的 `open_id`。保留手动回退，非交互安装仍要求显式 `--feishu-receive-id`。
+  Recipient onboarding: after the Feishu App ID / Secret, interactive installation paginates active employees visible via Directory v1 and shows localized Chinese name, mobile tail, and `open_id` for numbered selection; only the chosen `open_id` is persisted. Manual fallback remains available, while non-interactive installation still requires `--feishu-receive-id` explicitly.
+- 作用域与故障安全：更换 App ID 时不再静默复用旧应用的 `open_id`；Directory 部分成功响应会中止选人，飞书限流按官方响应重试；凭据加密/写入失败会可靠触发完整回滚。
+  Scope and failure safety: changing the App ID no longer silently reuses the previous app-scoped `open_id`; partial Directory responses abort selection, Feishu rate limits follow the API retry signals, and credential encryption/write failures reliably trigger a full rollback.
+- 独立去重：Telegram 继续使用历史 `last-alert.*` 状态文件，飞书使用独立状态；双发部分失败后只重试失败渠道，不会重复已成功渠道。
+  Independent deduplication: Telegram keeps its historical `last-alert.*` files while Feishu uses separate state; after a partial dual-delivery failure, only the failed channel is retried.
+- 凭据安全：飞书 App Secret 不进入普通配置、命令行、环境变量或升级备份；新 systemd 优先使用加密 credential，旧版本回退到独立 root-only `0600` 文件。停用飞书、卸载清理与失败回滚均覆盖两种凭据。
+  Credential safety: the Feishu App Secret never enters normal config, command lines, environment variables, or upgrade backups; newer systemd uses an encrypted credential, with a separate root-only `0600` file fallback. Disabling Feishu, uninstall cleanup, and rollback cover both forms.
+- 预检与诊断：Telegram 继续验证 token 与实际接收目标；飞书自动选人同时验证 App ID / Secret 和 Directory 权限，显式接收人路径只验证凭据，均不发送消息。`--doctor`、`test.sh`、升级成功通知和 Bash 回退均按配置渠道运行；升级通知明确采用 best-effort 语义。
+  Preflight and diagnostics: Telegram still validates the token and actual target; Feishu auto-selection validates both App ID / Secret and Directory access, while the explicit-recipient path validates credentials only, without sending. `--doctor`, `test.sh`, upgrade notifications, and the Bash fallback all honor configured channels; upgrade notices explicitly use best-effort semantics.
+- 测试/文档：新增飞书 API、渠道解析、双发部分失败、旧配置升级、Secret 不泄露和凭据回滚测试；更新中英文安装与安全说明。
+  Tests/docs: add coverage for the Feishu API, channel parsing, dual-delivery partial failure, legacy upgrades, Secret non-disclosure, and credential rollback; update Chinese and English installation/security guidance.
+
 ## 2.0.3
 
 安全与稳健性加固发布（三轮逐行审计的后续修复；未发现 critical/RCE）。运行时决策与去重哈希对正常输入保持不变。

@@ -37,6 +37,8 @@ rm -f /tmp/bash-only/files/security-update-notify-linux-*
     --host-label compat-host --skip-telegram-test --non-interactive -y --skip-post-install-check )
 ok "head -1 /usr/local/sbin/security-update-notify | grep -q 'bin/env bash'" "bash runtime installed"
 ok "grep -qF \"HOST_LABEL='compat-host'\" /etc/security-update-notify/telegram.env" "config written"
+ok "grep -qF \"CONFIG_VERSION='3'\" /etc/security-update-notify/telegram.env" "config upgraded to schema v3"
+ok "grep -qF \"NOTIFY_CHANNELS='telegram'\" /etc/security-update-notify/telegram.env" "legacy/default channel is Telegram"
 # 模拟一次此前的告警状态（升级后必须保留、不因升级而丢失或改变）。
 printf '%s\n' "67937ecd9dc8b78bb7bbb248d4ef6ef6ec0ac64ad65de2141dc171faec1803cd" >/var/lib/security-update-notify/last-alert.sha256
 
@@ -47,6 +49,7 @@ ver="$(/usr/local/sbin/security-update-notify --version | awk '{print $2}')"
 echo "  ok: version $ver"
 ok "grep -qF \"HOST_LABEL='compat-host'\" /etc/security-update-notify/telegram.env" "config PRESERVED across upgrade"
 ok "grep -qF '123456:abc_DEF-ghi' /etc/security-update-notify/telegram.env" "token PRESERVED across upgrade"
+ok "grep -qF \"NOTIFY_CHANNELS='telegram'\" /etc/security-update-notify/telegram.env" "notification channel PRESERVED across upgrade"
 ok "test -s /var/backups/security-update-notify/latest" "upgrade backup created"
 ok "grep -q '^67937ecd' /var/lib/security-update-notify/last-alert.sha256" "alert state PRESERVED across upgrade"
 

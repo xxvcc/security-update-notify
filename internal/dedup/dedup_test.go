@@ -121,3 +121,15 @@ func TestReadLastTrimsNewlines(t *testing.T) {
 		t.Errorf("ReadLast=%q,%d want deadbeef,1737000000", h, ts)
 	}
 }
+
+func TestChannelStoreUsesIndependentFiles(t *testing.T) {
+	dir := t.TempDir()
+	legacy := NewStore(dir)
+	feishu := NewChannelStore(dir, "feishu")
+	if legacy.HashFile == feishu.HashFile || legacy.TimeFile == feishu.TimeFile {
+		t.Fatal("channel store must not share legacy Telegram files")
+	}
+	if filepath.Base(feishu.HashFile) != "last-alert.feishu.sha256" || filepath.Base(feishu.TimeFile) != "last-alert.feishu.sent_at" {
+		t.Errorf("unexpected channel paths: %s %s", feishu.HashFile, feishu.TimeFile)
+	}
+}

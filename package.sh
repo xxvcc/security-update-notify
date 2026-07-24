@@ -85,9 +85,9 @@ fi
 
 # 安全检查：发布包不能包含本地运行配置或状态文件。
 # Safety: release package must not contain local runtime config/state files.
-if find "$WORK/$PKG" -type f \( -name '.env' -o -name '.env.*' ! -name '.env.example' -o -name 'telegram.env' -o -name '*.log' -o -name 'last-alert*' \) | grep -q .; then
-  echo "拒绝打包运行时配置或状态文件 / Refusing to package runtime config/state files" >&2
-  find "$WORK/$PKG" -type f \( -name '.env' -o -name '.env.*' ! -name '.env.example' -o -name 'telegram.env' -o -name '*.log' -o -name 'last-alert*' \) >&2
+if find "$WORK/$PKG" -type f \( -name '.env' -o -name '.env.*' ! -name '.env.example' -o -name 'telegram.env' -o -name '*.log' -o -name 'last-alert*' -o -name '*feishu-app-secret*' -o -path '*/credentials/*' -o -path '*/credstore*' \) | grep -q .; then
+  echo "拒绝打包运行时配置、凭据或状态文件 / Refusing to package runtime config, credentials, or state files" >&2
+  find "$WORK/$PKG" -type f \( -name '.env' -o -name '.env.*' ! -name '.env.example' -o -name 'telegram.env' -o -name '*.log' -o -name 'last-alert*' -o -name '*feishu-app-secret*' -o -path '*/credentials/*' -o -path '*/credstore*' \) >&2
   exit 1
 fi
 
