@@ -172,7 +172,7 @@ sudo ./install.sh
 - 飞书 App ID / 隐藏输入的 App Secret，然后从自动扫描结果中选择接收人；
 - 每日检查时间，默认 `09:00`；
 - 重复提醒策略；
-- 安装后是否额外发送一条测试消息。
+- 安装后是否发送测试消息；首次配置飞书或更换接收人时默认发送一条仅飞书的验证消息，输入 `n` 可跳过。
 
 如果想跳过交互式语言选择，可在命令行加 `--lang zh` 或 `--lang en`。
 
@@ -183,7 +183,7 @@ sudo ./install.sh
 
 扫描结果受飞书应用“通讯录数据范围”限制。扫描失败或没有可见员工时，交互安装器允许重试、手动输入当前应用下的 `open_id`，或中止安装；非交互模式必须显式提供 `--feishu-receive-id`。
 
-只有显式使用 `--send-test` 或 `test.sh --send-test` 才会向飞书 `open_id` 发送测试消息。请先确认该 `open_id` 就是预期接收人。
+首次交互配置飞书或更换接收人时，安装器默认发送一条仅飞书的验证消息，用于确认所选 `open_id` 位于机器人的可用范围内；输入 `n` 可跳过。非交互安装不会自动发送。显式使用 `--send-test` 或 `test.sh --send-test` 仍会测试全部已配置渠道。
 
 ### 3. 验证
 
@@ -278,7 +278,7 @@ App Secret 源文件必须是 root 所有的普通文件，不能是符号链接
 --notify-upgrade 1        # 升级成功后向已配置渠道发送通知；默认 0
 --skip-post-install-check # 跳过安装/升级后自检
 --allow-best-effort        # 允许尽力支持的发行版
---send-test                # 安装完成后额外发送测试消息
+--send-test                # 安装完成后测试全部已配置渠道
 --skip-telegram-test       # 跳过 Telegram 预检
 --skip-feishu-test         # 跳过独立凭据预检；未指定接收人时仍需扫描选人
 --skip-notify-test         # 跳过所有渠道预检

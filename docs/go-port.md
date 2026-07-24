@@ -110,7 +110,9 @@ sun.sh        ✅ 保持 shell 引导器；下载、sha256、指纹 pin、GPG �
 - **飞书**：App Secret 只从隐藏输入、systemd credential 或已验证的 root-only 普通文件进入内存；运行时
   使用应用级 `open_id` 单发内嵌 JSON 2.0 卡片，卡片只含静态组件与 `open_url`，不增加回调。交互安装的
   Directory v1 结果只用于人选确认，扫描范围受应用通讯录数据范围限制；更换 App ID 必须重新选择或显式
-  提供接收人，禁止复用旧应用的 `open_id`。Telegram 文本与 11 字段去重哈希均不受卡片展示影响。
+  提供接收人，禁止复用旧应用的 `open_id`。首次配置或更换接收人时默认用仅飞书临时配置发送验证消息，
+  失败进入安装事务回滚；非交互安装不自动发送，显式 `--send-test` 才测试全部渠道。Telegram 文本与 11 字段
+  去重哈希均不受卡片展示影响。
 - **needs-restarting reboot 判定优先级**：文本 `reboot is required` → 需要；否则
   `reboot should not be necessary|no core libraries` → 不需要；**仅当**上面都不匹配时 `rc==1` → 需要；
   其它非零 rc **不是** reboot 信号。needrestart：任一 `NEEDRESTART-SVC:` 行即触发 attention（`HasPrefix`

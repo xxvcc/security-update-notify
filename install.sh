@@ -16,6 +16,8 @@ FEISHU_APP_SECRET_FILE="${FEISHU_APP_SECRET_FILE:-}"
 # The literal App Secret is accepted only through the hidden prompt and kept in shell memory.
 FEISHU_APP_SECRET=""
 FEISHU_AUTH_VALIDATED=0
+FEISHU_RECIPIENT_SELECTED=0
+VERIFY_FEISHU_RECIPIENT=0
 FEISHU_APP_ID_EXPLICIT=0
 FEISHU_RECEIVE_ID_EXPLICIT=0
 [[ -z "$FEISHU_APP_ID" ]] || FEISHU_APP_ID_EXPLICIT=1
@@ -108,7 +110,7 @@ Options:
   --lang LANG                  Terminal language: zh | en, default zh
   --backend BACKEND            auto | apt | dnf, default auto
   --allow-best-effort          Permit best-effort distro versions
-  --send-test                  Send additional test message after install
+  --send-test                  Test all configured channels after install
   --skip-telegram-test         Skip pre-install Telegram token/chat validation
   --skip-feishu-test           Skip pre-install Feishu credential validation
   --skip-notify-test           Skip all pre-install channel validation
@@ -142,7 +144,7 @@ EOF
   --lang LANG                  终端语言：zh | en，默认 zh
   --backend BACKEND            auto | apt | dnf，默认 auto
   --allow-best-effort          允许尽力支持的发行版
-  --send-test                  安装后额外发送测试消息
+  --send-test                  安装后测试全部已配置渠道
   --skip-telegram-test         跳过安装前 Telegram token/chat 校验
   --skip-feishu-test           跳过安装前飞书凭据校验
   --skip-notify-test           跳过所有渠道的安装前校验
@@ -663,6 +665,7 @@ prompt_manual_feishu_receive_id() {
   while true; do
     prompt_required_text FEISHU_RECEIVE_ID "飞书接收人 open_id" "Feishu recipient open_id"
     if [[ "$FEISHU_RECEIVE_ID" =~ ^ou_[A-Za-z0-9_-]+$ ]]; then
+      FEISHU_RECIPIENT_SELECTED=1
       return 0
     fi
     say "无效 open_id：必须以 ou_ 开头，请重新输入。" \
@@ -705,6 +708,7 @@ select_feishu_recipient() {
             *)
               if selected="$(feishu_directory_user_id "$users_file" "$choice" 2>/dev/null)"; then
                 FEISHU_RECEIVE_ID="$selected"
+                FEISHU_RECIPIENT_SELECTED=1
                 say "已选择飞书接收人: $FEISHU_RECEIVE_ID" "Selected Feishu recipient: $FEISHU_RECEIVE_ID"
                 return 0
               fi
@@ -733,6 +737,63 @@ select_feishu_recipient() {
       *) say "无效选项。" "Invalid choice." >&2 ;;
     esac
   done
+}
+
+prompt_install_test_message() {
+  [[ "$SEND_TEST" -eq 0 && "$NON_INTERACTIVE" -ne 1 ]] || return 0
+  local answer default_feishu_verify=0
+  if channel_selected feishu \
+      && [[ "$IN_UPGRADE" != "1" || "$FEISHU_RECIPIENT_SELECTED" -eq 1 || "$FEISHU_RECEIVE_ID_EXPLICIT" -eq 1 ]]; then
+    default_feishu_verify=1
+  fi
+  while true; do
+    if [[ "$default_feishu_verify" -eq 1 ]]; then
+      read -r -p "$(m '安装后发送一条飞书测试消息，确认所选用户在机器人可用范围内？[Y/n]: ' 'Send a Feishu test message after install to verify the selected user is within the bot availability? [Y/n]: ')" answer
+      case "${answer:-Y}" in
+        y|Y) VERIFY_FEISHU_RECIPIENT=1; return 0 ;;
+        n|N) return 0 ;;
+      esac
+    else
+      read -r -p "$(m '安装后向已配置渠道额外发送测试消息？[y/N]: ' 'Send an additional test message to configured channels after install? [y/N]: ')" answer
+      case "${answer:-N}" in
+        y|Y) SEND_TEST=1; return 0 ;;
+        n|N) return 0 ;;
+      esac
+    fi
+    say "请输入 y 或 n。" "Enter y or n." >&2
+  done
+}
+
+write_feishu_recipient_test_config() {
+  local path="$1"
+  ( umask 077
+    {
+      printf 'CONFIG_VERSION=%s\n' "$(config_quote "$CONFIG_VERSION")"
+      printf 'NOTIFY_CHANNELS=%s\n' "$(config_quote feishu)"
+      printf 'FEISHU_APP_ID=%s\n' "$(config_quote "$FEISHU_APP_ID")"
+      printf 'FEISHU_RECEIVE_ID=%s\n' "$(config_quote "$FEISHU_RECEIVE_ID")"
+      printf 'HOST_LABEL=%s\n' "$(config_quote "$HOST_LABEL")"
+      printf 'INCLUDE_PUBLIC_IP=%s\n' "$(config_quote 0)"
+      printf 'NOTIFY_LANG=%s\n' "$(config_quote "$NOTIFY_LANG")"
+      printf 'BACKEND=%s\n' "$(config_quote "$BACKEND")"
+      printf 'CHECK_UPDATE_HEALTH=%s\n' "$(config_quote 0)"
+      printf 'STALE_UPDATE_DAYS=%s\n' "$(config_quote 0)"
+      printf 'CHECK_EOL=%s\n' "$(config_quote 0)"
+    } >"$path"
+  )
+}
+
+verify_feishu_recipient_after_install() {
+  TMP_DIR="${TMP_DIR:-$(mktemp -d)}"
+  local test_config="$TMP_DIR/feishu-recipient-test.env"
+  write_feishu_recipient_test_config "$test_config"
+  say "正在发送飞书接收人验证消息..." "Sending the Feishu recipient verification message..."
+  if ! SECURITY_UPDATE_NOTIFY_ENV="$test_config" "$BIN_FILE" --test-ok --no-dedupe; then
+    say "飞书接收人验证失败；请确认用户位于机器人的可用范围内。安装将回滚。" \
+        "Feishu recipient verification failed. Confirm that the user is within the bot availability. The install will roll back." >&2
+    return 1
+  fi
+  say "飞书接收人验证成功。" "Feishu recipient verification succeeded."
 }
 
 snapshot_feishu_credential() {
@@ -1295,7 +1356,7 @@ if [[ "$DEDUP_MODE" == "interval" ]]; then
   [[ "$DEDUP_INTERVAL_DAYS" =~ ^[0-9]+$ ]] && [[ "$DEDUP_INTERVAL_DAYS" -ge 1 ]] || { say "无效间隔天数" "Invalid interval days" >&2; exit 2; }
 fi
 valid_time "$CHECK_TIME" || { say "无效 --time，期望 HH:MM" "Invalid --time, expected HH:MM" >&2; exit 2; }
-if [[ "$SEND_TEST" -eq 0 && "$NON_INTERACTIVE" -ne 1 ]]; then read -r -p "$(m '安装后向已配置渠道额外发送测试消息？[y/N]: ' 'Send an additional test message to configured channels after install? [y/N]: ')" ans; [[ "${ans:-N}" =~ ^[Yy]$ ]] && SEND_TEST=1; fi
+prompt_install_test_message
 
 # 在写入任何系统文件 / 发送预检消息之前先校验配置值（拒绝换行、引号冲突等）。
 # Validate config values before writing any system file or sending the preflight message.
@@ -1479,7 +1540,11 @@ if [[ "$POST_INSTALL_CHECK" -eq 1 ]]; then
   fi
 fi
 systemctl list-timers security-update-notify.timer --no-pager
-[[ "$SEND_TEST" -eq 1 ]] && /usr/local/sbin/security-update-notify --test-ok --no-dedupe
+if [[ "$VERIFY_FEISHU_RECIPIENT" -eq 1 ]]; then
+  verify_feishu_recipient_after_install
+elif [[ "$SEND_TEST" -eq 1 ]]; then
+  /usr/local/sbin/security-update-notify --test-ok --no-dedupe
+fi
 
 if [[ "$IN_UPGRADE" == "1" && "$NOTIFY_UPGRADE" == "1" ]]; then
   /usr/local/sbin/security-update-notify --notify-upgrade-event --upgrade-from "$OLD_VERSION" --upgrade-to "$(/usr/local/sbin/security-update-notify --version | awk '{print $2; exit}')" || true

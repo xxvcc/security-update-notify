@@ -1,5 +1,17 @@
 # 变更记录
 
+## 2.2.1
+
+飞书首次交互安装或更换接收人时，默认发送一条仅飞书的验证消息，确认所选用户位于机器人可用范围内；双通道安装不会因此重复测试 Telegram。
+On the first interactive Feishu install or after changing the recipient, a Feishu-only verification message is sent by default to confirm that the selected user is within the bot availability; dual-channel installs do not duplicate the Telegram test.
+
+- 安装闭环：验证提示默认为 `[Y/n]`，可输入 `n` 跳过；非交互安装保持不自动发送，显式 `--send-test` 仍测试所有已配置渠道。
+  Installation closure: the verification prompt defaults to `[Y/n]` and can be skipped with `n`; non-interactive installs still send nothing automatically, while explicit `--send-test` continues to test every configured channel.
+- 故障安全：验证失败会触发现有安装事务回滚，并明确提示检查机器人可用范围；临时验证配置只包含飞书渠道和接收标识，不包含 Telegram 凭据或飞书 App Secret。
+  Failure safety: a failed verification triggers the existing transactional rollback and points to bot availability; the temporary verification config contains only the Feishu channel and recipient identity, never Telegram credentials or the Feishu App Secret.
+- 测试：新增首次安装、双通道跳过、纯 Telegram、已有飞书配置、接收人变更、非交互和显式全渠道测试的安装回归覆盖。
+  Tests: add installer regression coverage for first install, dual-channel opt-out, Telegram-only, existing Feishu configuration, recipient changes, non-interactive mode, and explicit all-channel tests.
+
 ## 2.2.0
 
 飞书通知升级为原生 Card JSON 2.0；Telegram 文本、去重哈希和按渠道独立恢复语义保持兼容。

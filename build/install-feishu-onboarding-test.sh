@@ -139,15 +139,32 @@ set -euo pipefail
 UI_LANG="${UI_LANG:-zh}"
 NON_INTERACTIVE="${NON_INTERACTIVE:-0}"
 FEISHU_APP_ID="${FEISHU_TEST_APP_ID:-cli_test}"
+FEISHU_RECEIVE_ID="${TEST_FEISHU_RECEIVE_ID:-ou_test_recipient}"
 FEISHU_APP_SECRET="fake-secret"
 FEISHU_APP_SECRET_FILE=""
 FEISHU_ENCRYPTED_CREDENTIAL="/nonexistent/encrypted"
 FEISHU_CREDENTIAL_FILE="/nonexistent/plain"
 FEISHU_AUTH_VALIDATED=0
+FEISHU_RECIPIENT_SELECTED="${TEST_FEISHU_RECIPIENT_SELECTED:-0}"
+VERIFY_FEISHU_RECIPIENT=0
+FEISHU_RECEIVE_ID_EXPLICIT="${TEST_FEISHU_RECEIVE_ID_EXPLICIT:-0}"
+NOTIFY_CHANNELS="${TEST_NOTIFY_CHANNELS:-feishu}"
+SEND_TEST="${TEST_SEND_TEST:-0}"
+IN_UPGRADE="${TEST_IN_UPGRADE:-0}"
+CONFIG_VERSION=3
+HOST_LABEL="test-host"
+NOTIFY_LANG=zh
+BACKEND=apt
+BIN_FILE="${TEST_BIN_FILE:-/nonexistent/security-update-notify}"
 FEISHU_API_BASE_URL="${TEST_FEISHU_API_BASE_URL:?}"
 TMP_DIR="${TEST_TMP:?}"
 m() { if [[ "$UI_LANG" == "en" ]]; then printf %s "$2"; else printf %s "$1"; fi; }
 say() { printf '%s\n' "$(m "$1" "$2")"; }
+channel_selected() { case ",$NOTIFY_CHANNELS," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
+config_quote() {
+  local value="$1"
+  if [[ "$value" == *"'"* ]]; then printf '"%s"' "$value"; else printf "'%s'" "$value"; fi
+}
 prompt_required_text() {
   local name="$1" value
   read -r value
@@ -166,6 +183,18 @@ case "${1:-select}" in
       cat "$TMP_DIR/error" >&2
       exit 1
     fi
+    ;;
+  prompt-test)
+    prompt_install_test_message
+    printf 'SEND_TEST=%s\nVERIFY_FEISHU_RECIPIENT=%s\n' "$SEND_TEST" "$VERIFY_FEISHU_RECIPIENT"
+    ;;
+  write-test-config)
+    write_feishu_recipient_test_config "$TMP_DIR/recipient-test.env"
+    stat -c 'MODE=%a' "$TMP_DIR/recipient-test.env"
+    cat "$TMP_DIR/recipient-test.env"
+    ;;
+  verify-recipient)
+    verify_feishu_recipient_after_install
     ;;
 esac
 '''
@@ -231,6 +260,62 @@ else
   [[ "$rc" -eq 2 ]] || { echo "Unexpected non-interactive exit code: $rc" >&2; exit 1; }
 fi
 grep -Fq -- '--feishu-receive-id' "$TMP/noninteractive.out"
+
+printf '\n' | TEST_NOTIFY_CHANNELS=feishu "$TMP/harness.sh" prompt-test >"$TMP/prompt-new-feishu.out"
+grep -Fxq 'SEND_TEST=0' "$TMP/prompt-new-feishu.out"
+grep -Fxq 'VERIFY_FEISHU_RECIPIENT=1' "$TMP/prompt-new-feishu.out"
+
+printf 'n\n' | TEST_NOTIFY_CHANNELS=telegram,feishu "$TMP/harness.sh" prompt-test >"$TMP/prompt-skip-feishu.out"
+grep -Fxq 'SEND_TEST=0' "$TMP/prompt-skip-feishu.out"
+grep -Fxq 'VERIFY_FEISHU_RECIPIENT=0' "$TMP/prompt-skip-feishu.out"
+
+printf '\n' | TEST_NOTIFY_CHANNELS=telegram "$TMP/harness.sh" prompt-test >"$TMP/prompt-telegram.out"
+grep -Fxq 'SEND_TEST=0' "$TMP/prompt-telegram.out"
+grep -Fxq 'VERIFY_FEISHU_RECIPIENT=0' "$TMP/prompt-telegram.out"
+
+printf '\n' | TEST_NOTIFY_CHANNELS=feishu TEST_IN_UPGRADE=1 "$TMP/harness.sh" prompt-test >"$TMP/prompt-existing-feishu.out"
+grep -Fxq 'SEND_TEST=0' "$TMP/prompt-existing-feishu.out"
+grep -Fxq 'VERIFY_FEISHU_RECIPIENT=0' "$TMP/prompt-existing-feishu.out"
+
+printf '\n' | TEST_NOTIFY_CHANNELS=feishu TEST_IN_UPGRADE=1 TEST_FEISHU_RECIPIENT_SELECTED=1 "$TMP/harness.sh" prompt-test >"$TMP/prompt-changed-feishu.out"
+grep -Fxq 'SEND_TEST=0' "$TMP/prompt-changed-feishu.out"
+grep -Fxq 'VERIFY_FEISHU_RECIPIENT=1' "$TMP/prompt-changed-feishu.out"
+
+NON_INTERACTIVE=1 TEST_NOTIFY_CHANNELS=feishu "$TMP/harness.sh" prompt-test >"$TMP/prompt-noninteractive.out"
+grep -Fxq 'SEND_TEST=0' "$TMP/prompt-noninteractive.out"
+grep -Fxq 'VERIFY_FEISHU_RECIPIENT=0' "$TMP/prompt-noninteractive.out"
+
+TEST_SEND_TEST=1 TEST_NOTIFY_CHANNELS=telegram,feishu "$TMP/harness.sh" prompt-test >"$TMP/prompt-explicit.out"
+grep -Fxq 'SEND_TEST=1' "$TMP/prompt-explicit.out"
+grep -Fxq 'VERIFY_FEISHU_RECIPIENT=0' "$TMP/prompt-explicit.out"
+
+TEST_NOTIFY_CHANNELS=telegram,feishu "$TMP/harness.sh" write-test-config >"$TMP/test-config.out"
+grep -Fxq 'MODE=600' "$TMP/test-config.out"
+grep -Fxq "NOTIFY_CHANNELS='feishu'" "$TMP/test-config.out"
+grep -Fxq "FEISHU_APP_ID='cli_test'" "$TMP/test-config.out"
+grep -Fxq "FEISHU_RECEIVE_ID='ou_test_recipient'" "$TMP/test-config.out"
+if grep -Eq 'TELEGRAM|APP_SECRET|fake-secret' "$TMP/test-config.out"; then
+  echo "Feishu recipient verification config contains unrelated channels or secrets" >&2
+  exit 1
+fi
+
+cat >"$TMP/mock-runtime" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+cp "$SECURITY_UPDATE_NOTIFY_ENV" "$TEST_TMP/verification-captured.env"
+printf '%s\n' "$*" >"$TEST_TMP/verification-args"
+exit "${TEST_VERIFY_RC:-0}"
+SH
+chmod +x "$TMP/mock-runtime"
+TEST_BIN_FILE="$TMP/mock-runtime" "$TMP/harness.sh" verify-recipient >"$TMP/verify-success.out"
+grep -Fq '飞书接收人验证成功。' "$TMP/verify-success.out"
+grep -Fxq -- '--test-ok --no-dedupe' "$TMP/verification-args"
+grep -Fxq "NOTIFY_CHANNELS='feishu'" "$TMP/verification-captured.env"
+if TEST_BIN_FILE="$TMP/mock-runtime" TEST_VERIFY_RC=1 "$TMP/harness.sh" verify-recipient >"$TMP/verify-failure.out" 2>&1; then
+  echo "Expected a failed Feishu recipient verification to return non-zero" >&2
+  exit 1
+fi
+grep -Fq '飞书接收人验证失败' "$TMP/verify-failure.out"
 
 python3 - "$TMP/requests.jsonl" <<'PY'
 import json

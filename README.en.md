@@ -172,7 +172,7 @@ The installer first asks for a UI language (Chinese or English, default Chinese)
 - Feishu App ID / hidden App Secret, followed by a recipient choice from the automatic scan;
 - daily check time, default `09:00`;
 - duplicate-alert behavior;
-- whether to send an extra test message after installation.
+- whether to send a test message after installation; the first Feishu setup or a recipient change defaults to a Feishu-only verification message, which can be skipped with `n`.
 
 To skip the interactive language prompt, pass `--lang zh` or `--lang en`.
 
@@ -183,7 +183,7 @@ Before writing the config, it performs channel preflight checks:
 
 Results are limited by the Feishu application's directory data scope. If scanning fails or returns no visible employees, the interactive installer can retry, accept a current-app `open_id` manually, or abort. Non-interactive mode requires `--feishu-receive-id` explicitly.
 
-Feishu receives a real test message only when you explicitly use `--send-test` or `test.sh --send-test`. Verify that the configured `open_id` is the intended recipient first.
+On the first interactive Feishu setup or after changing the recipient, the installer sends a Feishu-only verification message by default to confirm that the selected `open_id` is within the bot availability; enter `n` to skip it. Non-interactive installs send nothing automatically. Explicit `--send-test` or `test.sh --send-test` still tests every configured channel.
 
 ### 3. Verify
 
@@ -278,7 +278,7 @@ Common options:
 --notify-upgrade 1        # notify configured channels after successful upgrade; default 0
 --skip-post-install-check # skip post-install/upgrade self-check
 --allow-best-effort        # allow best-effort distro versions
---send-test                # send an extra install-complete test message
+--send-test                # test every configured channel after installation
 --skip-telegram-test       # skip Telegram preflight validation
 --skip-feishu-test         # skip separate credential preflight; selection still scans if needed
 --skip-notify-test         # skip all channel preflight validation
