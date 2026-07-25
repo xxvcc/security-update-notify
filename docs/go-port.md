@@ -6,11 +6,12 @@
 This is the living design doc for the full Go port. It captures the conclusions of the multi-agent
 analysis (inventory → design → adversarial critique → synthesis); the analysis's own output was ephemeral.
 
-> **Current status (2.2.1):** the Go runtime, signed bridge distribution, self-upgrade path, and all original
+> **Current status (2.2.2):** the Go runtime, signed bridge distribution, self-upgrade path, and all original
 > port phases are complete. Version 2.1.0 added selectable Telegram/Feishu delivery, per-channel dedup state,
 > diagnostics, upgrade notices, and configuration schema v3. Version 2.2.0 adds embedded Feishu Card JSON 2.0
 > while preserving Telegram text and dedup hashes. Version 2.2.1 closes recipient onboarding with a confirmed
-> post-install Feishu send and hardens runtime-lock/timer rollback behavior. The historical 2.0.0 release
+> post-install Feishu send and hardens runtime-lock/timer rollback behavior. Version 2.2.2 fixes Directory v1
+> recipient pagination when the final page retains its previous token. The historical 2.0.0 release
 > checklist remains below as design history, not as unfinished work.
 
 ## 诚实的底线 / Honest bottom line
@@ -35,7 +36,7 @@ analysis (inventory → design → adversarial critique → synthesis); the anal
 - **切换时分发单元：版本化“桥” tarball**（内含 install.sh 与含 `VERSION=latest` 字节的运行时文件），
   让已装 Bash 机器的旧自升级链继续工作；不在切换点抛弃 noarch 语义。
 - **install.sh / package.sh / sun.sh 主体：第一刀保持 shell**（特权、测试最全、收益近零）。
-- **桥版本 2.0.0 已发布；当前演进版本为 2.2.1。** 2.1.0 在不改变桥信任链的前提下新增多通知渠道；2.2.0 将飞书展示升级为原生 JSON 2.0 卡片；2.2.1 补齐接收人真实发送验证及锁/timer 回滚安全。
+- **桥版本 2.0.0 已发布；当前演进版本为 2.2.2。** 2.1.0 在不改变桥信任链的前提下新增多通知渠道；2.2.0 将飞书展示升级为原生 JSON 2.0 卡片；2.2.1 补齐接收人真实发送验证及锁/timer 回滚安全；2.2.2 修复飞书 Directory v1 末页沿用旧 token 时的自动选人误报。
 - **自升级：存活父进程做事务替换**（NOT rename-then-`syscall.Exec`）。
 
 ## Go 架构 / Architecture

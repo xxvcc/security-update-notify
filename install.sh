@@ -615,9 +615,14 @@ try:
             mobile = info.get("mobile") if isinstance(info.get("mobile"), str) else ""
             users.append({"name": str(name), "mobile_tail": mobile[-4:] if mobile else "", "open_id": open_id})
         page_response = data.get("page_response") if isinstance(data.get("page_response"), dict) else {}
+        has_more = page_response.get("has_more")
         next_token = page_response.get("page_token")
         page_token = next_token if isinstance(next_token, str) else ""
+        if has_more is False:
+            break
         if not page_token:
+            if has_more is True:
+                raise RuntimeError("Feishu directory pagination indicated more results without a page token")
             break
         if page_token in seen_page_tokens:
             raise RuntimeError("Feishu directory pagination repeated a page token")

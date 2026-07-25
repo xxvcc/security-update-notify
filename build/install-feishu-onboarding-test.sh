@@ -76,6 +76,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         page_token = body.get("page_request", {}).get("page_token", "")
         if not page_token:
+            if app_id == "cli_missing_page_token":
+                self.send_json({
+                    "code": 0,
+                    "data": {
+                        "employees": [],
+                        "page_response": {"has_more": True, "page_token": ""},
+                    },
+                })
+                return
             self.send_json({
                 "code": 0,
                 "data": {
@@ -106,7 +115,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     ],
                     "page_response": {
                         "has_more": app_id == "cli_repeat",
-                        "page_token": "next-page" if app_id == "cli_repeat" else "",
+                        "page_token": "next-page" if app_id in ("cli_repeat", "cli_stale_final_token") else "",
                     },
                 },
             })
@@ -240,6 +249,9 @@ grep -Fxq 'COUNT=2' "$TMP/retry.out"
 FEISHU_TEST_APP_ID=cli_rate_limit "$TMP/harness.sh" scan >"$TMP/rate-limit.out"
 grep -Fxq 'COUNT=2' "$TMP/rate-limit.out"
 
+FEISHU_TEST_APP_ID=cli_stale_final_token "$TMP/harness.sh" scan >"$TMP/stale-final-token.out"
+grep -Fxq 'COUNT=2' "$TMP/stale-final-token.out"
+
 if FEISHU_TEST_APP_ID=cli_abnormal "$TMP/harness.sh" scan >"$TMP/abnormal.out" 2>&1; then
   echo "Expected a partial Directory response to fail" >&2
   exit 1
@@ -251,6 +263,12 @@ if FEISHU_TEST_APP_ID=cli_repeat "$TMP/harness.sh" scan >"$TMP/repeat.out" 2>&1;
   exit 1
 fi
 grep -Fq 'Feishu directory pagination repeated a page token' "$TMP/repeat.out"
+
+if FEISHU_TEST_APP_ID=cli_missing_page_token "$TMP/harness.sh" scan >"$TMP/missing-page-token.out" 2>&1; then
+  echo "Expected has_more without a page token to fail" >&2
+  exit 1
+fi
+grep -Fq 'Feishu directory pagination indicated more results without a page token' "$TMP/missing-page-token.out"
 
 if NON_INTERACTIVE=1 "$TMP/harness.sh" select >"$TMP/noninteractive.out" 2>&1; then
   echo "Expected non-interactive selection to fail" >&2

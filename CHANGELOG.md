@@ -1,5 +1,17 @@
 # 变更记录
 
+## 2.2.2
+
+修复飞书 Directory v1 自动选人的分页结束判断，避免权限和凭据均正常时因末页沿用旧 `page_token` 而误报扫描失败。
+Fixes Feishu Directory v1 recipient-selection pagination so a final page that retains the previous `page_token` no longer causes a false scan failure when credentials and permissions are valid.
+
+- 分页契约：以 `page_response.has_more=false` 作为权威结束条件，即使响应仍包含旧 token 也正常完成扫描。
+  Pagination contract: treat `page_response.has_more=false` as the authoritative end condition, even when the response retains the previous token.
+- 故障安全：`has_more=true` 却缺少 token 时明确失败；确实仍有下一页且 token 重复时继续中止，避免死循环或静默遗漏用户。
+  Failure safety: fail explicitly when `has_more=true` has no token, and still abort when a genuinely continuing page repeats a token, preventing loops or silently omitted users.
+- 回归测试：覆盖末页旧 token、缺失下一页 token 和真实重复 token，同时保留通讯录权限、限流与部分响应测试。
+  Regression coverage: add stale-final-token, missing-next-token, and true repeated-token cases while retaining permission, rate-limit, and partial-response tests.
+
 ## 2.2.1
 
 飞书首次交互安装或更换接收人时，默认发送一条仅飞书的验证消息，确认所选用户位于机器人可用范围内；双通道安装不会因此重复测试 Telegram。
