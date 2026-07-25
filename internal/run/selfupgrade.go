@@ -75,45 +75,45 @@ func SelfUpgrade(ver string, disp i18n.Lang) int {
 
 	pkg := "security-update-notify-" + latest + ".tar.gz"
 	pkgdir := "security-update-notify-" + latest
-	url := "https://github.com/" + Repo + "/releases/download/v" + latest + "/" + pkg
 
 	say(os.Stdout, disp, "正在下载并校验发布包: "+ver+" -> "+latest, "Downloading and verifying release: "+ver+" -> "+latest)
 	tarPath := filepath.Join(tmp, pkg)
 	shaPath := tarPath + ".sha256"
-	if dist.Download(client, url, tarPath) != nil {
-		say(os.Stderr, disp, "下载发布包失败", "Failed to download release")
+	_, gpgErr := exec.LookPath("gpg")
+	hasGPG := gpgErr == nil
+	allowUnsigned := os.Getenv("SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED") == "1"
+	if !hasGPG && !allowUnsigned {
+		say(os.Stderr, disp, "缺少 gpg 且未 opt-in；为安全起见拒绝升级。",
+			"Missing gpg and not opted in; refusing to upgrade for safety.")
 		return 1
 	}
-	if dist.Download(client, url+".sha256", shaPath) != nil {
-		say(os.Stderr, disp, "下载校验文件失败", "Failed to download checksum")
+	selectedBase, err := dist.DownloadReleaseSet(client, dist.ReleaseBases(Repo, latest), pkg, tmp, hasGPG)
+	if err != nil {
+		say(os.Stderr, disp, "镜像和 GitHub 均无法提供完整发布包", "Neither the mirror nor GitHub provided a complete release set")
 		return 1
+	}
+	if strings.HasPrefix(selectedBase, dist.DefaultReleaseMirrorBase) {
+		say(os.Stdout, disp, "已通过发布镜像下载", "Downloaded through the release mirror")
+	} else {
+		say(os.Stdout, disp, "发布镜像不可用，已回退 GitHub", "Release mirror unavailable; fell back to GitHub")
 	}
 
 	// GPG 存在时签名恒为必需（缺 .asc 即拒，绝不静默降级到 sha256-only）；sha256-only 仅在本机确实无 gpg
 	// 且显式 opt-in 时保留，网络攻击者无法触发。验签在解包前完成。
-	if _, err := exec.LookPath("gpg"); err == nil {
+	if hasGPG {
 		ascPath := tarPath + ".asc"
-		if dist.Download(client, url+".asc", ascPath) != nil {
-			say(os.Stderr, disp, "缺少发布签名（.asc）；gpg 可用时签名为必需，拒绝升级。",
-				"Release signature (.asc) is missing; mandatory when gpg is available. Refusing to upgrade.")
-			return 1
-		}
 		if err := dist.VerifyReleaseKey(tarPath, shaPath, ascPath, assets.ReleaseSigningPublicKey(), assets.ReleaseSigningFingerprint); err != nil {
 			say(os.Stderr, disp, "签名或校验失败；拒绝升级："+err.Error(), "Verification failed; refusing to upgrade: "+err.Error())
 			return 1
 		}
 		say(os.Stdout, disp, "签名校验通过 ("+assets.ReleaseSigningFingerprint+")", "Signature verified ("+assets.ReleaseSigningFingerprint+")")
-	} else if os.Getenv("SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED") == "1" {
+	} else if allowUnsigned {
 		if err := dist.VerifySHA256(tarPath, shaPath); err != nil {
 			say(os.Stderr, disp, "sha256 校验失败；拒绝升级", "Checksum verification failed; refusing to upgrade")
 			return 1
 		}
 		say(os.Stderr, disp, "警告：本机没有 gpg 且已 opt-in，仅校验 sha256（不推荐）。",
 			"WARNING: gpg absent and opt-in set; sha256-only verification (not recommended).")
-	} else {
-		say(os.Stderr, disp, "缺少 gpg 且未 opt-in；为安全起见拒绝升级。",
-			"Missing gpg and not opted in; refusing to upgrade for safety.")
-		return 1
 	}
 
 	// 安全解包（拒绝穿越/特殊条目/顶层目录外条目），并做版本绑定核对。

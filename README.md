@@ -294,7 +294,9 @@ App Secret 源文件必须是 root 所有的普通文件，不能是符号链接
 curl -fsSL https://sun.xxv.cc | sudo bash -s -- upgrade --non-interactive -y
 ```
 
-已安装 SUN 后，也可以直接运行 `sudo security-update-notify --upgrade`：它会下载最新 GitHub 发布包，校验 `.sha256`，并用内置 pin 的指纹强制校验 GPG 签名（默认 fail-closed，缺签名即拒绝）后才升级。
+已安装 SUN 后，也可以直接运行 `sudo security-update-notify --upgrade`。一键安装器和内置升级都会优先读取 `https://dl.ll.cd/security-update-notify/latest.json` 并从同一镜像下载签名资产；镜像索引或完整资产集合传输失败时自动回退 GitHub。下载完成后仍会校验 `.sha256`，并用内置 pin 的指纹强制校验 GPG 签名（默认 fail-closed，缺签名即拒绝）后才升级。镜像只提供传输可用性，不是信任根。
+
+每个正式 GitHub Release 发布后，`Mirror signed release` 工作流会重新验签并同步版本化目录。三个公开资产从 `dl.ll.cd` 回读并再次验签成功后，才最后更新 `latest.json`；手动重跑旧版本只补齐其版本目录，不会覆盖当前 Latest。
 
 如果已安装过 SUN，安装器会自动读取 `/etc/security-update-notify/telegram.env` 和现有 timer 时间，显示当前通知方式，并默认保持现有消息通知设置；选择修改后可以更改接收平台、Telegram 配置、飞书应用、App Secret 或接收人。主菜单也提供独立的“消息通知设置”入口。移除接收平台会删除其保存凭据，新增或修改只重复验证受影响的平台；任一步失败都会随安装事务回滚。旧配置没有 `NOTIFY_CHANNELS` 时自动按 `telegram` 处理，未显式覆盖的其他选项继续沿用。
 
@@ -444,13 +446,13 @@ sudo ./uninstall.sh --purge-config
 
 发布包始终包含 `.sha256` 校验文件。`package.sh` 支持在存在 GPG 私钥时自动生成 `.tar.gz.asc` detached signature；`sun.sh` 默认以 `required` 模式校验签名，`auto` 仅作为兼容别名保留，也会要求 gpg 与 `.asc` 签名同时存在；只有显式传入 `--verify-signature off` 才会跳过签名校验。
 
-正式发布（存在对应 `vX.Y.Z` tag，或显式设置 `RELEASE=1` 的构建）**强制签名**：`package.sh` 会要求 GPG 签名，没有私钥则构建失败；release 发布后 CI 会用仓库内公钥校验产物的签名与指纹，缺签名/不匹配即让该 release 的检查失败。私钥不进入 CI，仍由维护者离线持有。此外，`security-update-notify --upgrade` 默认 **fail-closed**：直接下载 GitHub 发布包，校验 sha256，并在解包前用内置公钥与 pin 指纹强制校验 GPG 签名后才升级（应急可设 `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` 仅按 sha256 升级）。
+正式发布（存在对应 `vX.Y.Z` tag，或显式设置 `RELEASE=1` 的构建）**强制签名**：`package.sh` 会要求 GPG 签名，没有私钥则构建失败；release 发布后 CI 会用仓库内公钥校验产物的签名与指纹，缺签名/不匹配即让该 release 的检查失败。私钥不进入 CI，仍由维护者离线持有。此外，`security-update-notify --upgrade` 默认 **fail-closed**：从固定发布镜像优先下载、GitHub 回退，校验 sha256，并在解包前用内置公钥与 pin 指纹强制校验 GPG 签名后才升级（应急可设 `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` 仅按 sha256 升级）。
 
 ## 安全说明
 
 SUN 的范围刻意保持很小：
 
-- 出站仅 HTTPS：提醒按配置发往 Telegram Bot API 和/或 `open.feishu.cn`；默认另向公网 IP 探测服务（api.ipify.org / ifconfig.me）获取出口 IP（`INCLUDE_PUBLIC_IP=0` 可关闭）；自升级时访问 GitHub。若要用出口防火墙收紧，请把这些目的地一并放行或关闭对应功能；
+- 出站仅 HTTPS：提醒按配置发往 Telegram Bot API 和/或 `open.feishu.cn`；默认另向公网 IP 探测服务（api.ipify.org / ifconfig.me）获取出口 IP（`INCLUDE_PUBLIC_IP=0` 可关闭）；安装和自升级优先访问 `dl.ll.cd`，不可用时访问 GitHub。若要用出口防火墙收紧，请把这些目的地一并放行或关闭对应功能；
 - 不接收远程命令；
 - 不提供公开 HTTP 入口；
 - 不自动重启；

@@ -294,7 +294,9 @@ Rerun the one-line installer to upgrade to the latest release:
 curl -fsSL https://sun.xxv.cc | sudo bash -s -- upgrade --non-interactive -y
 ```
 
-Once SUN is installed you can also run `sudo security-update-notify --upgrade` directly: it downloads the latest GitHub release, verifies `.sha256`, and requires a GPG signature against the pinned fingerprint (fail-closed by default — it refuses if the signature is missing) before upgrading.
+Once SUN is installed you can also run `sudo security-update-notify --upgrade` directly. Both the bootstrap and built-in upgrade first read `https://dl.ll.cd/security-update-notify/latest.json` and download the signed assets from that mirror; they fall back to GitHub when the mirror index or complete asset-set transfer is unavailable. The downloaded package still must pass `.sha256` and GPG verification against the embedded pinned fingerprint (fail-closed by default; a missing signature is rejected). The mirror improves transport availability but is not a trust root.
+
+After each official GitHub Release is published, the `Mirror signed release` workflow re-verifies and syncs its versioned directory. It updates `latest.json` last, only after all three public assets have been read back from `dl.ll.cd` and verified again. Manually rerunning an older release only repairs that version directory and cannot replace the current Latest manifest.
 
 If SUN is already installed, the installer reads `/etc/security-update-notify/telegram.env` and the existing timer time first, displays the current notification method, and keeps the existing message notification settings by default. If you choose to edit them, you can change the receiving platforms, Telegram credentials, Feishu app, App Secret, or recipient. The main menu also provides a separate **Message notification settings** action. Removing a platform deletes its stored credentials; adding or editing a platform revalidates only the affected platform. Any failure rolls the whole installer transaction back. Legacy configs without `NOTIFY_CHANNELS` remain `telegram`, and other options not explicitly overridden keep their old values.
 
@@ -444,13 +446,13 @@ Packages installed as dependencies are left in place. `--purge-config` removes S
 
 Release packages always include a `.sha256` checksum file. `package.sh` can also create a detached `.tar.gz.asc` signature automatically when a GPG secret key is available. `sun.sh` defaults to `required` signature verification; `auto` is kept only as a compatibility alias and also requires both gpg and the `.asc` signature. Only an explicit `--verify-signature off` skips signature verification.
 
-Official releases (builds for a version with a corresponding `vX.Y.Z` tag, or builds with `RELEASE=1`) are **signed-mandatory**: `package.sh` requires a GPG signature and fails without a key, and after a release is published CI verifies the assets' signature and fingerprint against the repo's public key, failing the release checks if a signature is missing or mismatched. The private key never enters CI; it stays offline with the maintainer. In addition, `security-update-notify --upgrade` is **fail-closed** by default: it downloads the GitHub release directly, verifies sha256, and requires a GPG signature against an embedded public key and pinned fingerprint before extracting and upgrading (set `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` to upgrade on sha256 only in an emergency).
+Official releases (builds for a version with a corresponding `vX.Y.Z` tag, or builds with `RELEASE=1`) are **signed-mandatory**: `package.sh` requires a GPG signature and fails without a key, and after a release is published CI verifies the assets' signature and fingerprint against the repo's public key, failing the release checks if a signature is missing or mismatched. The private key never enters CI; it stays offline with the maintainer. In addition, `security-update-notify --upgrade` is **fail-closed** by default: it prefers the fixed release mirror and falls back to GitHub, verifies sha256, and requires a GPG signature against an embedded public key and pinned fingerprint before extracting and upgrading (set `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` to upgrade on sha256 only in an emergency).
 
 ## Security notes
 
 SUN is intentionally narrow:
 
-- outbound HTTPS only: alerts to the Telegram Bot API and/or `open.feishu.cn` as configured; by default also a public-IP echo service (api.ipify.org / ifconfig.me) for the egress IP (disable with `INCLUDE_PUBLIC_IP=0`); GitHub on self-upgrade. If you lock this down with an egress firewall, allow those destinations or disable the corresponding features;
+- outbound HTTPS only: alerts to the Telegram Bot API and/or `open.feishu.cn` as configured; by default also a public-IP echo service (api.ipify.org / ifconfig.me) for the egress IP (disable with `INCLUDE_PUBLIC_IP=0`); install and self-upgrade prefer `dl.ll.cd` and fall back to GitHub. If you lock this down with an egress firewall, allow those destinations or disable the corresponding features;
 - no command receiver;
 - no public HTTP endpoint;
 - no automatic reboot;

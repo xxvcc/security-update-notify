@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/xxvcc/security-update-notify/internal/httpx"
 )
@@ -23,6 +25,38 @@ func Download(client *http.Client, url, dest string) error {
 		return nil
 	}
 	return lastErr
+}
+
+// DownloadReleaseSet 从每个候选根路径下载同一版本的完整资产集合。只有传输失败才尝试下一个
+// 根路径；调用方在选定一套完整资产后执行校验，校验失败不得回退，以免掩盖镜像篡改。
+func DownloadReleaseSet(client *http.Client, bases []string, filename, destDir string, withSignature bool) (string, error) {
+	suffixes := []string{"", ".sha256"}
+	if withSignature {
+		suffixes = append(suffixes, ".asc")
+	}
+	var lastErr error
+	for _, rawBase := range bases {
+		base := strings.TrimRight(rawBase, "/")
+		ok := true
+		for _, suffix := range suffixes {
+			dest := filepath.Join(destDir, filename+suffix)
+			if err := Download(client, base+"/"+filename+suffix, dest); err != nil {
+				lastErr = fmt.Errorf("%s: %w", base, err)
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return base, nil
+		}
+		for _, suffix := range suffixes {
+			_ = os.Remove(filepath.Join(destDir, filename+suffix))
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no release download source configured")
+	}
+	return "", lastErr
 }
 
 func downloadOnce(client *http.Client, url, dest string) error {

@@ -1,5 +1,12 @@
 # 变更记录
 
+## Unreleased
+
+- 新增由 GitHub Release `published` 事件触发的签名发布镜像：工作流重新校验 SHA-256、GPG 签名和固定指纹后，通过受限 SSH 账号同步到 `https://dl.ll.cd/security-update-notify`；公开回读验签成功后才最后更新 `latest.json`。
+  Adds a signed release mirror triggered by GitHub Release `published`: the workflow rechecks SHA-256, the GPG signature, and the pinned fingerprint before syncing through a restricted SSH account to `https://dl.ll.cd/security-update-notify`; `latest.json` is updated last only after public read-back verification succeeds.
+- 一键安装器、Go 主运行时和 Bash 兼容运行时统一采用发布镜像优先、GitHub 回退。只有镜像传输不完整时才回退；一旦取得完整资产集合，任何校验失败都会中止，不会用回退掩盖镜像篡改。
+  The bootstrap, Go runtime, and Bash compatibility runtime now prefer the release mirror and fall back to GitHub. Fallback occurs only for an incomplete transfer; once a complete asset set is selected, any verification failure aborts instead of hiding mirror tampering behind a fallback.
+
 ## 2.2.3
 
 修复安装或升级时 Telegram 预检把临时网络故障误报为 Token 无效，并错误引导用户重录凭据的问题。

@@ -15,6 +15,7 @@ STATE_TIME_FILE="$STATE_DIR/last-alert.sent_at"
 LOCK_FILE="${SECURITY_UPDATE_NOTIFY_LOCK_FILE:-/run/security-update-notify.lock}"
 VERSION="2.2.3"
 REPO="xxvcc/security-update-notify"
+RELEASE_MIRROR_BASE="https://dl.ll.cd/security-update-notify"
 RELEASE_SIGNING_FINGERPRINT="C678256ACBFC6491BF5076655F3AE24999921FFC"
 UPGRADE_ALLOW_UNSIGNED="${SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED:-0}"
 LOG_FILE="${SECURITY_UPDATE_NOTIFY_LOG_FILE:-/var/log/security-update-notify.log}"
@@ -86,7 +87,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 latest_release_version() {
-  python3 - "$REPO" <<'PY'
+  python3 - "$REPO" "$RELEASE_MIRROR_BASE" <<'PY'
 import json
 import sys
 import urllib.error
@@ -102,18 +103,35 @@ class HTTPSOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
             raise urllib.error.URLError(f"refusing non-https redirect to {newurl}")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
-repo = sys.argv[1]
-url = f"https://api.github.com/repos/{repo}/releases/latest"
+repo, mirror = sys.argv[1:]
 opener = urllib.request.build_opener(HTTPSOnlyRedirectHandler)
-try:
-    with opener.open(url, timeout=20) as response:
-        if urllib.parse.urlparse(response.geturl()).scheme != "https":
-            raise SystemExit("refusing non-https final API URL")
-        data = json.load(response)
-    tag = str(data.get("tag_name", ""))
-    print(tag[1:] if tag.startswith("v") else tag)
-except Exception as exc:
-    print(exc, file=sys.stderr)
+errors = []
+for kind, url in (
+    ("mirror", mirror.rstrip("/") + "/latest.json"),
+    ("github", f"https://api.github.com/repos/{repo}/releases/latest"),
+):
+    try:
+        with opener.open(url, timeout=20) as response:
+            if urllib.parse.urlparse(response.geturl()).scheme != "https":
+                raise ValueError("refusing non-https final API URL")
+            data = json.load(response)
+        if kind == "mirror":
+            version = str(data.get("version", ""))
+            tag = str(data.get("tag", ""))
+            base_url = str(data.get("base_url", ""))
+            if not version or tag != "v" + version or base_url != mirror.rstrip("/") + "/" + tag:
+                raise ValueError("invalid mirror latest manifest")
+        else:
+            tag = str(data.get("tag_name", ""))
+            version = tag[1:] if tag.startswith("v") else tag
+            if not version:
+                raise ValueError("empty GitHub release tag")
+        print(version)
+        break
+    except Exception as exc:
+        errors.append(f"{kind}: {exc}")
+else:
+    print("; ".join(errors), file=sys.stderr)
     sys.exit(1)
 PY
 }
@@ -309,10 +327,10 @@ verify_release_signature() {
 }
 
 run_self_upgrade() {
-  # 不再把远程脚本 `curl ... | bash` 直接交给 root 执行；改为直接下载 GitHub 发布包，
+  # 不再把远程脚本 `curl ... | bash` 直接交给 root 执行；改为从发布镜像优先下载、GitHub 回退，
   # 校验 sha256，并用本程序内置（pin）的指纹强制校验 GPG 签名（默认 fail-closed），
   # 通过后才运行已校验包内的 install.sh。
-  # No longer pipe a remote script into root bash. Instead download the GitHub release directly,
+  # No longer pipe a remote script into root bash. Prefer the release mirror and fall back to GitHub,
   # verify sha256, and require a GPG signature against the fingerprint pinned in this program
   # (fail-closed by default); only then run install.sh from the verified package.
   local disp; disp="${UI_LANG:-${NOTIFY_LANG:-zh}}"
@@ -325,7 +343,8 @@ run_self_upgrade() {
     command -v "$c" >/dev/null 2>&1 || { say "升级需要命令: $c" "Upgrade requires command: $c" >&2; exit 1; }
   done
 
-  local latest tmp pkg pkgdir url sha_url sig_url expected rc pkg_version
+  local latest tmp pkg pkgdir base url expected rc pkg_version need_signature selected_base
+  local -a bases
   if ! latest="$(latest_release_version)"; then
     say "无法获取最新版本" "Failed to fetch latest version" >&2
     exit 1
@@ -344,13 +363,38 @@ run_self_upgrade() {
   trap 'rm -rf "$tmp"' EXIT
   pkg="security-update-notify-${latest}.tar.gz"
   pkgdir="security-update-notify-${latest}"
-  url="https://github.com/${REPO}/releases/download/v${latest}/${pkg}"
-  sha_url="${url}.sha256"
-  sig_url="${url}.asc"
+  bases=(
+    "${RELEASE_MIRROR_BASE%/}/v${latest}"
+    "https://github.com/${REPO}/releases/download/v${latest}"
+  )
+
+  need_signature=0
+  if command -v gpg >/dev/null 2>&1; then
+    need_signature=1
+  elif [[ "$UPGRADE_ALLOW_UNSIGNED" != "1" ]]; then
+    say "缺少 gpg 且未设置 SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1；为安全起见拒绝升级。" "Missing gpg and SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED is not set; refusing to upgrade for safety." >&2
+    exit 1
+  fi
 
   say "正在下载并校验发布包: $VERSION -> $latest" "Downloading and verifying release: $VERSION -> $latest"
-  download_release_file "$url" "$tmp/$pkg" || { say "下载发布包失败" "Failed to download release" >&2; exit 1; }
-  download_release_file "$sha_url" "$tmp/$pkg.sha256" || { say "下载校验文件失败" "Failed to download checksum" >&2; exit 1; }
+  selected_base=""
+  for base in "${bases[@]}"; do
+    url="${base%/}/${pkg}"
+    rm -f "$tmp/$pkg" "$tmp/$pkg.sha256" "$tmp/$pkg.asc"
+    if download_release_file "$url" "$tmp/$pkg" \
+        && download_release_file "${url}.sha256" "$tmp/$pkg.sha256" \
+        && { [[ "$need_signature" -eq 0 ]] || download_release_file "${url}.asc" "$tmp/$pkg.asc" 2>/dev/null; }; then
+      selected_base="$base"
+      break
+    fi
+    if [[ "$base" == "${RELEASE_MIRROR_BASE%/}/v${latest}" ]]; then
+      say "发布镜像下载不完整，正在回退 GitHub。" "Release mirror download incomplete; falling back to GitHub."
+    fi
+  done
+  [[ -n "$selected_base" ]] || { say "镜像和 GitHub 均无法提供完整发布包" "Neither the mirror nor GitHub provided a complete release set" >&2; exit 1; }
+  if [[ "$selected_base" == "${RELEASE_MIRROR_BASE%/}/v${latest}" ]]; then
+    say "已通过发布镜像下载。" "Downloaded through the release mirror."
+  fi
 
   expected="$(awk 'NF {print $1; exit}' "$tmp/$pkg.sha256")"
   [[ "$expected" =~ ^[A-Fa-f0-9]{64}$ ]] || { say "无效的校验文件" "Invalid checksum file" >&2; exit 1; }
@@ -367,15 +411,10 @@ run_self_upgrade() {
   # (MITM/compromised mirror returning 404) we refuse, and never silently downgrade to sha256-only
   # (the sha256 file is attacker-supplied too). The sha256-only branch remains only for hosts that
   # genuinely lack gpg AND explicitly opt in, so a network attacker cannot trigger a downgrade.
-  if command -v gpg >/dev/null 2>&1; then
-    download_release_file "$sig_url" "$tmp/$pkg.asc" 2>/dev/null \
-      || { say "缺少发布签名（.asc）；gpg 可用时签名为必需，拒绝升级。" "Release signature (.asc) is missing; a signature is mandatory when gpg is available. Refusing to upgrade." >&2; exit 1; }
+  if [[ "$need_signature" -eq 1 ]]; then
     verify_release_signature "$tmp/$pkg.asc" "$tmp/$pkg"
   elif [[ "$UPGRADE_ALLOW_UNSIGNED" == "1" ]]; then
     say "警告：本机没有 gpg 且已设置 SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1，仅校验 sha256（不推荐）。" "WARNING: gpg is not installed and SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1; sha256-only verification (not recommended)." >&2
-  else
-    say "缺少 gpg 且未设置 SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1；为安全起见拒绝升级。" "Missing gpg and SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED is not set; refusing to upgrade for safety." >&2
-    exit 1
   fi
 
   # 安全解包：拒绝路径穿越、非预期顶层目录，以及 symlink/hardlink/device 等特殊条目。
