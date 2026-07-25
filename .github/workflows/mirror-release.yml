@@ -148,6 +148,11 @@ jobs:
               "$MIRROR_BASE_URL/$TAG/$asset?run=$GITHUB_RUN_ID"
           done
           (cd public-check && sha256sum -c "$TARBALL.sha256")
+          export GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+          gpg --batch --import files/release-signing.pub.asc
+          have="$(gpg --batch --with-colons --list-keys | awk -F: '$1=="fpr" {print $10; exit}')"
+          [[ "$have" == "$PIN" ]] || { echo "::error::public verification key fingerprint mismatch"; exit 1; }
           gpg --batch --verify "public-check/$TARBALL.asc" "public-check/$TARBALL"
 
       - name: Publish latest manifest last
