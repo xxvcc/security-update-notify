@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2.2.4
+
 - 稳定安装入口迁移到 `https://dl.ll.cd/security-update-notify/sun.sh`，不再依赖 `sun.xxv.cc`；按项目划分的路径为同一下载域名上的后续项目保留独立命名空间。
   Moves the stable installer to `https://dl.ll.cd/security-update-notify/sun.sh`, removing the `sun.xxv.cc` dependency while preserving project-scoped namespaces for future downloads on the same domain.
 - `sun.sh` 现在进入签名发布包。镜像工作流仅从校验 SHA-256、GPG 签名和固定指纹后的归档提取脚本，先回读校验版本化副本，再更新稳定脚本，最后更新 `latest.json`；旧版本补同步不能覆盖稳定入口。
