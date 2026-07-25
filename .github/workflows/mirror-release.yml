@@ -1,0 +1,173 @@
+name: Mirror signed release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to mirror, for example v2.2.3
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  verify-and-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      MIRROR_BASE_URL: ${{ vars.MIRROR_BASE_URL }}
+      MIRROR_HOST: ${{ vars.MIRROR_HOST }}
+      MIRROR_PORT: ${{ vars.MIRROR_PORT }}
+      MIRROR_USER: ${{ vars.MIRROR_USER }}
+    steps:
+      - name: Validate deployment configuration
+        env:
+          MIRROR_SSH_KEY: ${{ secrets.MIRROR_SSH_KEY }}
+          MIRROR_KNOWN_HOSTS: ${{ secrets.MIRROR_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z.-]+)?$ ]] || {
+            echo "::error::invalid release tag: $TAG"
+            exit 2
+          }
+          [[ "$MIRROR_BASE_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]] || {
+            echo "::error::invalid MIRROR_BASE_URL"
+            exit 2
+          }
+          [[ -n "$MIRROR_HOST" && "$MIRROR_PORT" =~ ^[0-9]+$ && -n "$MIRROR_USER" ]] || {
+            echo "::error::mirror SSH variables are incomplete"
+            exit 2
+          }
+          [[ -n "$MIRROR_SSH_KEY" && -n "$MIRROR_KNOWN_HOSTS" ]] || {
+            echo "::error::mirror SSH secrets are incomplete"
+            exit 2
+          }
+
+      - name: Checkout the released tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - name: Download release assets
+        run: |
+          set -euo pipefail
+          mkdir rel
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir rel \
+            --pattern 'security-update-notify-*.tar.gz*'
+
+      - name: Verify checksum and pinned GPG signature
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          tarball="security-update-notify-${version}.tar.gz"
+          [[ -f "rel/$tarball" && -f "rel/$tarball.sha256" && -f "rel/$tarball.asc" ]] || {
+            echo "::error::release must contain exactly the signed asset set for $tarball"
+            exit 1
+          }
+          [[ "$(find rel -maxdepth 1 -type f -name 'security-update-notify-*.tar.gz*' | wc -l)" -eq 3 ]] || {
+            echo "::error::unexpected release asset set"
+            exit 1
+          }
+          pin="$(awk -F= '/^RELEASE_SIGNING_FINGERPRINT=/{gsub(/["'\''[:space:]]/, "", $2); print $2; exit}' files/security-update-notify)"
+          [[ "$pin" =~ ^[0-9A-Fa-f]{40}$ ]] || { echo "::error::invalid pinned fingerprint"; exit 1; }
+          export GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+          gpg --batch --import files/release-signing.pub.asc
+          have="$(gpg --batch --with-colons --list-keys | awk -F: '$1=="fpr" {print $10; exit}')"
+          [[ "$have" == "$pin" ]] || { echo "::error::public key fingerprint mismatch"; exit 1; }
+          (cd rel && sha256sum -c "$tarball.sha256")
+          gpg --batch --verify "rel/$tarball.asc" "rel/$tarball"
+          printf 'VERSION=%s\nTARBALL=%s\nPIN=%s\n' "$version" "$tarball" "$pin" >> "$GITHUB_ENV"
+
+      - name: Prepare immutable release directory and latest manifest
+        run: |
+          set -euo pipefail
+          mkdir -p "deploy/$TAG"
+          install -m 0644 "rel/$TARBALL" "rel/$TARBALL.sha256" "rel/$TARBALL.asc" "deploy/$TAG/"
+          sha="$(awk 'NF {print $1; exit}' "rel/$TARBALL.sha256")"
+          published_at="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json publishedAt --jq .publishedAt)"
+          python3 - "$VERSION" "$TAG" "$MIRROR_BASE_URL" "$sha" "$PIN" "$published_at" > latest.json <<'PY'
+          import json
+          import sys
+
+          version, tag, root, sha256, fingerprint, published_at = sys.argv[1:]
+          json.dump({
+              "version": version,
+              "tag": tag,
+              "base_url": f"{root.rstrip('/')}/{tag}",
+              "sha256": sha256,
+              "signing_fingerprint": fingerprint,
+              "published_at": published_at,
+          }, sys.stdout, ensure_ascii=True, separators=(",", ":"))
+          sys.stdout.write("\n")
+          PY
+          latest_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          if [[ "$TAG" == "$latest_tag" ]]; then
+            echo 'UPDATE_LATEST=1' >> "$GITHUB_ENV"
+          else
+            echo 'UPDATE_LATEST=0' >> "$GITHUB_ENV"
+            echo "Mirroring $TAG without changing latest.json (GitHub Latest is $latest_tag)."
+          fi
+
+      - name: Configure pinned SSH identity
+        env:
+          MIRROR_SSH_KEY: ${{ secrets.MIRROR_SSH_KEY }}
+          MIRROR_KNOWN_HOSTS: ${{ secrets.MIRROR_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$MIRROR_SSH_KEY" > "$HOME/.ssh/mirror_key"
+          printf '%s\n' "$MIRROR_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/mirror_key" "$HOME/.ssh/known_hosts"
+          printf 'RSYNC_RSH=ssh -i %s/.ssh/mirror_key -p %s -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=%s/.ssh/known_hosts\n' \
+            "$HOME" "$MIRROR_PORT" "$HOME" >> "$GITHUB_ENV"
+
+      - name: Upload immutable signed assets
+        run: |
+          set -euo pipefail
+          rsync --archive --checksum --delay-updates --chmod=D755,F644 \
+            "deploy/$TAG/" "$MIRROR_USER@$MIRROR_HOST:$TAG/"
+
+      - name: Verify assets through the public mirror
+        run: |
+          set -euo pipefail
+          mkdir public-check
+          for asset in "$TARBALL" "$TARBALL.sha256" "$TARBALL.asc"; do
+            curl --fail --location --retry 3 --retry-all-errors \
+              --proto '=https' --proto-redir '=https' \
+              --output "public-check/$asset" \
+              "$MIRROR_BASE_URL/$TAG/$asset?run=$GITHUB_RUN_ID"
+          done
+          (cd public-check && sha256sum -c "$TARBALL.sha256")
+          gpg --batch --verify "public-check/$TARBALL.asc" "public-check/$TARBALL"
+
+      - name: Publish latest manifest last
+        if: env.UPDATE_LATEST == '1'
+        run: |
+          set -euo pipefail
+          rsync --archive --checksum --delay-updates --chmod=F644 \
+            latest.json "$MIRROR_USER@$MIRROR_HOST:latest.json"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --proto '=https' --proto-redir '=https' \
+            "$MIRROR_BASE_URL/latest.json?run=$GITHUB_RUN_ID" > public-latest.json
+          cmp latest.json public-latest.json
+
+      - name: Mirror summary
+        run: |
+          {
+            echo "### Signed release mirror"
+            echo
+            echo "- Tag: \`$TAG\`"
+            echo "- Assets: \`$MIRROR_BASE_URL/$TAG/\`"
+            echo "- Updated latest.json: \`$UPDATE_LATEST\`"
+            echo "- Signing fingerprint: \`$PIN\`"
+          } >> "$GITHUB_STEP_SUMMARY"
