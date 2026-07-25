@@ -44,7 +44,7 @@ SUN keeps the boring part automatic and makes the human part obvious.
 - **No automatic reboot** — you stay in control of downtime.
 - **Telegram and Feishu, individually or together**: Telegram keeps compact plain text while Feishu uses native JSON 2.0 cards; old configs remain Telegram-only, and dual delivery keeps separate dedup state so one failing channel does not repeat the other.
 - **Reboot and service-restart detection** with `needrestart` or `needs-restarting`.
-- **Security-update watchdog**: beyond kernel/service restarts, it watches three commonly-missed things — ① whether the auto-update mechanism itself is unhealthy (timer disabled, last run failed, no successful update for too long, disk nearly full); ② whether security updates are still pending (dnf also counts critical/important); ③ whether the distro's security support is ending or already ended (EOL). A mechanism problem or a past-EOL release triggers an alert; the pending count and an approaching EOL ride along with alerts as info. All three can be turned off in the config.
+- **Patch-maintenance watchdog**: checks the auto-update mechanism, policy drift, hold/versionlock/exclude blocks, package-manager integrity, repository metadata, persistent patch backlogs, and overdue restart requirements. It also checks distro EOL and gives a weekly SUN release notice. Upgrades and restarts remain manual.
 - **Single-language UI (Chinese or English)**: the installer, menu and diagnostics pick a language as the first step (Chinese or English, default Chinese) and then render all terminal interaction in that one language. The choice also becomes the default notification language, overridable with `--notify-lang`.
 - **Public IP in notifications**: auto-detect the server public IP by default; you can also set it manually or disable it. Auto-detection is done by the Go runtime with the standard library and adds no `curl`/`python3` dependency.
 - **Duplicate alert suppression**: once, daily, or every N days.
@@ -316,15 +316,27 @@ With dual delivery, each channel has independent state. If Telegram succeeds and
 
 ## Security-update watchdog
 
-Beyond reboot/service-restart detection, SUN runs three extra checks by default (all can be disabled in `/etc/security-update-notify/telegram.env`):
+In addition to reboot/service-restart and distro-EOL detection, SUN runs seven patch-maintenance checks by default:
+
+1. Alert when pending security patches remain continuously beyond the threshold, `3` days by default.
+2. Alert immediately when APT hold or DNF versionlock/exclude hides a security patch.
+3. Detect drift in APT or dnf-automatic security-update policy and timer settings.
+4. Run `dpkg --audit`, `apt-get check`, or `dnf check` to detect a broken package-manager state.
+5. Check APT InRelease metadata for missing, expired, or stale data and distinguish refresh failures from signature/TLS errors; DNF metadata and signature/TLS failures are also classified separately.
+6. Escalate full-reboot or service-restart requirements that remain beyond the threshold, `7` days by default.
+7. Check for a SUN release every `7` days by default and send a notice only. It **never upgrades SUN automatically**.
 
 | Key | Default | What it does |
 | --- | --- | --- |
-| `CHECK_UPDATE_HEALTH` | `1` | Detects whether the auto-update mechanism is healthy: the timer (`apt-daily-upgrade` / `dnf-automatic`) is disabled, the last run failed, no successful update for more than `STALE_UPDATE_DAYS` days, or `/` or `/boot` has less than 200 MB free. Any hit triggers an alert. |
+| `CHECK_UPDATE_HEALTH` | `1` | Checks the auto-update mechanism, effective policy, package consistency, and repository health: disabled timers, failed/stale runs, low disk space, policy drift, broken package state, missing/expired/stale metadata, and signature/TLS errors. Set `0` to disable this group; backlog age, restart age, EOL, and SUN release notices remain enabled. |
 | `STALE_UPDATE_DAYS` | `7` | Days without a successful automatic security update before it's considered stale; set `0` to disable this sub-check. |
+| `PENDING_ALERT_DAYS` | `3` | Days that pending security updates may remain before alerting; set `0` to disable backlog alerts. The first-seen time is kept in root-only state and removed after the backlog clears. |
+| `RESTART_ALERT_DAYS` | `7` | Days before a persistent full-reboot or service-restart requirement is escalated; set `0` to disable age escalation. SUN never restarts the host or services automatically. |
+| `CHECK_SELF_UPDATE` | `1` | Periodically check for a SUN release; notify only, never auto-upgrade. |
+| `SELF_UPDATE_CHECK_DAYS` | `7` | SUN release-check interval. Successful results are cached; `--doctor` forces a read-only refresh. |
 | `CHECK_EOL` | `1` | Distro end-of-life (EOL) warning: a past-EOL release triggers an alert, an approaching one (within 90 days) is informational. Set `0` if you have extended support such as Ubuntu ESM. |
 
-The pending security-update count is informational — it rides along with alerts and shows in `--doctor`, but does not trigger an alert on its own. Run `security-update-notify --doctor` anytime to see the current state of all three.
+The pending count remains informational until it reaches `PENDING_ALERT_DAYS`. DNF's high-severity subtotal includes both `critical` and `important`. Run `security-update-notify --doctor` anytime to inspect all seven checks, pending counts, and the SUN release result; diagnostics never mutate age or release-cache state. `--test-ok`, `--test-reboot`, and the Go runtime's `--dry-run` neither write this state nor make the periodic release request.
 
 ## Installed files
 

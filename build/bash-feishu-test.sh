@@ -120,11 +120,13 @@ export SECURITY_UPDATE_NOTIFY_FEISHU_BASE_URL="http://127.0.0.1:$MOCK_PORT"
 NOTIFY_LANG=zh VERSION=2.2.0 HOST=bash-host INCLUDE_PUBLIC_IP=1 \
   PUBLIC_IP_VALUE=203.0.113.10 OS="Debian 12" BACKEND=apt KERNEL=6.1.0-test \
   NOW="2026-07-24 17:20:00 CST" reboot_required=1 restart_attention=1 \
-  HEALTH_ATTENTION=0 PENDING_SEC_COUNT=2 EOL_ATTENTION=0 \
+  HEALTH_ATTENTION=0 AUTO_HEALTH_ATTENTION=0 PATCH_RISK_ATTENTION=0 UPDATE_AVAILABLE=0 \
+  PENDING_SEC_COUNT=2 EOL_ATTENTION=0 \
   reboot_pkgs=$'linux-image-amd64\nTEST-MODE-no-real-reboot' \
   rs_zh=$'当前内核：6.1.0-test\n需检查/重启服务：ssh.service' \
   rs_en=$'Current kernel: 6.1.0-test\nServices to review/restart: ssh.service' \
-  HEALTH_TXT_ZH="" HEALTH_TXT_EN="" PENDING_TXT_ZH="• 待安装安全更新：2 项" \
+  HEALTH_TXT_ZH="" HEALTH_TXT_EN="" PATCH_TXT_ZH="" PATCH_TXT_EN="" \
+  UPDATE_TXT_ZH="" UPDATE_TXT_EN="" PENDING_TXT_ZH="• 待安装安全更新：2 项" \
   PENDING_TXT_EN="• Pending security updates: 2" EOL_TXT_ZH="" EOL_TXT_EN=""
 
 saved_host="$HOST"
@@ -161,16 +163,23 @@ PENDING_SEC_COUNT=0
 PENDING_TXT_ZH=""
 PENDING_TXT_EN=""
 green_card="$(feishu_build_check_card 0 "healthy fallback")"
+UPDATE_AVAILABLE=1
+UPDATE_TXT_ZH="SUN 新版本可用：2.2.0 -> 2.2.1。请手动运行 sudo security-update-notify --upgrade。"
+UPDATE_TXT_EN="A new SUN version is available: 2.2.0 -> 2.2.1. Run sudo security-update-notify --upgrade manually."
+update_card="$(feishu_build_check_card 1 "update fallback")"
+UPDATE_AVAILABLE=0
+UPDATE_TXT_ZH=""
+UPDATE_TXT_EN=""
 EOL_ATTENTION=1
 EOL_TXT_ZH="发行版已结束安全支持"
 EOL_TXT_EN="Distribution security support ended"
 red_card="$(feishu_build_check_card 1 "EOL fallback")"
 blue_card="$(feishu_build_upgrade_card 2.1.0 2.2.0 "upgrade fallback")"
-GREEN_CARD="$green_card" RED_CARD="$red_card" BLUE_CARD="$blue_card" /usr/bin/python3 - <<'PY'
+GREEN_CARD="$green_card" RED_CARD="$red_card" UPDATE_CARD="$update_card" BLUE_CARD="$blue_card" /usr/bin/python3 - <<'PY'
 import json
 import os
 
-for name, want in (("GREEN_CARD", "green"), ("RED_CARD", "red"), ("BLUE_CARD", "blue")):
+for name, want in (("GREEN_CARD", "green"), ("RED_CARD", "red"), ("UPDATE_CARD", "blue"), ("BLUE_CARD", "blue")):
     doc = json.loads(os.environ[name])
     assert doc.get("schema") == "2.0"
     assert doc.get("header", {}).get("template") == want, (name, doc.get("header"))

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/xxvcc/security-update-notify/internal/backend"
 	"github.com/xxvcc/security-update-notify/internal/config"
 	"github.com/xxvcc/security-update-notify/internal/i18n"
 	"github.com/xxvcc/security-update-notify/internal/osrel"
@@ -133,13 +134,35 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 		}
 	}
 
-	health, pending, eol := collectWatchdog(cfg, be, o)
+	var restart backend.RestartState
+	switch be {
+	case "apt":
+		restart = collectAPT()
+	case "dnf":
+		restart = collectDNF()
+	}
+	health, pending, patch, eol := collectWatchdog(cfg, be, o, restart, opts.Version, false, true, false)
 	if health.Attention {
 		say(out, lang, "失败：自动安全更新机制异常", "FAIL automatic security-update mechanism issue")
 		say(out, lang, health.TxtZH, health.TxtEN)
 		ok = false
 	} else {
 		say(out, lang, "正常：自动安全更新机制健康", "OK automatic security-update mechanism healthy")
+	}
+	if patch.RiskAttention {
+		say(out, lang, "失败：补丁维护检查发现风险", "FAIL patch-maintenance checks found risks")
+		say(out, lang, patch.TxtZH, patch.TxtEN)
+		ok = false
+	} else {
+		say(out, lang, "正常：补丁策略、软件包和仓库检查通过", "OK patch policy, package, and repository checks passed")
+	}
+	if patch.SelfUpdateCheckErr {
+		say(out, lang, "失败：无法检查 SUN 最新版本", "FAIL could not check the latest SUN version")
+		ok = false
+	} else if patch.UpdateAvailable {
+		say(out, lang, patch.UpdateTxtZH, patch.UpdateTxtEN)
+	} else if patch.LatestVersion != "" {
+		say(out, lang, "正常：SUN 已是最新版本（"+opts.Version+"）", "OK SUN is up to date ("+opts.Version+")")
 	}
 	if pending.Count > 0 {
 		say(out, lang, pending.TxtZH, pending.TxtEN)

@@ -1,6 +1,7 @@
 package watchdog
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -106,19 +107,55 @@ func TestCheckEOL(t *testing.T) {
 }
 
 func TestCollectPending(t *testing.T) {
-	dnf := CollectPending("dnf", "Last metadata ...\nFEDORA-x Critical/Sec. kernel-6.9.x86_64\nFEDORA-y Moderate/Sec. openssl.x86_64\n")
-	if dnf.Count != 2 || dnf.Crit != 1 {
-		t.Errorf("dnf count=%d crit=%d want 2,1", dnf.Count, dnf.Crit)
+	dnf := CollectPending("dnf", "Last metadata ...\nFEDORA-x Critical/Sec. kernel-6.9.x86_64\nFEDORA-y Important/Sec. openssl.x86_64\n")
+	if dnf.Count != 2 || dnf.Crit != 2 {
+		t.Errorf("dnf count=%d crit=%d want 2,2", dnf.Count, dnf.Crit)
 	}
-	if dnf.TxtZH != "待安装安全更新：2 个（其中高危/重要 1 个）" {
+	if dnf.TxtZH != "待安装安全更新：2 个（其中高危/重要 2 个）" {
 		t.Errorf("dnf TxtZH=%q", dnf.TxtZH)
 	}
 	apt := CollectPending("apt", "Inst libc6 [1] (2 Debian:12/stable [amd64]) security\nInst bash [5] (5.1 Debian:12/stable [amd64])\n")
 	if apt.Count != 1 {
 		t.Errorf("apt count=%d want 1", apt.Count)
 	}
+	if len(apt.Packages) != 1 || apt.Packages[0] != "libc6" {
+		t.Errorf("apt packages=%v", apt.Packages)
+	}
 	none := CollectPending("apt", "")
 	if none.Count != 0 || none.TxtZH != "" {
 		t.Errorf("empty: count=%d txt=%q", none.Count, none.TxtZH)
+	}
+}
+
+func TestBlockedPackages(t *testing.T) {
+	normalAPT := CollectPending("apt", "Inst bash [1] (2 Debian-Security) security\n")
+	ignoreHold := CollectPending("apt", "Inst bash [1] (2 Debian-Security) security\nInst openssl [1] (2 Debian-Security) security\n")
+	if got := BlockedAPT(normalAPT, ignoreHold, "openssl\nnonsecurity\n"); len(got) != 1 || got[0] != "openssl" {
+		t.Fatalf("BlockedAPT=%v", got)
+	}
+	normalDNF := CollectPending("dnf", "ADV Moderate/Sec. bash.x86_64\n")
+	allDNF := CollectPending("dnf", "ADV Moderate/Sec. bash.x86_64\nADV Important/Sec. openssl.x86_64\n")
+	if got := BlockedDNF(normalDNF, allDNF); len(got) != 1 || got[0] != "openssl.x86_64" {
+		t.Fatalf("BlockedDNF=%v", got)
+	}
+}
+
+func TestPolicyChecks(t *testing.T) {
+	apt := `APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+Unattended-Upgrade::Origins-Pattern:: "origin=Debian,label=Debian-Security";
+Unattended-Upgrade::Automatic-Reboot "false";`
+	if issues := CheckAPTPolicy(apt, true); len(issues) != 0 {
+		t.Fatalf("healthy apt policy issues=%v", issues)
+	}
+	if issues := CheckAPTPolicy(strings.Replace(apt, `"1"`, `"0"`, 1), false); len(issues) < 2 {
+		t.Fatalf("drifted apt policy issues=%v", issues)
+	}
+	dnf := "[commands]\nupgrade_type = security\napply_updates = yes\n"
+	if issues := CheckDNFPolicy(dnf); len(issues) != 0 {
+		t.Fatalf("healthy dnf policy issues=%v", issues)
+	}
+	if issues := CheckDNFPolicy("[commands]\nupgrade_type = default\napply_updates = no\n"); len(issues) != 2 {
+		t.Fatalf("drifted dnf policy issues=%v", issues)
 	}
 }

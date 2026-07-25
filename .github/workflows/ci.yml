@@ -29,11 +29,11 @@ jobs:
 
       - name: Shell syntax check
         run: |
-          bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify build/compat-test.sh build/rollback-test.sh build/bash-feishu-test.sh build/install-feishu-onboarding-test.sh build/install-notification-settings-test.sh build/install-telegram-preflight-test.sh build/runtime-lock-test.sh
+          bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify build/compat-test.sh build/rollback-test.sh build/bash-feishu-test.sh build/bash-patch-watchdog-test.sh build/install-feishu-onboarding-test.sh build/install-notification-settings-test.sh build/install-telegram-preflight-test.sh build/runtime-lock-test.sh
 
       - name: ShellCheck
         run: |
-          shellcheck -s bash -S warning -e SC2034,SC1091 install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify build/bash-feishu-test.sh build/install-feishu-onboarding-test.sh build/install-notification-settings-test.sh build/install-telegram-preflight-test.sh build/runtime-lock-test.sh
+          shellcheck -s bash -S warning -e SC2034,SC1091 install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify build/bash-feishu-test.sh build/bash-patch-watchdog-test.sh build/install-feishu-onboarding-test.sh build/install-notification-settings-test.sh build/install-telegram-preflight-test.sh build/runtime-lock-test.sh
 
       - name: Dotenv parser regression check
         run: |
@@ -628,6 +628,9 @@ jobs:
       - name: Bash fallback Feishu HTTP client regression check
         run: build/bash-feishu-test.sh
 
+      - name: Bash fallback patch watchdog regression check
+        run: build/bash-patch-watchdog-test.sh
+
       - name: Feishu installer onboarding regression check
         run: build/install-feishu-onboarding-test.sh
 
@@ -736,7 +739,11 @@ jobs:
             ./install.sh --telegram-token 123456:abc_DEF-ghi --telegram-chat-id -100123 --skip-telegram-test --non-interactive -y --skip-post-install-check
             expected_version="$(grep -E "^VERSION=" files/security-update-notify | head -1 | cut -d\" -f2)"
             /usr/local/sbin/security-update-notify --version | grep "$expected_version"
-            grep -q "CONFIG_VERSION='3'" /etc/security-update-notify/telegram.env
+            grep -q "CONFIG_VERSION='4'" /etc/security-update-notify/telegram.env
+            grep -q "PENDING_ALERT_DAYS='3'" /etc/security-update-notify/telegram.env
+            grep -q "RESTART_ALERT_DAYS='7'" /etc/security-update-notify/telegram.env
+            grep -q "CHECK_SELF_UPDATE='1'" /etc/security-update-notify/telegram.env
+            grep -q "SELF_UPDATE_CHECK_DAYS='7'" /etc/security-update-notify/telegram.env
             grep -q "NOTIFY_CHANNELS='telegram'" /etc/security-update-notify/telegram.env
             ./install.sh --skip-telegram-test --non-interactive -y --skip-post-install-check
             test -s /var/backups/security-update-notify/latest

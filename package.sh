@@ -20,6 +20,7 @@ tar_clean_env() { env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT tar "$@"; }
 cd "$ROOT"
 bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify \
   build/compat-test.sh build/rollback-test.sh build/bash-feishu-test.sh \
+  build/bash-patch-watchdog-test.sh \
   build/install-feishu-onboarding-test.sh build/install-notification-settings-test.sh \
   build/install-telegram-preflight-test.sh \
   build/runtime-lock-test.sh build/reproducibility-check.sh

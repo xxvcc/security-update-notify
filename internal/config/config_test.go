@@ -65,6 +65,7 @@ func TestWriteFormat(t *testing.T) {
 		"NOTIFY_OK": "0", "NOTIFY_UPGRADE": "0", "DEDUP_MODE": "always", "DEDUP_INTERVAL_DAYS": "3",
 		"NOTIFY_LANG": "en", "BACKEND": "apt", "CONFIG_VERSION": "1",
 		"CHECK_UPDATE_HEALTH": "1", "STALE_UPDATE_DAYS": "7", "CHECK_EOL": "1",
+		"PENDING_ALERT_DAYS": "3", "RESTART_ALERT_DAYS": "7", "CHECK_SELF_UPDATE": "1", "SELF_UPDATE_CHECK_DAYS": "7",
 	}
 	var buf bytes.Buffer
 	if err := Write(&buf, values); err != nil {
@@ -84,9 +85,9 @@ func TestWriteFormat(t *testing.T) {
 			t.Errorf("line %d = %q, want key %s", i, body[i], k)
 		}
 	}
-	// CONFIG_VERSION 强制为 '3'，DEDUP_MODE always -> once，空 PUBLIC_IP -> ''。
-	if body[0] != "CONFIG_VERSION='3'" {
-		t.Errorf("CONFIG_VERSION line = %q want CONFIG_VERSION='3'", body[0])
+	// CONFIG_VERSION 强制为 '4'，DEDUP_MODE always -> once，空 PUBLIC_IP -> ''。
+	if body[0] != "CONFIG_VERSION='4'" {
+		t.Errorf("CONFIG_VERSION line = %q want CONFIG_VERSION='4'", body[0])
 	}
 	joined := buf.String()
 	if !strings.Contains(joined, "DEDUP_MODE='once'") {
@@ -119,7 +120,7 @@ func TestWriteLoadRoundTrip(t *testing.T) {
 	for k, v := range in {
 		want[k] = v
 	}
-	want["CONFIG_VERSION"] = "3"
+	want["CONFIG_VERSION"] = "4"
 	want["DEDUP_MODE"] = "once"
 	for k, w := range want {
 		if got := cfg.Get(k); got != w {

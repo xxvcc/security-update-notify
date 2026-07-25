@@ -103,6 +103,8 @@ func TestRenderFeishuCardStatusColors(t *testing.T) {
 		{name: "ok", message: Message{Lang: i18n.ZH}, template: "green", title: "安全更新检查正常"},
 		{name: "maintenance", message: Message{Alert: true, Lang: i18n.ZH, RestartAttention: true}, template: "orange", title: "主机需要安全维护"},
 		{name: "health", message: Message{Alert: true, Lang: i18n.ZH, HealthAttention: true}, template: "red", title: "自动安全更新机制异常"},
+		{name: "patch", message: Message{Alert: true, Lang: i18n.ZH, PatchAttention: true}, template: "red", title: "补丁维护风险"},
+		{name: "release-only", message: Message{Alert: true, Lang: i18n.ZH, UpdateAvailable: true}, template: "blue", title: "SUN 新版本可用"},
 		{name: "eol", message: Message{Alert: true, Lang: i18n.EN, EolAttention: true}, template: "red", title: "Distribution security support ended"},
 	}
 	for _, tt := range tests {
@@ -122,6 +124,19 @@ func TestRenderFeishuCardStatusColors(t *testing.T) {
 				t.Fatalf("got template=%q title=%q", doc.Header.Template, doc.Header.Title.Content)
 			}
 		})
+	}
+}
+
+func TestRenderFeishuCardPatchAndReleaseSections(t *testing.T) {
+	b := RenderFeishuCard(Message{
+		Alert: true, Lang: i18n.ZH, Host: "host-01", PatchAttention: true, UpdateAvailable: true,
+		PatchTxtZH:  "• APT 依赖一致性检查失败",
+		UpdateTxtZH: "SUN 新版本可用：2.2.4 -> 2.2.5。请手动升级。",
+	})
+	for _, want := range []string{"补丁健康", "补丁维护风险", "APT 依赖一致性检查失败", "SUN 新版本", "2.2.5"} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("card missing %q", want)
+		}
 	}
 }
 

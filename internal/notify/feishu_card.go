@@ -65,7 +65,7 @@ func RenderFeishuCard(m Message) []byte {
 			cardCell(pick(en, "服务/进程重启", "Service/process restart"), attentionState(m.RestartAttention, en), boolColor(m.RestartAttention, "orange")),
 		),
 		cardGrid(
-			cardCell(pick(en, "自动更新", "Auto updates"), healthState(m.HealthAttention, en), boolColor(m.HealthAttention, "red")),
+			cardCell(pick(en, "补丁健康", "Patch health"), healthState(m.HealthAttention || m.PatchAttention, en), boolColor(m.HealthAttention || m.PatchAttention, "red")),
 			cardCell(pick(en, "安全支持", "Security support"), supportState(m, en), supportColor(m)),
 		),
 	}
@@ -97,6 +97,18 @@ func RenderFeishuCard(m Message) []byte {
 		elements = appendCardSection(elements,
 			pick(en, "自动安全更新机制", "Automatic security-update mechanism"),
 			limitCardText(healthText, 2000, en))
+	}
+	patchText := pick(en, m.PatchTxtZH, m.PatchTxtEN)
+	if patchText != "" {
+		elements = appendCardSection(elements,
+			pick(en, "补丁维护风险", "Patch maintenance risk"),
+			limitCardText(patchText, 3000, en))
+	}
+	updateText := pick(en, m.UpdateTxtZH, m.UpdateTxtEN)
+	if m.UpdateAvailable && updateText != "" {
+		elements = appendCardSection(elements,
+			pick(en, "SUN 新版本", "SUN update available"),
+			limitCardText(updateText, 1500, en))
 	}
 	pendingText := pick(en, m.PendingTxtZH, m.PendingTxtEN)
 	if pendingText != "" {
@@ -169,6 +181,10 @@ func checkCardPresentation(m Message, en bool) (string, string) {
 		return pick(en, "发行版安全支持已结束", "Distribution security support ended"), "red"
 	case m.HealthAttention:
 		return pick(en, "自动安全更新机制异常", "Automatic security updates need attention"), "red"
+	case m.PatchAttention:
+		return pick(en, "补丁维护风险", "Patch maintenance risk"), "red"
+	case m.UpdateAvailable:
+		return pick(en, "SUN 新版本可用", "SUN update available"), "blue"
 	default:
 		return pick(en, "主机需要安全维护", "Host maintenance required"), "orange"
 	}

@@ -60,6 +60,10 @@ NOTIFY_OK="${NOTIFY_OK:-}"
 CHECK_UPDATE_HEALTH="${CHECK_UPDATE_HEALTH:-}"
 STALE_UPDATE_DAYS="${STALE_UPDATE_DAYS:-}"
 CHECK_EOL="${CHECK_EOL:-}"
+PENDING_ALERT_DAYS="${PENDING_ALERT_DAYS:-}"
+RESTART_ALERT_DAYS="${RESTART_ALERT_DAYS:-}"
+CHECK_SELF_UPDATE="${CHECK_SELF_UPDATE:-}"
+SELF_UPDATE_CHECK_DAYS="${SELF_UPDATE_CHECK_DAYS:-}"
 CONFIG_FILE="/etc/security-update-notify/telegram.env"
 FEISHU_CREDENTIAL_DIR="/etc/security-update-notify/credentials"
 FEISHU_CREDENTIAL_FILE="$FEISHU_CREDENTIAL_DIR/feishu-app-secret"
@@ -227,7 +231,7 @@ load_env_file() {
     if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
     if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
     case "$key" in
-      NOTIFY_CHANNELS|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|FEISHU_APP_ID|FEISHU_RECEIVE_ID|FEISHU_APP_SECRET_FILE|CHECK_TIME|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION|UI_LANG|CHECK_UPDATE_HEALTH|STALE_UPDATE_DAYS|CHECK_EOL)
+      NOTIFY_CHANNELS|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|FEISHU_APP_ID|FEISHU_RECEIVE_ID|FEISHU_APP_SECRET_FILE|CHECK_TIME|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION|UI_LANG|CHECK_UPDATE_HEALTH|STALE_UPDATE_DAYS|CHECK_EOL|PENDING_ALERT_DAYS|RESTART_ALERT_DAYS|CHECK_SELF_UPDATE|SELF_UPDATE_CHECK_DAYS)
         printf -v "$key" '%s' "$value"
         case "$key" in
           NOTIFY_CHANNELS)
@@ -301,7 +305,7 @@ load_existing_config_defaults() {
         set_config_default "$key" "$value"
         EXISTING_CONFIG_LOADED=1
         ;;
-      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|FEISHU_RECEIVE_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|NOTIFY_UPGRADE|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION|CHECK_UPDATE_HEALTH|STALE_UPDATE_DAYS|CHECK_EOL)
+      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|FEISHU_RECEIVE_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|NOTIFY_UPGRADE|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION|CHECK_UPDATE_HEALTH|STALE_UPDATE_DAYS|CHECK_EOL|PENDING_ALERT_DAYS|RESTART_ALERT_DAYS|CHECK_SELF_UPDATE|SELF_UPDATE_CHECK_DAYS)
         set_config_default "$key" "$value"
         EXISTING_CONFIG_LOADED=1
         ;;
@@ -377,7 +381,7 @@ validate_config_value() {
 }
 validate_config_values() {
   local name value
-  for name in NOTIFY_CHANNELS TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID FEISHU_APP_ID FEISHU_RECEIVE_ID HOST_LABEL PUBLIC_IP INCLUDE_PUBLIC_IP NOTIFY_OK NOTIFY_UPGRADE DEDUP_MODE DEDUP_INTERVAL_DAYS NOTIFY_LANG BACKEND CONFIG_VERSION CHECK_UPDATE_HEALTH STALE_UPDATE_DAYS CHECK_EOL; do
+  for name in NOTIFY_CHANNELS TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID FEISHU_APP_ID FEISHU_RECEIVE_ID HOST_LABEL PUBLIC_IP INCLUDE_PUBLIC_IP NOTIFY_OK NOTIFY_UPGRADE DEDUP_MODE DEDUP_INTERVAL_DAYS NOTIFY_LANG BACKEND CONFIG_VERSION CHECK_UPDATE_HEALTH STALE_UPDATE_DAYS CHECK_EOL PENDING_ALERT_DAYS RESTART_ALERT_DAYS CHECK_SELF_UPDATE SELF_UPDATE_CHECK_DAYS; do
     set +u; value="${!name}"; set -u
     validate_config_value "$name" "$value"
   done
@@ -1916,10 +1920,14 @@ trap on_exit EXIT
 : "${CHECK_UPDATE_HEALTH:=1}"
 : "${STALE_UPDATE_DAYS:=7}"
 : "${CHECK_EOL:=1}"
+: "${PENDING_ALERT_DAYS:=3}"
+: "${RESTART_ALERT_DAYS:=7}"
+: "${CHECK_SELF_UPDATE:=1}"
+: "${SELF_UPDATE_CHECK_DAYS:=7}"
 # 始终写入安装器当前的配置 schema 版本，不沿用旧值（避免升级后写回过期的 CONFIG_VERSION）。
 # Always write the installer's current config schema version; do not reuse the old one (so an upgrade
 # does not write back a stale CONFIG_VERSION).
-CONFIG_VERSION=3
+CONFIG_VERSION=4
 [[ -r /etc/os-release ]] || { say "缺少 /etc/os-release" "Missing /etc/os-release" >&2; exit 1; }
 lib_read_os_release
 lib_detect_backend
@@ -2031,6 +2039,10 @@ case "${NOTIFY_UPGRADE,,}" in 1|true|yes|on) NOTIFY_UPGRADE=1 ;; 0|false|no|off)
 case "${CHECK_UPDATE_HEALTH,,}" in 1|true|yes|on) CHECK_UPDATE_HEALTH=1 ;; 0|false|no|off) CHECK_UPDATE_HEALTH=0 ;; *) say "无效 CHECK_UPDATE_HEALTH: $CHECK_UPDATE_HEALTH（应为 0 或 1）" "Invalid CHECK_UPDATE_HEALTH: $CHECK_UPDATE_HEALTH (expected 0 or 1)" >&2; exit 2 ;; esac
 [[ "$STALE_UPDATE_DAYS" =~ ^[0-9]+$ ]] || { say "无效 STALE_UPDATE_DAYS: $STALE_UPDATE_DAYS（应为非负整数）" "Invalid STALE_UPDATE_DAYS: $STALE_UPDATE_DAYS (expected a non-negative integer)" >&2; exit 2; }
 case "${CHECK_EOL,,}" in 1|true|yes|on) CHECK_EOL=1 ;; 0|false|no|off) CHECK_EOL=0 ;; *) say "无效 CHECK_EOL: $CHECK_EOL（应为 0 或 1）" "Invalid CHECK_EOL: $CHECK_EOL (expected 0 or 1)" >&2; exit 2 ;; esac
+[[ "$PENDING_ALERT_DAYS" =~ ^[0-9]+$ ]] || { say "无效 PENDING_ALERT_DAYS: $PENDING_ALERT_DAYS（应为非负整数）" "Invalid PENDING_ALERT_DAYS: $PENDING_ALERT_DAYS (expected a non-negative integer)" >&2; exit 2; }
+[[ "$RESTART_ALERT_DAYS" =~ ^[0-9]+$ ]] || { say "无效 RESTART_ALERT_DAYS: $RESTART_ALERT_DAYS（应为非负整数）" "Invalid RESTART_ALERT_DAYS: $RESTART_ALERT_DAYS (expected a non-negative integer)" >&2; exit 2; }
+case "${CHECK_SELF_UPDATE,,}" in 1|true|yes|on) CHECK_SELF_UPDATE=1 ;; 0|false|no|off) CHECK_SELF_UPDATE=0 ;; *) say "无效 CHECK_SELF_UPDATE: $CHECK_SELF_UPDATE（应为 0 或 1）" "Invalid CHECK_SELF_UPDATE: $CHECK_SELF_UPDATE (expected 0 or 1)" >&2; exit 2 ;; esac
+[[ "$SELF_UPDATE_CHECK_DAYS" =~ ^[1-9][0-9]*$ ]] || { say "无效 SELF_UPDATE_CHECK_DAYS: $SELF_UPDATE_CHECK_DAYS（应为正整数）" "Invalid SELF_UPDATE_CHECK_DAYS: $SELF_UPDATE_CHECK_DAYS (expected a positive integer)" >&2; exit 2; }
 prompt_text CHECK_TIME "每日检查时间 HH:MM" "Daily check time HH:MM" "09:00"
 if [[ -z "$DEDUP_MODE" ]]; then
   if [[ "$NON_INTERACTIVE" -eq 1 ]]; then DEDUP_MODE="daily"; else
@@ -2194,6 +2206,10 @@ umask 077
   printf 'CHECK_UPDATE_HEALTH=%s\n' "$(config_quote "$CHECK_UPDATE_HEALTH")"
   printf 'STALE_UPDATE_DAYS=%s\n' "$(config_quote "$STALE_UPDATE_DAYS")"
   printf 'CHECK_EOL=%s\n' "$(config_quote "$CHECK_EOL")"
+  printf 'PENDING_ALERT_DAYS=%s\n' "$(config_quote "$PENDING_ALERT_DAYS")"
+  printf 'RESTART_ALERT_DAYS=%s\n' "$(config_quote "$RESTART_ALERT_DAYS")"
+  printf 'CHECK_SELF_UPDATE=%s\n' "$(config_quote "$CHECK_SELF_UPDATE")"
+  printf 'SELF_UPDATE_CHECK_DAYS=%s\n' "$(config_quote "$SELF_UPDATE_CHECK_DAYS")"
 } >/etc/security-update-notify/telegram.env
 chmod 600 /etc/security-update-notify/telegram.env
 cat >/etc/systemd/system/security-update-notify.timer <<EOF

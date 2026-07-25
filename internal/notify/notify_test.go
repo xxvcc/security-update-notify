@@ -1,6 +1,7 @@
 package notify
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/xxvcc/security-update-notify/internal/backend"
@@ -61,6 +62,25 @@ func TestRenderMatchesGolden(t *testing.T) {
 		}
 		if got := Render(m); got != v.Message {
 			t.Errorf("scenario %s message mismatch:\n--- got ---\n%s\n--- want ---\n%s", name, got, v.Message)
+		}
+	}
+}
+
+func TestRenderPatchAndReleaseSections(t *testing.T) {
+	got := Render(Message{
+		Alert: true, Lang: i18n.EN, Host: "host-01", Backend: "apt",
+		PatchTxtZH:      "• APT 依赖一致性检查失败",
+		PatchTxtEN:      "• APT dependency consistency check failed; run apt-get check",
+		PatchAttention:  true,
+		UpdateTxtEN:     "A new SUN version is available: 2.2.4 -> 2.2.5. Run sudo security-update-notify --upgrade manually.",
+		UpdateAvailable: true,
+	})
+	for _, want := range []string{
+		"⚠️ Patch maintenance risk:\n• APT dependency consistency check failed",
+		"⬆️ A new SUN version is available: 2.2.4 -> 2.2.5",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("message missing %q:\n%s", want, got)
 		}
 	}
 }

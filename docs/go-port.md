@@ -8,7 +8,7 @@ analysis (inventory → design → adversarial critique → synthesis); the anal
 
 > **Current status (2.2.3):** the Go runtime, signed bridge distribution, self-upgrade path, and all original
 > port phases are complete. Version 2.1.0 added selectable Telegram/Feishu delivery, per-channel dedup state,
-> diagnostics, upgrade notices, and configuration schema v3. Version 2.2.0 adds embedded Feishu Card JSON 2.0
+> diagnostics, upgrade notices, and configuration schema v4. Version 2.2.0 adds embedded Feishu Card JSON 2.0
 > while preserving Telegram text and dedup hashes. Version 2.2.1 closes recipient onboarding with a confirmed
 > post-install Feishu send and hardens runtime-lock/timer rollback behavior. Version 2.2.2 fixes Directory v1
 > recipient pagination when the final page retains its previous token. Version 2.2.3 also provides
@@ -51,14 +51,14 @@ internal/
   version/    ✅ 语义化版本比较（fail-closed）——已从 PoC 迁入
   dist/       ✅ sha256 + pin 指纹 GPG 验签 + tar 安全检查（含解压上限）——已迁入
   golden/     ✅ 从真 Bash 运行时捕获的黄金向量（dedup hash + 归一化正文）——oracle
-  config/     ✅ telegram.env 严格行解析器 + 逐字节复刻 writer（18 键白名单、schema v3、fail-open/closed 分裂）
+  config/     ✅ telegram.env 严格行解析器 + 逐字节复刻 writer（22 键白名单、schema v4、fail-open/closed 分裂）
   delivery/   ✅ Telegram / 飞书共同的渠道解析与发送接口；旧配置缺渠道时默认 Telegram
   feishu/     ✅ tenant token + 应用级 open_id 文本/JSON 2.0 卡片发送（30 KB 门、3 次重试、限流信号）
   i18n/       ✅ UI_LANG / NOTIFY_LANG 解析（m/say 优先级），LC_ALL=C
   osrel/      ✅ os-release 解析 + 后端探测 + 支持分级（替代 lib.sh）
   backend/    ✅ needrestart -b 与 needs-restarting -r/-s 纯解析器（KCUR/KEXP/KSTA/SVC、文本优先 reboot
               判定、-s 能力探测）——单包合并 apt+dnf（原计划分两包，合并更便于共享 helper）
-  watchdog/   ✅ 健康 / EOL / pending 纯逻辑（HEALTH_SIG 尾逗号、EOL 表与 ci.yml 一致）
+  watchdog/   ✅ 健康 / 补丁策略与时长 / EOL / pending 纯逻辑（HEALTH_SIG 尾逗号、EOL 表与 ci.yml 一致）
   dedup/      ✅ 11 字段 sha256 + once/daily/interval + 原子状态写 + 渠道独立状态
   notify/     ✅ zh/en 文本模板 + JSON 2.0 卡片渲染 + format_restart_summary；文本 8/8 golden 逐字节通过
   telegram/   ✅ GetMe + SendMessage（net/http，rune 截断，3 次重试，只对 429/5xx 重试）—— 干掉 python3
@@ -67,7 +67,7 @@ internal/
   sysexec/    ✅ exec 边界：子进程一律 LC_ALL=C；非零退出当数据不致命（镜像 set +e）
   systemd/    ✅ systemctl 查询封装（is-enabled / show -p PROP --value）
   lock/       ✅ flock 单实例锁（非阻塞，抢不到静默退 0）
-  run/        ✅ Assemble + Collect + Execute；按渠道发送、部分失败隔离、doctor 与升级通知均支持双渠道
+  run/        ✅ Assemble + Collect + Execute；补丁状态原子持久化、周期只读版本提示、按渠道发送、部分失败隔离、doctor 与升级通知均支持双渠道
   cli/        ✅ 子命令分发 + 裸调用=run（--version/--test-*/--no-dedupe/--dry-run/--lang/--doctor/
               --check-upgrade/--notify-upgrade-event/--upgrade）
   dist/       ✅ sha256 + pin 指纹 GPG 验签 + tar 安全检查/解包（Extract 剥离 setuid）+ LatestRelease +
@@ -94,20 +94,26 @@ sun.sh        ✅ 保持 shell 引导器；下载、sha256、指纹 pin、GPG �
   = `sort -u` 后的服务列表本身，无成帧、无末尾换行。**
 - **`HOST` = `hostname -f`（再 `hostname`，再 `unknown`）——必须 EXEC**；`os.Hostname()` 返回短名，会
   悄悄改掉每台 FQDN 主机的 hash。
-- **`HEALTH_SIG`** = `sort -u` 的 reason token（disabled/failed/stale/never-success/disk）逗号连接
-  **带尾逗号**，无则空。**`reboot_pkgs`** = `sort -u` 换行连接，**无尾换行**。SVC 列表：`sort.Strings`
-  （= C locale 字节序）+ 去重；子进程一律 `LC_ALL=C`。
+- **`HEALTH_SIG`** = 旧健康 reason token（disabled/failed/stale/never-success/disk）与补丁维护 reason
+  合并后 `sort -u`、逗号连接并**带尾逗号**，无则空。补丁 reason 使用稳定代码；涉及包名或 SUN
+  版本的动态细节先排序去重，再把 SHA-256 前 12 hex 绑定到 reason，避免把任意正文放入哈希。
+  **不得增加第 12 个哈希字段**。**`reboot_pkgs`** = `sort -u` 换行连接，**无尾换行**。SVC 列表：
+  `sort.Strings`（= C locale 字节序）+ 去重；子进程一律 `LC_ALL=C`。
 - **状态回读 `TrimRight` 掉所有尾换行**（Bash `cat` 捕获）；否则每次运行都重发。`last-alert.sha256` =
   64hex+换行，`last-alert.sent_at` = epoch+换行；`STATE_DIR` 0750；临时文件 + rename 原子写，**hash 先于
   时间戳** rename；直写回退显式 0600。
-- **telegram.env 线格式**（文件名为兼容历史保留）：18 键固定写序、两行双语头注释、`config_quote`
+- **telegram.env 线格式**（文件名为兼容历史保留）：22 键固定写序、两行双语头注释、`config_quote`
   （默认单引号，值含单引号才用双引号，**绝不反斜杠转义**；校验禁止同时含两种引号），强制
-  `CONFIG_VERSION=3`，旧配置缺 `NOTIFY_CHANNELS` 时按 `telegram`，`DEDUP_MODE` always→once。
+  `CONFIG_VERSION=4`，旧配置缺 `NOTIFY_CHANNELS` 时按 `telegram`，`DEDUP_MODE` always→once。schema 3
+  缺少四个新键时使用默认值：pending 3 天、restart 7 天、SUN 版本检查开启且间隔 7 天。
   **不要用 `strconv.Quote`/`%q`/JSON**。文件 0600。
 - **配置读取“致命 vs 非致命”分裂**：文件不可读 → 继续（fail-open）；行无 `=` / 键正则不符 / 非白名单键 →
   exit 2（fail-closed）。`NOTIFY_LANG` 归一化为精确 zh/en，否则 zh（hash 字段 3 + 消息语言）。
-- **按键真值不对称**：`INCLUDE_PUBLIC_IP`/`CHECK_UPDATE_HEALTH`/`CHECK_EOL` 接受 `1/true/yes/on`（小写化）；
+- **按键真值不对称**：`INCLUDE_PUBLIC_IP`/`CHECK_UPDATE_HEALTH`/`CHECK_EOL`/`CHECK_SELF_UPDATE` 接受 `1/true/yes/on`（小写化）；
   `NOTIFY_OK` 与 `NOTIFY_UPGRADE` 用 **精确 `==1`**。不要统一成一个 bool 解析器。
+- **补丁状态副作用**：普通 timer 运行才可创建/清除 first_seen 和写 7 天版本缓存；doctor 强制版本查询但
+  全程只读；`--test-ok`、`--test-reboot`、`--dry-run` 既不写补丁状态，也不访问版本服务。版本检查只设置
+  通知字段，绝不能调用自升级、包管理器安装、服务重启或 reboot。
 - **Telegram**：token 正则 `^\d+:[A-Za-z0-9_-]+$`；4096 截断按 **rune**（`RuneCountInString` → 取前 4000
   rune + `\n…(truncated)`），非字节长度；表单 `chat_id/text/disable_web_page_preview=true`；3 次尝试间隔
   1s；**仅**对 ok=false-break 或 HTTP 429/500/502/503/504 重试。

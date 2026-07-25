@@ -32,6 +32,7 @@ type Input struct {
 	Restart backend.RestartState // check_apt/check_dnf 或 --test-reboot 夹具
 	Health  watchdog.Health
 	Pending watchdog.Pending
+	Patch   watchdog.Patch
 	EOL     watchdog.EOL
 
 	SendOK   bool // --test-ok 或 NOTIFY_OK=1
@@ -59,12 +60,12 @@ func Assemble(in Input) Output {
 		RebootPkgs:       in.Restart.RebootPkgs,
 		RestartAttention: in.Restart.RestartAttention,
 		RestartSignal:    in.Restart.RestartSignal,
-		HealthAttention:  in.Health.Attention,
-		HealthSig:        in.Health.Sig,
+		HealthAttention:  in.Health.Attention || in.Patch.RiskAttention || in.Patch.UpdateAvailable,
+		HealthSig:        watchdog.MergeSignals(in.Health.Sig, in.Patch.Sig),
 		EolAttention:     in.EOL.Attention,
 		EolSig:           in.EOL.Sig,
 	}
-	attention := in.Restart.RebootRequired || in.Restart.RestartAttention || in.Health.Attention || in.EOL.Attention
+	attention := in.Restart.RebootRequired || in.Restart.RestartAttention || fields.HealthAttention || in.EOL.Attention
 
 	out := Output{Fields: fields, Attention: attention}
 	if !attention && !in.SendOK {
@@ -89,6 +90,12 @@ func Assemble(in Input) Output {
 		HealthTxtZH:      in.Health.TxtZH,
 		HealthTxtEN:      in.Health.TxtEN,
 		HealthAttention:  in.Health.Attention,
+		PatchTxtZH:       in.Patch.TxtZH,
+		PatchTxtEN:       in.Patch.TxtEN,
+		PatchAttention:   in.Patch.RiskAttention,
+		UpdateTxtZH:      in.Patch.UpdateTxtZH,
+		UpdateTxtEN:      in.Patch.UpdateTxtEN,
+		UpdateAvailable:  in.Patch.UpdateAvailable,
 		PendingTxtZH:     in.Pending.TxtZH,
 		PendingTxtEN:     in.Pending.TxtEN,
 		PendingCount:     in.Pending.Count,

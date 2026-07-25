@@ -1,6 +1,15 @@
 # 变更记录
 
-## Unreleased
+## 2.3.0
+
+- 新增七类补丁维护检测：待安装安全补丁连续滞留（默认 3 天）、APT hold / DNF versionlock 或 exclude 阻断、自动更新策略漂移、包管理器损坏状态、软件源元数据缺失/过期/陈旧及签名/TLS/刷新失败、整机或服务重启需求长期未处理（默认 7 天），以及每周 SUN 新版本提示。
+  Adds seven patch-maintenance checks: persistent pending security patches (3 days by default), APT hold / DNF versionlock or exclude blocks, auto-update policy drift, broken package-manager state, missing/expired/stale repository metadata and signature/TLS/refresh failures, overdue host/service restart requirements (7 days by default), and a weekly SUN release notice.
+- SUN 版本检查只通知、绝不自动升级；成功结果缓存 7 天，`--doctor` 强制只读刷新，`--test-ok`、`--test-reboot` 和 `--dry-run` 不写状态也不访问版本服务。
+  SUN release checks are notify-only and never auto-upgrade. Successful results are cached for seven days; `--doctor` forces a read-only refresh, while `--test-ok`, `--test-reboot`, and `--dry-run` neither mutate state nor contact the release service.
+- 配置升级到 schema 4，新增 `PENDING_ALERT_DAYS`、`RESTART_ALERT_DAYS`、`CHECK_SELF_UPDATE` 与 `SELF_UPDATE_CHECK_DAYS`；旧 schema 3 配置缺键时采用安全默认值。`CHECK_UPDATE_HEALTH=0` 关闭策略、完整性和软件源检查，但不影响补丁滞留、重启时长、EOL 或版本提示。
+  Config schema 4 adds `PENDING_ALERT_DAYS`, `RESTART_ALERT_DAYS`, `CHECK_SELF_UPDATE`, and `SELF_UPDATE_CHECK_DAYS`; missing keys in schema 3 configs receive safe defaults. `CHECK_UPDATE_HEALTH=0` disables policy, integrity, and repository checks without disabling backlog age, restart age, EOL, or release notices.
+- Go 主运行时与 Bash 兼容运行时保持相同原因码、11 字段去重帧、双语正文和飞书卡片语义；仅有 SUN 新版本时使用蓝色卡片。DNF 高危子计数同时包含 `critical` 与 `important`。
+  The Go and Bash runtimes share reason codes, the existing 11-field dedup frame, bilingual messages, and Feishu-card semantics; a release-only notice uses a blue card. DNF's high-severity subtotal now includes both `critical` and `important`.
 
 ## 2.2.4
 

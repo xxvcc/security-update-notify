@@ -15,6 +15,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"time"
 )
 
 // Result 是一次命令执行的结果。Code 是退出码（命令无法启动时为 -1，Err 非空）。
@@ -63,6 +64,13 @@ func forcedEnv() []string {
 // Run 执行命令并捕获 stdout/stderr/退出码。非零退出不作为错误返回（镜像 `set +e`）。
 func Run(name string, args ...string) Result {
 	return RunContext(context.Background(), name, args...)
+}
+
+// RunTimeout bounds commands used by the daily watchdog. A timed-out command returns Code=-1 and Err set.
+func RunTimeout(timeout time.Duration, name string, args ...string) Result {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return RunContext(ctx, name, args...)
 }
 
 // RunContext 是带 context 的 Run（用于超时/取消）。

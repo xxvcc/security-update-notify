@@ -37,7 +37,11 @@ rm -f /tmp/bash-only/files/security-update-notify-linux-*
     --host-label compat-host --skip-telegram-test --non-interactive -y --skip-post-install-check )
 ok "head -1 /usr/local/sbin/security-update-notify | grep -q 'bin/env bash'" "bash runtime installed"
 ok "grep -qF \"HOST_LABEL='compat-host'\" /etc/security-update-notify/telegram.env" "config written"
-ok "grep -qF \"CONFIG_VERSION='3'\" /etc/security-update-notify/telegram.env" "config upgraded to schema v3"
+ok "grep -qF \"CONFIG_VERSION='4'\" /etc/security-update-notify/telegram.env" "config upgraded to schema v4"
+ok "grep -qF \"PENDING_ALERT_DAYS='3'\" /etc/security-update-notify/telegram.env" "pending-patch age default written"
+ok "grep -qF \"RESTART_ALERT_DAYS='7'\" /etc/security-update-notify/telegram.env" "restart age default written"
+ok "grep -qF \"CHECK_SELF_UPDATE='1'\" /etc/security-update-notify/telegram.env" "notify-only release check enabled"
+ok "grep -qF \"SELF_UPDATE_CHECK_DAYS='7'\" /etc/security-update-notify/telegram.env" "release-check interval written"
 ok "grep -qF \"NOTIFY_CHANNELS='telegram'\" /etc/security-update-notify/telegram.env" "legacy/default channel is Telegram"
 # 模拟一次此前的告警状态（升级后必须保留、不因升级而丢失或改变）。
 printf '%s\n' "67937ecd9dc8b78bb7bbb248d4ef6ef6ec0ac64ad65de2141dc171faec1803cd" >/var/lib/security-update-notify/last-alert.sha256

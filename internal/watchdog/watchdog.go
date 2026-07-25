@@ -128,10 +128,11 @@ func sortUniqCSV(xs []string) string {
 
 // Pending 是 collect_security_updates 的结果（信息项，不单独触发发送）。
 type Pending struct {
-	Count int
-	Crit  int
-	TxtZH string
-	TxtEN string
+	Count    int
+	Crit     int // critical + important security advisories
+	Packages []string
+	TxtZH    string
+	TxtEN    string
 }
 
 // archTail 复刻 `$NF ~ /\.(x86_64|noarch|aarch64|i686|ppc64le|s390x)$/`。
@@ -151,6 +152,7 @@ func hasArchTail(s string) bool {
 //   - apt：`apt-get -s upgrade` 中以 "Inst " 起始且（小写）含 "security" 的行计数。
 func CollectPending(backend, out string) Pending {
 	var p Pending
+	var packages []string
 	switch backend {
 	case "dnf":
 		for _, ln := range strings.Split(out, "\n") {
@@ -161,7 +163,9 @@ func CollectPending(backend, out string) Pending {
 			last := f[len(f)-1]
 			if hasArchTail(last) {
 				p.Count++
-				if strings.Contains(strings.ToLower(ln), "critical") {
+				packages = append(packages, last)
+				lower := strings.ToLower(ln)
+				if strings.Contains(lower, "critical") || strings.Contains(lower, "important") {
 					p.Crit++
 				}
 			}
@@ -170,11 +174,15 @@ func CollectPending(backend, out string) Pending {
 		for _, ln := range strings.Split(out, "\n") {
 			if strings.HasPrefix(ln, "Inst ") && strings.Contains(strings.ToLower(ln), "security") {
 				p.Count++
+				if fields := strings.Fields(ln); len(fields) > 1 {
+					packages = append(packages, strings.SplitN(fields[1], ":", 2)[0])
+				}
 			}
 		}
 	default:
 		return p
 	}
+	p.Packages = sortUniqStrings(packages)
 	if p.Count > 0 {
 		if p.Crit > 0 {
 			p.TxtZH = fmt.Sprintf("待安装安全更新：%d 个（其中高危/重要 %d 个）", p.Count, p.Crit)
@@ -185,6 +193,47 @@ func CollectPending(backend, out string) Pending {
 		}
 	}
 	return p
+}
+
+// BlockedAPT returns explicitly held packages that appear only when apt's hold gate is ignored.
+func BlockedAPT(normal, ignoreHold Pending, heldOutput string) []string {
+	normalSet := stringSet(normal.Packages)
+	heldSet := map[string]bool{}
+	for _, line := range strings.Split(heldOutput, "\n") {
+		name := strings.SplitN(strings.TrimSpace(line), ":", 2)[0]
+		if name != "" {
+			heldSet[name] = true
+		}
+	}
+	var blocked []string
+	for _, name := range ignoreHold.Packages {
+		base := strings.SplitN(name, ":", 2)[0]
+		if heldSet[base] && !normalSet[base] {
+			blocked = append(blocked, base)
+		}
+	}
+	return sortUniqStrings(blocked)
+}
+
+// BlockedDNF returns security-update package tokens hidden by versionlock or exclude. The unrestricted
+// input must come from the same query with both constraints disabled.
+func BlockedDNF(normal, unrestricted Pending) []string {
+	normalSet := stringSet(normal.Packages)
+	var blocked []string
+	for _, pkg := range unrestricted.Packages {
+		if !normalSet[pkg] {
+			blocked = append(blocked, pkg)
+		}
+	}
+	return sortUniqStrings(blocked)
+}
+
+func stringSet(xs []string) map[string]bool {
+	out := make(map[string]bool, len(xs))
+	for _, x := range xs {
+		out[x] = true
+	}
+	return out
 }
 
 // EOL 是 check_eol 的结果。

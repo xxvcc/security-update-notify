@@ -26,11 +26,12 @@ const (
 
 // Flags 是影响采集/决策的运行时标志。
 type Flags struct {
-	TestReboot bool   // --test-reboot：用固定夹具，不读真实重启状态
-	TestOK     bool   // --test-ok：无关注时也发 OK
-	NoDedupe   bool   // --no-dedupe
-	Lang       string // --lang（UI_LANG），空表示未指定
-	Version    string // 编译期注入的 SUN 版本，仅用于通知展示
+	TestReboot    bool   // --test-reboot：用固定夹具，不读真实重启状态
+	TestOK        bool   // --test-ok：无关注时也发 OK
+	NoDedupe      bool   // --no-dedupe
+	Lang          string // --lang（UI_LANG），空表示未指定
+	Version       string // 编译期注入的 SUN 版本，仅用于通知展示
+	NoStateWrites bool   // dry-run/diagnostic paths must not create patch-age state
 }
 
 // --test-reboot 的固定摘要（与 check_apt/check_dnf 的测试分支一致）。
@@ -73,22 +74,31 @@ func Collect(cfg *config.Config, f Flags) Input {
 		in.Restart = collectDNF()
 	}
 
-	in.Health, in.Pending, in.EOL = collectWatchdog(cfg, be, o)
+	persistPatchState := !f.NoStateWrites && !f.TestReboot && !f.TestOK
+	skipSelfUpdate := f.NoStateWrites || f.TestReboot || f.TestOK
+	in.Health, in.Pending, in.Patch, in.EOL = collectWatchdog(cfg, be, o, in.Restart, f.Version, persistPatchState, false, skipSelfUpdate)
+	if be == "dnf" && len(in.Pending.Packages) > 0 {
+		pkgs := in.Pending.Packages
+		if len(pkgs) > 40 {
+			pkgs = pkgs[:40]
+		}
+		in.Restart.RebootPkgs = strings.Join(pkgs, "\n")
+	}
 	return in
 }
 
 // collectWatchdog 采集看门狗三项（健康/待装/EOL），受各自的配置开关门控。Collect 与 Doctor 共用。
-func collectWatchdog(cfg *config.Config, be string, o osrel.OSRelease) (watchdog.Health, watchdog.Pending, watchdog.EOL) {
+func collectWatchdog(cfg *config.Config, be string, o osrel.OSRelease, restart backend.RestartState, currentVersion string, persistPatchState, forceSelfUpdate, skipSelfUpdate bool) (watchdog.Health, watchdog.Pending, watchdog.Patch, watchdog.EOL) {
 	var h watchdog.Health
 	if truthyLooseDefault(cfg.Get("CHECK_UPDATE_HEALTH"), true) && systemd.Available() {
 		h = collectHealth(be, staleDays(cfg))
 	}
-	p := watchdog.CollectPending(be, collectPendingOutput(be))
+	patch, p := collectPatchWatchdog(cfg, be, restart, currentVersion, patchCollectOptions{PersistState: persistPatchState, ForceSelfUpdate: forceSelfUpdate, SkipSelfUpdate: skipSelfUpdate})
 	var e watchdog.EOL
 	if truthyLooseDefault(cfg.Get("CHECK_EOL"), true) {
 		e = watchdog.CheckEOL(o.ID, o.VersionID, o.PrettyName, time.Now().Unix())
 	}
-	return h, p, e
+	return h, p, patch, e
 }
 
 // resolvePublicIP 复刻 INCLUDE_PUBLIC_IP + PUBLIC_IP + 运行时自动获取 的解析。
@@ -152,17 +162,13 @@ func collectDNF() backend.RestartState {
 			nrS = sysexec.Run("needs-restarting", "-s").Stdout
 		}
 	}
-	updateInfo := ""
-	if sysexec.Look("dnf") {
-		updateInfo = firstNLines(sysexec.Run("dnf", "-q", "updateinfo", "list", "security", "updates").Stdout, 40)
-	}
 	return backend.ParseDNF(backend.DNFInput{
 		HasNeedsRestarting: hasNR,
 		NeedsRestartingR:   nrR,
 		NeedsRestartingRC:  rcR,
 		HasS:               hasS,
 		NeedsRestartingS:   nrS,
-		UpdateInfo:         updateInfo,
+		UpdateInfo:         "",
 	})
 }
 
@@ -190,20 +196,6 @@ func collectHealth(be string, stale int) watchdog.Health {
 		StaleDays:         stale,
 		Disks:             collectDisks(),
 	})
-}
-
-func collectPendingOutput(be string) string {
-	switch be {
-	case "apt":
-		if sysexec.Look("apt-get") {
-			return sysexec.Run("apt-get", "-s", "upgrade").Stdout
-		}
-	case "dnf":
-		if sysexec.Look("dnf") {
-			return sysexec.Run("dnf", "-q", "updateinfo", "list", "security").Stdout
-		}
-	}
-	return ""
 }
 
 func collectDisks() []watchdog.DiskAvail {

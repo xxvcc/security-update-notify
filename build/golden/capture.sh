@@ -80,12 +80,26 @@ EOF
 # apt-get / dnf：collect_security_updates 会调用；置空以确定性地得到 0 个待装更新。
 printf '#!/usr/bin/env bash\nexit 0\n' >"$stub/apt-get"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$stub/dnf"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$stub/apt-mark"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$stub/dpkg"
+cat >"$stub/apt-config" <<'EOF'
+#!/usr/bin/env bash
+cat <<'OUT'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+Unattended-Upgrade::Origins-Pattern:: "origin=Debian,codename=${distro_codename}-security";
+Unattended-Upgrade::Automatic-Reboot "false";
+OUT
+EOF
 
 # systemctl：看门狗健康检查。SYS_ENABLED 控制 is-enabled 退出码；show 一律空。
 cat >"$stub/systemctl" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
-  is-enabled) exit "${SYS_ENABLED:-0}" ;;
+  is-enabled)
+    [[ "${2:-}" == apt-daily.timer ]] && exit 0
+    exit "${SYS_ENABLED:-0}"
+    ;;
   show) exit 0 ;;
   *) exit 0 ;;
 esac
@@ -99,6 +113,8 @@ echo "/dev/x 100000000 1000000 99000000 2% /"
 EOF
 
 chmod +x "$stub"/*
+mkdir -p "$WORK/apt-lists"
+printf 'Valid-Until: Fri, 25 Jul 2099 12:00:00 +0000\n' >"$WORK/apt-lists/debian-security_InRelease"
 
 # ---- 场景运行器 / scenario runner -----------------------------------------
 # 归一化易变行：系统/OS、当前内核/Current kernel、时间/Time 归一化为占位符，使 message 稳定。
@@ -119,7 +135,7 @@ run_scenario() {
   local kv
   for kv in "$@"; do
     case "$kv" in
-      NR_B=*|NR_R_OUT=*|NR_R_RC=*|NR_S_OUT=*|SYS_ENABLED=*|CHECK_UPDATE_HEALTH=*|CHECK_EOL=*|STALE_UPDATE_DAYS=*)
+      NR_B=*|NR_R_OUT=*|NR_R_RC=*|NR_S_OUT=*|SYS_ENABLED=*|CHECK_UPDATE_HEALTH=*|CHECK_EOL=*|STALE_UPDATE_DAYS=*|SECURITY_UPDATE_NOTIFY_APT_LISTS_DIR=*)
         runenv+=("$kv") ;;                       # 传给进程的桩/开关
       *) printf '%s\n' "$kv" >>"$envfile" ;;     # 写入 env 文件（配置键）
     esac
@@ -143,8 +159,8 @@ PY
 }
 
 # 通用确定性基线：固定主机名、关公网 IP、关看门狗噪声。
-BASE_APT=(TELEGRAM_BOT_TOKEN=fake TELEGRAM_CHAT_ID=fake HOST_LABEL=golden-host INCLUDE_PUBLIC_IP=0 BACKEND=apt NOTIFY_LANG=zh CHECK_UPDATE_HEALTH=0 CHECK_EOL=0 STALE_UPDATE_DAYS=0)
-BASE_DNF=(TELEGRAM_BOT_TOKEN=fake TELEGRAM_CHAT_ID=fake HOST_LABEL=golden-host INCLUDE_PUBLIC_IP=0 BACKEND=dnf NOTIFY_LANG=zh CHECK_UPDATE_HEALTH=0 CHECK_EOL=0 STALE_UPDATE_DAYS=0)
+BASE_APT=(TELEGRAM_BOT_TOKEN=fake TELEGRAM_CHAT_ID=fake HOST_LABEL=golden-host INCLUDE_PUBLIC_IP=0 BACKEND=apt NOTIFY_LANG=zh CHECK_UPDATE_HEALTH=0 CHECK_EOL=0 STALE_UPDATE_DAYS=0 CHECK_SELF_UPDATE=0)
+BASE_DNF=(TELEGRAM_BOT_TOKEN=fake TELEGRAM_CHAT_ID=fake HOST_LABEL=golden-host INCLUDE_PUBLIC_IP=0 BACKEND=dnf NOTIFY_LANG=zh CHECK_UPDATE_HEALTH=0 CHECK_EOL=0 STALE_UPDATE_DAYS=0 CHECK_SELF_UPDATE=0)
 
 echo "capturing golden vectors:"
 
@@ -166,12 +182,14 @@ run_scenario dnf-services-zh  run "${BASE_DNF[@]}" 'NR_R_OUT=Reboot should not b
 # 5) 看门狗：定时器未启用 -> HEALTH_SIG="disabled,"（锁定尾逗号 landmine）；apt，无重启
 run_scenario apt-health-disabled-zh  run \
   TELEGRAM_BOT_TOKEN=fake TELEGRAM_CHAT_ID=fake HOST_LABEL=golden-host INCLUDE_PUBLIC_IP=0 BACKEND=apt NOTIFY_LANG=zh \
-  CHECK_UPDATE_HEALTH=1 CHECK_EOL=0 STALE_UPDATE_DAYS=0 SYS_ENABLED=1 NR_B=''
+  CHECK_UPDATE_HEALTH=1 CHECK_EOL=0 STALE_UPDATE_DAYS=0 CHECK_SELF_UPDATE=0 SYS_ENABLED=1 NR_B='' \
+  "SECURITY_UPDATE_NOTIFY_APT_LISTS_DIR=$WORK/apt-lists"
 
 # 6) ok 路径（无关注 + NOTIFY_OK=1），带公网 IP，dnf
 run_scenario dnf-ok-pubip-zh --test-ok \
   TELEGRAM_BOT_TOKEN=fake TELEGRAM_CHAT_ID=fake HOST_LABEL=golden-host BACKEND=dnf NOTIFY_LANG=zh \
   NOTIFY_OK=1 INCLUDE_PUBLIC_IP=1 PUBLIC_IP=203.0.113.10 CHECK_UPDATE_HEALTH=0 CHECK_EOL=0 STALE_UPDATE_DAYS=0 \
+  CHECK_SELF_UPDATE=0 \
   'NR_R_OUT=Reboot should not be necessary.' NR_R_RC=0 NR_S_OUT=''
 
 printf '%s' "$VECTORS" | python3 -m json.tool >"$OUT_DIR/scenarios.json"

@@ -51,7 +51,9 @@ func AcquireExecutionLock(require bool, wait time.Duration) (release func(), acq
 // 75=显式 --wait-lock 超时（安装器据此拒绝把“未发送”误判为验证成功）。
 func Execute(cfg *config.Config, f DryRunFlags) int {
 	if f.DryRun {
-		out := Assemble(Collect(cfg, f.Flags))
+		flags := f.Flags
+		flags.NoStateWrites = true
+		out := Assemble(Collect(cfg, flags))
 		fmt.Println("HASH\t" + out.Hash())
 		if out.Send {
 			fmt.Print(out.Message)

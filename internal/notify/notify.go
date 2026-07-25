@@ -34,6 +34,10 @@ type Message struct {
 	// 看门狗附加段（由 watchdog 产出；空则不出现）。
 	HealthTxtZH, HealthTxtEN   string
 	HealthAttention            bool
+	PatchTxtZH, PatchTxtEN     string
+	PatchAttention             bool
+	UpdateTxtZH, UpdateTxtEN   string
+	UpdateAvailable            bool
 	PendingTxtZH, PendingTxtEN string
 	PendingCount               int
 	EolTxtZH, EolTxtEN         string
@@ -76,6 +80,20 @@ func (m Message) extra() string {
 			b.WriteString("\n\n⚠️ Automatic security-update mechanism problem:\n" + m.HealthTxtEN)
 		} else {
 			b.WriteString("\n\n⚠️ 自动安全更新机制异常：\n" + m.HealthTxtZH)
+		}
+	}
+	if m.PatchTxtZH != "" {
+		if en {
+			b.WriteString("\n\n⚠️ Patch maintenance risk:\n" + m.PatchTxtEN)
+		} else {
+			b.WriteString("\n\n⚠️ 补丁维护风险：\n" + m.PatchTxtZH)
+		}
+	}
+	if m.UpdateAvailable {
+		if en {
+			b.WriteString("\n\n⬆️ " + m.UpdateTxtEN)
+		} else {
+			b.WriteString("\n\n⬆️ " + m.UpdateTxtZH)
 		}
 	}
 	if m.PendingTxtZH != "" {
