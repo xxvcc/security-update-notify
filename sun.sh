@@ -3,8 +3,8 @@ set -euo pipefail
 
 # security-update-notify 引导安装器。
 # Bootstrap installer for security-update-notify.
-# 可将此脚本发布到你的网站，例如 https://example.com/install/sun.sh
-# Publish this script on your website, e.g. https://example.com/install/sun.sh
+# 稳定发布地址：https://dl.ll.cd/security-update-notify/sun.sh
+# Stable URL: https://dl.ll.cd/security-update-notify/sun.sh
 
 REPO="xxvcc/security-update-notify"
 VERSION="latest"
@@ -28,8 +28,8 @@ usage() {
   if [ "${UI_LANG:-zh}" = en ]; then
     cat <<'EOF'
 Usage:
-  curl -fsSL https://example.com/install/sun.sh | sudo bash
-  curl -fsSL https://example.com/install/sun.sh | sudo bash -s -- install [install args]
+  curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash
+  curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- install [install args]
 
 Bootstrap options:
   --lang LANG             Language for output and the selected script: zh | en
@@ -48,8 +48,8 @@ EOF
   else
     cat <<'EOF'
 用法:
-  curl -fsSL https://example.com/install/sun.sh | sudo bash
-  curl -fsSL https://example.com/install/sun.sh | sudo bash -s -- install [安装参数]
+  curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash
+  curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- install [安装参数]
 
 引导选项:
   --lang LANG             输出与所选脚本的语言：zh | en

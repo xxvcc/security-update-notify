@@ -61,7 +61,7 @@ rm -f "$DIST"/security-update-notify-*.tar.gz "$DIST"/security-update-notify-*.t
 
 # 只复制明确允许进入发布包的文件，避免未跟踪的本地文件或维护笔记误入 release。
 # Copy only explicitly allowed release files, preventing untracked local files or maintainer notes from leaking into releases.
-for f in .env.example CHANGELOG.md LICENSE README.md README.en.md install.sh menu.sh test.sh uninstall.sh; do
+for f in .env.example CHANGELOG.md LICENSE README.md README.en.md install.sh menu.sh sun.sh test.sh uninstall.sh; do
   cp "$ROOT/$f" "$WORK/$PKG/$f"
 done
 for f in lib.sh needrestart-report-only.conf release-signing.pub.asc security-update-notify security-update-notify.logrotate security-update-notify.service; do

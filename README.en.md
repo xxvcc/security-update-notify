@@ -22,7 +22,7 @@ It uses your distro's native update tools, runs from a systemd timer, and makes 
 ## One-line install
 
 ```bash
-curl -fsSL https://sun.xxv.cc | sudo bash
+curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash
 ```
 
 ---
@@ -152,10 +152,10 @@ During an interactive install, SUN accepts the App ID and a hidden App Secret, t
 
 ### 2. Install
 
-Recommended: use the website-hosted bootstrap installer. It downloads the latest GitHub Release, verifies the `.sha256` file and GPG signature (required by default), then opens the interactive menu:
+Recommended: use the website-hosted bootstrap installer. It downloads the latest signed Release, verifies the `.sha256` file and GPG signature (required by default), then opens the interactive menu:
 
 ```bash
-curl -fsSL https://sun.xxv.cc | sudo bash
+curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash
 ```
 
 If you prefer running from source:
@@ -291,12 +291,12 @@ Common options:
 Rerun the one-line installer to upgrade to the latest release:
 
 ```bash
-curl -fsSL https://sun.xxv.cc | sudo bash -s -- upgrade --non-interactive -y
+curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- upgrade --non-interactive -y
 ```
 
 Once SUN is installed you can also run `sudo security-update-notify --upgrade` directly. Both the bootstrap and built-in upgrade first read `https://dl.ll.cd/security-update-notify/latest.json` and download the signed assets from that mirror; they fall back to GitHub when the mirror index or complete asset-set transfer is unavailable. The downloaded package still must pass `.sha256` and GPG verification against the embedded pinned fingerprint (fail-closed by default; a missing signature is rejected). The mirror improves transport availability but is not a trust root.
 
-After each official GitHub Release is published, the `Mirror signed release` workflow re-verifies and syncs its versioned directory. It updates `latest.json` last, only after all three public assets have been read back from `dl.ll.cd` and verified again. Manually rerunning an older release only repairs that version directory and cannot replace the current Latest manifest.
+After each official GitHub Release is published, the `Mirror signed release` workflow re-verifies and syncs its versioned directory. Only after the signed assets and the versioned `sun.sh` extracted from the verified archive have been read back from `dl.ll.cd` does it update the stable `sun.sh`, followed by `latest.json` last. Manually rerunning an older release only repairs that version directory and cannot replace the stable bootstrap or current Latest manifest.
 
 If SUN is already installed, the installer reads `/etc/security-update-notify/telegram.env` and the existing timer time first, displays the current notification method, and keeps the existing message notification settings by default. If you choose to edit them, you can change the receiving platforms, Telegram credentials, Feishu app, App Secret, or recipient. The main menu also provides a separate **Message notification settings** action. Removing a platform deletes its stored credentials; adding or editing a platform revalidates only the affected platform. Any failure rolls the whole installer transaction back. Legacy configs without `NOTIFY_CHANNELS` remain `telegram`, and other options not explicitly overridden keep their old values.
 
@@ -493,7 +493,7 @@ dist/security-update-notify-VERSION.tar.gz
 dist/security-update-notify-VERSION.tar.gz.sha256
 ```
 
-The release archive contains only user-facing installation, diagnostic, and documentation files. `sun.sh` is a website-hosted bootstrap script and is not included in release archives; publish it separately to your stable URL if you want to use it.
+The release archive contains only user-facing installation, diagnostic, bootstrap, and documentation files. `sun.sh` is included in the signed archive; the mirror workflow extracts it only after verification and publishes it at the stable URL.
 
 Release archive contents:
 
@@ -505,6 +505,7 @@ README.md
 README.en.md
 install.sh
 menu.sh
+sun.sh
 test.sh
 uninstall.sh
 files/

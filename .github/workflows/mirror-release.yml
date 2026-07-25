@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: mirror-release-${{ github.event.release.tag_name || inputs.tag }}
+  group: signed-release-mirror-stable
   cancel-in-progress: false
 
 jobs:
@@ -88,11 +88,34 @@ jobs:
           gpg --batch --verify "rel/$tarball.asc" "rel/$tarball"
           printf 'VERSION=%s\nTARBALL=%s\nPIN=%s\n' "$version" "$tarball" "$pin" >> "$GITHUB_ENV"
 
-      - name: Prepare immutable release directory and latest manifest
+      - name: Prepare immutable release directory and latest files
         run: |
           set -euo pipefail
+          tar_clean_env() { env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT tar "$@"; }
           mkdir -p "deploy/$TAG"
           install -m 0644 "rel/$TARBALL" "rel/$TARBALL.sha256" "rel/$TARBALL.asc" "deploy/$TAG/"
+          bootstrap_member="security-update-notify-${VERSION}/sun.sh"
+          bootstrap_count="$(tar_clean_env -tzf "rel/$TARBALL" | awk -v member="$bootstrap_member" '$0 == member { count++ } END { print count + 0 }')"
+          if [[ "$bootstrap_count" -eq 1 ]]; then
+            bootstrap_listing="$(LC_ALL=C tar_clean_env -tvzf "rel/$TARBALL" "$bootstrap_member")"
+            [[ "$(printf '%s\n' "$bootstrap_listing" | wc -l)" -eq 1 && "${bootstrap_listing:0:1}" == "-" ]] || {
+              echo "::error::signed release archive must contain a regular $bootstrap_member"
+              exit 1
+            }
+            tar_clean_env -xOzf "rel/$TARBALL" "$bootstrap_member" > "deploy/$TAG/sun.sh"
+            chmod 0644 "deploy/$TAG/sun.sh"
+            cmp sun.sh "deploy/$TAG/sun.sh" || {
+              echo "::error::bootstrap in signed archive differs from the released tag"
+              exit 1
+            }
+            bootstrap_present=1
+          elif [[ "$bootstrap_count" -eq 0 ]]; then
+            bootstrap_present=0
+            echo "Legacy release $TAG has no signed sun.sh; repairing its existing assets only."
+          else
+            echo "::error::signed release archive contains multiple $bootstrap_member entries"
+            exit 1
+          fi
           sha="$(awk 'NF {print $1; exit}' "rel/$TARBALL.sha256")"
           published_at="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json publishedAt --jq .publishedAt)"
           python3 - "$VERSION" "$TAG" "$MIRROR_BASE_URL" "$sha" "$PIN" "$published_at" > latest.json <<'PY'
@@ -110,13 +133,7 @@ jobs:
           }, sys.stdout, ensure_ascii=True, separators=(",", ":"))
           sys.stdout.write("\n")
           PY
-          latest_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
-          if [[ "$TAG" == "$latest_tag" ]]; then
-            echo 'UPDATE_LATEST=1' >> "$GITHUB_ENV"
-          else
-            echo 'UPDATE_LATEST=0' >> "$GITHUB_ENV"
-            echo "Mirroring $TAG without changing latest.json (GitHub Latest is $latest_tag)."
-          fi
+          printf 'BOOTSTRAP_PRESENT=%s\n' "$bootstrap_present" >> "$GITHUB_ENV"
 
       - name: Configure pinned SSH identity
         env:
@@ -131,17 +148,21 @@ jobs:
           printf 'RSYNC_RSH=ssh -i %s/.ssh/mirror_key -p %s -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=%s/.ssh/known_hosts\n' \
             "$HOME" "$MIRROR_PORT" "$HOME" >> "$GITHUB_ENV"
 
-      - name: Upload immutable signed assets
+      - name: Upload immutable signed release files
         run: |
           set -euo pipefail
           rsync --archive --checksum --delay-updates --chmod=D755,F644 \
             "deploy/$TAG/" "$MIRROR_USER@$MIRROR_HOST:$TAG/"
 
-      - name: Verify assets through the public mirror
+      - name: Verify release files through the public mirror
         run: |
           set -euo pipefail
           mkdir public-check
-          for asset in "$TARBALL" "$TARBALL.sha256" "$TARBALL.asc"; do
+          assets=("$TARBALL" "$TARBALL.sha256" "$TARBALL.asc")
+          if [[ "$BOOTSTRAP_PRESENT" == "1" ]]; then
+            assets+=(sun.sh)
+          fi
+          for asset in "${assets[@]}"; do
             curl --fail --location --retry 3 --retry-all-errors \
               --proto '=https' --proto-redir '=https' \
               --output "public-check/$asset" \
@@ -154,6 +175,39 @@ jobs:
           have="$(gpg --batch --with-colons --list-keys | awk -F: '$1=="fpr" {print $10; exit}')"
           [[ "$have" == "$PIN" ]] || { echo "::error::public verification key fingerprint mismatch"; exit 1; }
           gpg --batch --verify "public-check/$TARBALL.asc" "public-check/$TARBALL"
+          if [[ "$BOOTSTRAP_PRESENT" == "1" ]]; then
+            cmp "deploy/$TAG/sun.sh" public-check/sun.sh
+          fi
+
+      - name: Confirm GitHub Latest before stable update
+        run: |
+          set -euo pipefail
+          latest_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          update_latest=0
+          stable_bootstrap_updated=0
+          if [[ "$TAG" == "$latest_tag" ]]; then
+            [[ "$BOOTSTRAP_PRESENT" == "1" ]] || {
+              echo "::error::current Latest release has no signed bootstrap"
+              exit 1
+            }
+            update_latest=1
+            stable_bootstrap_updated=1
+          else
+            echo "Mirrored $TAG without changing stable files (GitHub Latest is $latest_tag)."
+          fi
+          printf 'UPDATE_LATEST=%s\nSTABLE_BOOTSTRAP_UPDATED=%s\n' \
+            "$update_latest" "$stable_bootstrap_updated" >> "$GITHUB_ENV"
+
+      - name: Publish stable bootstrap
+        if: env.STABLE_BOOTSTRAP_UPDATED == '1'
+        run: |
+          set -euo pipefail
+          rsync --archive --checksum --delay-updates --chmod=F644 \
+            "deploy/$TAG/sun.sh" "$MIRROR_USER@$MIRROR_HOST:sun.sh"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --proto '=https' --proto-redir '=https' \
+            "$MIRROR_BASE_URL/sun.sh?run=$GITHUB_RUN_ID" > public-sun.sh
+          cmp "deploy/$TAG/sun.sh" public-sun.sh
 
       - name: Publish latest manifest last
         if: env.UPDATE_LATEST == '1'
@@ -173,6 +227,7 @@ jobs:
             echo
             echo "- Tag: \`$TAG\`"
             echo "- Assets: \`$MIRROR_BASE_URL/$TAG/\`"
+            echo "- Stable bootstrap updated: \`$STABLE_BOOTSTRAP_UPDATED\`"
             echo "- Updated latest.json: \`$UPDATE_LATEST\`"
             echo "- Signing fingerprint: \`$PIN\`"
           } >> "$GITHUB_STEP_SUMMARY"

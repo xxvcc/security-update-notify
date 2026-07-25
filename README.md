@@ -22,7 +22,7 @@
 ## 一键安装
 
 ```bash
-curl -fsSL https://sun.xxv.cc | sudo bash
+curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash
 ```
 
 ---
@@ -152,10 +152,10 @@ Telegram：
 
 ### 2. 安装
 
-推荐使用网站引导安装器。它会下载最新 GitHub Release、校验 `.sha256` 与 GPG 签名（默认必须通过），然后启动交互式菜单：
+推荐使用网站引导安装器。它会下载最新签名 Release、校验 `.sha256` 与 GPG 签名（默认必须通过），然后启动交互式菜单：
 
 ```bash
-curl -fsSL https://sun.xxv.cc | sudo bash
+curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash
 ```
 
 如果你更想从源码运行，也可以：
@@ -291,12 +291,12 @@ App Secret 源文件必须是 root 所有的普通文件，不能是符号链接
 重新运行一键安装器即可升级到最新 release：
 
 ```bash
-curl -fsSL https://sun.xxv.cc | sudo bash -s -- upgrade --non-interactive -y
+curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- upgrade --non-interactive -y
 ```
 
 已安装 SUN 后，也可以直接运行 `sudo security-update-notify --upgrade`。一键安装器和内置升级都会优先读取 `https://dl.ll.cd/security-update-notify/latest.json` 并从同一镜像下载签名资产；镜像索引或完整资产集合传输失败时自动回退 GitHub。下载完成后仍会校验 `.sha256`，并用内置 pin 的指纹强制校验 GPG 签名（默认 fail-closed，缺签名即拒绝）后才升级。镜像只提供传输可用性，不是信任根。
 
-每个正式 GitHub Release 发布后，`Mirror signed release` 工作流会重新验签并同步版本化目录。三个公开资产从 `dl.ll.cd` 回读并再次验签成功后，才最后更新 `latest.json`；手动重跑旧版本只补齐其版本目录，不会覆盖当前 Latest。
+每个正式 GitHub Release 发布后，`Mirror signed release` 工作流会重新验签并同步版本化目录。签名资产和从验签归档提取的版本化 `sun.sh` 从 `dl.ll.cd` 回读校验成功后，才依次更新稳定 `sun.sh` 和最后的 `latest.json`；手动重跑旧版本只补齐其版本目录，不会覆盖当前稳定入口或 Latest。
 
 如果已安装过 SUN，安装器会自动读取 `/etc/security-update-notify/telegram.env` 和现有 timer 时间，显示当前通知方式，并默认保持现有消息通知设置；选择修改后可以更改接收平台、Telegram 配置、飞书应用、App Secret 或接收人。主菜单也提供独立的“消息通知设置”入口。移除接收平台会删除其保存凭据，新增或修改只重复验证受影响的平台；任一步失败都会随安装事务回滚。旧配置没有 `NOTIFY_CHANNELS` 时自动按 `telegram` 处理，未显式覆盖的其他选项继续沿用。
 
@@ -493,7 +493,7 @@ dist/security-update-notify-VERSION.tar.gz
 dist/security-update-notify-VERSION.tar.gz.sha256
 ```
 
-发布压缩包只包含面向用户的安装、诊断和文档文件。`sun.sh` 是用于网站托管的一键引导脚本，不放入发布压缩包；如需使用，请从源码仓库单独发布到你的稳定 URL。
+发布压缩包只包含面向用户的安装、诊断、引导和文档文件。`sun.sh` 包含在签名压缩包中，镜像工作流会从验签后的归档提取并发布到稳定地址。
 
 发布包内容：
 
@@ -505,6 +505,7 @@ README.md
 README.en.md
 install.sh
 menu.sh
+sun.sh
 test.sh
 uninstall.sh
 files/

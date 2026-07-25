@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- 稳定安装入口迁移到 `https://dl.ll.cd/security-update-notify/sun.sh`，不再依赖 `sun.xxv.cc`；按项目划分的路径为同一下载域名上的后续项目保留独立命名空间。
+  Moves the stable installer to `https://dl.ll.cd/security-update-notify/sun.sh`, removing the `sun.xxv.cc` dependency while preserving project-scoped namespaces for future downloads on the same domain.
+- `sun.sh` 现在进入签名发布包。镜像工作流仅从校验 SHA-256、GPG 签名和固定指纹后的归档提取脚本，先回读校验版本化副本，再更新稳定脚本，最后更新 `latest.json`；旧版本补同步不能覆盖稳定入口。
+  `sun.sh` is now part of the signed release archive. The mirror workflow extracts it only after SHA-256, GPG-signature, and pinned-fingerprint verification, reads back the versioned copy before updating the stable script and finally `latest.json`; repairs of old releases cannot replace the stable entry point.
+- 所有 tag 的镜像任务共用仓库级并发锁，并在公网版本文件回读成功后重新确认 GitHub Latest，消除旧任务晚写覆盖新稳定入口的竞态。
+  Mirror jobs for all tags share a repository-wide concurrency lock and reconfirm GitHub Latest after public version-file verification, eliminating the race where an older job could overwrite a newer stable entry point.
 - 新增由 GitHub Release `published` 事件触发的签名发布镜像：工作流重新校验 SHA-256、GPG 签名和固定指纹后，通过受限 SSH 账号同步到 `https://dl.ll.cd/security-update-notify`；公开回读验签成功后才最后更新 `latest.json`。
   Adds a signed release mirror triggered by GitHub Release `published`: the workflow rechecks SHA-256, the GPG signature, and the pinned fingerprint before syncing through a restricted SSH account to `https://dl.ll.cd/security-update-notify`; `latest.json` is updated last only after public read-back verification succeeds.
 - 一键安装器、Go 主运行时和 Bash 兼容运行时统一采用发布镜像优先、GitHub 回退。只有镜像传输不完整时才回退；一旦取得完整资产集合，任何校验失败都会中止，不会用回退掩盖镜像篡改。

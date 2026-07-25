@@ -339,6 +339,13 @@ jobs:
           assert 'VERIFY_SIGNATURE="required"' in Path('sun.sh').read_text()
           assert f'const DefaultReleaseMirrorBase = "{expected_mirror}"' in Path('internal/dist/latest.go').read_text(), 'Go release mirror drifted'
 
+          mirror_workflow = Path('.github/workflows/mirror-release.yml').read_text()
+          assert 'group: signed-release-mirror-stable' in mirror_workflow, 'release mirrors must serialize across all tags'
+          confirm_latest = mirror_workflow.index('- name: Confirm GitHub Latest before stable update')
+          publish_bootstrap = mirror_workflow.index('- name: Publish stable bootstrap')
+          publish_manifest = mirror_workflow.index('- name: Publish latest manifest last')
+          assert confirm_latest < publish_bootstrap < publish_manifest, 'stable mirror publication order drifted'
+
           # Both pinned fingerprints must be present (40 hex) and identical. sun.sh's pin is otherwise
           # never validated by push/PR CI (verify-signed-release reads only files/security-update-notify),
           # so a drifted sun.sh pin would silently break the bootstrap without turning CI red.
@@ -822,6 +829,10 @@ jobs:
           tar -xzf dist/security-update-notify-*.tar.gz -C /tmp/security-update-notify-ci
           find /tmp/security-update-notify-ci -maxdepth 3 -type f -print | sort
           tar -tzf dist/security-update-notify-*.tar.gz | grep '/.env.example$'
+          tar -tzf dist/security-update-notify-*.tar.gz | grep '/sun.sh$'
+          packaged_sun="$(find /tmp/security-update-notify-ci -mindepth 2 -maxdepth 2 -type f -name sun.sh -print -quit)"
+          test -n "$packaged_sun"
+          cmp sun.sh "$packaged_sun"
           # 负向断言用显式 if…exit（不依赖“恰好是最后一条命令”这一脆弱前提）：发布包绝不能含真实 .env。
           if tar -tzf dist/security-update-notify-*.tar.gz | grep -E '/\.env$|/\.env\.(local|production)$'; then
             echo "::error::release package contains a real .env file" >&2; exit 1

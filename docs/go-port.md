@@ -20,7 +20,7 @@ analysis (inventory → design → adversarial critique → synthesis); the anal
 
 “全 Go”是善意的误称：**~90–95% 的代码进 Go，但背后压着两个搬不走的事实。**
 
-1. **引导信任根必须留在 shell。** `curl -fsSL https://sun.xxv.cc | sudo bash` 在任何可信二进制存在
+1. **引导信任根必须留在 shell。** `curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash` 在任何可信二进制存在
    *之前*运行——编译产物不可能是被 `curl|bash` 的第一个东西，此刻也没有任何已装组件能验证它。所以
    `sun.sh` 必须继续承担下载和验证引导。它的**安全 TCB（fetch/sha256/指纹 pin/gpg 验签/安全解包）
    与桥发布时一致**，并负责按架构选择产物。脚本行数不是安全结论，关键是信任边界未扩大。
