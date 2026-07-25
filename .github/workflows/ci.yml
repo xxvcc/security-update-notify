@@ -259,7 +259,7 @@ jobs:
           harness = '''#!/usr/bin/env bash
           set -euo pipefail
           NOTIFY_CHANNELS=""; TELEGRAM_BOT_TOKEN=""; TELEGRAM_CHAT_ID=""; FEISHU_APP_ID=""; FEISHU_RECEIVE_ID=""; HOST_LABEL=""; PUBLIC_IP=""; INCLUDE_PUBLIC_IP=""; NOTIFY_OK=""; NOTIFY_UPGRADE=""; CONFIG_VERSION=""; DEDUP_MODE=""; DEDUP_INTERVAL_DAYS=""; NOTIFY_LANG=""; BACKEND=""; CHECK_TIME=""
-          EXISTING_CONFIG_LOADED=0; EXISTING_TIMER_LOADED=0; EXISTING_FEISHU_APP_ID=""
+          EXISTING_CONFIG_LOADED=0; EXISTING_TIMER_LOADED=0; EXISTING_FEISHU_APP_ID=""; EXISTING_NOTIFY_CHANNELS=""
           ''' + s[start:end] + '''
           load_existing_config_defaults "$1"
           load_existing_timer_default "$2"
