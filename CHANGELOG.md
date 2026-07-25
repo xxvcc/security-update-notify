@@ -1,5 +1,21 @@
 # 变更记录
 
+## 2.2.3
+
+修复安装或升级时 Telegram 预检把临时网络故障误报为 Token 无效，并错误引导用户重录凭据的问题。
+Fixes installer and upgrade Telegram preflight incorrectly reporting temporary network failures as invalid tokens and prompting users to replace valid credentials.
+
+- 对连接重置、超时、HTTP 429 和 5xx 最多重试三次；耗尽后明确标记为临时网络故障，不清空 Token 或 Chat ID。
+  Connection resets, timeouts, HTTP 429, and 5xx responses are retried up to three times; exhaustion is reported as a temporary network failure without clearing the token or chat ID.
+- 交互模式可选择重试连接、跳过本次预检或中止；非交互模式以临时失败码 `75` 退出，使升级事务可靠回滚。Telegram 明确拒绝的 Token 或 Chat ID 仍进入凭据纠正流程。
+  Interactive mode can retry, skip this preflight, or abort; non-interactive mode exits with temporary-failure code `75` so the upgrade transaction rolls back reliably. Tokens or chat IDs explicitly rejected by Telegram still enter the credential-correction flow.
+- 新增“消息通知设置”交互入口：已有安装可查看当前通知方式、更改 Telegram/飞书接收平台，并分别修改 Telegram 凭据、飞书应用、App Secret 或接收人。移除平台会事务化删除其凭据，新增或修改时只重复验证受影响的平台。
+  Adds interactive message-notification settings for existing installs: view the current method, change Telegram/Feishu receiving platforms, and separately update Telegram credentials, the Feishu app, App Secret, or recipient. Removing a platform transactionally deletes its credentials, while additions and edits revalidate only affected platforms.
+- 无修改退出设置时不再创建备份、停止 timer 或发送预检消息；`--configure-notifications` 与非交互模式组合会在事务开始前明确拒绝，不会被显式平台参数静默绕过。
+  Leaving notification settings unchanged no longer creates a backup, stops the timer, or sends preflight messages. Combining `--configure-notifications` with non-interactive mode is rejected before the transaction and cannot be silently bypassed by explicit platform arguments.
+- 同平台凭据轮换会正确标记受影响平台；删除平台不会因跳过已移除平台的预检而返回失败。回归覆盖生产安装事务、临时故障退出码 `75` 回滚、成功凭据删除，以及 Telegram HTTP 429 和 socket 超时。
+  Same-platform credential rotation now marks the affected platform correctly, and removing a platform no longer fails while skipping its preflight. Regression coverage includes the production install transaction, rollback on temporary-failure exit `75`, successful credential deletion, Telegram HTTP 429, and socket timeouts.
+
 ## 2.2.2
 
 修复飞书 Directory v1 自动选人的分页结束判断，避免权限和凭据均正常时因末页沿用旧 `page_token` 而误报扫描失败。

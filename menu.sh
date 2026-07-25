@@ -39,15 +39,24 @@ while true; do
   echo
   say "请选择操作：" "Choose an action:"
   say "1) 安装或升级" "1) Install or upgrade"
-  say "2) 卸载" "2) Uninstall"
-  say "3) 检查或诊断" "3) Check or diagnose"
+  say "2) 消息通知设置" "2) Message notification settings"
+  say "3) 卸载" "3) Uninstall"
+  say "4) 检查或诊断" "4) Check or diagnose"
   say "0) 退出" "0) Exit"
-  read -r -p "$(m '请输入选项 [1-3/0]: ' 'Enter choice [1-3/0]: ')" choice
+  read -r -p "$(m '请输入选项 [1-4/0]: ' 'Enter choice [1-4/0]: ')" choice
   case "$choice" in
     1)
       exec "$SCRIPT_DIR/install.sh"
       ;;
     2)
+      if [[ ! -r /etc/security-update-notify/telegram.env ]]; then
+        say "尚未检测到已有安装，请先选择 '安装或升级'。" \
+            "No existing installation was detected; choose Install or upgrade first." >&2
+        continue
+      fi
+      exec "$SCRIPT_DIR/install.sh" --configure-notifications
+      ;;
+    3)
       echo
       say "卸载选项：" "Uninstall options:"
       say "1) 只移除程序，保留配置" "1) Remove program only, keep configuration"
@@ -61,7 +70,7 @@ while true; do
         *) say "无效选项" "Invalid choice" >&2 ;;
       esac
       ;;
-    3)
+    4)
       echo
       say "检查选项：" "Check options:"
       say "1) 基础检查或诊断" "1) Basic check or doctor"

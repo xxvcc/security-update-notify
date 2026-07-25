@@ -9,8 +9,20 @@ INSTALLER_ARGS=("$@")
 . "$SCRIPT_DIR/files/lib.sh"
 CHECK_TIME="${CHECK_TIME:-}"
 NOTIFY_CHANNELS="${NOTIFY_CHANNELS:-}"
+NOTIFY_CHANNELS_EXPLICIT=0
+[[ -z "$NOTIFY_CHANNELS" ]] || NOTIFY_CHANNELS_EXPLICIT=1
+EXISTING_NOTIFY_CHANNELS=""
+CONFIGURE_NOTIFICATIONS=0
+NOTIFICATION_SETTINGS_CHANGED=0
+TELEGRAM_CONFIGURATION_CHANGED=0
+FEISHU_CONFIGURATION_CHANGED=0
+FEISHU_FORCE_NEW_SECRET=0
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+TELEGRAM_BOT_TOKEN_EXPLICIT=0
+TELEGRAM_CHAT_ID_EXPLICIT=0
+[[ -z "$TELEGRAM_BOT_TOKEN" ]] || TELEGRAM_BOT_TOKEN_EXPLICIT=1
+[[ -z "$TELEGRAM_CHAT_ID" ]] || TELEGRAM_CHAT_ID_EXPLICIT=1
 FEISHU_APP_ID="${FEISHU_APP_ID:-}"
 FEISHU_RECEIVE_ID="${FEISHU_RECEIVE_ID:-}"
 FEISHU_APP_SECRET_FILE="${FEISHU_APP_SECRET_FILE:-}"
@@ -21,9 +33,12 @@ FEISHU_RECIPIENT_SELECTED=0
 VERIFY_FEISHU_RECIPIENT=0
 FEISHU_APP_ID_EXPLICIT=0
 FEISHU_RECEIVE_ID_EXPLICIT=0
+FEISHU_APP_SECRET_FILE_EXPLICIT=0
 [[ -z "$FEISHU_APP_ID" ]] || FEISHU_APP_ID_EXPLICIT=1
 [[ -z "$FEISHU_RECEIVE_ID" ]] || FEISHU_RECEIVE_ID_EXPLICIT=1
+[[ -z "$FEISHU_APP_SECRET_FILE" ]] || FEISHU_APP_SECRET_FILE_EXPLICIT=1
 EXISTING_FEISHU_APP_ID=""
+readonly TELEGRAM_API_BASE_URL="https://api.telegram.org"
 readonly FEISHU_API_BASE_URL="https://open.feishu.cn"
 HOST_LABEL="${HOST_LABEL:-}"
 PUBLIC_IP="${PUBLIC_IP:-}"
@@ -134,10 +149,11 @@ Options:
   --lang LANG                  Terminal language: zh | en, default zh
   --backend BACKEND            auto | apt | dnf, default auto
   --allow-best-effort          Permit best-effort distro versions
-  --send-test                  Test all configured channels after install
+  --configure-notifications    Interactively manage notification settings (existing install only)
+  --send-test                  Test all configured receiving platforms after install
   --skip-telegram-test         Skip pre-install Telegram token/chat validation
   --skip-feishu-test           Skip pre-install Feishu credential validation
-  --skip-notify-test           Skip all pre-install channel validation
+  --skip-notify-test           Skip all pre-install receiving-platform validation
   --skip-post-install-check    Skip post-install/upgrade self-check
   --non-interactive            Fail if required options are missing
   -y, --yes                    Do not prompt before installing packages
@@ -168,10 +184,11 @@ EOF
   --lang LANG                  终端语言：zh | en，默认 zh
   --backend BACKEND            auto | apt | dnf，默认 auto
   --allow-best-effort          允许尽力支持的发行版
-  --send-test                  安装后测试全部已配置渠道
+  --configure-notifications    交互管理消息通知设置（仅限已有安装）
+  --send-test                  安装后测试全部已配置接收平台
   --skip-telegram-test         跳过安装前 Telegram token/chat 校验
   --skip-feishu-test           跳过安装前飞书凭据校验
-  --skip-notify-test           跳过所有渠道的安装前校验
+  --skip-notify-test           跳过所有接收平台的安装前校验
   --skip-post-install-check    跳过安装/升级后的自检
   --non-interactive            缺少必需选项时直接失败
   -y, --yes                    安装软件包前不再询问
@@ -213,6 +230,15 @@ load_env_file() {
       NOTIFY_CHANNELS|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|FEISHU_APP_ID|FEISHU_RECEIVE_ID|FEISHU_APP_SECRET_FILE|CHECK_TIME|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION|UI_LANG|CHECK_UPDATE_HEALTH|STALE_UPDATE_DAYS|CHECK_EOL)
         printf -v "$key" '%s' "$value"
         case "$key" in
+          NOTIFY_CHANNELS)
+            NOTIFY_CHANNELS_EXPLICIT=1
+            ;;
+          TELEGRAM_BOT_TOKEN)
+            TELEGRAM_BOT_TOKEN_EXPLICIT=1
+            ;;
+          TELEGRAM_CHAT_ID)
+            TELEGRAM_CHAT_ID_EXPLICIT=1
+            ;;
           FEISHU_APP_ID)
             FEISHU_APP_ID_EXPLICIT=0
             [[ -z "$value" ]] || FEISHU_APP_ID_EXPLICIT=1
@@ -220,6 +246,9 @@ load_env_file() {
           FEISHU_RECEIVE_ID)
             FEISHU_RECEIVE_ID_EXPLICIT=0
             [[ -z "$value" ]] || FEISHU_RECEIVE_ID_EXPLICIT=1
+            ;;
+          FEISHU_APP_SECRET_FILE)
+            FEISHU_APP_SECRET_FILE_EXPLICIT=1
             ;;
         esac
         ;;
@@ -267,7 +296,12 @@ load_existing_config_defaults() {
         set_config_default "$key" "$value"
         EXISTING_CONFIG_LOADED=1
         ;;
-      NOTIFY_CHANNELS|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|FEISHU_RECEIVE_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|NOTIFY_UPGRADE|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION|CHECK_UPDATE_HEALTH|STALE_UPDATE_DAYS|CHECK_EOL)
+      NOTIFY_CHANNELS)
+        [[ -n "$EXISTING_NOTIFY_CHANNELS" ]] || EXISTING_NOTIFY_CHANNELS="$value"
+        set_config_default "$key" "$value"
+        EXISTING_CONFIG_LOADED=1
+        ;;
+      TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|FEISHU_RECEIVE_ID|HOST_LABEL|PUBLIC_IP|INCLUDE_PUBLIC_IP|NOTIFY_OK|NOTIFY_UPGRADE|DEDUP_MODE|DEDUP_INTERVAL_DAYS|NOTIFY_LANG|BACKEND|CONFIG_VERSION|CHECK_UPDATE_HEALTH|STALE_UPDATE_DAYS|CHECK_EOL)
         set_config_default "$key" "$value"
         EXISTING_CONFIG_LOADED=1
         ;;
@@ -293,12 +327,12 @@ require_arg() { [[ $# -ge 2 && -n "${2:-}" ]] || { say "缺少 $1 的值" "Missi
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --env-file) require_arg "$1" "${2:-}"; ENV_FILE="$2"; load_env_file "$2"; shift 2 ;;
-    --notify-channels) require_arg "$1" "${2:-}"; NOTIFY_CHANNELS="$2"; shift 2 ;;
-    --telegram-token) require_arg "$1" "${2:-}"; TELEGRAM_BOT_TOKEN="$2"; say "提示：--telegram-token 会让 token 出现在进程列表(ps)中，自动化建议改用 --telegram-token-file。" "Note: --telegram-token exposes the token in the process list (ps); for automation prefer --telegram-token-file." >&2; shift 2 ;;
-    --telegram-token-file) require_arg "$1" "${2:-}"; TELEGRAM_BOT_TOKEN="$(tr -d '\r\n' <"$2")"; shift 2 ;;
-    --telegram-chat-id) require_arg "$1" "${2:-}"; TELEGRAM_CHAT_ID="$2"; shift 2 ;;
+    --notify-channels) require_arg "$1" "${2:-}"; NOTIFY_CHANNELS="$2"; NOTIFY_CHANNELS_EXPLICIT=1; shift 2 ;;
+    --telegram-token) require_arg "$1" "${2:-}"; TELEGRAM_BOT_TOKEN="$2"; TELEGRAM_BOT_TOKEN_EXPLICIT=1; say "提示：--telegram-token 会让 token 出现在进程列表(ps)中，自动化建议改用 --telegram-token-file。" "Note: --telegram-token exposes the token in the process list (ps); for automation prefer --telegram-token-file." >&2; shift 2 ;;
+    --telegram-token-file) require_arg "$1" "${2:-}"; TELEGRAM_BOT_TOKEN="$(tr -d '\r\n' <"$2")"; TELEGRAM_BOT_TOKEN_EXPLICIT=1; shift 2 ;;
+    --telegram-chat-id) require_arg "$1" "${2:-}"; TELEGRAM_CHAT_ID="$2"; TELEGRAM_CHAT_ID_EXPLICIT=1; shift 2 ;;
     --feishu-app-id) require_arg "$1" "${2:-}"; FEISHU_APP_ID="$2"; FEISHU_APP_ID_EXPLICIT=1; shift 2 ;;
-    --feishu-app-secret-file) require_arg "$1" "${2:-}"; FEISHU_APP_SECRET_FILE="$2"; shift 2 ;;
+    --feishu-app-secret-file) require_arg "$1" "${2:-}"; FEISHU_APP_SECRET_FILE="$2"; FEISHU_APP_SECRET_FILE_EXPLICIT=1; shift 2 ;;
     --feishu-receive-id) require_arg "$1" "${2:-}"; FEISHU_RECEIVE_ID="$2"; FEISHU_RECEIVE_ID_EXPLICIT=1; shift 2 ;;
     --time) require_arg "$1" "${2:-}"; CHECK_TIME="$2"; shift 2 ;;
     --host-label) require_arg "$1" "${2:-}"; HOST_LABEL="$2"; shift 2 ;;
@@ -317,12 +351,17 @@ while [[ $# -gt 0 ]]; do
     --skip-notify-test) SKIP_TELEGRAM_TEST=1; SKIP_FEISHU_TEST=1; shift ;;
     --skip-post-install-check) POST_INSTALL_CHECK=0; shift ;;
     --allow-best-effort) ALLOW_BEST_EFFORT=1; shift ;;
+    --configure-notifications) CONFIGURE_NOTIFICATIONS=1; shift ;;
     --non-interactive) NON_INTERACTIVE=1; shift ;;
     -y|--yes) ASSUME_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) printf '%s\n' "未知参数 / Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+if [[ "$CONFIGURE_NOTIFICATIONS" -eq 1 && "$NON_INTERACTIVE" -eq 1 ]]; then
+  say "--configure-notifications 需要交互式终端。" "--configure-notifications requires an interactive terminal." >&2
+  exit 2
+fi
 case "${UI_LANG:-}" in zh|en) ;; *) UI_LANG="" ;; esac
 
 require_root() { [[ "$(id -u)" -eq 0 ]] || { say "请以 root 运行，例如 sudo ./install.sh" "Please run as root, e.g. sudo ./install.sh" >&2; exit 1; }; }
@@ -359,24 +398,40 @@ channel_selected() {
   esac
 }
 
+channel_in_list() {
+  case ",${1:-}," in
+    *",$2,"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+notification_method_label() {
+  case "${1:-}" in
+    telegram) printf 'Telegram' ;;
+    feishu) printf '%s' "$(m '飞书' 'Feishu')" ;;
+    telegram,feishu) printf '%s' "$(m 'Telegram + 飞书' 'Telegram + Feishu')" ;;
+    *) printf '%s' "${1:-$(m '未设置' 'not configured')}" ;;
+  esac
+}
+
 normalize_notify_channels() {
   local raw item has_telegram=0 has_feishu=0
   local -a items=()
   raw="${NOTIFY_CHANNELS//[[:space:]]/}"
   IFS=',' read -r -a items <<<"${raw,,}"
-  [[ "${#items[@]}" -gt 0 ]] || { say "通知渠道不能为空" "Notification channels cannot be empty" >&2; exit 2; }
+  [[ "${#items[@]}" -gt 0 ]] || { say "接收平台不能为空" "Receiving platforms cannot be empty" >&2; exit 2; }
   for item in "${items[@]}"; do
     case "$item" in
       telegram) has_telegram=1 ;;
       feishu) has_feishu=1 ;;
-      *) say "无效通知渠道: $item" "Invalid notification channel: $item" >&2; exit 2 ;;
+      *) say "无效接收平台: $item" "Invalid receiving platform: $item" >&2; exit 2 ;;
     esac
   done
   case "$has_telegram$has_feishu" in
     10) NOTIFY_CHANNELS=telegram ;;
     01) NOTIFY_CHANNELS=feishu ;;
     11) NOTIFY_CHANNELS=telegram,feishu ;;
-    *) say "通知渠道不能为空" "Notification channels cannot be empty" >&2; exit 2 ;;
+    *) say "接收平台不能为空" "Receiving platforms cannot be empty" >&2; exit 2 ;;
   esac
 }
 
@@ -386,7 +441,7 @@ choose_notify_channels() {
     NOTIFY_CHANNELS=telegram
     return
   fi
-  say "通知渠道:" "Notification channels:"
+  say "接收平台:" "Receiving platforms:"
   say "  1) Telegram（默认）" "  1) Telegram (default)"
   say "  2) 飞书" "  2) Feishu"
   say "  3) Telegram + 飞书" "  3) Telegram + Feishu"
@@ -398,6 +453,248 @@ choose_notify_channels() {
     3) NOTIFY_CHANNELS=telegram,feishu ;;
     *) say "无效选项" "Invalid choice" >&2; exit 2 ;;
   esac
+}
+
+change_receiving_platforms() {
+  local choice old_channels="$NOTIFY_CHANNELS" new_channels
+  say "请选择接收平台：" "Choose receiving platforms:"
+  say "  1) Telegram" "  1) Telegram"
+  say "  2) 飞书" "  2) Feishu"
+  say "  3) Telegram + 飞书" "  3) Telegram + Feishu"
+  say "  0) 返回" "  0) Back"
+  while true; do
+    read -r -p "$(m '请选择 [0-3]: ' 'Choose [0-3]: ')" choice
+    case "$choice" in
+      1) new_channels=telegram ;;
+      2) new_channels=feishu ;;
+      3) new_channels=telegram,feishu ;;
+      0|'') return 0 ;;
+      *) say "无效选项。" "Invalid choice." >&2; continue ;;
+    esac
+    break
+  done
+  if [[ "$new_channels" == "$old_channels" ]]; then
+    say "接收平台未变化。" "Receiving platforms are unchanged."
+    return 0
+  fi
+
+  if channel_in_list "$old_channels" telegram && ! channel_in_list "$new_channels" telegram; then
+    TELEGRAM_BOT_TOKEN=""
+    TELEGRAM_CHAT_ID=""
+    TELEGRAM_CONFIGURATION_CHANGED=0
+  elif ! channel_in_list "$old_channels" telegram && channel_in_list "$new_channels" telegram; then
+    TELEGRAM_BOT_TOKEN=""
+    TELEGRAM_CHAT_ID=""
+    TELEGRAM_CONFIGURATION_CHANGED=1
+  fi
+
+  if channel_in_list "$old_channels" feishu && ! channel_in_list "$new_channels" feishu; then
+    FEISHU_APP_ID=""
+    FEISHU_RECEIVE_ID=""
+    FEISHU_APP_SECRET=""
+    FEISHU_APP_SECRET_FILE=""
+    FEISHU_CONFIGURATION_CHANGED=0
+    FEISHU_FORCE_NEW_SECRET=0
+  elif ! channel_in_list "$old_channels" feishu && channel_in_list "$new_channels" feishu; then
+    FEISHU_APP_ID=""
+    FEISHU_RECEIVE_ID=""
+    FEISHU_APP_SECRET=""
+    FEISHU_APP_SECRET_FILE=""
+    FEISHU_APP_ID_EXPLICIT=0
+    FEISHU_RECEIVE_ID_EXPLICIT=0
+    FEISHU_CONFIGURATION_CHANGED=1
+    FEISHU_FORCE_NEW_SECRET=1
+  fi
+
+  NOTIFY_CHANNELS="$new_channels"
+  NOTIFICATION_SETTINGS_CHANGED=1
+  say "通知方式已调整为：$(notification_method_label "$NOTIFY_CHANNELS")" \
+      "Notification method changed to: $(notification_method_label "$NOTIFY_CHANNELS")"
+}
+
+reconfigure_telegram_settings() {
+  TELEGRAM_BOT_TOKEN=""
+  TELEGRAM_CHAT_ID=""
+  TELEGRAM_CONFIGURATION_CHANGED=1
+  NOTIFICATION_SETTINGS_CHANGED=1
+  say "稍后将重新输入 Telegram Bot Token 和 Chat ID。" \
+      "You will be prompted for a new Telegram Bot Token and Chat ID."
+}
+
+manage_feishu_settings() {
+  local choice
+  say "飞书设置：" "Feishu settings:"
+  say "  1) 更换接收人" "  1) Change recipient"
+  say "  2) 更换飞书应用和接收人" "  2) Change Feishu application and recipient"
+  say "  3) 更新 App Secret" "  3) Update App Secret"
+  say "  0) 返回" "  0) Back"
+  while true; do
+    read -r -p "$(m '请选择 [0-3]: ' 'Choose [0-3]: ')" choice
+    case "$choice" in
+      1)
+        FEISHU_RECEIVE_ID=""
+        FEISHU_RECEIVE_ID_EXPLICIT=0
+        FEISHU_RECIPIENT_SELECTED=0
+        FEISHU_CONFIGURATION_CHANGED=1
+        NOTIFICATION_SETTINGS_CHANGED=1
+        say "稍后将重新扫描并选择飞书接收人。" "The Feishu directory will be scanned again for a recipient."
+        return 0
+        ;;
+      2)
+        FEISHU_APP_ID=""
+        FEISHU_RECEIVE_ID=""
+        FEISHU_APP_SECRET=""
+        FEISHU_APP_SECRET_FILE=""
+        FEISHU_APP_ID_EXPLICIT=0
+        FEISHU_RECEIVE_ID_EXPLICIT=0
+        FEISHU_RECIPIENT_SELECTED=0
+        FEISHU_CONFIGURATION_CHANGED=1
+        FEISHU_FORCE_NEW_SECRET=1
+        NOTIFICATION_SETTINGS_CHANGED=1
+        say "稍后将重新输入飞书应用凭据并选择接收人。" \
+            "You will be prompted for new Feishu application credentials and a recipient."
+        return 0
+        ;;
+      3)
+        FEISHU_APP_SECRET=""
+        FEISHU_APP_SECRET_FILE=""
+        FEISHU_CONFIGURATION_CHANGED=1
+        FEISHU_FORCE_NEW_SECRET=1
+        NOTIFICATION_SETTINGS_CHANGED=1
+        say "稍后将重新输入飞书 App Secret。" "You will be prompted for a new Feishu App Secret."
+        return 0
+        ;;
+      0|'') return 0 ;;
+      *) say "无效选项。" "Invalid choice." >&2 ;;
+    esac
+  done
+}
+
+manage_notification_settings() {
+  local choice
+  while true; do
+    echo
+    say "消息通知设置" "Message notification settings"
+    say "当前通知方式：$(notification_method_label "$NOTIFY_CHANNELS")" \
+        "Current notification method: $(notification_method_label "$NOTIFY_CHANNELS")"
+    say "  1) 完成并继续（默认）" "  1) Finish and continue (default)"
+    say "  2) 更改接收平台" "  2) Change receiving platforms"
+    channel_selected telegram && say "  3) 修改 Telegram 配置" "  3) Change Telegram settings"
+    channel_selected feishu && say "  4) 修改飞书应用或接收人" "  4) Change Feishu application or recipient"
+    say "  0) 完成并继续" "  0) Finish and continue"
+    read -r -p "$(m '请选择 [1]: ' 'Choose [1]: ')" choice
+    case "${choice:-1}" in
+      1|0) return 0 ;;
+      2) change_receiving_platforms ;;
+      3)
+        if channel_selected telegram; then reconfigure_telegram_settings; else say "当前未启用 Telegram。" "Telegram is not currently enabled." >&2; fi
+        ;;
+      4)
+        if channel_selected feishu; then manage_feishu_settings; else say "当前未启用飞书。" "Feishu is not currently enabled." >&2; fi
+        ;;
+      *) say "无效选项。" "Invalid choice." >&2 ;;
+    esac
+  done
+}
+
+apply_explicit_receiving_platforms() {
+  [[ "$EXISTING_CONFIG_LOADED" -eq 1 ]] || return 0
+  local old_channels="$EXISTING_NOTIFY_CHANNELS" new_channels="$NOTIFY_CHANNELS"
+  if [[ "$NOTIFY_CHANNELS_EXPLICIT" -eq 1 && "$old_channels" != "$new_channels" ]]; then
+    NOTIFICATION_SETTINGS_CHANGED=1
+    if channel_in_list "$old_channels" telegram && ! channel_in_list "$new_channels" telegram; then
+      TELEGRAM_BOT_TOKEN=""
+      TELEGRAM_CHAT_ID=""
+      TELEGRAM_CONFIGURATION_CHANGED=0
+    elif ! channel_in_list "$old_channels" telegram && channel_in_list "$new_channels" telegram; then
+      [[ "$TELEGRAM_BOT_TOKEN_EXPLICIT" -eq 1 ]] || TELEGRAM_BOT_TOKEN=""
+      [[ "$TELEGRAM_CHAT_ID_EXPLICIT" -eq 1 ]] || TELEGRAM_CHAT_ID=""
+      TELEGRAM_CONFIGURATION_CHANGED=1
+    fi
+
+    if channel_in_list "$old_channels" feishu && ! channel_in_list "$new_channels" feishu; then
+      FEISHU_APP_ID=""
+      FEISHU_RECEIVE_ID=""
+      FEISHU_APP_SECRET=""
+      FEISHU_APP_SECRET_FILE=""
+      FEISHU_CONFIGURATION_CHANGED=0
+      FEISHU_FORCE_NEW_SECRET=0
+    elif ! channel_in_list "$old_channels" feishu && channel_in_list "$new_channels" feishu; then
+      [[ "$FEISHU_APP_ID_EXPLICIT" -eq 1 ]] || FEISHU_APP_ID=""
+      [[ "$FEISHU_RECEIVE_ID_EXPLICIT" -eq 1 ]] || FEISHU_RECEIVE_ID=""
+      FEISHU_APP_SECRET=""
+      [[ "$FEISHU_APP_SECRET_FILE_EXPLICIT" -eq 1 ]] || FEISHU_APP_SECRET_FILE=""
+      FEISHU_CONFIGURATION_CHANGED=1
+      FEISHU_FORCE_NEW_SECRET=1
+    fi
+  fi
+
+  if channel_selected telegram \
+      && (( TELEGRAM_BOT_TOKEN_EXPLICIT == 1 || TELEGRAM_CHAT_ID_EXPLICIT == 1 )); then
+    NOTIFICATION_SETTINGS_CHANGED=1
+    TELEGRAM_CONFIGURATION_CHANGED=1
+  fi
+  if channel_selected feishu \
+      && (( FEISHU_APP_ID_EXPLICIT == 1 || FEISHU_RECEIVE_ID_EXPLICIT == 1 \
+            || FEISHU_APP_SECRET_FILE_EXPLICIT == 1 )); then
+    NOTIFICATION_SETTINGS_CHANGED=1
+    FEISHU_CONFIGURATION_CHANGED=1
+    [[ "$FEISHU_APP_SECRET_FILE_EXPLICIT" -eq 0 ]] || FEISHU_FORCE_NEW_SECRET=1
+  fi
+}
+
+prompt_existing_notification_settings() {
+  if [[ "$CONFIGURE_NOTIFICATIONS" -eq 1 && "$EXISTING_CONFIG_LOADED" -ne 1 ]]; then
+    say "尚未检测到已有安装；请先选择 '安装或升级'。" \
+        "No existing installation was detected; run Install or upgrade first." >&2
+    exit 2
+  fi
+  [[ "$EXISTING_CONFIG_LOADED" -eq 1 ]] || return 0
+  if [[ "$NON_INTERACTIVE" -eq 1 && "$CONFIGURE_NOTIFICATIONS" -eq 1 ]]; then
+    say "--configure-notifications 需要交互式终端。" "--configure-notifications requires an interactive terminal." >&2
+    exit 2
+  fi
+  apply_explicit_receiving_platforms
+  say "当前通知方式：$(notification_method_label "$NOTIFY_CHANNELS")" \
+      "Current notification method: $(notification_method_label "$NOTIFY_CHANNELS")"
+  if [[ "$CONFIGURE_NOTIFICATIONS" -eq 1 ]]; then
+    manage_notification_settings
+    return 0
+  fi
+  [[ "$NOTIFY_CHANNELS_EXPLICIT" -eq 0 ]] || return 0
+  if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
+    return 0
+  fi
+  local answer
+  read -r -p "$(m '是否修改消息通知设置？[y/N]: ' 'Change message notification settings? [y/N]: ')" answer
+  if [[ "${answer:-N}" =~ ^[Yy]$ ]]; then
+    manage_notification_settings
+  fi
+  return 0
+}
+
+notification_settings_unchanged() {
+  [[ "$CONFIGURE_NOTIFICATIONS" -eq 1 && "$NOTIFICATION_SETTINGS_CHANGED" -eq 0 ]]
+}
+
+run_notification_preflights() {
+  notification_settings_unchanged && return 0
+  if [[ "$NOTIFICATION_SETTINGS_CHANGED" -eq 1 && "$TELEGRAM_CONFIGURATION_CHANGED" -eq 0 ]]; then
+    if channel_selected telegram; then
+      say "Telegram 配置未变化，跳过重复预检。" \
+          "Telegram settings are unchanged; skipping duplicate preflight."
+    fi
+  else
+    telegram_preflight
+  fi
+  if [[ "$NOTIFICATION_SETTINGS_CHANGED" -eq 1 && "$FEISHU_CONFIGURATION_CHANGED" -eq 0 ]]; then
+    if channel_selected feishu; then
+      say "飞书配置未变化，跳过重复预检。" \
+          "Feishu settings are unchanged; skipping duplicate preflight."
+    fi
+  else
+    feishu_preflight
+  fi
 }
 
 feishu_credential_available() {
@@ -774,7 +1071,8 @@ prompt_install_test_message() {
   [[ "$SEND_TEST" -eq 0 && "$NON_INTERACTIVE" -ne 1 ]] || return 0
   local answer default_feishu_verify=0
   if channel_selected feishu \
-      && [[ "$IN_UPGRADE" != "1" || "$FEISHU_RECIPIENT_SELECTED" -eq 1 || "$FEISHU_RECEIVE_ID_EXPLICIT" -eq 1 ]]; then
+      && [[ "$IN_UPGRADE" != "1" || "$FEISHU_RECIPIENT_SELECTED" -eq 1 \
+            || "$FEISHU_RECEIVE_ID_EXPLICIT" -eq 1 || "$FEISHU_CONFIGURATION_CHANGED" -eq 1 ]]; then
     default_feishu_verify=1
   fi
   while true; do
@@ -785,7 +1083,7 @@ prompt_install_test_message() {
         n|N) return 0 ;;
       esac
     else
-      read -r -p "$(m '安装后向已配置渠道额外发送测试消息？[y/N]: ' 'Send an additional test message to configured channels after install? [y/N]: ')" answer
+      read -r -p "$(m '安装后向已配置接收平台额外发送测试消息？[y/N]: ' 'Send an additional test message to configured receiving platforms after install? [y/N]: ')" answer
       case "${answer:-N}" in
         y|Y) SEND_TEST=1; return 0 ;;
         n|N) return 0 ;;
@@ -1216,7 +1514,9 @@ configure_feishu_inputs() {
     exit 2
   fi
   load_feishu_secret_source
-  if ! feishu_credential_available; then
+  if [[ "$FEISHU_FORCE_NEW_SECRET" -eq 1 && -z "$FEISHU_APP_SECRET" ]]; then
+    prompt_secret FEISHU_APP_SECRET "飞书 App Secret" "Feishu App Secret"
+  elif ! feishu_credential_available; then
     prompt_secret FEISHU_APP_SECRET "飞书 App Secret" "Feishu App Secret"
   fi
   if [[ -z "$FEISHU_RECEIVE_ID" ]]; then
@@ -1225,101 +1525,252 @@ configure_feishu_inputs() {
   validate_feishu_receive_id
 }
 
-telegram_preflight() {
-  channel_selected telegram || return 0
-  [[ "$SKIP_TELEGRAM_TEST" -eq 1 ]] && { say "跳过 Telegram 预检。" "Skipping Telegram preflight test."; return; }
-  local tg_err send_out
-  TMP_DIR="${TMP_DIR:-$(mktemp -d)}"
-  tg_err="$TMP_DIR/telegram.err"
-  send_out="$TMP_DIR/send.out"
+telegram_preflight_request() {
+  local operation="$1" text="${2:-}" base_url="${TELEGRAM_API_BASE_URL:-https://api.telegram.org}"
+  local request_timeout="${TELEGRAM_PREFLIGHT_TIMEOUT_SECONDS:-20}"
+  printf '%s\0%s\0%s\0%s\0%s\0%s' "$operation" "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" "$text" "$base_url" "$request_timeout" | python3 -c '
+import json
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+MAX_RESPONSE = 1024 * 1024
+RETRYABLE_HTTP = {429, 500, 502, 503, 504}
+payload = sys.stdin.buffer.read().split(b"\0", 5)
+operation = payload[0].decode("utf-8", "replace") if len(payload) > 0 else ""
+token = payload[1].decode("utf-8", "replace") if len(payload) > 1 else ""
+chat_id = payload[2].decode("utf-8", "replace") if len(payload) > 2 else ""
+text = payload[3].decode("utf-8", "replace") if len(payload) > 3 else ""
+base_url = payload[4].decode("utf-8", "replace").rstrip("/") if len(payload) > 4 else ""
+timeout_raw = payload[5].decode("ascii", "replace") if len(payload) > 5 else ""
+
+if operation not in ("getMe", "sendMessage"):
+    print("invalid Telegram preflight operation", file=sys.stderr)
+    sys.exit(2)
+if not re.match(r"^\d+:[A-Za-z0-9_-]+$", token):
+    print("TELEGRAM_BOT_TOKEN 格式无效 / invalid TELEGRAM_BOT_TOKEN format", file=sys.stderr)
+    sys.exit(2)
+if operation == "sendMessage" and not chat_id:
+    print("TELEGRAM_CHAT_ID 不能为空 / TELEGRAM_CHAT_ID is required", file=sys.stderr)
+    sys.exit(2)
+try:
+    request_timeout = float(timeout_raw)
+except ValueError:
+    request_timeout = 0
+if not 0.05 <= request_timeout <= 60:
+    print("invalid Telegram preflight timeout", file=sys.stderr)
+    sys.exit(2)
+
+try:
+    parsed_base = urllib.parse.urlparse(base_url)
+    allowed_base = (
+        (parsed_base.scheme == "https" and parsed_base.hostname == "api.telegram.org" and parsed_base.port in (None, 443))
+        or (parsed_base.scheme == "http" and parsed_base.hostname in ("127.0.0.1", "::1"))
+    )
+except ValueError:
+    allowed_base = False
+if not allowed_base or parsed_base.path not in ("", "/") or parsed_base.username or parsed_base.password or parsed_base.query or parsed_base.fragment:
+    print("invalid Telegram API base URL", file=sys.stderr)
+    sys.exit(2)
+
+url = f"{base_url}/bot{token}/{operation}"
+if operation == "getMe":
+    request = urllib.request.Request(url)
+else:
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+    request = urllib.request.Request(url, data=data, method="POST")
+
+def read_limited(response):
+    body = response.read(MAX_RESPONSE + 1)
+    if len(body) > MAX_RESPONSE:
+        raise ValueError("Telegram response too large")
+    return body
+
+def response_data(body):
+    try:
+        data = json.loads(body)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+def retry_delay(headers, attempt):
+    raw = headers.get("Retry-After", "") if headers else ""
+    try:
+        delay = float(raw)
+    except (TypeError, ValueError):
+        delay = 2 ** attempt
+    return min(max(delay, 0), 5)
+
+def api_detail(data):
+    if not data:
+        return "invalid or empty response"
+    description = str(data.get("description", "request rejected"))
+    return description[:300]
+
+for attempt in range(3):
+    try:
+        with urllib.request.urlopen(request, timeout=request_timeout) as response:
+            body = read_limited(response)
+            status = response.status
+            headers = response.headers
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        headers = exc.headers
+        try:
+            body = read_limited(exc)
+        except Exception:
+            body = b""
+        data = response_data(body)
+        api_code = data.get("error_code") if data else None
+        if status in RETRYABLE_HTTP or api_code in RETRYABLE_HTTP:
+            if attempt < 2:
+                time.sleep(retry_delay(headers, attempt))
+                continue
+            print(f"Telegram {operation} temporarily failed: HTTP {status}", file=sys.stderr)
+            sys.exit(75)
+        print(f"Telegram {operation} rejected: HTTP {status}: {api_detail(data)}", file=sys.stderr)
+        sys.exit(3)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        if attempt < 2:
+            time.sleep(2 ** attempt)
+            continue
+        reason = getattr(exc, "reason", exc)
+        print(f"Telegram {operation} network request failed after 3 attempts: {reason}", file=sys.stderr)
+        sys.exit(75)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(75)
+
+    data = response_data(body)
+    if data and data.get("ok") is True:
+        sys.stdout.buffer.write(body)
+        sys.exit(0)
+    api_code = data.get("error_code") if data else None
+    if status in RETRYABLE_HTTP or api_code in RETRYABLE_HTTP:
+        if attempt < 2:
+            time.sleep(retry_delay(headers, attempt))
+            continue
+        print(f"Telegram {operation} temporarily failed: HTTP {status}", file=sys.stderr)
+        sys.exit(75)
+    if data is None:
+        print(f"Telegram {operation} returned an invalid response", file=sys.stderr)
+        sys.exit(75)
+    print(f"Telegram {operation} rejected: HTTP {status}: {api_detail(data)}", file=sys.stderr)
+    sys.exit(3)
+
+print(f"Telegram {operation} temporarily failed", file=sys.stderr)
+sys.exit(75)
+'
+}
+
+telegram_preflight_transient_action() {
+  TELEGRAM_PREFLIGHT_TRANSIENT_ACTION=""
+  if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
+    say "非交互模式：Telegram 网络预检临时失败；未修改凭据。" \
+        "Non-interactive mode: Telegram network preflight temporarily failed; credentials were not changed." >&2
+    TELEGRAM_PREFLIGHT_TRANSIENT_ACTION=abort
+    return 0
+  fi
+  say "Telegram 网络预检暂时失败；这不表示 Bot Token 或 Chat ID 无效。" \
+      "Telegram network preflight temporarily failed; this does not mean the Bot Token or Chat ID is invalid." >&2
+  say "  1) 重试连接（默认）" "  1) Retry the connection (default)"
+  say "  2) 跳过本次 Telegram 预检" "  2) Skip this Telegram preflight"
+  say "  3) 中止安装或升级" "  3) Abort installation or upgrade"
+  local action
   while true; do
-    say "正在验证 Telegram Bot Token..." "Validating Telegram Bot Token..."
-    local getme bot_user
-    if ! getme="$(printf '%s' "$TELEGRAM_BOT_TOKEN" | python3 -c '
-import json, re, sys, urllib.request
+    read -r -p "$(m '请选择 [1]: ' 'Choose [1]: ')" action
+    case "${action:-1}" in
+      1) TELEGRAM_PREFLIGHT_TRANSIENT_ACTION=retry; return 0 ;;
+      2) TELEGRAM_PREFLIGHT_TRANSIENT_ACTION=skip; return 0 ;;
+      3) TELEGRAM_PREFLIGHT_TRANSIENT_ACTION=abort; return 0 ;;
+      *) say "无效选项。" "Invalid choice." >&2 ;;
+    esac
+  done
+}
 
-token = sys.stdin.read()
-if not re.match(r"^\d+:[A-Za-z0-9_-]+$", token):
-    print("TELEGRAM_BOT_TOKEN 格式无效 / invalid TELEGRAM_BOT_TOKEN format", file=sys.stderr)
-    sys.exit(2)
-try:
-    with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/getMe", timeout=20) as response:
-        body = response.read().decode("utf-8", "replace")
-except Exception as exc:
-    print(exc, file=sys.stderr)
-    sys.exit(1)
-print(body)
-try:
-    ok = bool(json.loads(body).get("ok"))
-except Exception:
-    ok = False
-sys.exit(0 if ok else 1)
-' 2>"$tg_err")"; then
-      say "❌ Telegram token 校验失败。" "❌ Telegram token validation failed."
-      cat "$tg_err" 2>/dev/null || true
-    else
-      bot_user="$(printf '%s' "$getme" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("result",{}).get("username", "unknown"))' 2>/dev/null || echo unknown)"
-      say "✅ Token 有效: @${bot_user}" "✅ Token is valid: @${bot_user}"
-      say "正在向 Telegram Chat ID 发送测试消息..." "Sending test message to Telegram Chat ID..."
-      local text
-      text="$(m '✅ security-update-notify Telegram 测试成功。主机: ' '✅ security-update-notify Telegram test succeeded. Host: ')$(hostname -f 2>/dev/null || hostname)"
-      if printf '%s\0%s\0%s' "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" "$text" | python3 -c '
-import json, re, sys, urllib.parse, urllib.request
-
-payload = sys.stdin.buffer.read().split(b"\0", 2)
-token = payload[0].decode("utf-8", "replace") if len(payload) > 0 else ""
-chat_id = payload[1].decode("utf-8", "replace") if len(payload) > 1 else ""
-text = payload[2].decode("utf-8", "replace") if len(payload) > 2 else ""
-if not re.match(r"^\d+:[A-Za-z0-9_-]+$", token):
-    print("TELEGRAM_BOT_TOKEN 格式无效 / invalid TELEGRAM_BOT_TOKEN format", file=sys.stderr)
-    sys.exit(2)
-url = f"https://api.telegram.org/bot{token}/sendMessage"
-data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
-try:
-    with urllib.request.urlopen(url, data=data, timeout=20) as response:
-        body = response.read().decode("utf-8", "replace")
-except Exception as exc:
-    print(exc, file=sys.stderr)
-    sys.exit(1)
-print(body)
-try:
-    ok = bool(json.loads(body).get("ok"))
-except Exception:
-    ok = False
-sys.exit(0 if ok else 1)
-' >"$send_out" 2>"$tg_err"; then
-        say "✅ Telegram 测试消息已发送。" "✅ Telegram test message sent."
-        return
-      else
-        say "❌ Telegram 测试消息发送失败。" "❌ Telegram test message failed."
-        cat "$tg_err" 2>/dev/null || true
-      fi
-    fi
-    if [ "${UI_LANG:-zh}" = en ]; then
-      cat <<'EOF'
+telegram_preflight_credentials_help() {
+  if [ "${UI_LANG:-zh}" = en ]; then
+    cat <<'EOF'
 Possible causes:
 1. Bot token is wrong
 2. Chat ID is wrong
 3. You have not sent /start to the bot
 4. The bot is not in the target group or cannot post there
-5. This server cannot reach api.telegram.org
 EOF
-    else
-      cat <<'EOF'
+  else
+    cat <<'EOF'
 可能原因:
 1. Bot Token 错误
 2. Chat ID 错误
 3. 你还没有给 bot 发送 /start
 4. bot 不在目标群组中，或没有发消息权限
-5. 这台服务器无法访问 api.telegram.org
 EOF
+  fi
+}
+
+telegram_preflight() {
+  channel_selected telegram || return 0
+  [[ "$SKIP_TELEGRAM_TEST" -eq 1 ]] && { say "跳过 Telegram 预检。" "Skipping Telegram preflight test."; return; }
+  local tg_err send_out getme bot_user text request_rc retry
+  TMP_DIR="${TMP_DIR:-$(mktemp -d)}"
+  tg_err="$TMP_DIR/telegram.err"
+  send_out="$TMP_DIR/send.out"
+  while true; do
+    say "正在验证 Telegram Bot Token..." "Validating Telegram Bot Token..."
+    if getme="$(telegram_preflight_request getMe 2>"$tg_err")"; then
+      bot_user="$(printf '%s' "$getme" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("result",{}).get("username", "unknown"))' 2>/dev/null || echo unknown)"
+      say "✅ Token 有效: @${bot_user}" "✅ Token is valid: @${bot_user}"
+      say "正在向 Telegram Chat ID 发送测试消息..." "Sending test message to Telegram Chat ID..."
+      text="$(m '✅ security-update-notify Telegram 测试成功。主机: ' '✅ security-update-notify Telegram test succeeded. Host: ')$(hostname -f 2>/dev/null || hostname)"
+      if telegram_preflight_request sendMessage "$text" >"$send_out" 2>"$tg_err"; then
+        say "✅ Telegram 测试消息已发送。" "✅ Telegram test message sent."
+        return 0
+      else
+        request_rc=$?
+        case "$request_rc" in
+          75) say "❌ Telegram 测试消息因临时网络故障未能发送。" \
+                  "❌ Telegram test message could not be sent because of a temporary network failure." >&2 ;;
+          2) say "❌ Telegram 本地配置格式无效。" "❌ Local Telegram configuration is invalid." >&2 ;;
+          3) say "❌ Telegram 测试消息被 API 拒绝。" "❌ Telegram test message was rejected by the API." >&2 ;;
+          *) say "❌ Telegram 预检发生内部错误。" "❌ Telegram preflight encountered an internal error." >&2 ;;
+        esac
+      fi
+    else
+      request_rc=$?
+      case "$request_rc" in
+        75) say "❌ Telegram Bot Token 验证遇到临时网络故障。" \
+                "❌ Telegram Bot Token validation encountered a temporary network failure." >&2 ;;
+        2) say "❌ Telegram Bot Token 本地格式无效。" "❌ Local Telegram Bot Token format is invalid." >&2 ;;
+        3) say "❌ Telegram Bot Token 校验被 API 拒绝。" "❌ Telegram Bot Token validation was rejected by the API." >&2 ;;
+        *) say "❌ Telegram 预检发生内部错误。" "❌ Telegram preflight encountered an internal error." >&2 ;;
+      esac
     fi
+    cat "$tg_err" >&2 2>/dev/null || true
+    if [[ "$request_rc" -eq 75 ]]; then
+      telegram_preflight_transient_action
+      case "$TELEGRAM_PREFLIGHT_TRANSIENT_ACTION" in
+        retry) continue ;;
+        skip) say "已跳过本次 Telegram 预检；当前凭据保持不变。" \
+                  "Skipped this Telegram preflight; current credentials remain unchanged."; return 0 ;;
+        abort) say "Telegram 网络预检失败，安装或升级已中止。" \
+                   "Telegram network preflight failed; installation or upgrade aborted." >&2; return 75 ;;
+      esac
+    fi
+    if [[ "$request_rc" -ne 2 && "$request_rc" -ne 3 ]]; then
+      say "Telegram 预检内部错误，安装或升级已中止。" \
+          "Telegram preflight internal error; installation or upgrade aborted." >&2
+      return 1
+    fi
+    telegram_preflight_credentials_help
     if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
-      say "非交互模式：Telegram 预检失败。" "Non-interactive mode: Telegram preflight failed." >&2
-      exit 2
+      say "非交互模式：Telegram 凭据预检失败。" "Non-interactive mode: Telegram credential preflight failed." >&2
+      return 2
     fi
     read -r -p "$(m '重新输入 Telegram token 和 chat ID？[Y/n]: ' 'Re-enter Telegram token and chat ID? [Y/n]: ')" retry
-    [[ "${retry:-Y}" =~ ^[Yy]$ ]] || { say "Telegram 预检失败，安装中止。" "Telegram preflight failed; aborting." >&2; exit 2; }
+    [[ "${retry:-Y}" =~ ^[Yy]$ ]] || { say "Telegram 凭据预检失败，安装中止。" "Telegram credential preflight failed; aborting." >&2; return 2; }
     TELEGRAM_BOT_TOKEN=""
     TELEGRAM_CHAT_ID=""
     prompt_secret TELEGRAM_BOT_TOKEN "Telegram Bot Token" "Telegram Bot Token"
@@ -1431,14 +1882,11 @@ OLD_VERSION="$(current_installed_version)"
 if [[ "$OLD_VERSION" != "none" || -e "$CONFIG_FILE" || -e "$TIMER_FILE" || -e "$SERVICE_FILE" ]]; then
   IN_UPGRADE=1
 fi
-# 安装前先快照并挂上回滚 trap：失败时恢复已有文件、删除本次新建的文件（全新安装也适用）。
-# Snapshot before any change and arm the rollback trap: on failure restore pre-existing files and
-# remove files this run created (applies to fresh installs too).
-create_backup
-trap on_error ERR
-trap on_exit EXIT
 load_existing_config_defaults "$CONFIG_FILE"
 load_existing_timer_default "$TIMER_FILE"
+if [[ "$EXISTING_CONFIG_LOADED" -eq 1 && -z "$EXISTING_NOTIFY_CHANNELS" ]]; then
+  EXISTING_NOTIFY_CHANNELS=telegram
+fi
 if [[ "$FEISHU_APP_ID_EXPLICIT" -eq 1 && "$FEISHU_RECEIVE_ID_EXPLICIT" -eq 0 \
       && -n "$FEISHU_RECEIVE_ID" && "$FEISHU_APP_ID" != "$EXISTING_FEISHU_APP_ID" ]]; then
   FEISHU_RECEIVE_ID=""
@@ -1448,6 +1896,16 @@ fi
 [[ "$EXISTING_CONFIG_LOADED" -eq 1 ]] && say "检测到已有配置，升级时将复用未显式覆盖的旧设置。" "Existing config detected; reusing old settings not explicitly overridden."
 [[ "$EXISTING_TIMER_LOADED" -eq 1 ]] && say "检测到已有定时器时间：$CHECK_TIME" "Existing timer time detected: $CHECK_TIME"
 choose_notify_channels
+prompt_existing_notification_settings
+if notification_settings_unchanged; then
+  say "消息通知设置未修改。" "Message notification settings were not changed."
+  exit 0
+fi
+# 提示阶段只修改内存状态；确认确有安装工作后再创建备份并挂上回滚 trap。
+# Prompts only change in-memory state. Create the backup and arm rollback only once work is confirmed.
+create_backup
+trap on_error ERR
+trap on_exit EXIT
 : "${CHECK_TIME:=09:00}"
 : "${DEDUP_INTERVAL_DAYS:=3}"
 : "${NOTIFY_LANG:=$UI_LANG}"
@@ -1537,8 +1995,8 @@ command -v systemctl >/dev/null || { say "需要 systemctl" "systemctl is requir
 TRANSACTION_ACTIVE=1
 quiesce_existing_timer
 
-# 通知渠道预检即使在全新服务器上也需要 python3/CA 根证书。
-# Notification preflight needs python3/CA roots even on fresh servers.
+# 接收平台预检即使在全新服务器上也需要 python3/CA 根证书。
+# Receiving-platform preflight needs python3/CA roots even on fresh servers.
 MINIMAL_PACKAGES=()
 case "$BACKEND" in
   apt)
@@ -1597,8 +2055,7 @@ prompt_install_test_message
 # Validate config values before writing any system file or sending the preflight message.
 validate_config_values
 
-telegram_preflight
-feishu_preflight
+run_notification_preflights
 
 install_missing_packages() {
   [[ "${#MISSING_PACKAGES[@]}" -eq 0 ]] && { say "所有必需软件包均已安装。" "All required packages are already installed."; return; }

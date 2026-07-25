@@ -20,7 +20,9 @@ tar_clean_env() { env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT tar "$@"; }
 cd "$ROOT"
 bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify \
   build/compat-test.sh build/rollback-test.sh build/bash-feishu-test.sh \
-  build/install-feishu-onboarding-test.sh build/runtime-lock-test.sh build/reproducibility-check.sh
+  build/install-feishu-onboarding-test.sh build/install-notification-settings-test.sh \
+  build/install-telegram-preflight-test.sh \
+  build/runtime-lock-test.sh build/reproducibility-check.sh
 
 ALLOW_DIRTY_PACKAGE="${ALLOW_DIRTY_PACKAGE:-0}"
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then

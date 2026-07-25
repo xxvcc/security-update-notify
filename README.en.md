@@ -15,7 +15,7 @@
 
 It uses your distro's native update tools, runs from a systemd timer, and makes outbound-only HTTPS requests: alerts go to the Telegram Bot API and/or Feishu Open Platform as configured; by default it also queries a public-IP echo service (api.ipify.org / ifconfig.me) for the egress IP (disable with `INCLUDE_PUBLIC_IP=0`, or set `PUBLIC_IP` manually); and it contacts GitHub on self-upgrade. No dashboard. No agent port. No remote-control bot.
 
-> Since **2.0**, the runtime is a statically-compiled **Go binary**, shipped per architecture (amd64/arm64/386/ppc64le/s390x); unbuilt architectures fall back to the self-contained Bash runtime. The **Go binary runtime** needs neither `python3` nor `curl`; the Bash fallback runtime still depends on `python3` (for notification APIs and version/date math). The `install.sh` installer also uses `python3` for channel preflight checks.
+> Since **2.0**, the runtime is a statically-compiled **Go binary**, shipped per architecture (amd64/arm64/386/ppc64le/s390x); unbuilt architectures fall back to the self-contained Bash runtime. The **Go binary runtime** needs neither `python3` nor `curl`; the Bash fallback runtime still depends on `python3` (for notification APIs and version/date math). The `install.sh` installer also uses `python3` for receiving-platform preflight checks.
 
 **Languages**: [中文](README.md) | English
 
@@ -90,7 +90,7 @@ SUN systemd timer
     ↓
 check post-update reboot / service-restart state
     ↓
-send to configured channels only if attention is required
+send to configured receiving platforms only if attention is required
 ```
 
 SUN does **not**:
@@ -131,7 +131,7 @@ These require `--allow-best-effort`:
 
 ## Quick start
 
-### 1. Prepare notification channels
+### 1. Prepare message notifications
 
 Telegram:
 
@@ -166,24 +166,24 @@ cd security-update-notify
 sudo ./install.sh
 ```
 
-The installer first asks for a UI language (Chinese or English, default Chinese), then lets you select Telegram, Feishu, or both. It asks for the matching channel credentials:
+The installer first asks for a UI language (Chinese or English, default Chinese), then lets you select Telegram, Feishu, or both platforms. It asks for the matching receiving-platform credentials:
 
 - Telegram Bot Token / Chat ID; and/or
 - Feishu App ID / hidden App Secret, followed by a recipient choice from the automatic scan;
 - daily check time, default `09:00`;
 - duplicate-alert behavior;
-- whether to send a test message after installation; the first Feishu setup or a recipient change defaults to a Feishu-only verification message, which can be skipped with `n`.
+- whether to send a test message after installation; the first Feishu setup or an app, App Secret, or recipient change defaults to a Feishu-only verification message, which can be skipped with `n`.
 
 To skip the interactive language prompt, pass `--lang zh` or `--lang en`.
 
-Before writing the config, it performs channel preflight checks:
+Before writing the config, it performs receiving-platform preflight checks:
 
-- Telegram: `getMe` validates the bot token, then `sendMessage` validates the chat ID and permission;
+- Telegram: `getMe` validates the bot token, then `sendMessage` validates the chat ID and permission. Connection resets, timeouts, HTTP 429, and 5xx responses are retried three times. A persistent temporary network failure is not mislabeled as an invalid token and does not clear existing credentials; interactive mode can retry, skip this preflight, or abort, while non-interactive mode fails with exit `75` and rolls back;
 - Feishu: obtains a `tenant_access_token` and scans active employees in the application's directory scope. If an `open_id` was supplied explicitly, it performs only the application-credential preflight. No message is sent during installation preflight.
 
 Results are limited by the Feishu application's directory data scope. If scanning fails or returns no visible employees, the interactive installer can retry, accept a current-app `open_id` manually, or abort. Non-interactive mode requires `--feishu-receive-id` explicitly.
 
-On the first interactive Feishu setup or after changing the recipient, the installer sends a Feishu-only verification message by default to confirm that the selected `open_id` is within the bot availability; enter `n` to skip it. Verification waits up to 60 seconds for an existing check to release the runtime lock and enables the SUN timer only after a confirmed send; a timeout or send failure rolls the install back, so “not sent” cannot be mistaken for success. Non-interactive installs send nothing automatically. Explicit `--send-test` or `test.sh --send-test` still tests every configured channel.
+On the first interactive Feishu setup or after changing the app, App Secret, or recipient, the installer sends a Feishu-only verification message by default to confirm that the selected `open_id` is within the bot availability; enter `n` to skip it. Verification waits up to 60 seconds for an existing check to release the runtime lock and enables the SUN timer only after a confirmed send; a timeout or send failure rolls the install back, so “not sent” cannot be mistaken for success. Non-interactive installs send nothing automatically. Explicit `--send-test` or `test.sh --send-test` still tests every configured receiving platform.
 
 ### 3. Verify
 
@@ -275,13 +275,14 @@ Common options:
 --public-ip IP             # manually set public IP in notifications; auto-detected at runtime when empty
 --include-public-ip 0      # disable public IP in notifications; default 1
 --notify-ok 1             # send OK notification when no action is needed; default 0
---notify-upgrade 1        # notify configured channels after successful upgrade; default 0
+--notify-upgrade 1        # notify configured receiving platforms after successful upgrade; default 0
 --skip-post-install-check # skip post-install/upgrade self-check
 --allow-best-effort        # allow best-effort distro versions
---send-test                # test every configured channel after installation
+--configure-notifications  # interactively manage message notification settings; existing installs only
+--send-test                # test every configured receiving platform after installation
 --skip-telegram-test       # skip Telegram preflight validation
 --skip-feishu-test         # skip separate credential preflight; selection still scans if needed
---skip-notify-test         # skip all channel preflight validation
+--skip-notify-test         # skip all receiving-platform preflight validation
 ```
 
 
@@ -295,7 +296,9 @@ curl -fsSL https://sun.xxv.cc | sudo bash -s -- upgrade --non-interactive -y
 
 Once SUN is installed you can also run `sudo security-update-notify --upgrade` directly: it downloads the latest GitHub release, verifies `.sha256`, and requires a GPG signature against the pinned fingerprint (fail-closed by default — it refuses if the signature is missing) before upgrading.
 
-If SUN is already installed, the installer reads `/etc/security-update-notify/telegram.env` and the existing timer time first. A legacy config without `NOTIFY_CHANNELS` automatically remains `telegram`; options not explicitly overridden keep their old values. Before upgrading, key files are backed up to `/var/backups/security-update-notify/<timestamp>`, but the Feishu App Secret is not copied there; failed upgrades attempt an automatic rollback and restore the SUN timer's pre-install enablement link and active state. A post-upgrade self-check runs by default; use `--notify-upgrade 1` to notify the configured channels after a successful upgrade. Upgrade notices are best-effort: a notification failure never rolls back a completed upgrade, and the whole dual-send is not retried in a way that would duplicate a successful channel.
+If SUN is already installed, the installer reads `/etc/security-update-notify/telegram.env` and the existing timer time first, displays the current notification method, and keeps the existing message notification settings by default. If you choose to edit them, you can change the receiving platforms, Telegram credentials, Feishu app, App Secret, or recipient. The main menu also provides a separate **Message notification settings** action. Removing a platform deletes its stored credentials; adding or editing a platform revalidates only the affected platform. Any failure rolls the whole installer transaction back. Legacy configs without `NOTIFY_CHANNELS` remain `telegram`, and other options not explicitly overridden keep their old values.
+
+Before upgrading, key files are backed up to `/var/backups/security-update-notify/<timestamp>`, but the Feishu App Secret is not copied there; failed upgrades attempt an automatic rollback and restore the SUN timer's pre-install enablement link and active state. A post-upgrade self-check runs by default; use `--notify-upgrade 1` to notify the configured receiving platforms after a successful upgrade. Upgrade notices are best-effort: a notification failure never rolls back a completed upgrade, and the whole dual-send is not retried in a way that would duplicate a successful platform.
 
 ## Duplicate alert modes
 
@@ -405,7 +408,7 @@ sudoedit /etc/security-update-notify/telegram.env
 # Set NOTIFY_LANG=zh (Chinese) or NOTIFY_LANG=en (English)
 ```
 
-Rerun the installer to change channels, the Feishu app, or its recipient. The installer validates the App ID/app-scoped `open_id` binding and creates, migrates, or removes the App Secret credential; do not bypass those steps by editing only `NOTIFY_CHANNELS`.
+To switch receiving platforms or change the Feishu app or recipient, rerun the one-line installer and choose **Message notification settings**. The installer validates the App ID/app-scoped `open_id` binding and creates, migrates, or removes the App Secret credential; do not bypass those steps by editing only `NOTIFY_CHANNELS`.
 
 Run built-in diagnostics:
 
@@ -463,11 +466,15 @@ From the source checkout:
 ```bash
 bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify \
   build/compat-test.sh build/rollback-test.sh build/bash-feishu-test.sh \
-  build/install-feishu-onboarding-test.sh build/runtime-lock-test.sh
+  build/install-feishu-onboarding-test.sh build/install-notification-settings-test.sh \
+  build/install-telegram-preflight-test.sh \
+  build/runtime-lock-test.sh
 go vet ./...
 go test -race -cover ./...
 build/bash-feishu-test.sh
 build/install-feishu-onboarding-test.sh
+build/install-notification-settings-test.sh
+build/install-telegram-preflight-test.sh
 build/runtime-lock-test.sh
 build/compat-test.sh
 build/rollback-test.sh

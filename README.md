@@ -15,7 +15,7 @@
 
 它使用发行版原生更新机制，通过 systemd timer 定时运行，只发起出站 HTTPS 请求：提醒按配置发往 Telegram Bot API 和/或飞书开放平台；默认还会向公网 IP 探测服务（api.ipify.org / ifconfig.me）获取出口 IP（可用 `INCLUDE_PUBLIC_IP=0` 关闭或用 `PUBLIC_IP` 手动指定）；自升级时访问 GitHub。没有 Web 面板，没有常驻控制端口，也不接收消息命令。
 
-> 自 **2.0** 起，运行时是一个静态编译的 **Go 二进制**，按架构分发（amd64/arm64/386/ppc64le/s390x）；未构建的架构自动回退到自包含的 Bash 运行时。**Go 二进制运行时**不依赖 `python3` 或 `curl`；而 Bash 回退运行时仍依赖 `python3`（用于通知 API 与版本/日期计算）。安装器 `install.sh` 在通知渠道预检时也使用 `python3`。
+> 自 **2.0** 起，运行时是一个静态编译的 **Go 二进制**，按架构分发（amd64/arm64/386/ppc64le/s390x）；未构建的架构自动回退到自包含的 Bash 运行时。**Go 二进制运行时**不依赖 `python3` 或 `curl`；而 Bash 回退运行时仍依赖 `python3`（用于通知 API 与版本/日期计算）。安装器 `install.sh` 在接收平台预检时也使用 `python3`。
 
 **语言 / Languages**：中文 | [English](README.en.md)
 
@@ -90,7 +90,7 @@ SUN 的 systemd timer
     ↓
 检查更新后是否需要整机重启或服务重启
     ↓
-只有在需要人工处理时才向已配置渠道发送消息
+只有在需要人工处理时才向已配置接收平台发送消息
 ```
 
 SUN **不会**：
@@ -131,7 +131,7 @@ SUN **不会**：
 
 ## 快速开始
 
-### 1. 准备通知渠道
+### 1. 准备消息通知
 
 Telegram：
 
@@ -166,7 +166,7 @@ cd security-update-notify
 sudo ./install.sh
 ```
 
-安装器会先让你选择界面语言（中文或英文，默认中文），然后选择 Telegram、飞书或双发。随后按所选渠道询问：
+安装器会先让你选择界面语言（中文或英文，默认中文），然后选择 Telegram、飞书或双平台。随后按所选接收平台询问：
 
 - Telegram Bot Token / Chat ID；和/或
 - 飞书 App ID / 隐藏输入的 App Secret，然后从自动扫描结果中选择接收人；
@@ -176,14 +176,14 @@ sudo ./install.sh
 
 如果想跳过交互式语言选择，可在命令行加 `--lang zh` 或 `--lang en`。
 
-写入配置前，安装器会先做渠道预检：
+写入配置前，安装器会先做接收平台预检：
 
-- Telegram：使用 `getMe` 验证 Bot Token，并用 `sendMessage` 验证 Chat ID 与权限；
+- Telegram：使用 `getMe` 验证 Bot Token，并用 `sendMessage` 验证 Chat ID 与权限；连接重置、超时、HTTP 429 和 5xx 会自动重试三次。持续的临时网络故障不会被误报为 Token 无效，也不会清空旧凭据；交互模式可重试、跳过本次预检或中止，非交互模式以退出码 `75` 失败并回滚；
 - 飞书：获取 `tenant_access_token` 后扫描应用通讯录范围内的在职员工；如已显式提供 `open_id`，则只验证应用凭据。安装预检不会发送消息。
 
 扫描结果受飞书应用“通讯录数据范围”限制。扫描失败或没有可见员工时，交互安装器允许重试、手动输入当前应用下的 `open_id`，或中止安装；非交互模式必须显式提供 `--feishu-receive-id`。
 
-首次交互配置飞书或更换接收人时，安装器默认发送一条仅飞书的验证消息，用于确认所选 `open_id` 位于机器人的可用范围内；输入 `n` 可跳过。验证会等待现有检查释放运行锁（最多 60 秒），确认发送成功后才启用 SUN timer；超时或发送失败都会回滚，不能把“未发送”误判为成功。非交互安装不会自动发送。显式使用 `--send-test` 或 `test.sh --send-test` 仍会测试全部已配置渠道。
+首次交互配置飞书或更换应用、Secret、接收人时，安装器默认发送一条仅飞书的验证消息，用于确认所选 `open_id` 位于机器人的可用范围内；输入 `n` 可跳过。验证会等待现有检查释放运行锁（最多 60 秒），确认发送成功后才启用 SUN timer；超时或发送失败都会回滚，不能把“未发送”误判为成功。非交互安装不会自动发送。显式使用 `--send-test` 或 `test.sh --send-test` 仍会测试全部已配置接收平台。
 
 ### 3. 验证
 
@@ -275,10 +275,11 @@ App Secret 源文件必须是 root 所有的普通文件，不能是符号链接
 --public-ip IP             # 手动指定通知中的公网 IP；不填则运行时自动获取
 --include-public-ip 0      # 关闭通知中的公网 IP 显示；默认 1
 --notify-ok 1             # 无需处理时也发送 OK 通知；默认 0
---notify-upgrade 1        # 升级成功后向已配置渠道发送通知；默认 0
+--notify-upgrade 1        # 升级成功后向已配置接收平台发送通知；默认 0
 --skip-post-install-check # 跳过安装/升级后自检
 --allow-best-effort        # 允许尽力支持的发行版
---send-test                # 安装完成后测试全部已配置渠道
+--configure-notifications  # 交互管理消息通知设置（仅限已有安装）
+--send-test                # 安装完成后测试全部已配置接收平台
 --skip-telegram-test       # 跳过 Telegram 预检
 --skip-feishu-test         # 跳过独立凭据预检；未指定接收人时仍需扫描选人
 --skip-notify-test         # 跳过所有渠道预检
@@ -295,7 +296,9 @@ curl -fsSL https://sun.xxv.cc | sudo bash -s -- upgrade --non-interactive -y
 
 已安装 SUN 后，也可以直接运行 `sudo security-update-notify --upgrade`：它会下载最新 GitHub 发布包，校验 `.sha256`，并用内置 pin 的指纹强制校验 GPG 签名（默认 fail-closed，缺签名即拒绝）后才升级。
 
-如果已安装过 SUN，安装器会自动读取 `/etc/security-update-notify/telegram.env` 和现有 timer 时间；旧配置没有 `NOTIFY_CHANNELS` 时自动按 `telegram` 处理，未显式覆盖的选项继续沿用。升级前会备份关键文件到 `/var/backups/security-update-notify/<timestamp>`，但飞书 App Secret 不进入该备份；升级失败会尝试自动回滚，并恢复 SUN timer 安装前的启用链接与 active 状态。升级后默认运行自检；可用 `--notify-upgrade 1` 向已配置渠道发送升级通知。升级通知采用 best-effort 语义，不会因通知失败回滚已经完成的升级，也不会整体重试双发而重复已成功渠道。
+如果已安装过 SUN，安装器会自动读取 `/etc/security-update-notify/telegram.env` 和现有 timer 时间，显示当前通知方式，并默认保持现有消息通知设置；选择修改后可以更改接收平台、Telegram 配置、飞书应用、App Secret 或接收人。主菜单也提供独立的“消息通知设置”入口。移除接收平台会删除其保存凭据，新增或修改只重复验证受影响的平台；任一步失败都会随安装事务回滚。旧配置没有 `NOTIFY_CHANNELS` 时自动按 `telegram` 处理，未显式覆盖的其他选项继续沿用。
+
+升级前会备份关键文件到 `/var/backups/security-update-notify/<timestamp>`，但飞书 App Secret 不进入该备份；升级失败会尝试自动回滚，并恢复 SUN timer 安装前的启用链接与 active 状态。升级后默认运行自检；可用 `--notify-upgrade 1` 向已配置接收平台发送升级通知。升级通知采用 best-effort 语义，不会因通知失败回滚已经完成的升级，也不会整体重试双发而重复已成功平台。
 
 ## 重复提醒策略
 
@@ -405,7 +408,7 @@ sudoedit /etc/security-update-notify/telegram.env
 # 设置 NOTIFY_LANG=zh（中文）或 NOTIFY_LANG=en（English）
 ```
 
-切换通知渠道、飞书应用或接收人时，请重新运行安装器。安装器会验证 App ID 与应用级 `open_id` 的绑定，并负责创建、迁移或清理 App Secret 凭据；不要只手工修改 `NOTIFY_CHANNELS` 绕过这些步骤。
+切换接收平台、飞书应用或接收人时，请重新运行一键安装器并选择“消息通知设置”。安装器会验证 App ID 与应用级 `open_id` 的绑定，并负责创建、迁移或清理 App Secret 凭据；不要只手工修改 `NOTIFY_CHANNELS` 绕过这些步骤。
 
 运行内置诊断：
 
@@ -463,11 +466,15 @@ SUN 的范围刻意保持很小：
 ```bash
 bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify \
   build/compat-test.sh build/rollback-test.sh build/bash-feishu-test.sh \
-  build/install-feishu-onboarding-test.sh build/runtime-lock-test.sh
+  build/install-feishu-onboarding-test.sh build/install-notification-settings-test.sh \
+  build/install-telegram-preflight-test.sh \
+  build/runtime-lock-test.sh
 go vet ./...
 go test -race -cover ./...
 build/bash-feishu-test.sh
 build/install-feishu-onboarding-test.sh
+build/install-notification-settings-test.sh
+build/install-telegram-preflight-test.sh
 build/runtime-lock-test.sh
 build/compat-test.sh
 build/rollback-test.sh

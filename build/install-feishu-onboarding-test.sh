@@ -155,6 +155,7 @@ FEISHU_ENCRYPTED_CREDENTIAL="/nonexistent/encrypted"
 FEISHU_CREDENTIAL_FILE="/nonexistent/plain"
 FEISHU_AUTH_VALIDATED=0
 FEISHU_RECIPIENT_SELECTED="${TEST_FEISHU_RECIPIENT_SELECTED:-0}"
+FEISHU_CONFIGURATION_CHANGED="${TEST_FEISHU_CONFIGURATION_CHANGED:-0}"
 VERIFY_FEISHU_RECIPIENT=0
 FEISHU_RECEIVE_ID_EXPLICIT="${TEST_FEISHU_RECEIVE_ID_EXPLICIT:-0}"
 NOTIFY_CHANNELS="${TEST_NOTIFY_CHANNELS:-feishu}"
@@ -294,6 +295,10 @@ grep -Fxq 'VERIFY_FEISHU_RECIPIENT=0' "$TMP/prompt-telegram.out"
 printf '\n' | TEST_NOTIFY_CHANNELS=feishu TEST_IN_UPGRADE=1 "$TMP/harness.sh" prompt-test >"$TMP/prompt-existing-feishu.out"
 grep -Fxq 'SEND_TEST=0' "$TMP/prompt-existing-feishu.out"
 grep -Fxq 'VERIFY_FEISHU_RECIPIENT=0' "$TMP/prompt-existing-feishu.out"
+
+printf '\n' | TEST_NOTIFY_CHANNELS=feishu TEST_IN_UPGRADE=1 TEST_FEISHU_CONFIGURATION_CHANGED=1 "$TMP/harness.sh" prompt-test >"$TMP/prompt-reconfigured-feishu.out"
+grep -Fxq 'SEND_TEST=0' "$TMP/prompt-reconfigured-feishu.out"
+grep -Fxq 'VERIFY_FEISHU_RECIPIENT=1' "$TMP/prompt-reconfigured-feishu.out"
 
 printf '\n' | TEST_NOTIFY_CHANNELS=feishu TEST_IN_UPGRADE=1 TEST_FEISHU_RECIPIENT_SELECTED=1 "$TMP/harness.sh" prompt-test >"$TMP/prompt-changed-feishu.out"
 grep -Fxq 'SEND_TEST=0' "$TMP/prompt-changed-feishu.out"

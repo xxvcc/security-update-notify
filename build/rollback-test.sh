@@ -146,6 +146,17 @@ EOF
 chmod +x /usr/local/bin/dpkg /usr/local/bin/apt-get
 printf '#!/usr/bin/env bash\nexit 0\n' >/usr/local/bin/systemd-analyze; chmod +x /usr/local/bin/systemd-analyze
 
+cat >/usr/local/bin/python3 <<'EOF'
+#!/usr/bin/env bash
+if [[ "${FORCE_TELEGRAM_PREFLIGHT_TEMPORARY:-0}" == "1" ]]; then
+  cat >/dev/null
+  echo "mock: Telegram preflight temporarily unavailable" >&2
+  exit 75
+fi
+exec /usr/bin/python3 "$@"
+EOF
+chmod +x /usr/local/bin/python3
+
 REAL_SYSTEMD_CREDS="$(command -v systemd-creds || true)"
 [[ -n "$REAL_SYSTEMD_CREDS" ]] || { echo "systemd-creds is required for the encrypted credential rollback test" >&2; exit 1; }
 cat >/usr/local/bin/systemd-creds <<EOF
@@ -269,6 +280,59 @@ fi
 if grep -RqsF rollback-secret-one /etc/security-update-notify/telegram.env /var/backups/security-update-notify /tmp/i1.log; then
   echo "  FAIL: Feishu secret leaked into config, backup, or log"; exit 1
 fi
+
+echo "### Notification settings no-op -> no backup, preflight, or timer mutation"
+settings_backup_before="$(find /var/backups/security-update-notify -mindepth 1 -maxdepth 1 -type d | wc -l)"
+printf '1\n' | ./install.sh --configure-notifications --skip-notify-test --lang en >/tmp/settings-noop.log 2>&1
+rc_settings_noop=$?
+settings_backup_after="$(find /var/backups/security-update-notify -mindepth 1 -maxdepth 1 -type d | wc -l)"
+[[ "$rc_settings_noop" -eq 0 && "$settings_backup_after" == "$settings_backup_before" \
+   && "$(cat "$MOCK_SYSTEMD_STATE/active")" == 1 ]] \
+  && grep -qF 'Message notification settings were not changed.' /tmp/settings-noop.log \
+  && echo "  ok: unchanged settings exited before backup and timer quiescence" \
+  || { echo "  FAIL: unchanged settings performed installation work"; FAIL=1; }
+
+echo "### Non-interactive notification settings conflict -> reject before transaction"
+./install.sh --configure-notifications --notify-channels telegram --non-interactive --lang en >/tmp/settings-conflict.log 2>&1
+rc_settings_conflict=$?
+settings_conflict_backup_after="$(find /var/backups/security-update-notify -mindepth 1 -maxdepth 1 -type d | wc -l)"
+[[ "$rc_settings_conflict" -eq 2 && "$settings_conflict_backup_after" == "$settings_backup_before" \
+   && "$(cat "$MOCK_SYSTEMD_STATE/active")" == 1 ]] \
+  && grep -qF 'requires an interactive terminal' /tmp/settings-conflict.log \
+  && echo "  ok: conflicting settings flags were not silently ignored" \
+  || { echo "  FAIL: conflicting settings flags entered the installer transaction"; FAIL=1; }
+
+echo "### Same-channel Telegram credential rotation -> validate only Telegram"
+printf %s 123456:rotated_DEF >/tmp/telegram-token-rotated
+chmod 600 /tmp/telegram-token-rotated
+./install.sh --telegram-token-file /tmp/telegram-token-rotated --telegram-chat-id -200 \
+  --skip-telegram-test --skip-feishu-test --non-interactive -y --skip-post-install-check \
+  --lang en >/tmp/telegram-rotation.log 2>&1
+rc_telegram_rotation=$?
+[[ "$rc_telegram_rotation" -eq 0 ]] \
+  && grep -qF "TELEGRAM_BOT_TOKEN='123456:rotated_DEF'" /etc/security-update-notify/telegram.env \
+  && grep -qF "TELEGRAM_CHAT_ID='-200'" /etc/security-update-notify/telegram.env \
+  && grep -qF 'Skipping Telegram preflight test.' /tmp/telegram-rotation.log \
+  && grep -qF 'Feishu settings are unchanged; skipping duplicate preflight.' /tmp/telegram-rotation.log \
+  && ! grep -qF 'Skipping Feishu preflight test.' /tmp/telegram-rotation.log \
+  && echo "  ok: credential rotation persisted and skipped the unaffected platform" \
+  || { echo "  FAIL: same-channel credential rotation did not use selective preflight"; FAIL=1; }
+
+echo "### Telegram temporary preflight failure -> exit 75 and full rollback"
+printf %s 123456:temporary_DEF >/tmp/telegram-token-temporary
+chmod 600 /tmp/telegram-token-temporary
+FORCE_TELEGRAM_PREFLIGHT_TEMPORARY=1 ./install.sh \
+  --telegram-token-file /tmp/telegram-token-temporary --telegram-chat-id -300 \
+  --non-interactive -y --skip-post-install-check --lang en >/tmp/telegram-temporary.log 2>&1
+rc_telegram_temporary=$?
+[[ "$rc_telegram_temporary" -eq 75 ]] \
+  && grep -qF 'network preflight temporarily failed; credentials were not changed' /tmp/telegram-temporary.log \
+  && grep -qiE 'roll|回滚' /tmp/telegram-temporary.log \
+  && grep -qF "TELEGRAM_BOT_TOKEN='123456:rotated_DEF'" /etc/security-update-notify/telegram.env \
+  && grep -qF "TELEGRAM_CHAT_ID='-200'" /etc/security-update-notify/telegram.env \
+  && [[ "$(cat "$MOCK_SYSTEMD_STATE/active")" == 1 ]] \
+  && echo "  ok: temporary failure propagated exit 75 and restored prior credentials/timer" \
+  || { echo "  FAIL: temporary Telegram failure did not roll back transactionally"; FAIL=1; }
 
 echo "### Explicit validation exit after timer quiescence -> transactional ROLLBACK"
 ./install.sh --notify-lang invalid --skip-notify-test --non-interactive -y --skip-post-install-check >/tmp/post-quiesce-exit.log 2>&1
@@ -413,5 +477,26 @@ grep -qE 'Rollback could not fully restore the pre-install state|回滚未能完
   && echo "  ok: timer restoration failure was surfaced, not swallowed" \
   || { echo "  FAIL: missing incomplete rollback diagnostic"; FAIL=1; }
 systemctl start security-update-notify.timer
+
+echo "### Successful Feishu disable -> remove persisted credential"
+./install.sh --notify-channels telegram --skip-notify-test --non-interactive -y \
+  --skip-post-install-check --lang en >/tmp/disable-feishu.log 2>&1
+rc_disable_feishu=$?
+[[ "$rc_disable_feishu" -eq 0 ]] \
+  && grep -qF "NOTIFY_CHANNELS='telegram'" /etc/security-update-notify/telegram.env \
+  && [[ ! -e /etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred \
+        && ! -e /etc/security-update-notify/credentials/feishu-app-secret \
+        && ! -e /etc/systemd/system/security-update-notify.service.d/credentials.conf \
+        && "$(cat "$MOCK_SYSTEMD_STATE/active")" == 1 ]] \
+  && echo "  ok: successful platform removal deleted the Feishu credential" \
+  || {
+    echo "  FAIL: successful Feishu disable left config, credential, or timer inconsistent"
+    echo "  rc=$rc_disable_feishu active=$(cat "$MOCK_SYSTEMD_STATE/active")"
+    grep '^NOTIFY_CHANNELS=' /etc/security-update-notify/telegram.env 2>/dev/null || true
+    find /etc/credstore.encrypted /etc/security-update-notify/credentials \
+      /etc/systemd/system/security-update-notify.service.d -maxdepth 1 -type f -print 2>/dev/null || true
+    tail -30 /tmp/disable-feishu.log
+    FAIL=1
+  }
 
 if [ "$FAIL" = 0 ]; then echo "### ROLLBACK TEST PASSED"; else echo "### ROLLBACK TEST FAILED"; exit 1; fi
