@@ -13,6 +13,7 @@ import (
 // maxArchiveBytes bounds total decompressed bytes to defend against a decompression bomb. Real release
 // packages are tens of KB; this ceiling is purely defense in depth.
 const maxArchiveBytes = 256 << 20 // 256 MiB
+const maxArchiveEntries = 10_000
 
 // CheckArchive 复刻 safe_release_archive：只允许普通文件与目录，拒绝符号链接 / 硬链接 / 设备 /
 // FIFO 等特殊条目，拒绝路径穿越；所有条目必须落在 topDir 之内。用类型安全的 tar.Header.Typeflag
@@ -39,8 +40,10 @@ func CheckArchive(tarball, topDir string) error {
 	}
 	defer gz.Close()
 
-	tr := tar.NewReader(io.LimitReader(gz, maxArchiveBytes))
+	limited := &io.LimitedReader{R: gz, N: maxArchiveBytes + 1}
+	tr := tar.NewReader(limited)
 	sawTop := false
+	entries := 0
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -48,6 +51,10 @@ func CheckArchive(tarball, topDir string) error {
 		}
 		if err != nil {
 			return err
+		}
+		entries++
+		if entries > maxArchiveEntries {
+			return fmt.Errorf("archive exceeds entry limit (%d)", maxArchiveEntries)
 		}
 		switch hdr.Typeflag {
 		case tar.TypeReg, tar.TypeRegA, tar.TypeDir:
@@ -71,6 +78,9 @@ func CheckArchive(tarball, topDir string) error {
 	}
 	if !sawTop {
 		return fmt.Errorf("archive has no entries under top dir %q", topDir)
+	}
+	if limited.N == 0 {
+		return fmt.Errorf("archive exceeds size limit")
 	}
 	return nil
 }

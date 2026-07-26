@@ -1,9 +1,9 @@
-// Package notify 组装发给 Telegram 的中/英文正文，逐字节复刻 files/security-update-notify 的告警/OK
-// 模板与 format_restart_summary。运行时用字面 \n 再统一替换为换行；此处直接用真换行构造，等价且更清晰。
+// Package notify 组装发给 Telegram 的中/英文正文，逐字节保留 2.x 的告警/OK 模板与
+// format_restart_summary。字面 \n 会统一替换为换行；此处直接用真换行构造，等价且更清晰。
 // 所有全角标点、箭头、圆点、省略号、emoji（含变体选择符）均按源文件原样保留。
 //
 // Package notify assembles the bilingual Telegram body, reproducing the alert/OK templates and
-// format_restart_summary from files/security-update-notify byte-for-byte. The runtime uses literal \n then
+// 2.x format_restart_summary byte-for-byte. The runtime uses literal \n then
 // substitutes newlines; here we emit real newlines directly (equivalent, clearer). Full-width punctuation,
 // arrows, bullets, ellipses and emoji (incl. variation selectors) are preserved verbatim.
 package notify

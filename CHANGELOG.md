@@ -1,5 +1,23 @@
 # 变更记录
 
+## 3.0.0
+
+- 完成全 Go 产品面迁移：安装/升级、消息通知设置、运行检查、诊断、显式通知测试、卸载、自升级和发布打包均由 Go 实现；`sun.sh` 是唯一维护的 Shell 产品实现，仅负责首次安装前的依赖补齐、下载、SHA-256、固定指纹 GPG 验签、安全解包和架构选择。旧安装、菜单、运行时、测试、卸载与打包实现均已删除。
+  Completes the all-Go product migration: install/upgrade, notification settings, runtime checks, diagnostics, explicit notification tests, uninstall, self-upgrade, and release packaging are implemented in Go. `sun.sh` is the only maintained shell product implementation and is limited to first-install bootstrapping and verification. Legacy shell installer, menu, runtime, test, uninstall, and packaging implementations are removed.
+- Go 安装器保留 schema 4 的 22 键配置与 `0/1/2/75` 退出码，增加独立安装锁、运行锁屏障、依赖安装确认、原子受管写入、root-only 备份、失败全量回滚、timer 精确状态恢复、飞书 Directory 选人及 systemd credential 生命周期；`security-update-notify configure notifications`、`test` 与 `uninstall` 成为正式子命令。
+  The Go installer preserves schema 4's 22-key config and `0/1/2/75` exit codes while providing a dedicated install lock, runtime-lock barrier, dependency confirmation, atomic managed writes, root-only backups, full rollback, exact timer-state restoration, Feishu Directory onboarding, and the systemd-credential lifecycle. `security-update-notify configure notifications`, `test`, and `uninstall` are now first-class subcommands.
+- 根 `VERSION` 成为唯一版本源，并绑定唯一 CHANGELOG 标题、tag、包内版本和二进制版本。Go 发布工具 `go run ./cmd/sun-release package` 生成可复现、明确白名单、SHA-256 与 GPG 签名的资产集；正式包固定且只包含 linux/amd64、arm64、386、ppc64le、s390x 五个 Go 二进制，不允许缩小集合，也不再为 armv7、riscv64 等未列架构回退到 Bash 运行时。
+  Root `VERSION` is now the single source of truth and is bound to the unique changelog heading, tag, packaged version, and binary versions. The Go release tool, `go run ./cmd/sun-release package`, creates the reproducible allowlisted SHA-256/GPG-signed asset set. Official archives contain exactly linux/amd64, arm64, 386, ppc64le, and s390x Go binaries; the set cannot be reduced, and there is no Bash-runtime fallback for unlisted architectures such as armv7 or riscv64.
+- 受支持架构上的 2.x 安装可通过验签自升级原地迁移：Go 打包器为 3.0 归档确定性生成只做架构选择与 `exec` 的 `install.sh` 启动器，以及供旧 Bash 客户端版本绑定的一行不可执行标记；旧进程由此进入已验证 Go 安装事务，保留配置、timer 时间、凭据和去重状态。迁移文件不安装到系统，也不恢复第二套 Shell 安装/运行时实现；未列架构在替换前明确失败。
+  Existing 2.x installations on supported architectures migrate in place through verified self-upgrade. The Go packager deterministically generates a minimal `install.sh` architecture/exec launcher and a one-line non-executable version marker for old Bash clients; both lead into the authenticated Go transaction and are never installed. No second shell installer/runtime returns, and unlisted architectures fail before replacement.
+
+- 三轮审计加固通知与凭据边界：Telegram/飞书 API 禁止重定向，限制凭据与响应大小，拒绝符号链接及多行凭据文件，并为 GPG 与 `systemd-creds` 操作增加显式目录和超时。
+  Three audit passes harden notification and credential boundaries: Telegram/Feishu API redirects are refused, credential and response sizes are bounded, symlinked or multiline credential files are rejected, and GPG/`systemd-creds` operations use explicit homes and timeouts.
+- 自升级归档统一限制路径、条目类型、条目数和声明解压大小；下载、latest 元数据、包内版本及子进程环境覆盖均改为严格绑定。去重状态先提交时间戳再提交 hash，第二步失败时不会静默抑制下一次真实告警。
+  Self-upgrade archives now have consistent path, type, entry-count, and declared-size limits; downloads, latest metadata, packaged versions, and child-process environment overrides are strictly bound. Dedup state commits the timestamp before the hash so a failed second commit cannot silently suppress the next real alert.
+- 发布和镜像门禁要求 tag、源码版本、五架构 Go 二进制及唯一三文件资产集一致，限制资产大小并绑定 checksum 文件名；Go 诊断接受 schema 4，`--purge-config` 删除 SUN 专用时间戳备份，CI 新增恶意归档与相关回归覆盖，并修复 Docker heredoc 烟测缺少 stdin 导致的空跑假阳性。
+  Release and mirror gates now bind the tag, source version, all five Go binaries, and one exact three-file asset set, with asset-size and checksum-filename limits. Go diagnostics accept schema 4, `--purge-config` removes SUN-specific timestamped backups, CI covers hostile archives and related regressions, and the Docker heredoc smoke test no longer passes without running because stdin was detached.
+
 ## 2.3.0
 
 - 新增七类补丁维护检测：待安装安全补丁连续滞留（默认 3 天）、APT hold / DNF versionlock 或 exclude 阻断、自动更新策略漂移、包管理器损坏状态、软件源元数据缺失/过期/陈旧及签名/TLS/刷新失败、整机或服务重启需求长期未处理（默认 7 天），以及每周 SUN 新版本提示。
@@ -168,8 +186,8 @@ Version-comparison and state-write robustness fixes.
 
 - 自升级版本比较改用语义化比较（`python3`）替换 `sort -V`：`sort -V` 会把预发布号（如 `1.0.0-rc1`）排在正式版 `1.0.0` 之上，导致从 rc 升级到正式版被误判为“降级”而拒绝自升级；解析失败一律按“非更新”处理（fail-closed），数字段仅接受纯 ASCII 数字，畸形 tag 不会被解析成伪数值。多段版本（`1.7.0.1 > 1.7.0`）与预发布优先级仍按预期处理。
   Self-upgrade version comparison now uses a semantic-version compare (`python3`) instead of `sort -V`: `sort -V` ranks a pre-release such as `1.0.0-rc1` above the release `1.0.0`, so an rc→final upgrade was mis-judged as a downgrade and refused; a parse failure is treated as "not newer" (fail-closed), and numeric segments accept only pure ASCII digits so a malformed tag cannot parse to a bogus number. Multi-segment versions (`1.7.0.1 > 1.7.0`) and pre-release precedence are preserved.
-- 告警去重状态文件改为原子写入（`mktemp` + rename）：`>` 会先截断再写，崩溃或磁盘满时可能留下被截断/清空的状态文件；改为临时文件加原子重命名，且 hash 先于时间戳落盘，中途崩溃只会让下次更倾向“发送”，不会静默抑制真实告警。
-  The alert-dedup state files are now written atomically (`mktemp` + rename): `>` truncates before writing, so a crash or full disk could leave a truncated/empty state file; writes now go through a temp file plus atomic rename, with the hash committed before the timestamp, so a mid-write crash only biases the next run toward sending, never toward silently suppressing a real alert.
+- 告警去重状态文件改为原子写入（`mktemp` + rename）：`>` 会先截断再写，崩溃或磁盘满时可能留下被截断/清空的状态文件；改为临时文件加原子重命名，且时间戳先于 hash 落盘，中途崩溃只会让下次更倾向“发送”，不会静默抑制真实告警。
+  The alert-dedup state files are now written atomically (`mktemp` + rename): `>` truncates before writing, so a crash or full disk could leave a truncated/empty state file; writes now go through a temp file plus atomic rename, with the timestamp committed before the hash, so a mid-write crash only biases the next run toward sending, never toward silently suppressing a real alert.
 - 新增 CI 回归守卫，锁定上述修复：版本比较表用例（含禁止 `sort -V` 重现的源码断言）、状态原子写不变量、以及配置解析的 fail-open 不变量。
   Added CI regression guards locking in the above: version-comparison table cases (with a source assertion forbidding a `sort -V` regression), state-write atomicity invariants, and the config-parser fail-open invariant.
 

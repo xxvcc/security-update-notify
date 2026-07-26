@@ -1,22 +1,41 @@
 // Package dist 承载发布产物的信任与传输核心：sha256 校验、pin 指纹的 GPG 验签、tar 安全检查。
-// 从 files/security-update-notify 的自升级路径与 sun.sh 引导迁出的等价实现，仅用标准库（验签
-// 委托 gpg——stdlib 无 OpenPGP 验证器，且分析结论是 crypto 不是脆弱点，Bash 的文本胶水才是）。
+// 它与 sun.sh 引导器共享同一信任契约；除系统 gpg 外仅使用 Go 标准库。
 //
 // Package dist carries the release trust+transport core: sha256 verification, pinned-fingerprint GPG
-// verification, and tar safety checks. It is the standard-library equivalent of the self-upgrade path in
-// files/security-update-notify and the sun.sh bootstrap (signature verification is delegated to gpg —
-// stdlib has no OpenPGP verifier, and the fragile part was never the crypto but the Bash text glue).
+// verification, and tar safety checks. It shares the trust contract used by sun.sh; only signature
+// verification is delegated to the system gpg.
 package dist
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"time"
 )
+
+const (
+	gpgCommandTimeout = 30 * time.Second
+	maxGPGOutputBytes = 1 << 20
+	maxGPGErrorBytes  = 4 << 10
+	trustedSystemPath = "/usr/sbin:/usr/bin:/sbin:/bin"
+)
+
+var trustedGPGPaths = [...]string{"/usr/bin/gpg", "/bin/gpg"}
+
+// GPGAvailable reports whether a GPG executable exists in a fixed system
+// location. Privileged verification deliberately does not trust the caller's
+// PATH, because the selected executable is part of the release trust boundary.
+func GPGAvailable() bool {
+	_, err := trustedGPGExecutable()
+	return err == nil
+}
 
 // VerifyRelease 复刻自升级的信任校验，顺序 fail-closed：sha256 → 指纹 pin → GPG 验签。
 // 任何一步失败都以错误返回（而非 Bash 里一堆 `|| exit 1` 守卫），绝不被静默吞掉。
@@ -26,7 +45,7 @@ import (
 // failure is silently swallowed.
 func VerifyRelease(tarball, sha256File, ascFile, pubKeyFile, wantFpr string) error {
 	// 1) sha256：读期望值并与实算比对
-	want, err := readExpectedSHA(sha256File)
+	want, err := readExpectedSHA(sha256File, filepath.Base(tarball))
 	if err != nil {
 		return fmt.Errorf("read sha256 file: %w", err)
 	}
@@ -67,7 +86,7 @@ func VerifyRelease(tarball, sha256File, ascFile, pubKeyFile, wantFpr string) err
 
 // VerifySHA256 只做 sha256 校验（sha256-only 分支用；gpg 缺失且显式 opt-in 时）。
 func VerifySHA256(tarball, sha256File string) error {
-	want, err := readExpectedSHA(sha256File)
+	want, err := readExpectedSHA(sha256File, filepath.Base(tarball))
 	if err != nil {
 		return fmt.Errorf("read sha256 file: %w", err)
 	}
@@ -99,18 +118,33 @@ func VerifyReleaseKey(tarball, sha256File, ascFile string, pubKey []byte, wantFp
 	return VerifyRelease(tarball, sha256File, ascFile, tmp.Name(), wantFpr)
 }
 
-func readExpectedSHA(path string) (string, error) {
-	b, err := os.ReadFile(path)
+func readExpectedSHA(path, archiveName string) (string, error) {
+	if archiveName == "" || archiveName == "." || archiveName == ".." || filepath.Base(archiveName) != archiveName {
+		return "", fmt.Errorf("invalid archive name %q", archiveName)
+	}
+	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
-	fields := strings.Fields(string(b))
-	if len(fields) == 0 {
-		return "", fmt.Errorf("empty sha256 file")
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, maxReleaseMetadataBytes+1))
+	if err != nil {
+		return "", err
 	}
-	h := fields[0]
+	if len(b) > maxReleaseMetadataBytes {
+		return "", fmt.Errorf("sha256 file exceeds size limit")
+	}
+	const digestLength = sha256.Size * 2
+	if len(b) < digestLength {
+		return "", fmt.Errorf("invalid sha256 file (expected exactly one record for %q)", archiveName)
+	}
+	h := string(b[:digestLength])
 	if len(h) != 64 || !isHex(h) {
 		return "", fmt.Errorf("not a sha256 hex digest: %q", h)
+	}
+	wantRecord := h + "  " + archiveName + "\n"
+	if string(b) != wantRecord {
+		return "", fmt.Errorf("invalid sha256 file (expected exactly one record for %q)", archiveName)
 	}
 	return h, nil
 }
@@ -139,19 +173,28 @@ func isHex(s string) bool {
 }
 
 func runGPG(home string, args ...string) error {
-	cmd := exec.Command("gpg", append([]string{"--batch", "--no-tty"}, args...)...)
-	cmd.Env = append(os.Environ(), "GNUPGHOME="+home)
-	out, err := cmd.CombinedOutput()
+	out, err := runGPGOutput(home, append([]string{"--no-tty"}, args...)...)
 	if err != nil {
-		return fmt.Errorf("gpg %v: %v: %s", args, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("gpg failed: %v: %s", err, summarizeGPGOutput(out))
 	}
 	return nil
 }
 
+func summarizeGPGOutput(out []byte) string {
+	if len(out) > maxGPGErrorBytes {
+		out = out[:maxGPGErrorBytes]
+	}
+	s := strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' || r >= 0x20 && r != 0x7f {
+			return r
+		}
+		return ' '
+	}, string(out))
+	return strings.TrimSpace(s)
+}
+
 func gpgFingerprint(home string) (string, error) {
-	cmd := exec.Command("gpg", "--batch", "--with-colons", "--list-keys")
-	cmd.Env = append(os.Environ(), "GNUPGHOME="+home)
-	out, err := cmd.Output()
+	out, err := runGPGOutput(home, "--with-colons", "--list-keys")
 	if err != nil {
 		return "", err
 	}
@@ -176,4 +219,55 @@ func gpgFingerprint(home string) (string, error) {
 		return "", fmt.Errorf("no fingerprint found in keyring")
 	}
 	return fpr, nil
+}
+
+type boundedGPGOutput struct {
+	buf      bytes.Buffer
+	overflow bool
+}
+
+func (w *boundedGPGOutput) Write(p []byte) (int, error) {
+	if remaining := maxGPGOutputBytes + 1 - w.buf.Len(); remaining > 0 {
+		if len(p) < remaining {
+			remaining = len(p)
+		}
+		_, _ = w.buf.Write(p[:remaining])
+	}
+	if w.buf.Len() > maxGPGOutputBytes {
+		w.overflow = true
+	}
+	return len(p), nil
+}
+
+func runGPGOutput(home string, args ...string) ([]byte, error) {
+	gpg, err := trustedGPGExecutable()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), gpgCommandTimeout)
+	defer cancel()
+	baseArgs := []string{"--batch", "--homedir", home}
+	cmd := exec.CommandContext(ctx, gpg, append(baseArgs, args...)...)
+	cmd.Env = []string{"HOME=" + home, "GNUPGHOME=" + home, "PATH=" + trustedSystemPath, "LC_ALL=C"}
+	out := &boundedGPGOutput{}
+	cmd.Stdout = out
+	cmd.Stderr = out
+	err = cmd.Run()
+	if ctx.Err() != nil {
+		return out.buf.Bytes(), fmt.Errorf("timed out")
+	}
+	if out.overflow {
+		return out.buf.Bytes()[:maxGPGOutputBytes], fmt.Errorf("output exceeds size limit")
+	}
+	return out.buf.Bytes(), err
+}
+
+func trustedGPGExecutable() (string, error) {
+	for _, candidate := range trustedGPGPaths {
+		info, err := os.Stat(candidate)
+		if err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
+			return candidate, nil
+		}
+	}
+	return "", exec.ErrNotFound
 }

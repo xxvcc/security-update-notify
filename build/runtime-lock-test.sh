@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Production-entrypoint lock contract shared by the compiled Go runtime and Bash fallback.
+# Production-entrypoint lock contract for the compiled Go runtime.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -8,8 +8,8 @@ cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 
 GO_RUNTIME="$TMP/security-update-notify-go"
-BASH_RUNTIME="$ROOT/files/security-update-notify"
 "$ROOT/build/build.sh" linux amd64 lock-test "$GO_RUNTIME"
+RUNTIMES=("$GO_RUNTIME")
 
 cat >"$TMP/valid.env" <<'EOF'
 CONFIG_VERSION=3
@@ -53,7 +53,7 @@ expect_rc() {
   fi
 }
 
-for runtime in "$GO_RUNTIME" "$BASH_RUNTIME"; do
+for runtime in "${RUNTIMES[@]}"; do
   name="$(basename "$runtime")"
   for invalid_wait in '' 00001 +1 -0 3601 9999 1s; do
     run_runtime "$runtime" "$TMP/missing.env" "$TMP/$name-invalid.out" --wait-lock "$invalid_wait" --doctor --skip-notify
@@ -68,7 +68,7 @@ expect_rc "Go dry-run remains lock-free under contention" 0
 grep -q $'^HASH\t' "$TMP/go-dry-run.out"
 run_runtime "$GO_RUNTIME" "$TMP/missing.env" "$TMP/go-doctor-dry-run.out" --doctor --dry-run --skip-notify --wait-lock 0
 expect_rc "Go doctor keeps lock precedence over --dry-run" 75
-for runtime in "$GO_RUNTIME" "$BASH_RUNTIME"; do
+for runtime in "${RUNTIMES[@]}"; do
   name="$(basename "$runtime")"
   run_runtime "$runtime" "$TMP/missing.env" "$TMP/$name-doctor.out" --doctor --skip-notify --wait-lock 0
   expect_rc "$name contended doctor" 75
@@ -85,7 +85,7 @@ exec 8>&-
 
 bad_lock="$TMP/missing-parent/runtime.lock"
 LOCK_FILE="$bad_lock"
-for runtime in "$GO_RUNTIME" "$BASH_RUNTIME"; do
+for runtime in "${RUNTIMES[@]}"; do
   name="$(basename "$runtime")"
   run_runtime "$runtime" "$TMP/valid.env" "$TMP/$name-lock-open-wait.out" --doctor --skip-notify --wait-lock 0
   expect_rc "$name explicit lock-open failure" 1
@@ -94,20 +94,8 @@ for runtime in "$GO_RUNTIME" "$BASH_RUNTIME"; do
   expect_rc "$name default lock-open failure" 1
 done
 
-mkdir -p "$TMP/mock-bin"
-cat >"$TMP/mock-bin/flock" <<'EOF'
-#!/usr/bin/env bash
-exit 70
-EOF
-chmod +x "$TMP/mock-bin/flock"
 LOCK_FILE="$TMP/runtime.lock"
-PATH="$TMP/mock-bin:$PATH" run_runtime "$BASH_RUNTIME" "$TMP/valid.env" "$TMP/bash-flock-error.out" \
-  --doctor --skip-notify --wait-lock 0
-expect_rc "Bash operational flock failure" 1
-grep -Fq 'Failed to acquire the security-update-notify lock' "$TMP/bash-flock-error.out"
-
-LOCK_FILE="$TMP/runtime.lock"
-for runtime in "$GO_RUNTIME" "$BASH_RUNTIME"; do
+for runtime in "${RUNTIMES[@]}"; do
   name="$(basename "$runtime")"
   ready="$TMP/$name-holder-ready"
   rm -f "$ready"
@@ -133,4 +121,4 @@ for runtime in "$GO_RUNTIME" "$BASH_RUNTIME"; do
   ! grep -Fq 'Timed out waiting for the security-update-notify lock' "$TMP/$name-wake.out"
 done
 
-echo "Go and Bash production entrypoints share lock parsing, precedence, error, timeout, and wake semantics"
+echo "Go production entrypoint lock parsing, precedence, error, timeout, and wake semantics passed"

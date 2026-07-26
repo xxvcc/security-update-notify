@@ -1,9 +1,11 @@
 package dist
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -42,6 +44,50 @@ func TestLatestReleaseNon200(t *testing.T) {
 
 	if _, err := LatestRelease(srv.Client(), "x/y"); err == nil {
 		t.Error("expected error on non-200")
+	}
+}
+
+func TestLatestReleaseRejectsOversizedOrTrailingJSON(t *testing.T) {
+	for name, body := range map[string]string{
+		"oversized": strings.Repeat("x", maxReleaseJSONBytes+1),
+		"trailing":  `{"tag_name":"v2.3.1"}{"tag_name":"v9.9.9"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, body)
+			}))
+			defer srv.Close()
+			oldMirror, oldGitHub := releaseMirrorBase, githubAPIBase
+			releaseMirrorBase = ""
+			githubAPIBase = srv.URL
+			defer func() { releaseMirrorBase, githubAPIBase = oldMirror, oldGitHub }()
+			if _, err := LatestRelease(srv.Client(), "x/y"); err == nil {
+				t.Fatal("invalid release JSON was accepted")
+			}
+		})
+	}
+}
+
+func TestLatestReleaseRejectsUnsafeVersion(t *testing.T) {
+	for name, version := range map[string]string{
+		"newline": "2.3.1\nforged",
+		"slash":   "2.3.1/asset",
+		"long":    strings.Repeat("1", 129),
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				body, _ := json.Marshal(map[string]string{"tag_name": "v" + version})
+				_, _ = w.Write(body)
+			}))
+			defer srv.Close()
+			oldMirror, oldGitHub := releaseMirrorBase, githubAPIBase
+			releaseMirrorBase = ""
+			githubAPIBase = srv.URL
+			defer func() { releaseMirrorBase, githubAPIBase = oldMirror, oldGitHub }()
+			if _, err := LatestRelease(srv.Client(), "x/y"); err == nil {
+				t.Fatal("unsafe release version was accepted")
+			}
+		})
 	}
 }
 

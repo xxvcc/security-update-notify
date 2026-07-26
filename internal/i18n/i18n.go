@@ -1,10 +1,10 @@
 // Package i18n 复刻运行时的语言解析：终端显示语言按 UI_LANG → NOTIFY_LANG → zh 回退，且仅当有效
-// 值恰为 "en" 时才用英文（其余一律中文），与 files/security-update-notify 里的 m()/say() 等价；
+// 值恰为 "en" 时才用英文（其余一律中文）；
 // NOTIFY_LANG 单独归一化为精确 zh/en（其它 → zh），它同时是去重 hash 的第 3 个字段与通知正文语言。
 //
 // Package i18n reproduces the runtime language resolution: the terminal display language falls back
 // UI_LANG → NOTIFY_LANG → zh, and is English only when the effective value is exactly "en" (anything
-// else is Chinese), matching m()/say() in files/security-update-notify. NOTIFY_LANG is separately
+// else is Chinese). NOTIFY_LANG is separately
 // normalized to exactly zh/en (else zh); it is both the 3rd dedup-hash field and the notification body language.
 package i18n
 
@@ -24,7 +24,7 @@ const (
 )
 
 // Display 解析终端显示语言：uiLang 优先，否则 notifyLang，否则 zh；只有有效值恰为 "en" 才是英文。
-// 这是 Bash m()/say() 里 `${UI_LANG:-${NOTIFY_LANG:-zh}}` = en 判断的等价实现。
+// 这保留了 2.x 的语言选择兼容语义。
 func Display(uiLang, notifyLang string) Lang {
 	v := uiLang
 	if v == "" {

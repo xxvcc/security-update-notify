@@ -166,6 +166,109 @@ func TestRetryOn429(t *testing.T) {
 	}
 }
 
+func TestRetryOnAny5xx(t *testing.T) {
+	var n int32
+	c, srv, slept := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&n, 1) == 1 {
+			w.WriteHeader(520)
+			_, _ = io.WriteString(w, `{"code":999}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"code":0,"tenant_access_token":"t"}`)
+	})
+	defer srv.Close()
+	if err := c.Probe(context.Background(), "cli_app", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 || *slept != 1 {
+		t.Errorf("requests=%d slept=%d want 2,1", n, *slept)
+	}
+}
+
+func TestMissingOrNullBusinessCodeIsTemporary(t *testing.T) {
+	for _, codeField := range []string{"", `"code":null,`} {
+		name := "missing"
+		if codeField != "" {
+			name = "null"
+		}
+		t.Run("token-"+name, func(t *testing.T) {
+			c, srv, slept := newTestClient(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, `{`+codeField+`"tenant_access_token":"tenant-token"}`)
+			})
+			defer srv.Close()
+			err := c.Probe(context.Background(), "cli_app", "secret")
+			if err == nil || !IsTemporary(err) {
+				t.Fatalf("error=%v, want temporary malformed-response failure", err)
+			}
+			if *slept != 0 {
+				t.Fatalf("malformed token response was retried %d times", *slept)
+			}
+		})
+
+		t.Run("message-"+name, func(t *testing.T) {
+			requests := 0
+			c, srv, slept := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				if strings.Contains(r.URL.Path, "tenant_access_token") {
+					_, _ = io.WriteString(w, `{"code":0,"tenant_access_token":"tenant-token"}`)
+					return
+				}
+				_, _ = io.WriteString(w, `{`+codeField+`"msg":"success"}`)
+			})
+			defer srv.Close()
+			err := c.SendText(context.Background(), "cli_app", "secret", "ou_lanny", "hello")
+			if err == nil || !IsTemporary(err) {
+				t.Fatalf("error=%v, want temporary malformed-response failure", err)
+			}
+			if requests != 2 || *slept != 0 {
+				t.Fatalf("requests=%d sleeps=%d want 2,0", requests, *slept)
+			}
+		})
+	}
+}
+
+func TestRetryOnFeishuBusinessRateLimit(t *testing.T) {
+	t.Run("token", func(t *testing.T) {
+		var requests int32
+		c, srv, slept := newTestClient(func(w http.ResponseWriter, _ *http.Request) {
+			if atomic.AddInt32(&requests, 1) == 1 {
+				_, _ = io.WriteString(w, `{"code":99991400}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"code":0,"tenant_access_token":"tenant-token"}`)
+		})
+		defer srv.Close()
+		if err := c.Probe(context.Background(), "cli_app", "secret"); err != nil {
+			t.Fatal(err)
+		}
+		if requests != 2 || *slept != 1 {
+			t.Fatalf("requests=%d sleeps=%d want 2,1", requests, *slept)
+		}
+	})
+
+	t.Run("message", func(t *testing.T) {
+		var messages int32
+		c, srv, slept := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "tenant_access_token") {
+				_, _ = io.WriteString(w, `{"code":0,"tenant_access_token":"tenant-token"}`)
+				return
+			}
+			if atomic.AddInt32(&messages, 1) == 1 {
+				_, _ = io.WriteString(w, `{"code":99991400}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"code":0}`)
+		})
+		defer srv.Close()
+		if err := c.SendText(context.Background(), "cli_app", "secret", "ou_lanny", "hello"); err != nil {
+			t.Fatal(err)
+		}
+		if messages != 2 || *slept != 1 {
+			t.Fatalf("messages=%d sleeps=%d want 2,1", messages, *slept)
+		}
+	})
+}
+
 func TestPermanentAPIErrorIsNotRetriedOrLeaked(t *testing.T) {
 	var n int32
 	c, srv, slept := newTestClient(func(w http.ResponseWriter, r *http.Request) {
@@ -178,6 +281,9 @@ func TestPermanentAPIErrorIsNotRetriedOrLeaked(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
+	if IsTemporary(err) {
+		t.Fatalf("permanent credential error was classified temporary: %v", err)
+	}
 	if strings.Contains(err.Error(), "top-secret") {
 		t.Fatal("app secret leaked in error")
 	}
@@ -186,11 +292,92 @@ func TestPermanentAPIErrorIsNotRetriedOrLeaked(t *testing.T) {
 	}
 }
 
+func TestExhaustedServerFailureIsTemporary(t *testing.T) {
+	var requests int32
+	c, srv, slept := newTestClient(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"code":999}`)
+	})
+	defer srv.Close()
+	err := c.Probe(context.Background(), "cli_app", "secret")
+	if err == nil || !IsTemporary(err) {
+		t.Fatalf("error=%v, want temporary", err)
+	}
+	if requests != 3 || *slept != 2 {
+		t.Fatalf("requests=%d sleeps=%d, want 3,2", requests, *slept)
+	}
+}
+
 func TestMissingReceiveID(t *testing.T) {
 	c := &Client{HTTP: http.DefaultClient}
 	if err := c.SendText(context.Background(), "a", "s", "", "text"); err == nil {
 		t.Fatal("expected missing receive id")
 	}
+}
+
+func TestRejectsRemotePlaintextBaseURL(t *testing.T) {
+	c := &Client{HTTP: http.DefaultClient, BaseURL: "http://api.example.com"}
+	if err := c.Probe(context.Background(), "cli_app", "secret"); err == nil {
+		t.Fatal("Probe accepted a remote plaintext base URL")
+	}
+}
+
+func TestDoesNotFollowCredentialBearingRedirect(t *testing.T) {
+	var targetRequests int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&targetRequests, 1)
+		_, _ = io.WriteString(w, `{"code":0,"tenant_access_token":"stolen"}`)
+	}))
+	defer target.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", target.URL)
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+	c := &Client{HTTP: source.Client(), BaseURL: source.URL}
+	if err := c.Probe(context.Background(), "cli_test", "secret"); err == nil {
+		t.Fatal("Probe accepted a redirect")
+	}
+	if got := atomic.LoadInt32(&targetRequests); got != 0 {
+		t.Fatalf("credential-bearing redirect reached target %d times", got)
+	}
+}
+
+func TestRejectsNon2xxSuccessPayloads(t *testing.T) {
+	t.Run("token", func(t *testing.T) {
+		c, srv, slept := newTestClient(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusMultipleChoices)
+			_, _ = io.WriteString(w, `{"code":0,"tenant_access_token":"tenant-token"}`)
+		})
+		defer srv.Close()
+		if err := c.Probe(context.Background(), "cli_test", "secret"); err == nil {
+			t.Fatal("3xx token response was accepted")
+		}
+		if *slept != 0 {
+			t.Fatalf("3xx response was retried %d times", *slept)
+		}
+	})
+
+	t.Run("message", func(t *testing.T) {
+		requests := 0
+		c, srv, slept := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			if strings.Contains(r.URL.Path, "tenant_access_token") {
+				_, _ = io.WriteString(w, `{"code":0,"tenant_access_token":"tenant-token"}`)
+				return
+			}
+			w.WriteHeader(http.StatusMultipleChoices)
+			_, _ = io.WriteString(w, `{"code":0}`)
+		})
+		defer srv.Close()
+		if err := c.SendText(context.Background(), "cli_test", "secret", "ou_lanny", "text"); err == nil {
+			t.Fatal("3xx message response was accepted")
+		}
+		if requests != 2 || *slept != 0 {
+			t.Fatalf("requests=%d sleeps=%d want 2,0", requests, *slept)
+		}
+	})
 }
 
 func TestNonOpenIDRejected(t *testing.T) {
@@ -219,7 +406,7 @@ func TestOversizedTokenResponseRejected(t *testing.T) {
 		io.WriteString(w, strings.Repeat("x", maxRespBytes+1))
 	})
 	defer srv.Close()
-	if err := c.Probe(context.Background(), "cli_app", "secret"); err == nil || !strings.Contains(err.Error(), "too large") {
+	if err := c.Probe(context.Background(), "cli_app", "secret"); err == nil || !strings.Contains(err.Error(), "too large") || !IsTemporary(err) {
 		t.Fatalf("error=%v want too large", err)
 	}
 }

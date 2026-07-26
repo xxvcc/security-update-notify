@@ -1,11 +1,9 @@
-// Package cli 是 Go 运行时的命令分发层。复刻运行时的“裸调用即运行检查”语义，并保留 flag 风格入口
-// （--test-ok/--test-reboot/--no-dedupe/--lang/--version），同时保留 PoC 的信任+传输 helper 子命令
-// （version-newer/verify/check-archive，供瘦身 sun.sh shim 与自升级使用）。
+// Package cli 是 Go 程序的命令分发层。复刻运行时的“裸调用即运行检查”语义，并保留 2.x flag 风格入口，
+// 同时提供 3.x 的显式子命令与信任 helper 子命令。
 //
 // Package cli is the Go runtime's command dispatch. It reproduces the runtime's "a bare invocation runs
-// the check" semantics and keeps the flag-style entrypoints (--test-ok/--test-reboot/--no-dedupe/--lang/
-// --version), plus the PoC trust+transport helper subcommands (version-newer/verify/check-archive) used
-// by the thin sun.sh shim and self-upgrade.
+// the check" semantics and keeps the 2.x flag-style entrypoints while adding the explicit 3.x commands and
+// trust helpers used by the thin sun.sh bootstrap and self-upgrade.
 package cli
 
 import (
@@ -27,6 +25,22 @@ const defaultEnvFile = "/etc/security-update-notify/telegram.env"
 func Main(ver string, args []string) int {
 	if len(args) > 0 {
 		switch args[0] {
+		case "install":
+			return installMode(ver, args[1:])
+		case "configure":
+			return configureMode(ver, args[1:])
+		case "run":
+			return runMode(ver, args[1:])
+		case "doctor":
+			return runMode(ver, append([]string{"--doctor"}, args[1:]...))
+		case "check-upgrade":
+			return runMode(ver, append([]string{"--check-upgrade"}, args[1:]...))
+		case "upgrade":
+			return runMode(ver, append([]string{"--upgrade"}, args[1:]...))
+		case "test":
+			return testMode(ver, args[1:])
+		case "uninstall":
+			return uninstallMode(args[1:])
 		case "version-newer":
 			return cmdVersionNewer(args[1:])
 		case "verify":
@@ -190,7 +204,20 @@ func envFile() string {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `Usage: security-update-notify [--test-ok] [--test-reboot] [--no-dedupe] [--wait-lock SECONDS] [--dry-run] [--doctor] [--check-upgrade] [--upgrade] [--lang zh|en] [--version]
+	fmt.Fprintln(os.Stderr, `Usage:
+  security-update-notify [run flags]
+  security-update-notify install [install options]
+  security-update-notify configure notifications [install options]
+  security-update-notify run [run flags]
+  security-update-notify doctor [doctor flags]
+  security-update-notify check-upgrade [--lang zh|en]
+  security-update-notify upgrade [--lang zh|en]
+  security-update-notify test [--send-test] [--simulate-reboot] [--no-dedupe] [--lang zh|en]
+  security-update-notify uninstall [--purge-config] [--lang zh|en]
+
+Run flags:
+  --test-ok --test-reboot --no-dedupe --wait-lock SECONDS --dry-run
+  --doctor --check-upgrade --upgrade --lang zh|en --version
 
 Checks OS backend reboot/service-restart state, then sends configured notifications.
 

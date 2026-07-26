@@ -11,8 +11,10 @@ package httpx
 import (
 	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -34,6 +36,40 @@ func New(timeout time.Duration) *http.Client {
 			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
 		},
 	}
+}
+
+// GuardAPIBase accepts an HTTPS API root, plus plain HTTP only on the local loopback interface for
+// deterministic integration tests. Credentials must never be sent to a remote plaintext endpoint.
+func GuardAPIBase(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	if u.Host == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("invalid API base URL")
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	host := strings.ToLower(u.Hostname())
+	ip := net.ParseIP(host)
+	if u.Scheme == "http" && (host == "localhost" || (ip != nil && ip.IsLoopback())) {
+		return nil
+	}
+	return fmt.Errorf("refusing non-https API base URL")
+}
+
+// NoRedirects returns a shallow copy of client that exposes redirect responses to the caller.
+// API requests carry credentials, so even an HTTPS redirect must not be followed to another host.
+func NoRedirects(client *http.Client) (*http.Client, error) {
+	if client == nil {
+		return nil, fmt.Errorf("missing HTTP client")
+	}
+	clone := *client
+	clone.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &clone, nil
 }
 
 // GuardHTTPS 校验一个 URL 的 scheme 必须是 https（用于初始 URL 与最终 URL 的复核）。

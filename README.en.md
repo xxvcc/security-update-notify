@@ -13,9 +13,11 @@
 
 **security-update-notify** — or **SUN** — is a small Linux utility for people who maintain servers and do not want to miss important post-update actions.
 
-It uses your distro's native update tools, runs from a systemd timer, and makes outbound-only HTTPS requests: alerts go to the Telegram Bot API and/or Feishu Open Platform as configured; by default it also queries a public-IP echo service (api.ipify.org / ifconfig.me) for the egress IP (disable with `INCLUDE_PUBLIC_IP=0`, or set `PUBLIC_IP` manually); and it contacts GitHub on self-upgrade. No dashboard. No agent port. No remote-control bot.
+It uses your distro's native update tools, runs from a systemd timer, and makes outbound-only HTTPS requests: alerts go to the Telegram Bot API and/or Feishu Open Platform as configured; by default it also queries a public-IP echo service (api.ipify.org / ifconfig.me) for the egress IP (disable with `INCLUDE_PUBLIC_IP=0`, or set `PUBLIC_IP` manually); install and self-upgrade prefer the `dl.ll.cd` release mirror and fall back to GitHub when transport is unavailable. No dashboard. No agent port. No remote-control bot.
 
-> Since **2.0**, the runtime is a statically-compiled **Go binary**, shipped per architecture (amd64/arm64/386/ppc64le/s390x); unbuilt architectures fall back to the self-contained Bash runtime. The **Go binary runtime** needs neither `python3` nor `curl`; the Bash fallback runtime still depends on `python3` (for notification APIs and version/date math). The `install.sh` installer also uses `python3` for receiving-platform preflight checks.
+> Since **3.0**, installation, configuration, runtime checks, diagnostics, tests, uninstall, self-upgrade, and release packaging are implemented in Go. The only maintained shell product implementation is the first-install bootstrap, `sun.sh`. The Go packager also generates an `install.sh` launcher solely so 2.x clients can cross the major-version boundary; it only selects and `exec`s the verified Go installer, is never installed, and is not a second installer implementation. Official archives contain exactly five Linux binaries: amd64, arm64, 386, ppc64le, and s390x. There is no Bash runtime or fallback for unlisted architectures; unsupported machines are rejected before the Go installer runs (the bootstrap may already have installed its own download/verification dependencies).
+
+The installed Go binary needs no `python3`, `curl`, or `tar` for routine checks and notifications. Self-upgrade still invokes `gpg` for signature verification, and OS/patch state still comes from the distribution's apt/dnf, needrestart/needs-restarting, and systemd commands as applicable.
 
 **Languages**: [中文](README.md) | English
 
@@ -24,6 +26,8 @@ It uses your distro's native update tools, runs from a systemd timer, and makes 
 ```bash
 curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash
 ```
+
+The bootstrap requires `curl`, `tar`, `sha256sum`, `mktemp`, `python3`, `env`, `gpg`, and `timeout`. When commands are missing, it first installs the corresponding bootstrap dependencies through apt, dnf, or yum, then checks each command again. It fails before download/installation if no supported package manager exists or a command is still missing. GPG verification is mandatory by default.
 
 ---
 
@@ -163,8 +167,14 @@ If you prefer running from source:
 ```bash
 git clone https://github.com/xxvcc/security-update-notify.git
 cd security-update-notify
-sudo ./install.sh
+source ./VERSION
+arch="$(go env GOARCH)"
+case "$arch" in amd64|arm64|386|ppc64le|s390x) ;; *) echo "unsupported architecture: $arch" >&2; exit 1 ;; esac
+./build/build.sh linux "$arch" "$VERSION" ./security-update-notify
+sudo ./security-update-notify install
 ```
+
+Source builds require the Go toolchain pinned by `go.mod`, and the current machine must use one of the five release architectures above. `build/build.sh` injects the canonical root `VERSION`; do not install a plain `go run` or `go build` binary whose version was not injected.
 
 The installer first asks for a UI language (Chinese or English, default Chinese), then lets you select Telegram, Feishu, or both platforms. It asks for the matching receiving-platform credentials:
 
@@ -183,14 +193,14 @@ Before writing the config, it performs receiving-platform preflight checks:
 
 Results are limited by the Feishu application's directory data scope. If scanning fails or returns no visible employees, the interactive installer can retry, accept a current-app `open_id` manually, or abort. Non-interactive mode requires `--feishu-receive-id` explicitly.
 
-On the first interactive Feishu setup or after changing the app, App Secret, or recipient, the installer sends a Feishu-only verification message by default to confirm that the selected `open_id` is within the bot availability; enter `n` to skip it. Verification waits up to 60 seconds for an existing check to release the runtime lock and enables the SUN timer only after a confirmed send; a timeout or send failure rolls the install back, so “not sent” cannot be mistaken for success. Non-interactive installs send nothing automatically. Explicit `--send-test` or `test.sh --send-test` still tests every configured receiving platform.
+On the first interactive Feishu setup or after changing the app, App Secret, or recipient, the installer sends a Feishu-only verification message by default to confirm that the selected `open_id` is within the bot availability; enter `n` to skip it. Verification waits up to 60 seconds for an existing check to release the runtime lock and enables the SUN timer only after a confirmed send; a timeout or send failure rolls the install back, so “not sent” cannot be mistaken for success. Non-interactive installs send nothing automatically. Explicit `--send-test` or `security-update-notify test --send-test` still tests every configured receiving platform.
 
 ### 3. Verify
 
 ```bash
-sudo ./test.sh
-sudo ./test.sh --send-test --no-dedupe
-sudo ./test.sh --simulate-reboot --no-dedupe
+sudo security-update-notify test
+sudo security-update-notify test --send-test --no-dedupe
+sudo security-update-notify test --simulate-reboot --no-dedupe
 ```
 
 The simulated reboot test only sends a test alert. It does **not** reboot the server.
@@ -200,7 +210,7 @@ The simulated reboot test only sends a test alert. It does **not** reboot the se
 Useful for provisioning scripts:
 
 ```bash
-sudo ./install.sh \
+curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- install \
   --notify-channels telegram \
   --telegram-token '123456:ABC...' \
   --telegram-chat-id 'CHAT_ID' \
@@ -220,7 +230,7 @@ For non-interactive Feishu installation, provide the App Secret through a separa
 sudo install -m 600 /dev/null /root/.security-update-notify-feishu-secret
 sudoedit /root/.security-update-notify-feishu-secret
 
-sudo ./install.sh \
+curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- install \
   --notify-channels feishu \
   --feishu-app-id 'cli_xxx' \
   --feishu-receive-id 'ou_xxx' \
@@ -242,7 +252,8 @@ cp .env.example .env
 chmod 600 .env
 sudoedit .env
 
-sudo ./install.sh --env-file .env --non-interactive -y
+curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | \
+  sudo bash -s -- install --env-file "$PWD/.env" --non-interactive -y
 ```
 
 You can also keep only the token in a root-only file:
@@ -251,7 +262,7 @@ You can also keep only the token in a root-only file:
 sudo install -m 600 /dev/null /root/.security-update-notify-token
 sudoedit /root/.security-update-notify-token
 
-sudo ./install.sh \
+curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- install \
   --telegram-token-file /root/.security-update-notify-token \
   --telegram-chat-id 'CHAT_ID' \
   --non-interactive \
@@ -278,12 +289,14 @@ Common options:
 --notify-upgrade 1        # notify configured receiving platforms after successful upgrade; default 0
 --skip-post-install-check # skip post-install/upgrade self-check
 --allow-best-effort        # allow best-effort distro versions
---configure-notifications  # interactively manage message notification settings; existing installs only
+--lock-wait SECONDS       # runtime-lock barrier, 0..3600 seconds; default 60
 --send-test                # test every configured receiving platform after installation
 --skip-telegram-test       # skip Telegram preflight validation
 --skip-feishu-test         # skip separate credential preflight; selection still scans if needed
 --skip-notify-test         # skip all receiving-platform preflight validation
 ```
+
+Once SUN is installed, `sudo security-update-notify install [options]` runs the same Go installer directly. Use `sudo security-update-notify configure notifications` to manage message notification settings transactionally on an existing installation.
 
 
 ### Upgrade
@@ -294,11 +307,11 @@ Rerun the one-line installer to upgrade to the latest release:
 curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- upgrade --non-interactive -y
 ```
 
-Once SUN is installed you can also run `sudo security-update-notify --upgrade` directly. Both the bootstrap and built-in upgrade first read `https://dl.ll.cd/security-update-notify/latest.json` and download the signed assets from that mirror; they fall back to GitHub when the mirror index or complete asset-set transfer is unavailable. The downloaded package still must pass `.sha256` and GPG verification against the embedded pinned fingerprint (fail-closed by default; a missing signature is rejected). The mirror improves transport availability but is not a trust root.
+Once SUN is installed you can also run `sudo security-update-notify upgrade` directly. Both the bootstrap and built-in upgrade first read `https://dl.ll.cd/security-update-notify/latest.json` and download the signed assets from that mirror; they fall back to GitHub when the mirror index or complete asset-set transfer is unavailable. The downloaded package still must pass `.sha256` and GPG verification against the embedded pinned fingerprint (fail-closed by default; a missing signature is rejected). The mirror improves transport availability but is not a trust root.
 
 After each official GitHub Release is published, the `Mirror signed release` workflow re-verifies and syncs its versioned directory. Only after the signed assets and the versioned `sun.sh` extracted from the verified archive have been read back from `dl.ll.cd` does it update the stable `sun.sh`, followed by `latest.json` last. Manually rerunning an older release only repairs that version directory and cannot replace the stable bootstrap or current Latest manifest.
 
-If SUN is already installed, the installer reads `/etc/security-update-notify/telegram.env` and the existing timer time first, displays the current notification method, and keeps the existing message notification settings by default. If you choose to edit them, you can change the receiving platforms, Telegram credentials, Feishu app, App Secret, or recipient. The main menu also provides a separate **Message notification settings** action. Removing a platform deletes its stored credentials; adding or editing a platform revalidates only the affected platform. Any failure rolls the whole installer transaction back. Legacy configs without `NOTIFY_CHANNELS` remain `telegram`, and other options not explicitly overridden keep their old values.
+If SUN is already installed, the installer reads `/etc/security-update-notify/telegram.env` and the existing timer time and keeps every setting that was not explicitly overridden. Run `sudo security-update-notify configure notifications` to change receiving platforms, Telegram credentials, the Feishu app, App Secret, or recipient transactionally. Removing a platform deletes its stored credentials; adding or editing one revalidates only that platform. Any failure rolls the whole installer transaction back. Legacy configs without `NOTIFY_CHANNELS` remain `telegram`, and other options not explicitly overridden keep their old values.
 
 Before upgrading, key files are backed up to `/var/backups/security-update-notify/<timestamp>`, but the Feishu App Secret is not copied there; failed upgrades attempt an automatic rollback and restore the SUN timer's pre-install enablement link and active state. A post-upgrade self-check runs by default; use `--notify-upgrade 1` to notify the configured receiving platforms after a successful upgrade. Upgrade notices are best-effort: a notification failure never rolls back a completed upgrade, and the whole dual-send is not retried in a way that would duplicate a successful platform.
 
@@ -333,10 +346,10 @@ In addition to reboot/service-restart and distro-EOL detection, SUN runs seven p
 | `PENDING_ALERT_DAYS` | `3` | Days that pending security updates may remain before alerting; set `0` to disable backlog alerts. The first-seen time is kept in root-only state and removed after the backlog clears. |
 | `RESTART_ALERT_DAYS` | `7` | Days before a persistent full-reboot or service-restart requirement is escalated; set `0` to disable age escalation. SUN never restarts the host or services automatically. |
 | `CHECK_SELF_UPDATE` | `1` | Periodically check for a SUN release; notify only, never auto-upgrade. |
-| `SELF_UPDATE_CHECK_DAYS` | `7` | SUN release-check interval. Successful results are cached; `--doctor` forces a read-only refresh. |
+| `SELF_UPDATE_CHECK_DAYS` | `7` | SUN release-check interval. Successful results are cached; `security-update-notify doctor` forces a read-only refresh. |
 | `CHECK_EOL` | `1` | Distro end-of-life (EOL) warning: a past-EOL release triggers an alert, an approaching one (within 90 days) is informational. Set `0` if you have extended support such as Ubuntu ESM. |
 
-The pending count remains informational until it reaches `PENDING_ALERT_DAYS`. DNF's high-severity subtotal includes both `critical` and `important`. Run `security-update-notify --doctor` anytime to inspect all seven checks, pending counts, and the SUN release result; diagnostics never mutate age or release-cache state. `--test-ok`, `--test-reboot`, and the Go runtime's `--dry-run` neither write this state nor make the periodic release request.
+The pending count remains informational until it reaches `PENDING_ALERT_DAYS`. DNF's high-severity subtotal includes both `critical` and `important`. Run `security-update-notify doctor` anytime to inspect all seven checks, pending counts, and the SUN release result; diagnostics never mutate age or release-cache state. Simulated `security-update-notify test` modes and `security-update-notify run --dry-run` neither write this state nor make the periodic release request.
 
 ## Installed files
 
@@ -372,7 +385,7 @@ SUN configures or uses:
 - `apt-listchanges`
 - apt periodic timers
 
-The installer enables unattended-upgrades security update timers. Before each overwrite of `/etc/apt/apt.conf.d/20auto-upgrades`, it saves a timestamped SUN-specific backup; on first install it also keeps a fixed-name backup, and `--purge-config` restores that fixed backup when it exists.
+The installer enables unattended-upgrades security update timers. Before each overwrite of `/etc/apt/apt.conf.d/20auto-upgrades`, it saves a timestamped SUN-specific backup; on first install it also keeps a fixed-name backup. `--purge-config` restores that fixed backup when it exists and removes SUN's fixed and timestamped backups.
 
 It checks:
 
@@ -386,7 +399,7 @@ SUN configures or uses:
 
 - `dnf-automatic`
 - `yum-utils` or `dnf-utils`
-- `python3`, `ca-certificates`
+- `ca-certificates`
 
 It checks:
 
@@ -394,7 +407,7 @@ It checks:
 - `needs-restarting -s` (systemd services that need a restart; no longer the raw `needs-restarting` process list, which caused false alerts)
 - `dnf updateinfo list security updates`
 
-If `/etc/dnf/automatic.conf` exists, SUN first saves a timestamped backup, then configures security-only automatic updates; `--purge-config` attempts to restore the newest SUN-created backup.
+If `/etc/dnf/automatic.conf` exists, SUN first saves a timestamped backup, then configures security-only automatic updates; `--purge-config` attempts to restore the newest SUN-created backup and removes SUN-specific timestamped backups.
 
 ```ini
 upgrade_type = security
@@ -422,14 +435,14 @@ sudoedit /etc/security-update-notify/telegram.env
 # Set NOTIFY_LANG=zh (Chinese) or NOTIFY_LANG=en (English)
 ```
 
-To switch receiving platforms or change the Feishu app or recipient, rerun the one-line installer and choose **Message notification settings**. The installer validates the App ID/app-scoped `open_id` binding and creates, migrates, or removes the App Secret credential; do not bypass those steps by editing only `NOTIFY_CHANNELS`.
+To switch receiving platforms or change the Feishu app or recipient, run `sudo security-update-notify configure notifications`. The Go installer validates the App ID/app-scoped `open_id` binding and creates, migrates, or removes the App Secret credential; do not bypass those steps by editing only `NOTIFY_CHANNELS`.
 
 Run built-in diagnostics:
 
 ```bash
 security-update-notify --version
-security-update-notify --check-upgrade
-sudo security-update-notify --doctor
+security-update-notify check-upgrade
+sudo security-update-notify doctor
 ```
 
 View logs:
@@ -443,22 +456,22 @@ sudo tail -n 100 /var/log/security-update-notify.log
 Remove the program and systemd/logrotate integration, while keeping config and state:
 
 ```bash
-sudo ./uninstall.sh
+sudo security-update-notify uninstall
 ```
 
 Remove config and state too:
 
 ```bash
-sudo ./uninstall.sh --purge-config
+sudo security-update-notify uninstall --purge-config
 ```
 
 Packages installed as dependencies are left in place. `--purge-config` removes SUN config, Telegram/Feishu credentials, state, upgrade backups (which may contain bot-token copies) and rotated logs, and restores apt/dnf automatic-update config when a SUN-created backup exists.
 
 ## Release signatures
 
-Release packages always include a `.sha256` checksum file. `package.sh` can also create a detached `.tar.gz.asc` signature automatically when a GPG secret key is available. `sun.sh` defaults to `required` signature verification; `auto` is kept only as a compatibility alias and also requires both gpg and the `.asc` signature. Only an explicit `--verify-signature off` skips signature verification.
+Release packages always include a `.sha256` checksum file. `go run ./cmd/sun-release package` creates a detached `.tar.gz.asc` signature when the key is available, and requires it for an official release or an existing version tag. `sun.sh` defaults to `required` signature verification; `auto` is kept only as a compatibility alias and also requires both gpg and the `.asc` signature. Only an explicit `--verify-signature off` skips signature verification.
 
-Official releases (builds for a version with a corresponding `vX.Y.Z` tag, or builds with `RELEASE=1`) are **signed-mandatory**: `package.sh` requires a GPG signature and fails without a key, and after a release is published CI verifies the assets' signature and fingerprint against the repo's public key, failing the release checks if a signature is missing or mismatched. The private key never enters CI; it stays offline with the maintainer. In addition, `security-update-notify --upgrade` is **fail-closed** by default: it prefers the fixed release mirror and falls back to GitHub, verifies sha256, and requires a GPG signature against an embedded public key and pinned fingerprint before extracting and upgrading (set `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` to upgrade on sha256 only in an emergency).
+Root `VERSION`, in the exact form `VERSION="X.Y.Z"`, is the single source of truth. Official releases (a corresponding `vX.Y.Z` tag or `RELEASE=1`) are **signed and fixed to all five Go architectures**. The Go release tool binds that root version to the unique CHANGELOG heading, tag, packaged version, and every binary's `--version`; the architecture set cannot be overridden. It fails when Go, Bash (used only to syntax-check `sun.sh`), any amd64/arm64/386/ppc64le/s390x build, or the GPG private key matching the pinned fingerprint is missing. After publication, CI accepts exactly one tag-matched asset set containing the tarball, checksum, and signature, then verifies its signature and fingerprint against the repository public key. The private key never enters CI; it stays offline with the maintainer. In addition, `security-update-notify upgrade` is **fail-closed** by default: it prefers the fixed release mirror and falls back to GitHub, verifies sha256, and requires a GPG signature against an embedded public key and pinned fingerprint before extracting and upgrading (set `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` to upgrade on sha256 only in an emergency).
 
 ## Security notes
 
@@ -478,34 +491,32 @@ The release `.sha256` file protects against accidental corruption or version mis
 From the source checkout:
 
 ```bash
-bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify \
-  build/compat-test.sh build/rollback-test.sh build/bash-feishu-test.sh \
-  build/install-feishu-onboarding-test.sh build/install-notification-settings-test.sh \
-  build/install-telegram-preflight-test.sh \
-  build/runtime-lock-test.sh
+bash -n sun.sh build/*.sh
+shellcheck -s bash -S warning sun.sh build/*.sh
+unformatted="$(rg --files cmd internal -g '*.go' -0 | xargs -0 gofmt -l)"
+test -z "$unformatted"
 go vet ./...
 go test -race -cover ./...
-build/bash-feishu-test.sh
-build/install-feishu-onboarding-test.sh
-build/install-notification-settings-test.sh
-build/install-telegram-preflight-test.sh
+build/archive-safety-test.sh
 build/runtime-lock-test.sh
-build/compat-test.sh
-build/rollback-test.sh
-./package.sh
+build/reproducibility-check.sh linux amd64
+docker run --rm -v "$PWD:/src:ro" debian:12 bash /src/build/compat-test.sh
+docker run --rm -v "$PWD:/src:ro" debian:12 bash /src/build/rollback-test.sh
+go run ./cmd/sun-release package
 cd dist && sha256sum -c security-update-notify-*.tar.gz.sha256
 ```
 
-`build/compat-test.sh` and `build/rollback-test.sh` use Docker. The remaining commands use the project's declared Go toolchain and local shell tooling.
+`build/compat-test.sh` and `build/rollback-test.sh` modify system paths and must only be run with the disposable Docker commands above, never directly on the host. An official release must also pass CI's five-architecture execution, hostile-archive, signature, and public-asset verification gates.
 
 Generated files:
 
 ```text
 dist/security-update-notify-VERSION.tar.gz
 dist/security-update-notify-VERSION.tar.gz.sha256
+dist/security-update-notify-VERSION.tar.gz.asc  # signed build
 ```
 
-The release archive contains only user-facing installation, diagnostic, bootstrap, and documentation files. `sun.sh` is included in the signed archive; the mirror workflow extracts it only after verification and publishes it at the stable URL.
+The release archive contains only user-facing installation, diagnostic, bootstrap, migration-compatibility, and documentation files. `sun.sh` is included in the signed archive; the mirror workflow extracts it only after verification and publishes it at the stable URL. `install.sh` and `files/security-update-notify` are generated by the Go packager as a minimal launcher and version marker for old 2.x self-upgrade clients. They contain no legacy installer/runtime logic and are never installed.
 
 Release archive contents:
 
@@ -515,12 +526,19 @@ CHANGELOG.md
 LICENSE
 README.md
 README.en.md
-install.sh
-menu.sh
+VERSION
 sun.sh
-test.sh
-uninstall.sh
-files/
+install.sh                              # 2.x -> 3.0 Go launcher only
+files/needrestart-report-only.conf
+files/release-signing.pub.asc
+files/security-update-notify            # old-client version marker only
+files/security-update-notify.logrotate
+files/security-update-notify.service
+files/security-update-notify-linux-amd64
+files/security-update-notify-linux-arm64
+files/security-update-notify-linux-386
+files/security-update-notify-linux-ppc64le
+files/security-update-notify-linux-s390x
 ```
 
 ## License

@@ -1,10 +1,9 @@
 // Command security-update-notify 是 SUN 的 Go 二进制入口。分发逻辑在 internal/cli；裸调用即运行检查，
-// 保留 --test-ok/--test-reboot/--no-dedupe/--lang/--version 与信任 helper 子命令（version-newer/verify/
-// check-archive）。--doctor/--check-upgrade/--upgrade 正在移植（见 docs/go-port.md）。
+// install/configure/run/doctor/check-upgrade/upgrade/test/uninstall 与信任 helper 均由同一二进制提供。
 //
 // Command security-update-notify is SUN's Go binary entrypoint. Dispatch lives in internal/cli; a bare
-// invocation runs the check, keeping --test-ok/--test-reboot/--no-dedupe/--lang/--version and the trust
-// helper subcommands. --doctor/--check-upgrade/--upgrade are being ported (see docs/go-port.md).
+// invocation runs the check, and the same binary provides install, configure, run, doctor, upgrade, test,
+// uninstall, and the trust-helper subcommands.
 package main
 
 import (

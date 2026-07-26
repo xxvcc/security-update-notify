@@ -13,7 +13,7 @@ type UpgradeMessage struct {
 	Now             string
 }
 
-// RenderUpgrade 复刻升级成功通知（files/security-update-notify:848-849）。
+// RenderUpgrade renders the stable bilingual upgrade-success notification.
 func RenderUpgrade(m UpgradeMessage) string {
 	if m.Lang == i18n.EN {
 		host := "Host: " + m.Host

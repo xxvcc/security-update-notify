@@ -26,8 +26,10 @@ func Extract(tarball, destDir string) error {
 	}
 	defer gz.Close()
 
-	tr := tar.NewReader(io.LimitReader(gz, maxArchiveBytes))
+	limited := &io.LimitedReader{R: gz, N: maxArchiveBytes + 1}
+	tr := tar.NewReader(limited)
 	var written int64
+	entries := 0
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -35,6 +37,10 @@ func Extract(tarball, destDir string) error {
 		}
 		if err != nil {
 			return err
+		}
+		entries++
+		if entries > maxArchiveEntries {
+			return fmt.Errorf("archive exceeds entry limit (%d)", maxArchiveEntries)
 		}
 		switch hdr.Typeflag {
 		case tar.TypeReg, tar.TypeRegA, tar.TypeDir:
@@ -64,22 +70,28 @@ func Extract(tarball, destDir string) error {
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
 		}
+		if hdr.Size < 0 || hdr.Size > maxArchiveBytes-written {
+			return fmt.Errorf("archive exceeds size limit")
+		}
 		out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm)
 		if err != nil {
 			return err
 		}
-		n, err := io.Copy(out, io.LimitReader(tr, maxArchiveBytes-written))
-		out.Close()
+		n, err := io.CopyN(out, tr, hdr.Size)
+		closeErr := out.Close()
 		if err != nil {
 			return err
 		}
-		written += n
-		if written >= maxArchiveBytes {
-			return fmt.Errorf("archive exceeds size limit")
+		if closeErr != nil {
+			return closeErr
 		}
+		written += n
 		if err := os.Chmod(target, perm); err != nil {
 			return err
 		}
+	}
+	if limited.N == 0 {
+		return fmt.Errorf("archive exceeds size limit")
 	}
 	return nil
 }

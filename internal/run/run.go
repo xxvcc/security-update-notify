@@ -48,7 +48,7 @@ type Output struct {
 	FeishuCard []byte // 飞书 JSON 2.0 卡片（Send=false 时为空）
 }
 
-// Assemble 复刻运行时末尾的决策与消息组装（files/security-update-notify:1044-1091）：
+// Assemble 保留 2.x 运行时的决策与消息组装契约：
 // 关注 = 需要整机重启 或 服务重启关注 或 机制异常 或 已过 EOL（pending 与临近 EOL 仅信息，不触发）。
 // 有关注 -> 告警正文并发送；无关注 -> 仅当 SendOK 才发 OK 正文，否则静默不发。
 func Assemble(in Input) Output {

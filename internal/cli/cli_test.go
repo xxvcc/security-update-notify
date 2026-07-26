@@ -1,6 +1,9 @@
 package cli
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseWaitLockSeconds(t *testing.T) {
 	t.Parallel()
@@ -30,5 +33,52 @@ func TestParseWaitLockSeconds(t *testing.T) {
 				t.Fatalf("parseWaitLockSeconds(%q) = (%d, %v), want (%d, %v)", tt.value, got, ok, tt.want, tt.ok)
 			}
 		})
+	}
+}
+
+func TestExplicitRunSubcommandPreservesVersionFlag(t *testing.T) {
+	if rc := Main("3.0.0-test", []string{"run", "--version"}); rc != 0 {
+		t.Fatalf("Main(run --version)=%d", rc)
+	}
+}
+
+func TestTestSubcommandRejectsUnknownAndInvalidLanguage(t *testing.T) {
+	for _, args := range [][]string{{"test", "--unknown"}, {"test", "--lang", "fr"}, {"test", "--lang"}} {
+		if rc := Main("3.0.0-test", args); rc != 2 {
+			t.Fatalf("Main(%q)=%d want 2", strings.Join(args, " "), rc)
+		}
+	}
+}
+
+func TestUninstallSubcommandRejectsUnknownAndInvalidLanguageBeforeMutation(t *testing.T) {
+	for _, args := range [][]string{{"uninstall", "--unknown"}, {"uninstall", "--lang", "fr"}, {"uninstall", "--lang"}} {
+		if rc := Main("3.0.0-test", args); rc != 2 {
+			t.Fatalf("Main(%q)=%d want 2", strings.Join(args, " "), rc)
+		}
+	}
+}
+
+func TestUninstallHelpAcceptsLanguageBeforeOrAfterHelp(t *testing.T) {
+	for _, args := range [][]string{
+		{"uninstall", "--lang", "en", "--help"},
+		{"uninstall", "--help", "--lang", "en"},
+	} {
+		if rc := Main("3.0.0-test", args); rc != 0 {
+			t.Fatalf("Main(%q)=%d want 0", strings.Join(args, " "), rc)
+		}
+	}
+}
+
+func TestInstallAndConfigureSubcommandDispatch(t *testing.T) {
+	for _, args := range [][]string{
+		{"install", "--help"},
+		{"configure", "notifications", "--help"},
+	} {
+		if rc := Main("3.0.0-test", args); rc != 0 {
+			t.Fatalf("Main(%q)=%d want 0", strings.Join(args, " "), rc)
+		}
+	}
+	if rc := Main("3.0.0-test", []string{"configure", "unknown"}); rc != 2 {
+		t.Fatalf("Main(configure unknown)=%d want 2", rc)
 	}
 }

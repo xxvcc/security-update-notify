@@ -77,6 +77,8 @@ func TestShouldSend(t *testing.T) {
 		{"daily-next-day", false, "h", "h", base, nextDay, "daily", 3, true},
 		{"interval-within", false, "h", "h", base, base + 86400, "interval", 3, false},
 		{"interval-beyond", false, "h", "h", base, base + 3*86400, "interval", 3, true},
+		{"daily-clock-rollback", false, "h", "h", base + 3600, base, "daily", 3, true},
+		{"interval-clock-rollback", false, "h", "h", base + 3600, base, "interval", 3, true},
 		{"interval-bad-days-defaults-3", false, "h", "h", base, base + 2*86400, "interval", 0, false},
 	}
 	for _, c := range cases {
@@ -107,6 +109,45 @@ func TestStoreRoundTripAndAtomicity(t *testing.T) {
 	leftovers, _ := filepath.Glob(filepath.Join(dir, ".state.*"))
 	if len(leftovers) != 0 {
 		t.Errorf("leftover temp files: %v", leftovers)
+	}
+}
+
+func TestStoreWriteFailurePreservesExistingState(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	if err := store.Write("old-hash", 1737000000); err != nil {
+		t.Fatal(err)
+	}
+	store.Dir = filepath.Join(dir, "missing", "state")
+	if err := store.Write("new-hash", 1738000000); err == nil {
+		t.Fatal("expected state write failure")
+	}
+	hash, sentAt := store.ReadLast()
+	if hash != "old-hash" || sentAt != 1737000000 {
+		t.Fatalf("failed write changed state to %q,%d", hash, sentAt)
+	}
+}
+
+func TestStoreCommitsTimestampBeforeHash(t *testing.T) {
+	dir := t.TempDir()
+	hashTarget := filepath.Join(dir, "hash-target")
+	if err := os.Mkdir(hashTarget, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	timeTarget := filepath.Join(dir, "sent-at")
+	if err := os.WriteFile(timeTarget, []byte("100\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := &Store{Dir: dir, HashFile: hashTarget, TimeFile: timeTarget}
+	if err := store.Write("new-hash", 200); err == nil {
+		t.Fatal("expected hash rename failure")
+	}
+	b, err := os.ReadFile(timeTarget)
+	if err != nil || string(b) != "200\n" {
+		t.Fatalf("timestamp was not committed before hash: %q err=%v", b, err)
+	}
+	if !ShouldSend(false, "new-hash", "old-hash", 200, 200, "daily", 3) {
+		t.Fatal("old hash plus new timestamp suppressed a newly delivered alert")
 	}
 }
 

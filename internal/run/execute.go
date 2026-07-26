@@ -141,7 +141,12 @@ func deliverChannels(cfg *config.Config, channels []string, message delivery.Mes
 			fmt.Fprintf(os.Stderr, "%s notification failed: %v\n", channelLabel(item.name), err)
 			continue
 		}
-		_ = item.store.Write(curHash, now)
+		if err := item.store.Write(curHash, now); err != nil {
+			sendFailed = true
+			logEvent(fmt.Sprintf("%s state failed backend=%s host=%s", item.name, backend, host))
+			fmt.Fprintf(os.Stderr, "%s notification was sent but delivery state could not be persisted: %v\n", channelLabel(item.name), err)
+			continue
+		}
 		logEvent(fmt.Sprintf("%s sent backend=%s host=%s reboot_required=%s restart_attention=%s hash=%s",
 			item.name, backend, host, b01(rebootRequired), b01(restartAttention), curHash))
 	}

@@ -28,4 +28,4 @@ CapabilityBoundingSet=
 UMask=0077
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
-ReadWritePaths=/var/lib/security-update-notify /var/log/security-update-notify.log
+ReadWritePaths=/var/lib/security-update-notify -/var/log/security-update-notify.log

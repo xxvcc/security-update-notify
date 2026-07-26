@@ -1,79 +1,140 @@
 #!/usr/bin/env bash
-# 桥升级兼容测试：bash 运行时 -> Go 桥升级，验证配置/状态保留、Go 二进制落地、且不会全网重复告警。
+# Container-only compatibility gate: upgrade a representative 2.x/schema-3
+# installation in place with the 3.x Go installer.
 set -euo pipefail
 
-# 断言助手：`cond && echo ok` 形式在 set -e 下不致命（非末尾的 && 左元被豁免），保留断言会
-# 静默失败。ok 让每条断言都能真正 fail 整个测试。
-ok() { if eval "$1"; then echo "  ok: $2"; else echo "  FAIL: $2" >&2; exit 1; fi; }
+[[ -f /.dockerenv || "${SUN_CONTAINER_TEST:-0}" == 1 ]] || {
+  echo "build/compat-test.sh must run only in a disposable container" >&2
+  exit 2
+}
+
+ok() {
+  if eval "$1"; then
+    echo "  ok: $2"
+  else
+    echo "  FAIL: $2" >&2
+    exit 1
+  fi
+}
+
 export DEBIAN_FRONTEND=noninteractive
-apt-get update >/dev/null
-apt-get install -y python3 ca-certificates file >/dev/null
-
 mkdir -p /run/systemd/system /etc/systemd/system /usr/local/sbin \
-         /etc/security-update-notify /var/lib/security-update-notify /var/log /etc/logrotate.d
+  /etc/security-update-notify /var/lib/security-update-notify /var/log /etc/logrotate.d \
+  /tmp/mock-systemd /usr/local/bin
 
-# systemctl / systemd-analyze 桩（容器内无真 systemd）。
 cat >/usr/local/bin/systemctl <<'EOF'
 #!/usr/bin/env bash
-case "$1" in
-  daemon-reload|enable|restart|disable) exit 0 ;;
-  list-timers) echo "security-update-notify.timer mock"; exit 0 ;;
-  is-enabled) exit 0 ;;
-  *) echo "mock systemctl $*"; exit 0 ;;
+set -euo pipefail
+state=/tmp/mock-systemd
+case "${1:-}" in
+  is-enabled)
+    if [[ -e "$state/enabled" ]]; then echo enabled; exit 0; fi
+    echo disabled
+    exit 1
+    ;;
+  is-active)
+    [[ -e "$state/active" ]]
+    ;;
+  disable)
+    rm -f "$state/enabled" "$state/active"
+    ;;
+  enable)
+    if [[ " $* " == *" security-update-notify.timer "* ]]; then
+      touch "$state/enabled"
+      [[ " $* " == *" --now "* ]] && touch "$state/active"
+    fi
+    ;;
+  start)
+    [[ "${2:-}" == security-update-notify.timer ]] && touch "$state/active"
+    ;;
+  stop|daemon-reload)
+    ;;
+  list-timers)
+    echo "security-update-notify.timer mock"
+    ;;
+  *)
+    echo "mock systemctl: unsupported arguments: $*" >&2
+    exit 1
+    ;;
 esac
 EOF
-chmod +x /usr/local/bin/systemctl
+chmod 0755 /usr/local/bin/systemctl
 printf '#!/usr/bin/env bash\nexit 0\n' >/usr/local/bin/systemd-analyze
-chmod +x /usr/local/bin/systemd-analyze
+chmod 0755 /usr/local/bin/systemd-analyze
 
-TARBALL="$(ls /src/dist/security-update-notify-*.tar.gz)"
-cd /tmp && tar -xzf "$TARBALL"
-PKGDIR="$(basename "$TARBALL" .tar.gz)"
+tarball="$(find /src/dist -maxdepth 1 -type f -name 'security-update-notify-*.tar.gz' -print -quit)"
+[[ -n "$tarball" ]] || { echo "release tarball missing under /src/dist" >&2; exit 1; }
+version="$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' /src/VERSION)"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z]+)?$ \
+   && "$(wc -l </src/VERSION)" -eq 1 ]] || {
+  echo "invalid canonical VERSION" >&2
+  exit 1
+}
+work=/tmp/sun-compat-release
+mkdir -p "$work"
+tar -xzf "$tarball" -C "$work"
+package_dir="$work/$(basename "$tarball" .tar.gz)"
+runtime="$package_dir/files/security-update-notify-linux-amd64"
+[[ -x "$runtime" ]] || { echo "amd64 Go runtime missing" >&2; exit 1; }
+[[ -x "$package_dir/install.sh" ]] || { echo "2.x compatibility launcher missing" >&2; exit 1; }
+[[ "$(cat "$package_dir/files/security-update-notify")" == "VERSION=\"$version\"" ]] || {
+  echo "2.x compatibility version marker is not bound to $version" >&2
+  exit 1
+}
 
-echo "### Stage 1: install the OLD bash runtime (no Go binary present -> fallback)"
-cp -r "/tmp/$PKGDIR" /tmp/bash-only
-rm -f /tmp/bash-only/files/security-update-notify-linux-*
-( cd /tmp/bash-only && ./install.sh --telegram-token 123456:abc_DEF-ghi --telegram-chat-id -100123 \
-    --host-label compat-host --skip-telegram-test --non-interactive -y --skip-post-install-check )
-ok "head -1 /usr/local/sbin/security-update-notify | grep -q 'bin/env bash'" "bash runtime installed"
-ok "grep -qF \"HOST_LABEL='compat-host'\" /etc/security-update-notify/telegram.env" "config written"
-ok "grep -qF \"CONFIG_VERSION='4'\" /etc/security-update-notify/telegram.env" "config upgraded to schema v4"
-ok "grep -qF \"PENDING_ALERT_DAYS='3'\" /etc/security-update-notify/telegram.env" "pending-patch age default written"
-ok "grep -qF \"RESTART_ALERT_DAYS='7'\" /etc/security-update-notify/telegram.env" "restart age default written"
-ok "grep -qF \"CHECK_SELF_UPDATE='1'\" /etc/security-update-notify/telegram.env" "notify-only release check enabled"
-ok "grep -qF \"SELF_UPDATE_CHECK_DAYS='7'\" /etc/security-update-notify/telegram.env" "release-check interval written"
-ok "grep -qF \"NOTIFY_CHANNELS='telegram'\" /etc/security-update-notify/telegram.env" "legacy/default channel is Telegram"
-# 模拟一次此前的告警状态（升级后必须保留、不因升级而丢失或改变）。
-printf '%s\n' "67937ecd9dc8b78bb7bbb248d4ef6ef6ec0ac64ad65de2141dc171faec1803cd" >/var/lib/security-update-notify/last-alert.sha256
-
-echo "### Stage 2: upgrade in place to the Go bridge (install.sh installs the Go binary)"
-( cd "/tmp/$PKGDIR" && SECURITY_UPDATE_NOTIFY_UPGRADE=1 ./install.sh --skip-telegram-test --non-interactive -y --skip-post-install-check )
-ok "file /usr/local/sbin/security-update-notify | grep -q 'ELF'" "Go binary installed"
-ver="$(/usr/local/sbin/security-update-notify --version | awk '{print $2}')"
-echo "  ok: version $ver"
-ok "grep -qF \"HOST_LABEL='compat-host'\" /etc/security-update-notify/telegram.env" "config PRESERVED across upgrade"
-ok "grep -qF '123456:abc_DEF-ghi' /etc/security-update-notify/telegram.env" "token PRESERVED across upgrade"
-ok "grep -qF \"NOTIFY_CHANNELS='telegram'\" /etc/security-update-notify/telegram.env" "notification channel PRESERVED across upgrade"
-ok "test -s /var/backups/security-update-notify/latest" "upgrade backup created"
-ok "grep -q '^67937ecd' /var/lib/security-update-notify/last-alert.sha256" "alert state PRESERVED across upgrade"
-
-echo "### Stage 3: no-fleet-re-alert proof (installed Go binary == Bash golden hash)"
-cat >/tmp/env <<'EOF'
-TELEGRAM_BOT_TOKEN=123456:fake_TOKEN-value
-TELEGRAM_CHAT_ID=-100999
-HOST_LABEL=golden-host
-BACKEND=apt
-NOTIFY_LANG=zh
-INCLUDE_PUBLIC_IP=0
-CHECK_UPDATE_HEALTH=0
-CHECK_EOL=0
-STALE_UPDATE_DAYS=0
+cat >/etc/security-update-notify/telegram.env <<'EOF'
+CONFIG_VERSION='3'
+NOTIFY_CHANNELS='telegram'
+TELEGRAM_BOT_TOKEN='123456:abc_DEF-ghi'
+TELEGRAM_CHAT_ID='-100123'
+HOST_LABEL='compat-host'
+PUBLIC_IP=''
+INCLUDE_PUBLIC_IP='0'
+NOTIFY_OK='0'
+NOTIFY_UPGRADE='0'
+DEDUP_MODE='daily'
+DEDUP_INTERVAL_DAYS='3'
+NOTIFY_LANG='en'
+BACKEND='apt'
+CHECK_UPDATE_HEALTH='0'
+STALE_UPDATE_DAYS='0'
+CHECK_EOL='0'
 EOF
-got="$(SECURITY_UPDATE_NOTIFY_ENV=/tmp/env /usr/local/sbin/security-update-notify --test-reboot --no-dedupe --dry-run | awk -F'\t' '/^HASH/{print $2}')"
-want="67937ecd9dc8b78bb7bbb248d4ef6ef6ec0ac64ad65de2141dc171faec1803cd"
-if [ "$got" = "$want" ]; then
-  echo "  ok: installed Go binary reproduces the Bash golden hash -> upgrade will NOT re-alert"
-else
-  echo "  FAIL: hash $got != golden $want"; exit 1
-fi
-echo "### ALL BRIDGE COMPAT CHECKS PASSED"
+chmod 0600 /etc/security-update-notify/telegram.env
+printf 'legacy-runtime\n' >/usr/local/sbin/security-update-notify
+chmod 0755 /usr/local/sbin/security-update-notify
+printf '[Unit]\nDescription=legacy\n' >/etc/systemd/system/security-update-notify.service
+printf '[Timer]\nOnCalendar=*-*-* 08:30:00\n' >/etc/systemd/system/security-update-notify.timer
+printf '%s\n' '67937ecd9dc8b78bb7bbb248d4ef6ef6ec0ac64ad65de2141dc171faec1803cd' \
+  >/var/lib/security-update-notify/last-alert.sha256
+touch /tmp/mock-systemd/enabled /tmp/mock-systemd/active
+
+echo "### Upgrade representative 2.x state through the generated 3.x compatibility bridge"
+(
+  cd "$package_dir"
+  ./install.sh --skip-notify-test --non-interactive -y --skip-post-install-check --lang en
+)
+
+ok "[[ \"$(/usr/local/sbin/security-update-notify --version)\" == 'security-update-notify $version' ]]" \
+  "Go $version runtime installed"
+ok "grep -qF \"CONFIG_VERSION='4'\" /etc/security-update-notify/telegram.env" \
+  "configuration upgraded to schema 4"
+ok "grep -qF \"HOST_LABEL='compat-host'\" /etc/security-update-notify/telegram.env" \
+  "host label preserved"
+ok "grep -qF \"TELEGRAM_BOT_TOKEN='123456:abc_DEF-ghi'\" /etc/security-update-notify/telegram.env" \
+  "Telegram token preserved"
+ok "grep -qF \"NOTIFY_CHANNELS='telegram'\" /etc/security-update-notify/telegram.env" \
+  "notification platform preserved"
+ok "grep -qF \"PENDING_ALERT_DAYS='3'\" /etc/security-update-notify/telegram.env" \
+  "new pending-patch default added"
+ok "grep -qF \"RESTART_ALERT_DAYS='7'\" /etc/security-update-notify/telegram.env" \
+  "new restart-age default added"
+ok "grep -qF \"CHECK_SELF_UPDATE='1'\" /etc/security-update-notify/telegram.env" \
+  "self-update check default added"
+ok "grep -q '^67937ecd' /var/lib/security-update-notify/last-alert.sha256" \
+  "deduplication state preserved"
+ok "test -s /var/backups/security-update-notify/latest" "transaction backup created"
+ok "test -e /tmp/mock-systemd/enabled && test -e /tmp/mock-systemd/active" \
+  "project timer enabled and active"
+
+echo "3.0 compatibility upgrade test passed"

@@ -3,6 +3,7 @@ package dist
 import (
 	"archive/tar"
 	"compress/gzip"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -46,7 +47,7 @@ func TestCheckArchive(t *testing.T) {
 		hdrs    []*tar.Header
 		wantErr bool
 	}{
-		{"good", []*tar.Header{dir(top + "/"), reg(top + "/install.sh"), reg(top + "/files/x")}, false},
+		{"good", []*tar.Header{dir(top + "/"), reg(top + "/VERSION"), reg(top + "/files/x")}, false},
 		{"symlink-rejected", []*tar.Header{dir(top + "/"), link(top + "/bad-link")}, true},
 		{"absolute-rejected", []*tar.Header{reg("/etc/passwd")}, true},
 		{"traversal-rejected", []*tar.Header{reg(top + "/../evil")}, true},
@@ -64,5 +65,20 @@ func TestCheckArchive(t *testing.T) {
 				t.Errorf("CheckArchive() err=%v, wantErr=%v", err, c.wantErr)
 			}
 		})
+	}
+}
+
+func TestArchiveEntryLimit(t *testing.T) {
+	const top = "security-update-notify-9.9.9"
+	headers := make([]*tar.Header, 0, maxArchiveEntries+1)
+	for i := 0; i <= maxArchiveEntries; i++ {
+		headers = append(headers, reg(filepath.Join(top, fmt.Sprintf("file-%05d", i))))
+	}
+	path := buildTarGz(t, headers)
+	if err := CheckArchive(path, top); err == nil {
+		t.Fatal("archive entry bomb passed safety check")
+	}
+	if err := Extract(path, t.TempDir()); err == nil {
+		t.Fatal("archive entry bomb was extracted")
 	}
 }

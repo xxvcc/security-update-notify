@@ -1,11 +1,8 @@
-// Package version 复刻 files/security-update-notify 里 is_newer_version 的 python 语义化版本
-// 比较器：数字段逐段比较（缺省段补 0），pre-release 后缀按 semver 规则排序，任何解析失败一律
-// fail-closed（视为“非更新”），使其可无守卫地替换 Bash 侧的自升级门。
+// Package version 保留 SUN 2.x 的语义化版本比较：数字段逐段比较（缺省段补 0），pre-release
+// 后缀按 semver 规则排序，任何解析失败一律 fail-closed（视为“非更新”）。
 //
-// Package version reproduces the python semantic-version comparator embedded in
-// files/security-update-notify (is_newer_version): numeric segments compared pairwise (missing = 0),
-// pre-release suffixes ranked per semver, any parse failure fails closed (treated as "not newer") so
-// it can replace the Bash self-upgrade gate without guards.
+// Package version retains SUN's stable semantic-version ordering: numeric segments are compared pairwise
+// (missing = 0), pre-release suffixes are ranked per semver, and parse failures fail closed.
 package version
 
 import (

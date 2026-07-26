@@ -2,874 +2,31 @@ name: CI
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
   pull_request:
   workflow_dispatch:
   release:
-    types: [ published, edited ]
+    types: [published, edited]
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'release' }}
+
 jobs:
-  shell-and-package:
+  quality:
     if: ${{ github.event_name != 'release' }}
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        # package.sh 现在会构建并纳入 Go 运行时二进制（桥）；固定 1.26.4 以保证可复现。
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.26.4'
-          check-latest: false
-          cache: false
-
-      - name: Shell syntax check
-        run: |
-          bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify build/compat-test.sh build/rollback-test.sh build/bash-feishu-test.sh build/bash-patch-watchdog-test.sh build/install-feishu-onboarding-test.sh build/install-notification-settings-test.sh build/install-telegram-preflight-test.sh build/runtime-lock-test.sh
-
-      - name: ShellCheck
-        run: |
-          shellcheck -s bash -S warning -e SC2034,SC1091 install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify build/bash-feishu-test.sh build/bash-patch-watchdog-test.sh build/install-feishu-onboarding-test.sh build/install-notification-settings-test.sh build/install-telegram-preflight-test.sh build/runtime-lock-test.sh
-
-      - name: Dotenv parser regression check
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          s = Path('install.sh').read_text()
-          start = s.index('load_env_file() {')
-          end = s.index('\nset_config_default()', start)
-          harness = '''#!/usr/bin/env bash
-          set -euo pipefail
-          m(){ printf %s "$1"; }; say(){ echo "$1" >&2; }
-          UI_LANG="zh"; CHECK_TIME="09:00"; NOTIFY_CHANNELS=""; TELEGRAM_BOT_TOKEN=""; TELEGRAM_CHAT_ID=""; FEISHU_APP_ID=""; FEISHU_RECEIVE_ID=""; FEISHU_APP_SECRET_FILE=""; FEISHU_APP_ID_EXPLICIT=0; FEISHU_RECEIVE_ID_EXPLICIT=0; HOST_LABEL=""; PUBLIC_IP=""; INCLUDE_PUBLIC_IP="1"; NOTIFY_OK=""; NOTIFY_UPGRADE=""; CONFIG_VERSION=""; DEDUP_MODE=""; DEDUP_INTERVAL_DAYS="3"; NOTIFY_LANG="zh"; BACKEND="auto"; SEND_TEST=0; SKIP_TELEGRAM_TEST=0; SKIP_FEISHU_TEST=0; NON_INTERACTIVE=0; ASSUME_YES=0; ALLOW_BEST_EFFORT=0; POST_INSTALL_CHECK=1
-          ''' + s[start:end] + '''
-          load_env_file "$1"
-          printf '%s\n' "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" "$CHECK_TIME" "$NOTIFY_LANG" "$DEDUP_MODE" "$SEND_TEST" "$ALLOW_BEST_EFFORT" "$HOST_LABEL" "$PUBLIC_IP" "$INCLUDE_PUBLIC_IP" "$NOTIFY_OK" "$NOTIFY_UPGRADE" "$CONFIG_VERSION" "$NOTIFY_CHANNELS" "$FEISHU_APP_ID" "$FEISHU_RECEIVE_ID" "$FEISHU_APP_SECRET_FILE" "$SKIP_FEISHU_TEST"
-          '''
-          Path('/tmp/sun-env-harness.sh').write_text(harness)
-          PY
-          chmod +x /tmp/sun-env-harness.sh
-          cat >/tmp/sun.env <<'EOF'
-          TELEGRAM_BOT_TOKEN=abc123 # inline comment
-          TELEGRAM_CHAT_ID=-100123
-          CHECK_TIME=10:30
-          NOTIFY_LANG=en
-          DEDUP_MODE=daily
-          SEND_TEST=TRUE
-          ALLOW_BEST_EFFORT=Yes
-          HOST_LABEL="prod web 01"
-          PUBLIC_IP=203.0.113.10
-          INCLUDE_PUBLIC_IP=0
-          NOTIFY_OK=yes
-          NOTIFY_UPGRADE=true
-          CONFIG_VERSION=3
-          NOTIFY_CHANNELS=telegram,feishu
-          FEISHU_APP_ID=cli_test
-          FEISHU_RECEIVE_ID=ou_lanny
-          FEISHU_APP_SECRET_FILE=/run/secrets/feishu-app-secret
-          SKIP_FEISHU_TEST=true
-          EOF
-          /tmp/sun-env-harness.sh /tmp/sun.env > /tmp/sun-env.out
-          diff -u /tmp/sun-env.out - <<'EOF'
-          abc123
-          -100123
-          10:30
-          en
-          daily
-          1
-          1
-          prod web 01
-          203.0.113.10
-          0
-          1
-          1
-          3
-          telegram,feishu
-          cli_test
-          ou_lanny
-          /run/secrets/feishu-app-secret
-          1
-          EOF
-          if /tmp/sun-env-harness.sh <(echo 'BAD_KEY=x') >/tmp/bad.out 2>/tmp/bad.err; then
-            echo "Unexpectedly accepted unknown env key" >&2
-            exit 1
-          fi
-
-      - name: Notification language regression check
-        run: |
-          set -euo pipefail
-          export CHECK_UPDATE_HEALTH=0 CHECK_EOL=0 STALE_UPDATE_DAYS=0  # 隔离看门狗 / isolate watchdog from this test
-          tmp="$(mktemp -d)"
-          trap 'rm -rf "$tmp"' EXIT
-          cp files/security-update-notify "$tmp/security-update-notify"
-          sed -i \
-            -e "s|^STATE_DIR=.*|STATE_DIR=\"$tmp/state\"|" \
-            -e "s|^LOCK_FILE=.*|LOCK_FILE=\"$tmp/security-update-notify.lock\"|" \
-            -e "s|^LOG_FILE=.*|LOG_FILE=\"$tmp/security-update-notify.log\"|" \
-            "$tmp/security-update-notify"
-          chmod +x "$tmp/security-update-notify"
-          mkdir -p "$tmp/bin"
-          cat >"$tmp/bin/python3" <<'EOF'
-          #!/usr/bin/env bash
-          exec /usr/bin/python3 -c 'import os, sys
-          payload = sys.stdin.buffer.read().split(b"\0", 2)
-          text = payload[2].decode("utf-8", "replace") if len(payload) > 2 else ""
-          capture = os.environ.get("CAPTURE")
-          if capture:
-              with open(capture, "w", encoding="utf-8") as fh:
-                  fh.write(text)
-          print("{\"ok\": true}")
-          '
-          EOF
-          chmod +x "$tmp/bin/python3"
-
-          cat >"$tmp/env.alert.zh" <<'EOF'
-          TELEGRAM_BOT_TOKEN=fake
-          TELEGRAM_CHAT_ID=fake
-          NOTIFY_LANG=zh
-          BACKEND=apt
-          INCLUDE_PUBLIC_IP=0
-          EOF
-          cat >"$tmp/env.alert.en" <<'EOF'
-          TELEGRAM_BOT_TOKEN=fake
-          TELEGRAM_CHAT_ID=fake
-          NOTIFY_LANG=en
-          BACKEND=apt
-          DEDUP_MODE=always
-          EOF
-          cat >"$tmp/env.ok.zh" <<'EOF'
-          TELEGRAM_BOT_TOKEN=fake
-          TELEGRAM_CHAT_ID=fake
-          NOTIFY_LANG=zh
-          BACKEND=dnf
-          PUBLIC_IP=203.0.113.10
-          EOF
-          cat >"$tmp/env.ok.en" <<'EOF'
-          TELEGRAM_BOT_TOKEN=fake
-          TELEGRAM_CHAT_ID=fake
-          NOTIFY_LANG=en
-          BACKEND=dnf
-          DEDUP_MODE=always
-          EOF
-
-          PATH="$tmp/bin:$PATH" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env.alert.zh" CAPTURE="$tmp/alert.zh.msg" "$tmp/security-update-notify" --test-reboot --no-dedupe >/dev/null
-          PATH="$tmp/bin:$PATH" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env.alert.en" CAPTURE="$tmp/alert.en.msg" "$tmp/security-update-notify" --test-reboot --no-dedupe >/dev/null
-          PATH="$tmp/bin:$PATH" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env.ok.zh" CAPTURE="$tmp/ok.zh.msg" "$tmp/security-update-notify" --test-ok --no-dedupe >/dev/null
-          PATH="$tmp/bin:$PATH" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env.ok.en" CAPTURE="$tmp/ok.en.msg" "$tmp/security-update-notify" --test-ok --no-dedupe >/dev/null
-
-          # 负向断言用显式 if…exit：`! grep` 会被 set -e 豁免（取反命令），非末尾命中也不中断，
-          # 会让语言串味 / 公网 IP 泄露等回归带绿灯通过。refute 能真正 fail 这一步。
-          refute() { if grep -q "$1" "$2"; then echo "::error::forbidden string '$1' found in $2" >&2; exit 1; fi; }
-          grep -q '安全更新后需要处理' "$tmp/alert.zh.msg"
-          refute 'Security update action required' "$tmp/alert.zh.msg"
-          refute '公网 IP：' "$tmp/alert.zh.msg"
-          grep -q 'Security update action required' "$tmp/alert.en.msg"
-          refute '安全更新后需要处理' "$tmp/alert.en.msg"
-          grep -q '安全更新检查正常' "$tmp/ok.zh.msg"
-          grep -q '公网 IP：203.0.113.10' "$tmp/ok.zh.msg"
-          refute 'Security update check OK' "$tmp/ok.zh.msg"
-          grep -q 'Security update check OK' "$tmp/ok.en.msg"
-          refute '安全更新检查正常' "$tmp/ok.en.msg"
-
-      - name: dnf reboot/restart detection regression check
-        run: |
-          set -euo pipefail
-          export CHECK_UPDATE_HEALTH=0 CHECK_EOL=0 STALE_UPDATE_DAYS=0 CHECK_SELF_UPDATE=0  # 隔离看门狗 / isolate watchdog from this test
-          tmp="$(mktemp -d)"
-          trap 'rm -rf "$tmp"' EXIT
-          cp files/security-update-notify "$tmp/security-update-notify"
-          sed -i \
-            -e "s|^STATE_DIR=.*|STATE_DIR=\"$tmp/state\"|" \
-            -e "s|^LOCK_FILE=.*|LOCK_FILE=\"$tmp/lock\"|" \
-            -e "s|^LOG_FILE=.*|LOG_FILE=\"$tmp/log\"|" \
-            "$tmp/security-update-notify"
-          chmod +x "$tmp/security-update-notify"
-          mkdir -p "$tmp/bin"
-          cat >"$tmp/bin/python3" <<'EOF'
-          #!/usr/bin/env bash
-          exec /usr/bin/python3 -c 'import os, sys
-          payload = sys.stdin.buffer.read().split(b"\0", 2)
-          text = payload[2].decode("utf-8", "replace") if len(payload) > 2 else ""
-          capture = os.environ.get("CAPTURE")
-          if capture:
-              with open(capture, "w", encoding="utf-8") as fh:
-                  fh.write(text)
-          print("{\"ok\": true}")
-          '
-          EOF
-          chmod +x "$tmp/bin/python3"
-          cat >"$tmp/bin/needs-restarting" <<'EOF'
-          #!/usr/bin/env bash
-          case "${1:-}" in
-            --help) echo '  -r, --reboothint'; echo '  -s, --services    Only report services needing restart'; exit 0 ;;
-            -r) [[ -n "${NR_R_OUT:-}" ]] && printf '%s\n' "$NR_R_OUT"; exit "${NR_R_RC:-0}" ;;
-            -s) [[ -n "${NR_S_OUT:-}" ]] && printf '%s\n' "$NR_S_OUT"; exit 0 ;;
-            *)  [[ -n "${NR_ALL_OUT:-}" ]] && printf '%s\n' "$NR_ALL_OUT"; exit 0 ;;
-          esac
-          EOF
-          chmod +x "$tmp/bin/needs-restarting"
-          printf '#!/usr/bin/env bash\nexit 0\n' >"$tmp/bin/dnf"
-          chmod +x "$tmp/bin/dnf"
-          cat >"$tmp/env.dnf" <<'EOF'
-          TELEGRAM_BOT_TOKEN=fake
-          TELEGRAM_CHAT_ID=fake
-          NOTIFY_LANG=zh
-          BACKEND=dnf
-          INCLUDE_PUBLIC_IP=0
-          EOF
-          run() { PATH="$tmp/bin:$PATH" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env.dnf" "$tmp/security-update-notify" --no-dedupe; }
-
-          # Healthy host: stale-lib processes exist but no services/reboot -> must stay SILENT (noise fix)
-          rm -f "$tmp/a.msg"
-          NR_R_OUT=$'No core libraries or services have been updated since boot-up.\nReboot should not be necessary.' NR_R_RC=0 \
-            NR_S_OUT="" NR_ALL_OUT=$'1234 : /usr/sbin/sshd' CAPTURE="$tmp/a.msg" run >/dev/null
-          test ! -e "$tmp/a.msg"
-
-          # Services need restart -> alert listing services
-          rm -f "$tmp/b.msg"
-          NR_R_OUT=$'Reboot should not be necessary.' NR_R_RC=0 \
-            NR_S_OUT=$'sshd.service\ncrond.service' CAPTURE="$tmp/b.msg" run >/dev/null
-          grep -q 'sshd.service' "$tmp/b.msg"
-          grep -q '建议评估/重启的服务（2 个）' "$tmp/b.msg"
-          grep -q '整机重启：暂不需要' "$tmp/b.msg"
-
-          # Reboot required (rc=1 + message) -> alert with reboot required
-          rm -f "$tmp/c.msg"
-          NR_R_OUT=$'Reboot is required to ensure that your system benefits from these updates.' NR_R_RC=1 \
-            NR_S_OUT="" CAPTURE="$tmp/c.msg" run >/dev/null
-          grep -q '整机重启：需要' "$tmp/c.msg"
-
-          # needs-restarting -r generic error (rc=2, no reboot message) -> must NOT raise a false reboot alert
-          rm -f "$tmp/d.msg"
-          NR_R_OUT='needs-restarting: unexpected error' NR_R_RC=2 \
-            NR_S_OUT="" CAPTURE="$tmp/d.msg" run >/dev/null
-          test ! -e "$tmp/d.msg"
-
-      - name: Existing config reuse regression check
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          s = Path('install.sh').read_text()
-          start = s.index('set_config_default() {')
-          end = s.index('\nrequire_arg()', start)
-          harness = '''#!/usr/bin/env bash
-          set -euo pipefail
-          NOTIFY_CHANNELS=""; TELEGRAM_BOT_TOKEN=""; TELEGRAM_CHAT_ID=""; FEISHU_APP_ID=""; FEISHU_RECEIVE_ID=""; HOST_LABEL=""; PUBLIC_IP=""; INCLUDE_PUBLIC_IP=""; NOTIFY_OK=""; NOTIFY_UPGRADE=""; CONFIG_VERSION=""; DEDUP_MODE=""; DEDUP_INTERVAL_DAYS=""; NOTIFY_LANG=""; BACKEND=""; CHECK_TIME=""
-          EXISTING_CONFIG_LOADED=0; EXISTING_TIMER_LOADED=0; EXISTING_FEISHU_APP_ID=""; EXISTING_NOTIFY_CHANNELS=""
-          ''' + s[start:end] + '''
-          load_existing_config_defaults "$1"
-          load_existing_timer_default "$2"
-          printf '%s\n' "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_CHAT_ID" "$HOST_LABEL" "$PUBLIC_IP" "$INCLUDE_PUBLIC_IP" "$NOTIFY_OK" "$NOTIFY_UPGRADE" "$CONFIG_VERSION" "$DEDUP_MODE" "$DEDUP_INTERVAL_DAYS" "$NOTIFY_LANG" "$BACKEND" "$CHECK_TIME" "$EXISTING_CONFIG_LOADED" "$EXISTING_TIMER_LOADED" "$NOTIFY_CHANNELS" "$FEISHU_APP_ID" "$FEISHU_RECEIVE_ID"
-          '''
-          Path('/tmp/sun-existing-harness.sh').write_text(harness)
-          PY
-          chmod +x /tmp/sun-existing-harness.sh
-          cat >/tmp/telegram.env <<'EOF'
-          CONFIG_VERSION='3'
-          NOTIFY_CHANNELS='telegram,feishu'
-          TELEGRAM_BOT_TOKEN='123456:abc_DEF-ghi'
-          TELEGRAM_CHAT_ID='-100123'
-          FEISHU_APP_ID='cli_test'
-          FEISHU_RECEIVE_ID='ou_lanny'
-          HOST_LABEL='old host'
-          PUBLIC_IP='203.0.113.99'
-          INCLUDE_PUBLIC_IP='0'
-          NOTIFY_OK='1'
-          NOTIFY_UPGRADE='1'
-          DEDUP_MODE='daily'
-          DEDUP_INTERVAL_DAYS='7'
-          NOTIFY_LANG='en'
-          BACKEND='apt'
-          FUTURE_KEY='ignored'
-          EOF
-          cat >/tmp/security-update-notify.timer <<'EOF'
-          [Timer]
-          OnCalendar=*-*-* 08:45:00
-          EOF
-          /tmp/sun-existing-harness.sh /tmp/telegram.env /tmp/security-update-notify.timer > /tmp/existing.out
-          diff -u /tmp/existing.out - <<'EOF'
-          123456:abc_DEF-ghi
-          -100123
-          old host
-          203.0.113.99
-          0
-          1
-          1
-          3
-          daily
-          7
-          en
-          apt
-          08:45
-          1
-          1
-          telegram,feishu
-          cli_test
-          ou_lanny
-          EOF
-
-      - name: Security hardening regression check
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          expected_key = Path('files/release-signing.pub.asc').read_text().strip()
-          expected_mirror = 'https://dl.ll.cd/security-update-notify'
-          assert "--proto '=https' --proto-redir '=https'" in Path('sun.sh').read_text(), 'sun.sh curl must restrict redirects to https'
-          assert "--proto '=https' --proto-redir '=https'" in Path('files/security-update-notify').read_text(), 'self-upgrade curl must restrict redirects to https'
-          assert 'env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT tar' in Path('sun.sh').read_text(), 'sun.sh tar calls must ignore tar option environment'
-          assert 'env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT tar' in Path('files/security-update-notify').read_text(), 'self-upgrade tar calls must ignore tar option environment'
-          assert 'env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT tar' in Path('package.sh').read_text(), 'package.sh tar calls must ignore tar option environment'
-          for path in ('files/security-update-notify', 'sun.sh'):
-              text = Path(path).read_text()
-              assert f'RELEASE_MIRROR_BASE="{expected_mirror}"' in text, f'{path}: fixed release mirror drifted'
-              match = re.search(r"release_signing_public_key\(\) \{\n  cat <<'EOF'\n(.*?)\nEOF\n\}", text, re.S)
-              assert match, f"{path}: embedded release signing key missing"
-              assert match.group(1).strip() == expected_key, f"{path}: embedded release signing key drifted"
-              assert 'SECURITY_UPDATE_NOTIFY_SIGNING_FINGERPRINT' not in text, f"{path}: signing fingerprint must not be env-overridable"
-
-          assert 'REPO="xxvcc/security-update-notify"' in Path('files/security-update-notify').read_text()
-          assert 'VERIFY_SIGNATURE="required"' in Path('sun.sh').read_text()
-          assert f'const DefaultReleaseMirrorBase = "{expected_mirror}"' in Path('internal/dist/latest.go').read_text(), 'Go release mirror drifted'
-
-          mirror_workflow = Path('.github/workflows/mirror-release.yml').read_text()
-          assert 'group: signed-release-mirror-stable' in mirror_workflow, 'release mirrors must serialize across all tags'
-          confirm_latest = mirror_workflow.index('- name: Confirm GitHub Latest before stable update')
-          publish_bootstrap = mirror_workflow.index('- name: Publish stable bootstrap')
-          publish_manifest = mirror_workflow.index('- name: Publish latest manifest last')
-          assert confirm_latest < publish_bootstrap < publish_manifest, 'stable mirror publication order drifted'
-
-          # Both pinned fingerprints must be present (40 hex) and identical. sun.sh's pin is otherwise
-          # never validated by push/PR CI (verify-signed-release reads only files/security-update-notify),
-          # so a drifted sun.sh pin would silently break the bootstrap without turning CI red.
-          fprs = {}
-          for path in ('files/security-update-notify', 'sun.sh'):
-              fm = re.search(r'^RELEASE_SIGNING_FINGERPRINT="([0-9A-Fa-f]{40})"', Path(path).read_text(), re.M)
-              assert fm, f'{path}: pinned RELEASE_SIGNING_FINGERPRINT (40 hex) missing'
-              fprs[path] = fm.group(1).upper()
-          assert len(set(fprs.values())) == 1, f'pinned fingerprints differ between files: {fprs}'
-
-          runtime = Path('files/security-update-notify').read_text()
-          verify_call = runtime.index('verify_release_signature "$tmp/$pkg.asc" "$tmp/$pkg"')
-          extract = runtime.index('tar --no-same-owner --no-same-permissions -xzf "$pkg"')
-          assert verify_call < extract, 'self-upgrade must verify before extraction'
-          assert 'files/release-signing.pub.asc' not in runtime[runtime.index('run_self_upgrade() {'):extract], 'self-upgrade must not trust a key from the unverified archive'
-          PY
-
-          # Tie the pinned fingerprint to the ACTUAL embedded public key at push time (verify-signed-release
-          # does this too, but only on release events). Fails if the pin and the shipped key ever diverge.
-          hardening_gpg_home="$(mktemp -d)"
-          GNUPGHOME="$hardening_gpg_home" gpg --batch --import files/release-signing.pub.asc 2>/dev/null
-          key_fpr="$(GNUPGHOME="$hardening_gpg_home" gpg --batch --with-colons --list-keys | awk -F: '$1=="fpr"{print $10; exit}')"
-          pin_fpr="$(awk -F'"' '/^RELEASE_SIGNING_FINGERPRINT=/{print $2; exit}' files/security-update-notify)"
-          [ -n "$key_fpr" ] && [ "$key_fpr" = "$pin_fpr" ] || { echo "::error::embedded public key fingerprint ($key_fpr) != pinned ($pin_fpr)"; exit 1; }
-          echo "pinned fingerprint matches embedded key and both files agree: $pin_fpr"
-
-          python3 - <<'PY'
-          from pathlib import Path
-          s = Path('files/security-update-notify').read_text()
-          start = s.index('safe_release_archive() {')
-          end = s.index('\nverify_release_signature()', start)
-          harness = '''#!/usr/bin/env bash
-          set -euo pipefail
-          say(){ printf '%s\n' "$1" >&2; }
-          ''' + s[start:end] + '''
-          tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-          mkdir -p "$tmp/build/security-update-notify-9.9.9"
-          printf '%s\n' ok > "$tmp/build/security-update-notify-9.9.9/ok.txt"
-          (cd "$tmp/build" && tar -czf "$tmp/good.tar.gz" security-update-notify-9.9.9)
-          cat >"$tmp/pwn" <<EOF
-          #!/usr/bin/env bash
-          touch "$tmp/tar-options-pwned"
-          EOF
-          chmod +x "$tmp/pwn"
-          TAR_OPTIONS="--checkpoint=1 --checkpoint-action=exec=$tmp/pwn" safe_release_archive "$tmp/good.tar.gz" security-update-notify-9.9.9
-          test ! -e "$tmp/tar-options-pwned"
-
-          rm -rf "$tmp/build"
-          mkdir -p "$tmp/build/security-update-notify-9.9.9"
-          ln -s /etc/passwd "$tmp/build/security-update-notify-9.9.9/bad-link"
-          (cd "$tmp/build" && tar -czf "$tmp/bad.tar.gz" security-update-notify-9.9.9)
-          if ( safe_release_archive "$tmp/bad.tar.gz" security-update-notify-9.9.9 ) 2>"$tmp/safe-archive.err"; then
-            echo "safe_release_archive accepted a symlink entry" >&2
-            exit 1
-          fi
-          grep -Eq '不支持的条目类型|Unsupported archive entry type' "$tmp/safe-archive.err"
-          '''
-          Path('/tmp/sun-archive-harness.sh').write_text(harness)
-          PY
-          chmod +x /tmp/sun-archive-harness.sh
-          /tmp/sun-archive-harness.sh
-
-          python3 - <<'PY'
-          from pathlib import Path
-          s = Path('files/security-update-notify').read_text()
-          start = s.index('eol_date_for() {')
-          end = s.index('\n# 发行版安全支持即将', start)
-          harness = '''#!/usr/bin/env bash
-          set -euo pipefail
-          ''' + s[start:end] + '''
-          check(){ got="$(eol_date_for "$1" "$2" "${3:-}")"; [ "$got" = "$4" ] || { echo "$1 $2 ${3:-}: got '$got', want '$4'" >&2; exit 1; }; }
-          check centos 8 "CentOS Stream 8" 2024-05-31
-          check centos 9 "CentOS Stream 9" 2027-05-31
-          check centos 8 "CentOS Linux 8" 2021-12-31
-          check centos 7 "CentOS Linux 7" 2024-06-30
-          check amzn 2023 "Amazon Linux 2023" 2029-06-30
-          check almalinux 8 "AlmaLinux 8" 2029-03-01
-          check rhel 9 "Red Hat Enterprise Linux 9" 2032-05-31
-          '''
-          Path('/tmp/sun-eol-harness.sh').write_text(harness)
-          PY
-          chmod +x /tmp/sun-eol-harness.sh
-          /tmp/sun-eol-harness.sh
-
-      - name: Version comparison regression check
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          s = Path('files/security-update-notify').read_text()
-          start = s.index('is_newer_version() {')
-          end = s.index('\nrun_check_upgrade()', start)
-          body = s[start:end]
-          # Guard against reverting to sort -V (ranks 1.0.0-rc1 ABOVE 1.0.0 -> mis-gates rc->final as a downgrade).
-          assert 'sort -V' not in body, 'is_newer_version must not use sort -V (mis-ranks pre-release)'
-          assert 'python3' in body, 'is_newer_version must use the python3 semver comparator'
-          harness = '''#!/usr/bin/env bash
-          set -uo pipefail
-          ''' + body + '''
-          fail=0
-          ck(){ is_newer_version "$1" "$2"; g=$?; if [ "$g" != "$3" ]; then echo "FAIL $1 -> $2 exp=$3 got=$g" >&2; fail=1; fi; }
-          ck 1.0.0-rc1 1.0.0 0
-          ck 1.0.0 1.0.0-rc1 1
-          ck 1.0.0-rc1 1.0.0-rc2 0
-          ck 1.9.3 1.9.4 0
-          ck 1.9.4 1.9.3 1
-          ck 1.9.3 1.9.3 1
-          ck 1.7.0 1.7.0.1 0
-          ck 1.7.0.1 1.7.0 1
-          ck v1.2.3 v1.2.4 0
-          ck 1.9.3 not-a-ver 1
-          ck 1.9.3 1_0.0.0 1
-          exit $fail
-          '''
-          Path('/tmp/sun-vercmp-harness.sh').write_text(harness)
-          PY
-          chmod +x /tmp/sun-vercmp-harness.sh
-          /tmp/sun-vercmp-harness.sh
-
-      - name: State-write atomicity regression check
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          s = Path('files/security-update-notify').read_text()
-          # Guard against reverting to naked '>' redirects (torn/empty state file on ENOSPC/crash).
-          assert 'mktemp "$STATE_DIR/.state.XXXXXX"' in s, 'state write must use mktemp temp files'
-          assert 'mv -f "$state_tmp" "$STATE_FILE"' in s, 'state hash must be committed via atomic rename'
-          assert 'mv -f "$time_tmp" "$STATE_TIME_FILE"' in s, 'state timestamp must be committed via atomic rename'
-          print('state-write source invariants OK')
-          PY
-          tmp="$(mktemp -d)"
-          trap 'rm -rf "$tmp"' EXIT
-          cp files/security-update-notify "$tmp/security-update-notify"
-          sed -i \
-            -e "s|^STATE_DIR=.*|STATE_DIR=\"$tmp/state\"|" \
-            -e "s|^LOCK_FILE=.*|LOCK_FILE=\"$tmp/lock\"|" \
-            -e "s|^LOG_FILE=.*|LOG_FILE=\"$tmp/log\"|" \
-            "$tmp/security-update-notify"
-          chmod +x "$tmp/security-update-notify"
-          mkdir -p "$tmp/bin"
-          cat >"$tmp/bin/python3" <<'EOF'
-          #!/usr/bin/env bash
-          exec /usr/bin/python3 -c 'import sys; print("{\"ok\": true}")'
-          EOF
-          chmod +x "$tmp/bin/python3"
-          cat >"$tmp/env" <<'EOF'
-          TELEGRAM_BOT_TOKEN=fake
-          TELEGRAM_CHAT_ID=fake
-          NOTIFY_LANG=zh
-          BACKEND=apt
-          INCLUDE_PUBLIC_IP=0
-          EOF
-          PATH="$tmp/bin:$PATH" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env" "$tmp/security-update-notify" --test-reboot --no-dedupe >/dev/null
-          test -s "$tmp/state/last-alert.sha256"
-          grep -Eq '^[0-9a-f]{64}$' "$tmp/state/last-alert.sha256"
-          grep -Eq '^[0-9]+$' "$tmp/state/last-alert.sent_at"
-          [ "$(find "$tmp/state" -maxdepth 1 -name '.state.*' | wc -l)" -eq 0 ]
-          echo "state written atomically, no leftover temp files"
-
-      - name: Bash fallback multi-channel partial-failure regression check
-        run: |
-          set -euo pipefail
-          export CHECK_UPDATE_HEALTH=0 CHECK_EOL=0 STALE_UPDATE_DAYS=0
-          tmp="$(mktemp -d)"
-          trap 'rm -rf "$tmp"' EXIT
-          cp files/security-update-notify "$tmp/security-update-notify"
-          sed -i \
-            -e "s|^STATE_DIR=.*|STATE_DIR=\"$tmp/state\"|" \
-            -e "s|^LOCK_FILE=.*|LOCK_FILE=\"$tmp/lock\"|" \
-            -e "s|^LOG_FILE=.*|LOG_FILE=\"$tmp/log\"|" \
-            "$tmp/security-update-notify"
-          chmod +x "$tmp/security-update-notify"
-          mkdir -p "$tmp/bin" "$tmp/credentials"
-          printf %s fake-secret >"$tmp/credentials/feishu_app_secret"
-          chmod 600 "$tmp/credentials/feishu_app_secret"
-          cat >"$tmp/bin/python3" <<'EOF'
-          #!/usr/bin/env bash
-          if [[ "${1:-}" == "/dev/fd/3" ]]; then
-            exec /usr/bin/python3 "$@"
-          fi
-          exec /usr/bin/python3 -c 'import os, sys
-          import json
-          parts = sys.stdin.buffer.read().split(b"\0", 3)
-          if len(parts) == 2:
-              print("tenant-token", end="")
-              sys.exit(0)
-          first = parts[0].decode("utf-8", "replace") if parts else ""
-          channel = "feishu" if first == "tenant-token" else "telegram"
-          if channel == "feishu":
-              card = json.loads(parts[3].decode("utf-8", "replace")) if len(parts) > 3 else {}
-              if card.get("schema") != "2.0":
-                  sys.exit(1)
-              template = card.get("header", {}).get("template", "")
-              if template not in {"orange", "blue"}:
-                  sys.exit(1)
-              with open(os.environ["CARD_CAPTURE"], "a", encoding="utf-8") as fh:
-                  fh.write(template + "\n")
-          with open(os.environ["CAPTURE"], "a", encoding="utf-8") as fh:
-              fh.write(channel + "\n")
-          if channel == os.environ.get("FAIL_CHANNEL"):
-              sys.exit(1)
-          print("{\"ok\": true}")
-          '
-          EOF
-          chmod +x "$tmp/bin/python3"
-          cat >"$tmp/env" <<'EOF'
-          CONFIG_VERSION=3
-          NOTIFY_CHANNELS=telegram,feishu
-          TELEGRAM_BOT_TOKEN=123456:fake
-          TELEGRAM_CHAT_ID=-100123
-          FEISHU_APP_ID=cli_test
-          FEISHU_RECEIVE_ID=ou_lanny
-          NOTIFY_LANG=zh
-          BACKEND=apt
-          INCLUDE_PUBLIC_IP=0
-          DEDUP_MODE=once
-          EOF
-          : >"$tmp/attempts"
-          : >"$tmp/cards"
-          set +e
-          PATH="$tmp/bin:$PATH" CAPTURE="$tmp/attempts" CARD_CAPTURE="$tmp/cards" FAIL_CHANNEL=feishu \
-            CREDENTIALS_DIRECTORY="$tmp/credentials" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env" \
-            "$tmp/security-update-notify" --test-reboot --no-dedupe >/dev/null 2>&1
-          rc=$?
-          set -e
-          test "$rc" -eq 1
-          test "$(grep -c '^telegram$' "$tmp/attempts")" -eq 1
-          test "$(grep -c '^feishu$' "$tmp/attempts")" -eq 1
-          test -s "$tmp/state/last-alert.sha256"
-          test ! -e "$tmp/state/last-alert.feishu.sha256"
-
-          : >"$tmp/attempts"
-          PATH="$tmp/bin:$PATH" CAPTURE="$tmp/attempts" CARD_CAPTURE="$tmp/cards" \
-            CREDENTIALS_DIRECTORY="$tmp/credentials" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env" \
-            "$tmp/security-update-notify" --test-reboot >/dev/null
-          test "$(grep -c '^feishu$' "$tmp/attempts")" -eq 1
-          if grep -q '^telegram$' "$tmp/attempts"; then
-            echo "Telegram was repeated after its first successful delivery" >&2
-            exit 1
-          fi
-          test -s "$tmp/state/last-alert.feishu.sha256"
-
-          rm -rf "$tmp/state"
-          : >"$tmp/attempts"
-          set +e
-          PATH="$tmp/bin:$PATH" CAPTURE="$tmp/attempts" CARD_CAPTURE="$tmp/cards" FAIL_CHANNEL=telegram \
-            CREDENTIALS_DIRECTORY="$tmp/credentials" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env" \
-            "$tmp/security-update-notify" --test-reboot --no-dedupe >/dev/null 2>&1
-          rc=$?
-          set -e
-          test "$rc" -eq 1
-          test "$(grep -c '^telegram$' "$tmp/attempts")" -eq 1
-          test "$(grep -c '^feishu$' "$tmp/attempts")" -eq 1
-          test ! -e "$tmp/state/last-alert.sha256"
-          test -s "$tmp/state/last-alert.feishu.sha256"
-
-          : >"$tmp/attempts"
-          PATH="$tmp/bin:$PATH" CAPTURE="$tmp/attempts" CARD_CAPTURE="$tmp/cards" \
-            CREDENTIALS_DIRECTORY="$tmp/credentials" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env" \
-            "$tmp/security-update-notify" --test-reboot >/dev/null
-          test "$(grep -c '^telegram$' "$tmp/attempts")" -eq 1
-          if grep -q '^feishu$' "$tmp/attempts"; then
-            echo "Feishu was repeated after its first successful delivery" >&2
-            exit 1
-          fi
-          test -s "$tmp/state/last-alert.sha256"
-
-          printf '%s\n' 'NOTIFY_UPGRADE=1' >>"$tmp/env"
-          : >"$tmp/attempts"
-          PATH="$tmp/bin:$PATH" CAPTURE="$tmp/attempts" CARD_CAPTURE="$tmp/cards" FAIL_CHANNEL=feishu \
-            CREDENTIALS_DIRECTORY="$tmp/credentials" SECURITY_UPDATE_NOTIFY_ENV="$tmp/env" \
-            "$tmp/security-update-notify" --notify-upgrade-event --upgrade-from 2.1.0 --upgrade-to 2.2.0 >/dev/null 2>&1
-          test "$(grep -c '^telegram$' "$tmp/attempts")" -eq 1
-          test "$(grep -c '^feishu$' "$tmp/attempts")" -eq 1
-          grep -q '^orange$' "$tmp/cards"
-          grep -q '^blue$' "$tmp/cards"
-          echo "partial failures are channel-local; upgrade notices are best-effort"
-
-      - name: Bash fallback Feishu HTTP client regression check
-        run: build/bash-feishu-test.sh
-
-      - name: Bash fallback patch watchdog regression check
-        run: build/bash-patch-watchdog-test.sh
-
-      - name: Feishu installer onboarding regression check
-        run: build/install-feishu-onboarding-test.sh
-
-      - name: Notification settings regression check
-        run: build/install-notification-settings-test.sh
-
-      - name: Telegram installer preflight regression check
-        run: build/install-telegram-preflight-test.sh
-
-      - name: Go/Bash runtime lock contract regression check
-        run: build/runtime-lock-test.sh
-
-      - name: Config parser regression check
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          s = Path('files/security-update-notify').read_text()
-          start = s.index('load_config_file() {')
-          end = s.index('\ntelegram_get_me()', start)
-          body = s[start:end]
-          harness = '''#!/usr/bin/env bash
-          set -uo pipefail
-          say(){ :; }
-          ''' + body + '''
-          t="$(mktemp -d)"; trap 'rm -rf "$t" 2>/dev/null || true' EXIT
-          ck(){
-            printf '%s\n' "$2" > "$t/c"
-            HOST_LABEL=""; NOTIFY_OK=""
-            load_config_file "$t/c"; rc=$?
-            if [ "$rc" != "$3" ]; then echo "FAIL[$1] rc exp=$3 got=$rc" >&2; exit 1; fi
-            if [ "$#" -ge 4 ] && [ "${HOST_LABEL:-}" != "$4" ]; then echo "FAIL[$1] HOST_LABEL exp=[$4] got=[${HOST_LABEL:-}]" >&2; exit 1; fi
-          }
-          # fail-OPEN invariant: a quoted value with a trailing inline comment must NOT abort the notifier
-          # (an over-eager "unterminated quote" check would turn a config typo into a total alert outage).
-          ck quoted-plus-comment 'HOST_LABEL="prod" # note' 0
-          ck double-quoted 'HOST_LABEL="my host"' 0 "my host"
-          ck single-quoted "HOST_LABEL='my host'" 0 "my host"
-          ck unquoted-comment 'HOST_LABEL=web1 # prod' 0 "web1"
-          ck embedded-hash 'HOST_LABEL=web#1' 0 "web#1"
-          ck unknown-key 'BAD_KEY=x' 2
-          ck no-equals 'JUSTTEXT' 2
-          echo "config parser OK"
-          '''
-          Path('/tmp/sun-cfg-harness.sh').write_text(harness)
-          PY
-          chmod +x /tmp/sun-cfg-harness.sh
-          /tmp/sun-cfg-harness.sh
-
-      - name: Package release artifact
-        run: |
-          set -euo pipefail
-          probe=internal/package-guard-untracked-probe.go
-          exclude=.git/info/exclude
-          exclude_backup="$(mktemp)"
-          cp "$exclude" "$exclude_backup"
-          trap 'rm -f "$probe"; cp "$exclude_backup" "$exclude"; rm -f "$exclude_backup"' EXIT
-          printf '/%s\n' "$probe" >>"$exclude"
-          printf 'package internal\n' >"$probe"
-          git check-ignore -q "$probe"
-          if ./package.sh >/tmp/package-untracked.out 2>/tmp/package-untracked.err; then
-            echo "::error::package.sh accepted an ignored, untracked Go source file" >&2
-            exit 1
-          fi
-          grep -q 'Untracked release-source files' /tmp/package-untracked.err
-          grep -qF "$probe" /tmp/package-untracked.err
-          rm -f "$probe"
-          cp "$exclude_backup" "$exclude"
-          ./package.sh
-
-      - name: Bridge upgrade compat test (bash runtime -> Go, config/state preserved, no re-alert)
-        # 在真实 Debian 容器里：先装 bash 运行时，再原地升级到 Go 桥；断言配置/token/告警状态保留、
-        # Go 二进制落地、且安装后的 Go 二进制复刻 Bash 的 golden hash（升级不会全网重复告警）。
-        run: |
-          docker run --rm -v "$PWD:/src:ro" debian:12 bash /src/build/compat-test.sh
-
-      - name: Upgrade rollback test (failed upgrade restores previous state)
-        # 在真实容器里：安装成功后，让第二次升级在写完新配置后 systemctl enable 失败，断言 install.sh
-        # 的备份/回滚把配置与二进制恢复到上一状态（保护 fleet 免于半途失败的升级）。
-        run: |
-          docker run --rm -v "$PWD:/src:ro" debian:12 bash /src/build/rollback-test.sh
-
-      - name: Smoke install in Debian container
-        run: |
-          docker run --rm -v "$PWD:/src:ro" debian:12 bash -s <<'CONTAINER'
-            set -euo pipefail
-            apt-get update >/dev/null
-            apt-get install -y systemd python3 ca-certificates >/dev/null
-            mkdir -p /run/systemd/system /etc/systemd/system /usr/local/sbin /etc/security-update-notify /var/lib/security-update-notify /var/log /etc/logrotate.d
-            cat >/usr/local/bin/systemctl <<"EOF"
-          #!/usr/bin/env bash
-          case "$1" in
-            daemon-reload|enable|restart) exit 0 ;;
-            list-timers) echo "security-update-notify.timer mock"; exit 0 ;;
-            is-enabled) exit 0 ;;
-            *) echo "mock systemctl $*"; exit 0 ;;
-          esac
-          EOF
-            chmod +x /usr/local/bin/systemctl
-            cat >/usr/local/bin/systemd-analyze <<"EOF"
-          #!/usr/bin/env bash
-          exit 0
-          EOF
-            chmod +x /usr/local/bin/systemd-analyze
-            cd /src
-            ./install.sh --telegram-token 123456:abc_DEF-ghi --telegram-chat-id -100123 --skip-telegram-test --non-interactive -y --skip-post-install-check
-            expected_version="$(grep -E "^VERSION=" files/security-update-notify | head -1 | cut -d\" -f2)"
-            /usr/local/sbin/security-update-notify --version | grep "$expected_version"
-            grep -q "CONFIG_VERSION='4'" /etc/security-update-notify/telegram.env
-            grep -q "PENDING_ALERT_DAYS='3'" /etc/security-update-notify/telegram.env
-            grep -q "RESTART_ALERT_DAYS='7'" /etc/security-update-notify/telegram.env
-            grep -q "CHECK_SELF_UPDATE='1'" /etc/security-update-notify/telegram.env
-            grep -q "SELF_UPDATE_CHECK_DAYS='7'" /etc/security-update-notify/telegram.env
-            grep -q "NOTIFY_CHANNELS='telegram'" /etc/security-update-notify/telegram.env
-            ./install.sh --skip-telegram-test --non-interactive -y --skip-post-install-check
-            test -s /var/backups/security-update-notify/latest
-
-            secret=ci-feishu-secret-not-in-config
-            printf %s "$secret" >/tmp/feishu-app-secret
-            chmod 600 /tmp/feishu-app-secret
-            ./install.sh --notify-channels feishu --feishu-app-id cli_test --feishu-receive-id ou_lanny \
-              --feishu-app-secret-file /tmp/feishu-app-secret --skip-feishu-test --non-interactive -y --skip-post-install-check
-            grep -q "NOTIFY_CHANNELS='feishu'" /etc/security-update-notify/telegram.env
-            grep -q "FEISHU_APP_ID='cli_test'" /etc/security-update-notify/telegram.env
-            grep -q "FEISHU_RECEIVE_ID='ou_lanny'" /etc/security-update-notify/telegram.env
-            if grep -RqsF "$secret" /etc/security-update-notify/telegram.env /var/backups/security-update-notify; then
-              echo "Feishu App Secret leaked into normal config or upgrade backup" >&2
-              exit 1
-            fi
-            test -s /etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred \
-              || test -s /etc/security-update-notify/credentials/feishu-app-secret
-
-            # 模拟不支持 systemd-creds 的旧环境，验证独立 root-only 0600 回退及卸载清理。
-            systemd_creds_bin="$(command -v systemd-creds)"
-            mv "$systemd_creds_bin" /usr/local/sbin/systemd-creds.disabled
-            secret=ci-feishu-plain-fallback-secret
-            printf %s "$secret" >/tmp/feishu-app-secret
-            chmod 600 /tmp/feishu-app-secret
-            ./install.sh --feishu-app-secret-file /tmp/feishu-app-secret --skip-feishu-test \
-              --non-interactive -y --skip-post-install-check
-            test -s /etc/security-update-notify/credentials/feishu-app-secret
-            test "$(stat -c %a /etc/security-update-notify/credentials/feishu-app-secret)" = 600
-            test ! -e /etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred
-            test ! -e /etc/systemd/system/security-update-notify.service.d/credentials.conf
-            if grep -RqsF "$secret" /etc/security-update-notify/telegram.env /var/backups/security-update-notify; then
-              echo "plaintext fallback secret leaked into normal config or backup" >&2
-              exit 1
-            fi
-
-            # Restore encrypted-credential support and verify the reverse plain -> encrypted switch.
-            mv /usr/local/sbin/systemd-creds.disabled "$systemd_creds_bin"
-            secret=ci-feishu-encrypted-again
-            printf %s "$secret" >/tmp/feishu-app-secret
-            chmod 600 /tmp/feishu-app-secret
-            ./install.sh --feishu-app-secret-file /tmp/feishu-app-secret --skip-feishu-test \
-              --non-interactive -y --skip-post-install-check
-            test -s /etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred
-            test ! -e /etc/security-update-notify/credentials/feishu-app-secret
-            test -s /etc/systemd/system/security-update-notify.service.d/credentials.conf
-
-            # Disabling Feishu removes both credential forms and its systemd drop-in.
-            ./install.sh --notify-channels telegram --skip-telegram-test \
-              --non-interactive -y --skip-post-install-check
-            grep -q "NOTIFY_CHANNELS='telegram'" /etc/security-update-notify/telegram.env
-            test ! -e /etc/security-update-notify/credentials/feishu-app-secret
-            test ! -e /etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred
-            test ! -e /etc/systemd/system/security-update-notify.service.d/credentials.conf
-
-            # Secret sources must be regular root-owned files inaccessible to group/other.
-            reject_secret_source() {
-              set +e
-              ./install.sh --notify-channels feishu --feishu-app-id cli_test --feishu-receive-id ou_lanny \
-                --feishu-app-secret-file "$1" --skip-feishu-test --non-interactive -y --skip-post-install-check \
-                >/tmp/rejected-secret-source.log 2>&1
-              rc=$?
-              set -e
-              test "$rc" -eq 2
-            }
-            printf %s rejected-secret >/tmp/feishu-secret-wide
-            chmod 644 /tmp/feishu-secret-wide
-            reject_secret_source /tmp/feishu-secret-wide
-            printf %s rejected-secret >/tmp/feishu-secret-foreign
-            chmod 600 /tmp/feishu-secret-foreign
-            chown 65534:65534 /tmp/feishu-secret-foreign
-            reject_secret_source /tmp/feishu-secret-foreign
-            ln -s /tmp/feishu-secret-wide /tmp/feishu-secret-link
-            reject_secret_source /tmp/feishu-secret-link
-
-            ./uninstall.sh --purge-config
-            test ! -e /etc/security-update-notify/credentials/feishu-app-secret
-            test ! -e /etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred
-            test ! -e /etc/systemd/system/security-update-notify.service.d/credentials.conf
-          CONTAINER
-
-      - name: Verify checksum
-        run: |
-          cd dist
-          sha256sum -c security-update-notify-*.tar.gz.sha256
-
-      - name: Inspect package contents
-        run: |
-          mkdir -p /tmp/security-update-notify-ci
-          tar -xzf dist/security-update-notify-*.tar.gz -C /tmp/security-update-notify-ci
-          find /tmp/security-update-notify-ci -maxdepth 3 -type f -print | sort
-          tar -tzf dist/security-update-notify-*.tar.gz | grep '/.env.example$'
-          tar -tzf dist/security-update-notify-*.tar.gz | grep '/sun.sh$'
-          packaged_sun="$(find /tmp/security-update-notify-ci -mindepth 2 -maxdepth 2 -type f -name sun.sh -print -quit)"
-          test -n "$packaged_sun"
-          cmp sun.sh "$packaged_sun"
-          # 负向断言用显式 if…exit（不依赖“恰好是最后一条命令”这一脆弱前提）：发布包绝不能含真实 .env。
-          if tar -tzf dist/security-update-notify-*.tar.gz | grep -E '/\.env$|/\.env\.(local|production)$'; then
-            echo "::error::release package contains a real .env file" >&2; exit 1
-          fi
-          if tar -tzf dist/security-update-notify-*.tar.gz | grep -E '(^|/)(credentials|credstore)(/|$)|feishu-app-secret'; then
-            echo "::error::release package contains a runtime credential path" >&2; exit 1
-          fi
-
-      - name: Upload dist artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: security-update-notify-dist
-          path: dist/*
-
-  go:
-    # Go 端口的门禁：格式/静态检查/竞态测试/交叉编译矩阵/可复现构建。与 shell-and-package 并行，
-    # 发布事件时跳过（发布只跑 verify-signed-release）。GOTOOLCHAIN=local 保证使用固定安装的工具链，
-    # 不因 go.mod 的 toolchain 指令静默下载别的版本（可复现构建的前提）。
-    # Gate for the Go port: format/vet/race-test/cross-compile matrix/reproducible build. Runs in parallel
-    # with shell-and-package, skipped on release events. GOTOOLCHAIN=local pins to the installed toolchain
-    # so the go.mod toolchain directive never silently downloads a different version (a repro prerequisite).
-    if: ${{ github.event_name != 'release' }}
-    runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       GOTOOLCHAIN: local
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Go
+      - name: Set up pinned Go toolchain
         uses: actions/setup-go@v5
         with:
           go-version: '1.26.4'
@@ -878,98 +35,284 @@ jobs:
 
       - name: gofmt
         run: |
-          unformatted="$(gofmt -l cmd internal)"
-          if [ -n "$unformatted" ]; then
-            echo "::error::gofmt needed on the following files:"; echo "$unformatted"; exit 1
+          set -euo pipefail
+          unformatted="$(find cmd internal -type f -name '*.go' -print0 | sort -z | xargs -0 gofmt -l)"
+          if [[ -n "$unformatted" ]]; then
+            echo "::error::gofmt is required for:"
+            printf '%s\n' "$unformatted"
+            exit 1
           fi
+
+      - name: Repository whitespace check
+        run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD --
 
       - name: go vet
         run: go vet ./...
 
-      - name: Embedded assets drift guard
+      - name: Race tests and coverage
         run: |
           set -euo pipefail
-          diff -u files/release-signing.pub.asc internal/assets/embed/release-signing.pub.asc
-          diff -u files/security-update-notify.service internal/assets/embed/security-update-notify.service
-          diff -u files/needrestart-report-only.conf internal/assets/embed/needrestart-report-only.conf
-          diff -u files/security-update-notify.logrotate internal/assets/embed/security-update-notify.logrotate
-          pin_go="$(grep -oE 'ReleaseSigningFingerprint = "[0-9A-Fa-f]{40}"' internal/assets/assets.go | grep -oE '[0-9A-Fa-f]{40}')"
-          pin_sh="$(awk -F'"' '/^RELEASE_SIGNING_FINGERPRINT=/{print $2; exit}' files/security-update-notify)"
-          [ "$pin_go" = "$pin_sh" ] || { echo "::error::Go pinned fingerprint ($pin_go) != Bash ($pin_sh)"; exit 1; }
-          echo "embedded assets match files/ and fingerprint pins agree: $pin_go"
+          go test -race -covermode=atomic -coverprofile=coverage.out ./...
+          total="$(go tool cover -func=coverage.out | awk '/^total:/ {sub(/%$/, "", $3); print $3}')"
+          [[ -n "$total" ]] || { echo "::error::could not read total Go coverage"; exit 1; }
+          awk -v total="$total" 'BEGIN {
+            if (total + 0 < 60.0) {
+              printf "::error::total Go coverage %.1f%% is below 60.0%%\n", total
+              exit 1
+            }
+            printf "total Go coverage %.1f%%\n", total
+          }'
 
-      - name: go test -race -cover
-        run: go test -race -cover ./...
+      - name: Go archive and signature failure gates
+        run: |
+          go test -race ./internal/dist \
+            -run '^(TestCheckArchive|TestArchiveEntryLimit|TestExtractRejectsSpecialAndTraversal|TestVerifyReleaseFailClosed)$'
 
-      - name: End-to-end run-path golden check (compiled binary reproduces Bash hash)
+      - name: Production entrypoint lock contract
+        run: build/runtime-lock-test.sh
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage
+          path: coverage.out
+          if-no-files-found: error
+          retention-days: 7
+
+  bootstrap:
+    if: ${{ github.event_name != 'release' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Syntax-check the retained Shell gates
+        run: |
+          bash -n \
+            sun.sh \
+            build/archive-safety-test.sh \
+            build/build.sh \
+            build/compat-test.sh \
+            build/reproducibility-check.sh \
+            build/rollback-test.sh \
+            build/runtime-lock-test.sh
+
+      - name: ShellCheck the retained Shell gates
+        run: |
+          shellcheck -s bash -S warning \
+            sun.sh \
+            build/archive-safety-test.sh \
+            build/build.sh \
+            build/compat-test.sh \
+            build/reproducibility-check.sh \
+            build/rollback-test.sh \
+            build/runtime-lock-test.sh
+
+      - name: Compile archive allowlist validator
+        run: python3 -m py_compile build/release-archive-test.py
+
+      - name: Hostile bootstrap archive gate
+        run: build/archive-safety-test.sh
+
+      - name: Stable mirror publication invariants
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/mirror-release.yml').read_text(encoding='utf-8')
+          required = [
+              'group: signed-release-mirror-stable',
+              'python3 build/release-archive-test.py "rel/$tarball" "$version" "$epoch" .',
+              'cmp "deploy/$TAG/$asset" "public-check/$asset"',
+              '- name: Confirm GitHub Latest before stable update',
+              '- name: Publish stable bootstrap',
+              '- name: Publish latest manifest last',
+          ]
+          for item in required:
+              if item not in workflow:
+                  raise SystemExit(f'mirror workflow invariant missing: {item}')
+          positions = [workflow.index(item) for item in required[1:]]
+          if positions != sorted(positions):
+              raise SystemExit('stable mirror publication order changed')
+          PY
+
+  package:
+    if: ${{ github.event_name != 'release' }}
+    needs: [quality, bootstrap]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Checkout complete history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up pinned Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.4'
+          check-latest: false
+          cache: false
+
+      - name: Reject ignored untracked release sources
         run: |
           set -euo pipefail
-          ./build/build.sh linux amd64 ci /tmp/sun
-          check() { # <golden-scenario> <backend> <lang>
-            env="$(mktemp)"
-            {
-              echo "TELEGRAM_BOT_TOKEN=123456:fake_TOKEN-value"
-              echo "TELEGRAM_CHAT_ID=-100999"
-              echo "HOST_LABEL=golden-host"
-              echo "BACKEND=$2"
-              echo "NOTIFY_LANG=$3"
-              echo "INCLUDE_PUBLIC_IP=0"
-              echo "CHECK_UPDATE_HEALTH=0"
-              echo "CHECK_EOL=0"
-              echo "STALE_UPDATE_DAYS=0"
-            } >"$env"
-            got="$(SECURITY_UPDATE_NOTIFY_ENV="$env" /tmp/sun --test-reboot --no-dedupe --dry-run | awk -F'\t' '/^HASH/{print $2}')"
-            want="$(python3 -c "import json,sys; print({x['name']:x['hash'] for x in json.load(open('internal/golden/testdata/scenarios.json'))}['$1'])")"
-            [ "$got" = "$want" ] || { echo "::error::$1: compiled Go hash $got != Bash golden $want"; exit 1; }
-            echo "OK $1 $got"
+          probe=internal/releasepkg/ci-untracked-probe.go
+          exclude_backup="$(mktemp)"
+          cp .git/info/exclude "$exclude_backup"
+          cleanup() {
+            rm -f "$probe"
+            cp "$exclude_backup" .git/info/exclude
+            rm -f "$exclude_backup"
           }
-          check apt-test-reboot-zh apt zh
-          check apt-test-reboot-en apt en
-          check dnf-test-reboot-zh dnf zh
-          check dnf-test-reboot-en dnf en
+          trap cleanup EXIT
+          printf '/%s\n' "$probe" >>.git/info/exclude
+          printf 'package releasepkg\n' >"$probe"
+          if go run ./cmd/sun-release package --dist dist-probe --sign off \
+              >/tmp/package-probe.out 2>/tmp/package-probe.err; then
+            echo "::error::Go packager accepted an ignored untracked release source"
+            exit 1
+          fi
+          grep -Fq "$probe" /tmp/package-probe.err
 
-      - name: Cross-compile matrix
+      - name: Build the complete release twice
         run: |
           set -euo pipefail
-          for pair in linux/amd64 linux/arm64 linux/386 linux/ppc64le linux/s390x; do
-            os="${pair%/*}"; arch="${pair#*/}"
-            ./build/build.sh "$os" "$arch" "ci" "/tmp/sun-$arch"
-            echo "built $pair"
-          done
+          rm -rf dist dist-a dist-b
+          epoch="$(git show -s --format=%ct HEAD)"
+          go run ./cmd/sun-release package --dist dist-a --sign off --source-date-epoch "$epoch"
+          go run ./cmd/sun-release package --dist dist-b --sign off --source-date-epoch "$epoch"
 
-      - name: Multi-arch runtime golden check (QEMU)
-        # 不只交叉编译，还在 QEMU 下真正 *运行* 各架构二进制，断言其 --test-reboot hash 与 Bash golden
-        # 一致（覆盖 32 位 386、大端 s390x 等；仅编译过不代表运行时正确）。
+      - name: Verify reproducibility, checksum, and exact allowlist
         run: |
           set -euo pipefail
-          sudo apt-get update >/dev/null
-          sudo apt-get install -y qemu-user-static >/dev/null
-          env="$(mktemp)"
-          {
-            echo "TELEGRAM_BOT_TOKEN=123456:fake_TOKEN-value"; echo "TELEGRAM_CHAT_ID=-1"
-            echo "HOST_LABEL=golden-host"; echo "BACKEND=apt"; echo "NOTIFY_LANG=zh"
-            echo "INCLUDE_PUBLIC_IP=0"; echo "CHECK_UPDATE_HEALTH=0"; echo "CHECK_EOL=0"; echo "STALE_UPDATE_DAYS=0"
-          } >"$env"
-          want="$(python3 -c "import json,sys; print({x['name']:x['hash'] for x in json.load(open('internal/golden/testdata/scenarios.json'))}['apt-test-reboot-zh'])")"
-          for arch in arm64 s390x 386 ppc64le; do
-            got="$(SECURITY_UPDATE_NOTIFY_ENV="$env" /tmp/sun-$arch --test-reboot --no-dedupe --dry-run | awk -F'\t' '/^HASH/{print $2}')"
-            [ "$got" = "$want" ] || { echo "::error::$arch runtime hash $got != golden $want"; exit 1; }
-            echo "OK $arch $got"
+          version="$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' VERSION)"
+          [[ -n "$version" && "$(wc -l <VERSION)" -eq 1 ]] || {
+            echo "::error::invalid canonical VERSION"
+            exit 1
+          }
+          archive="security-update-notify-${version}.tar.gz"
+          for dir in dist-a dist-b; do
+            [[ "$(find "$dir" -maxdepth 1 -type f | wc -l)" -eq 2 ]] || {
+              echo "::error::$dir must contain exactly the unsigned tarball and checksum"
+              exit 1
+            }
+            (cd "$dir" && sha256sum -c "$archive.sha256")
           done
+          cmp "dist-a/$archive" "dist-b/$archive"
+          cmp "dist-a/$archive.sha256" "dist-b/$archive.sha256"
+          epoch="$(git show -s --format=%ct HEAD)"
+          python3 build/release-archive-test.py "dist-a/$archive" "$version" "$epoch" .
+          mkdir dist
+          cp "dist-a/$archive" "dist-a/$archive.sha256" dist/
 
-      - name: Reproducible-build gate (double build sha256 equality)
-        run: ./build/reproducibility-check.sh linux amd64
+      - name: Upload unsigned CI release set
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-update-notify-dist
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  lifecycle:
+    if: ${{ github.event_name != 'release' }}
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download CI release set
+        uses: actions/download-artifact@v4
+        with:
+          name: security-update-notify-dist
+          path: dist
+
+      - name: Upgrade a schema-3 installation in a Debian container
+        run: docker run --rm -v "$PWD:/src:ro" debian:12 bash /src/build/compat-test.sh
+
+      - name: Fresh install, failed-upgrade rollback, and uninstall lifecycle
+        run: docker run --rm -v "$PWD:/src:ro" debian:12 bash /src/build/rollback-test.sh
+
+  multiarch:
+    if: ${{ github.event_name != 'release' }}
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download CI release set
+        uses: actions/download-artifact@v4
+        with:
+          name: security-update-notify-dist
+          path: dist
+
+      - name: Install QEMU user emulators
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+
+      - name: Run all five packaged architectures
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' VERSION)"
+          archive="dist/security-update-notify-${version}.tar.gz"
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          tar -xzf "$archive" -C "$work"
+          package_dir="$work/security-update-notify-$version"
+          config="$work/runtime.env"
+          cat >"$config" <<'EOF'
+          CONFIG_VERSION=4
+          NOTIFY_CHANNELS=telegram
+          TELEGRAM_BOT_TOKEN=123456:fake_TOKEN-value
+          TELEGRAM_CHAT_ID=-100999
+          HOST_LABEL=golden-host
+          BACKEND=apt
+          NOTIFY_LANG=zh
+          INCLUDE_PUBLIC_IP=0
+          CHECK_UPDATE_HEALTH=0
+          CHECK_EOL=0
+          STALE_UPDATE_DAYS=0
+          CHECK_SELF_UPDATE=0
+          EOF
+          want="$(python3 -c "import json; print({x['name']: x['hash'] for x in json.load(open('internal/golden/testdata/scenarios.json'))}['apt-test-reboot-zh'])")"
+          run_arch() {
+            local arch="$1"
+            local binary="$package_dir/files/security-update-notify-linux-$arch"
+            local -a command
+            case "$arch" in
+              amd64) command=("$binary") ;;
+              arm64) command=(qemu-aarch64-static "$binary") ;;
+              386) command=("$binary") ;;
+              ppc64le) command=(qemu-ppc64le-static "$binary") ;;
+              s390x) command=(qemu-s390x-static "$binary") ;;
+              *) echo "unknown architecture: $arch" >&2; return 2 ;;
+            esac
+            [[ "$("${command[@]}" --version)" == "security-update-notify $version" ]]
+            local got
+            got="$(SECURITY_UPDATE_NOTIFY_ENV="$config" "${command[@]}" \
+              --test-reboot --no-dedupe --dry-run | awk -F '\t' '$1 == "HASH" {print $2}')"
+            [[ "$got" == "$want" ]] || {
+              echo "::error::$arch runtime hash $got != golden $want"
+              return 1
+            }
+            echo "OK linux/$arch $got"
+          }
+          for arch in amd64 arm64 386 ppc64le s390x; do
+            run_arch "$arch"
+          done
 
   verify-signed-release:
-    # 发布 release 后，用仓库内的公钥强制校验该 release 的产物：必须带 .asc、sha256 正确、
-    # 签名公钥指纹等于程序里 pin 的指纹、签名有效。缺签名或不匹配即让 release 的 CI 失败。
-    # 私钥永不进入 CI——这里只用公钥做验证，保持离线签名模型。
-    # After a release is published, verify its assets with the repo's public key: a .asc must be
-    # present, sha256 must match, the signing key fingerprint must equal the one pinned in the
-    # program, and the signature must be valid. Missing/invalid signing fails the release CI.
-    # The private key never enters CI — this only verifies with the public key.
     if: ${{ github.event_name == 'release' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -977,37 +320,98 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 1
 
-      - name: Download release assets
+      - name: Download the exact release asset set
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          mkdir -p rel
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir rel --pattern 'security-update-notify-*.tar.gz*'
-          ls -la rel
+          mkdir rel
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir rel \
+            --pattern 'security-update-notify-*.tar.gz*'
 
-      - name: Verify checksum and pinned GPG signature
+      - name: Verify checksum, pinned signer, and release allowlist
+        env:
+          TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          pin="$(awk -F= '/^RELEASE_SIGNING_FINGERPRINT=/{gsub(/["'\''[:space:]]/, "", $2); print $2; exit}' files/security-update-notify)"
-          case "$pin" in *[!0-9A-Fa-f]*|"") echo "::error::could not read a valid pinned RELEASE_SIGNING_FINGERPRINT"; exit 1 ;; esac
-          [ "${#pin}" -eq 40 ] || { echo "::error::pinned fingerprint is not 40 hex chars: '$pin'"; exit 1; }
-          export GNUPGHOME="$(mktemp -d)"
-          chmod 700 "$GNUPGHOME"
-          gpg --batch --import files/release-signing.pub.asc
-          have="$(gpg --batch --with-colons --list-keys | awk -F: '$1=="fpr"{print $10; exit}')"
-          [ "$have" = "$pin" ] || { echo "::error::repo public key fingerprint ($have) != pinned ($pin)"; exit 1; }
-          cd rel
-          shopt -s nullglob
-          tarballs=( security-update-notify-*.tar.gz )
-          [ "${#tarballs[@]}" -gt 0 ] || { echo "::error::no release tarball found"; exit 1; }
-          for tgz in "${tarballs[@]}"; do
-            echo "Verifying $tgz against pinned fingerprint $pin ..."
-            [ -f "$tgz.sha256" ] || { echo "::error::missing $tgz.sha256"; exit 1; }
-            sha256sum -c "$tgz.sha256"
-            [ -f "$tgz.asc" ] || { echo "::error::release $tgz is NOT signed (.asc missing); signing is mandatory"; exit 1; }
-            gpg --batch --verify "$tgz.asc" "$tgz" || { echo "::error::signature verification failed for $tgz"; exit 1; }
-            echo "OK: $tgz is properly signed by the pinned release key ($pin)"
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z]+)?$ && "${#TAG}" -le 65 ]] || {
+            echo "::error::invalid release tag: $TAG"
+            exit 1
+          }
+          version="${TAG#v}"
+          archive="security-update-notify-${version}.tar.gz"
+          source_version="$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' VERSION)"
+          [[ "$source_version" == "$version" && "$(wc -l <VERSION)" -eq 1 ]] || {
+            echo "::error::released source VERSION is not bound to $TAG"
+            exit 1
+          }
+          [[ -f "rel/$archive" && -f "rel/$archive.sha256" && -f "rel/$archive.asc" ]] || {
+            echo "::error::release must contain tarball, checksum, and signature for $archive"
+            exit 1
+          }
+          [[ "$(find rel -maxdepth 1 -type f | wc -l)" -eq 3 ]] || {
+            echo "::error::unexpected release asset set"
+            exit 1
+          }
+          [[ "$(stat -c %s "rel/$archive")" -gt 0 && "$(stat -c %s "rel/$archive")" -le 268435456 ]]
+          for metadata in "$archive.sha256" "$archive.asc"; do
+            [[ "$(stat -c %s "rel/$metadata")" -gt 0 && "$(stat -c %s "rel/$metadata")" -le 1048576 ]]
           done
+
+          [[ "$(wc -l <"rel/$archive.sha256")" -eq 1 ]]
+          read -r expected_sha expected_name extra <"rel/$archive.sha256"
+          [[ "$expected_sha" =~ ^[0-9a-f]{64}$ && "$expected_name" == "$archive" && -z "${extra:-}" ]] || {
+            echo "::error::checksum manifest is not bound to $archive"
+            exit 1
+          }
+          actual_sha="$(sha256sum "rel/$archive" | awk '{print $1}')"
+          [[ "$actual_sha" == "$expected_sha" ]] || { echo "::error::checksum mismatch"; exit 1; }
+
+          pin="$(sed -n 's/^RELEASE_SIGNING_FINGERPRINT="\([0-9A-Fa-f]\{40\}\)"$/\1/p' sun.sh)"
+          [[ "$pin" =~ ^[0-9A-Fa-f]{40}$ && "$(grep -c '^RELEASE_SIGNING_FINGERPRINT=' sun.sh)" -eq 1 ]] || {
+            echo "::error::invalid pinned release fingerprint"
+            exit 1
+          }
+          GNUPGHOME="$(mktemp -d)"
+          export GNUPGHOME
+          chmod 0700 "$GNUPGHOME"
+          gpg --batch --import files/release-signing.pub.asc
+          mapfile -t primary_fingerprints < <(
+            gpg --batch --with-colons --list-keys |
+              awk -F: '$1 == "pub" {want = 1; next} want && $1 == "fpr" {print $10; want = 0}'
+          )
+          [[ "${#primary_fingerprints[@]}" -eq 1 && "${primary_fingerprints[0]}" == "$pin" ]] || {
+            echo "::error::release keyring is not exactly the pinned primary key"
+            exit 1
+          }
+          status="$(gpg --batch --status-fd=1 --verify "rel/$archive.asc" "rel/$archive" 2>/tmp/gpg-verify.log)" || {
+            cat /tmp/gpg-verify.log >&2
+            exit 1
+          }
+          awk -v pin="$pin" '$1 == "[GNUPG:]" && $2 == "VALIDSIG" && ($3 == pin || $NF == pin) {valid = 1} END {exit !valid}' \
+            <<<"$status" || { echo "::error::signature is not bound to the pinned primary key"; exit 1; }
+
+          epoch="$(git show -s --format=%ct HEAD)"
+          python3 build/release-archive-test.py "rel/$archive" "$version" "$epoch" .
+
+          release_work="$(mktemp -d)"
+          env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT \
+            tar --no-same-owner --no-same-permissions -xzf "rel/$archive" -C "$release_work"
+          package_dir="$release_work/security-update-notify-$version"
+          for arch in amd64 arm64 386 ppc64le s390x; do
+            runtime="$package_dir/files/security-update-notify-linux-$arch"
+            [[ -x "$runtime" ]] || { echo "::error::missing executable linux/$arch runtime"; exit 1; }
+            if readelf -l "$runtime" | grep -q 'INTERP'; then
+              echo "::error::linux/$arch runtime is dynamically linked"
+              exit 1
+            fi
+          done
+          [[ "$("$package_dir/files/security-update-notify-linux-amd64" --version)" == \
+              "security-update-notify $version" ]] || {
+            echo "::error::released amd64 runtime version is not bound to $TAG"
+            exit 1
+          }
+          echo "OK: $archive is reproducible, allowlisted, and signed by $pin"

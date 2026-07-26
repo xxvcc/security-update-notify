@@ -14,15 +14,13 @@ import (
 // gpgHome 在临时 GNUPGHOME 里跑 gpg（loopback pinentry，无 passphrase），返回合并输出。
 func gpgHome(t *testing.T, home string, args ...string) ([]byte, error) {
 	t.Helper()
-	cmd := exec.Command("gpg", append([]string{"--batch", "--no-tty", "--pinentry-mode", "loopback", "--passphrase", ""}, args...)...)
-	cmd.Env = append(os.Environ(), "GNUPGHOME="+home)
+	cmd := exec.Command("gpg", append([]string{"--batch", "--no-tty", "--homedir", home, "--pinentry-mode", "loopback", "--passphrase", ""}, args...)...)
 	return cmd.CombinedOutput()
 }
 
 func fprOf(t *testing.T, home string) string {
 	t.Helper()
-	cmd := exec.Command("gpg", "--batch", "--with-colons", "--list-keys")
-	cmd.Env = append(os.Environ(), "GNUPGHOME="+home)
+	cmd := exec.Command("gpg", "--batch", "--homedir", home, "--with-colons", "--list-keys")
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatal(err)
@@ -41,7 +39,7 @@ func fprOf(t *testing.T, home string) string {
 // 只有 pin 指纹对应的那把密钥所签、且 sha256 正确的包才被接受；换密钥、换指纹、篡改 sha256 一律拒绝。
 // 这守护自升级信任链最关键的“不可替换签名”性质。gpg 缺失则跳过。
 func TestVerifyReleaseFailClosed(t *testing.T) {
-	if _, err := exec.LookPath("gpg"); err != nil {
+	if !GPGAvailable() {
 		t.Skip("gpg not available")
 	}
 	dir := t.TempDir()
@@ -88,6 +86,11 @@ func TestVerifyReleaseFailClosed(t *testing.T) {
 	if err := VerifyRelease(tarball, shaFile, asc1, pub1, fpr1); err != nil {
 		t.Errorf("good signature rejected: %v", err)
 	}
+	// A caller-supplied GNUPGHOME must not override the verifier's isolated keyring.
+	t.Setenv("GNUPGHOME", h2)
+	if err := VerifyRelease(tarball, shaFile, asc1, pub1, fpr1); err != nil {
+		t.Errorf("hostile GNUPGHOME overrode isolated verifier: %v", err)
+	}
 	// b) 换指纹：pin 一个不同的指纹 -> 拒绝（指纹 pin 门）
 	if err := VerifyRelease(tarball, shaFile, asc1, pub1, "DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF"); err == nil {
 		t.Error("wrong pinned fingerprint was accepted")
@@ -126,9 +129,27 @@ func TestVerifyReleaseFailClosed(t *testing.T) {
 	}
 }
 
+func TestTrustedGPGExecutableIgnoresCallerPATH(t *testing.T) {
+	if !GPGAvailable() {
+		t.Skip("gpg not available")
+	}
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "gpg")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexit 99\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	got, err := trustedGPGExecutable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == fake || !filepath.IsAbs(got) {
+		t.Fatalf("trusted GPG resolved to %q", got)
+	}
+}
+
 func gpgArmorExport(t *testing.T, home, fpr string) ([]byte, error) {
-	cmd := exec.Command("gpg", "--batch", "--armor", "--export", fpr)
-	cmd.Env = append(os.Environ(), "GNUPGHOME="+home)
+	cmd := exec.Command("gpg", "--batch", "--homedir", home, "--armor", "--export", fpr)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	err := cmd.Run()

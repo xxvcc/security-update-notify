@@ -19,6 +19,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/xxvcc/security-update-notify/internal/httpx"
 )
 
 const defaultBaseURL = "https://api.telegram.org"
@@ -41,8 +43,7 @@ func sanitizeErr(err error) error {
 // tokenRe 复刻 `^\d+:[A-Za-z0-9_-]+$`。
 var tokenRe = regexp.MustCompile(`^[0-9]+:[A-Za-z0-9_-]+$`)
 
-// retryStatus 是值得重试的 HTTP 状态码（429 限流 + 5xx）。
-var retryStatus = map[int]bool{429: true, 500: true, 502: true, 503: true, 504: true}
+func retryableStatus(status int) bool { return status == 429 || (status >= 500 && status < 600) }
 
 // Client 承载 HTTP 客户端与可注入的 BaseURL / Sleep（便于测试）。
 type Client struct {
@@ -69,37 +70,106 @@ func (c *Client) sleep(d time.Duration) {
 // ErrBadToken 表示 token 格式非法（对应运行时的退出码 2 语义）。
 var ErrBadToken = fmt.Errorf("invalid TELEGRAM_BOT_TOKEN format")
 
-func validToken(token string) bool { return tokenRe.MatchString(token) }
+type temporaryError struct{ err error }
+
+func (e *temporaryError) Error() string   { return e.err.Error() }
+func (e *temporaryError) Unwrap() error   { return e.err }
+func (e *temporaryError) Temporary() bool { return true }
+
+// IsTemporary reports transport, timeout, rate-limit, and server-side failures
+// so installers do not mistake an unavailable API for invalid credentials.
+func IsTemporary(err error) bool {
+	var temporary interface{ Temporary() bool }
+	return errors.As(err, &temporary) && temporary.Temporary()
+}
+
+func temporary(err error) error {
+	if err == nil || IsTemporary(err) {
+		return err
+	}
+	return &temporaryError{err: err}
+}
+
+func validToken(token string) bool { return len(token) <= 256 && tokenRe.MatchString(token) }
+
+func (c *Client) apiClient() (*http.Client, error) { return httpx.NoRedirects(c.HTTP) }
 
 // GetMe 校验 token 并请求 getMe，成功要求响应 JSON 的 ok=true。
 func (c *Client) GetMe(ctx context.Context, token string) error {
 	if !validToken(token) {
 		return ErrBadToken
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base()+"/bot"+token+"/getMe", nil)
+	base := strings.TrimRight(c.base(), "/")
+	if err := httpx.GuardAPIBase(base); err != nil {
+		return err
+	}
+	client, err := c.apiClient()
 	if err != nil {
 		return err
 	}
-	resp, err := c.HTTP.Do(req)
+	endpoint := base + "/bot" + token + "/getMe"
+	var last error
+	for attempt := 0; attempt < 3; attempt++ {
+		retryable, transient, err := c.getMeAttempt(ctx, client, endpoint)
+		if err == nil {
+			return nil
+		}
+		last = err
+		if !retryable {
+			if transient {
+				return temporary(err)
+			}
+			return err
+		}
+		if attempt < 2 {
+			c.sleep(time.Second)
+		}
+	}
+	return temporary(last)
+}
+
+func (c *Client) getMeAttempt(ctx context.Context, client *http.Client, endpoint string) (retryable, transient bool, returnErr error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return sanitizeErr(err)
+		return false, false, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return true, true, sanitizeErr(err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxRespBytes))
-	if !jsonOK(body) {
-		return fmt.Errorf("getMe failed: %s", strings.TrimSpace(string(body)))
+	body, err := readResponseBody(resp.Body)
+	if err != nil {
+		return false, true, err
 	}
-	return nil
+	if retryableStatus(resp.StatusCode) {
+		return true, true, fmt.Errorf("getMe HTTP %d: %s", resp.StatusCode, truncErr(string(body)))
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false, false, fmt.Errorf("getMe HTTP %d: %s", resp.StatusCode, truncErr(string(body)))
+	}
+	ok, valid := decodeOK(body)
+	if !valid {
+		return false, true, fmt.Errorf("getMe returned an invalid response")
+	}
+	if !ok {
+		return false, false, fmt.Errorf("getMe failed: %s", truncErr(strings.TrimSpace(string(body))))
+	}
+	return false, false, nil
 }
 
 // SendMessage 发送一条消息：按 rune 截断超长正文，最多尝试 3 次（间隔 1s），仅对 429/5xx 或网络错误
 // 重试；ok=false 或其它 4xx 立即失败。
 func (c *Client) SendMessage(ctx context.Context, token, chatID, text string) error {
-	if token == "" || chatID == "" {
+	if token == "" || chatID == "" || len(chatID) > 256 {
 		return fmt.Errorf("missing Telegram token or chat id")
 	}
 	if !validToken(token) {
 		return ErrBadToken
+	}
+	base := strings.TrimRight(c.base(), "/")
+	if err := httpx.GuardAPIBase(base); err != nil {
+		return err
 	}
 	text = truncate(text)
 	form := url.Values{
@@ -107,14 +177,20 @@ func (c *Client) SendMessage(ctx context.Context, token, chatID, text string) er
 		"text":                     {text},
 		"disable_web_page_preview": {"true"},
 	}
-	endpoint := c.base() + "/bot" + token + "/sendMessage"
+	endpoint := base + "/bot" + token + "/sendMessage"
+	client, err := c.apiClient()
+	if err != nil {
+		return err
+	}
 	var lastErr string
+	lastTransient := false
 	for attempt := 0; attempt < 3; attempt++ {
-		retryable, ok, msg := c.attempt(ctx, endpoint, form)
+		retryable, transient, ok, msg := c.attempt(ctx, client, endpoint, form)
 		if ok {
 			return nil
 		}
 		lastErr = msg
+		lastTransient = transient
 		if !retryable {
 			break
 		}
@@ -125,33 +201,55 @@ func (c *Client) SendMessage(ctx context.Context, token, chatID, text string) er
 	if lastErr == "" {
 		lastErr = "Telegram notification failed"
 	}
-	return fmt.Errorf("%s", lastErr)
+	err = fmt.Errorf("%s", lastErr)
+	if lastTransient {
+		return temporary(err)
+	}
+	return err
 }
 
 // attempt 执行一次发送，返回 (是否可重试, 是否成功, 错误信息)。
-func (c *Client) attempt(ctx context.Context, endpoint string, form url.Values) (retryable, ok bool, msg string) {
+func (c *Client) attempt(ctx context.Context, client *http.Client, endpoint string, form url.Values) (retryable, transient, ok bool, msg string) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
-		return false, false, err.Error()
+		return false, false, false, err.Error()
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := c.HTTP.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		return true, false, sanitizeErr(err).Error() // 网络错误 -> 可重试（已剥离含 token 的 URL）
+		return true, true, false, sanitizeErr(err).Error() // 网络错误 -> 可重试（已剥离含 token 的 URL）
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxRespBytes))
-	if retryStatus[resp.StatusCode] {
-		return true, false, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncErr(string(body)))
+	body, err := readResponseBody(resp.Body)
+	if err != nil {
+		return false, true, false, err.Error()
 	}
-	if jsonOK(body) {
-		return false, true, ""
+	if retryableStatus(resp.StatusCode) {
+		return true, true, false, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncErr(string(body)))
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false, false, false, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncErr(string(body)))
+	}
+	ok, valid := decodeOK(body)
+	if !valid {
+		return false, true, false, "Telegram returned an invalid response"
+	}
+	if ok {
+		return false, false, true, ""
 	}
 	// ok=false 或其它非重试状态码：永久失败。
-	if resp.StatusCode >= 400 {
-		return false, false, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncErr(string(body)))
+	return false, false, false, truncErr(strings.TrimSpace(string(body)))
+}
+
+func readResponseBody(r io.Reader) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, maxRespBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read Telegram response")
 	}
-	return false, false, strings.TrimSpace(string(body))
+	if len(body) > maxRespBytes {
+		return nil, fmt.Errorf("Telegram response too large")
+	}
+	return body, nil
 }
 
 // truncate 复刻 4096→4000 rune 截断（RuneCountInString + rune 切片，非字节长度）。
@@ -170,12 +268,12 @@ func truncErr(s string) string {
 	return s
 }
 
-func jsonOK(body []byte) bool {
+func decodeOK(body []byte) (bool, bool) {
 	var v struct {
-		OK bool `json:"ok"`
+		OK *bool `json:"ok"`
 	}
-	if err := json.Unmarshal(body, &v); err != nil {
-		return false
+	if err := json.Unmarshal(body, &v); err != nil || v.OK == nil {
+		return false, false
 	}
-	return v.OK
+	return *v.OK, true
 }

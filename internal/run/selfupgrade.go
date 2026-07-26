@@ -1,10 +1,17 @@
 package run
 
 import (
+	"bytes"
+	"context"
+	"debug/elf"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -16,13 +23,31 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/version"
 )
 
-var latestVersionRe = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z._-]*$`)
-var pkgVersionRe = regexp.MustCompile(`(?m)^VERSION="([^"]*)"`)
+var latestVersionRe = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$`)
 
-// SelfUpgrade 复刻 run_self_upgrade（--upgrade）：非 root 时经 sudo 重新执行自身；否则直接下载 GitHub
-// 发布包，校验 sha256，用内置 pin 指纹强制校验 GPG 签名（解包前，fail-closed），安全解包并做版本绑定，
-// 最后运行已校验包内的 install.sh 完成落地。二进制替换发生在 install.sh（子进程）的备份/回滚事务里，
-// 本进程作为“存活父进程”等待并透传其退出码——不做 rename-then-exec 自替换。
+const (
+	maxUpgradeVersionOutputBytes = 4 << 10
+	privilegedUpgradePath        = "/usr/sbin:/usr/bin:/sbin:/bin"
+)
+
+type releaseELFIdentity struct {
+	machine elf.Machine
+	class   elf.Class
+	data    elf.Data
+}
+
+var releaseELFIdentities = map[string]releaseELFIdentity{
+	"amd64":   {machine: elf.EM_X86_64, class: elf.ELFCLASS64, data: elf.ELFDATA2LSB},
+	"arm64":   {machine: elf.EM_AARCH64, class: elf.ELFCLASS64, data: elf.ELFDATA2LSB},
+	"386":     {machine: elf.EM_386, class: elf.ELFCLASS32, data: elf.ELFDATA2LSB},
+	"ppc64le": {machine: elf.EM_PPC64, class: elf.ELFCLASS64, data: elf.ELFDATA2LSB},
+	"s390x":   {machine: elf.EM_S390, class: elf.ELFCLASS64, data: elf.ELFDATA2MSB},
+}
+
+// SelfUpgrade 复刻 run_self_upgrade（--upgrade）：非 root 时经 sudo 重新执行自身；否则下载发布包，
+// 校验 sha256，用内置 pin 指纹强制校验 GPG 签名（解包前，fail-closed），安全解包并做版本/架构绑定，
+// 最后运行已验证包内当前架构的 Go 二进制完成安装。二进制替换发生在安装器子进程的备份/回滚事务里，
+// 本进程作为“存活父进程”等待并透传其退出码——不做 rename-then-exec 自替换，也不依赖 Bash runtime。
 func SelfUpgrade(ver string, disp i18n.Lang) int {
 	if os.Geteuid() != 0 {
 		sudo, err := exec.LookPath("sudo")
@@ -79,8 +104,7 @@ func SelfUpgrade(ver string, disp i18n.Lang) int {
 	say(os.Stdout, disp, "正在下载并校验发布包: "+ver+" -> "+latest, "Downloading and verifying release: "+ver+" -> "+latest)
 	tarPath := filepath.Join(tmp, pkg)
 	shaPath := tarPath + ".sha256"
-	_, gpgErr := exec.LookPath("gpg")
-	hasGPG := gpgErr == nil
+	hasGPG := dist.GPGAvailable()
 	allowUnsigned := os.Getenv("SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED") == "1"
 	if !hasGPG && !allowUnsigned {
 		say(os.Stderr, disp, "缺少 gpg 且未 opt-in；为安全起见拒绝升级。",
@@ -117,7 +141,7 @@ func SelfUpgrade(ver string, disp i18n.Lang) int {
 	}
 
 	// 安全解包（拒绝穿越/特殊条目/顶层目录外条目），并做版本绑定核对。
-	if err := dist.CheckArchive(tarPath, pkgdir); err != nil {
+	if err := validateUpgradeArchive(tarPath, pkgdir); err != nil {
 		say(os.Stderr, disp, "压缩包安全检查失败："+err.Error(), "Archive safety check failed: "+err.Error())
 		return 1
 	}
@@ -126,43 +150,207 @@ func SelfUpgrade(ver string, disp i18n.Lang) int {
 		return 1
 	}
 	extractDir := filepath.Join(tmp, pkgdir)
-	installSh := filepath.Join(extractDir, "install.sh")
-	if !fileExists(installSh) {
-		say(os.Stderr, disp, "发布包缺少 install.sh", "Release is missing install.sh")
+	installBinary, err := selectUpgradeBinary(extractDir, latest, runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		say(os.Stderr, disp, "发布包校验失败；拒绝升级："+err.Error(),
+			"Release payload validation failed; refusing to upgrade: "+err.Error())
 		return 1
 	}
-	// 版本绑定：已校验包内声明的 VERSION 必须等于请求的 latest（顶层目录名已 pin，再核对文件内 VERSION）。
-	if pv := scrapePkgVersion(filepath.Join(extractDir, "files", "security-update-notify")); pv != "" && pv != latest {
-		say(os.Stderr, disp, "发布包内版本("+pv+")与请求版本("+latest+")不一致；拒绝升级。",
-			"Package version ("+pv+") does not match requested ("+latest+"); refusing to upgrade.")
+	if err := validateUpgradeBinaryVersion(installBinary, extractDir, latest); err != nil {
+		say(os.Stderr, disp, "发布包二进制版本校验失败；拒绝升级："+err.Error(),
+			"Release binary version validation failed; refusing to upgrade: "+err.Error())
 		return 1
 	}
-	_ = os.Chmod(installSh, 0o755)
 
 	say(os.Stdout, disp, "正在以已校验的发布包升级...", "Upgrading from the verified release...")
-	cmd := exec.Command("./install.sh", "--non-interactive", "-y", "--lang", string(disp))
-	cmd.Dir = extractDir
-	cmd.Env = append(os.Environ(), "SECURITY_UPDATE_NOTIFY_UPGRADE=1")
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd := upgradeInstallCommand(installBinary, extractDir, disp)
 	if err := cmd.Run(); err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return ee.ExitCode()
+		if code, ok := upgradeInstallerExitCode(err); ok {
+			return code
 		}
-		say(os.Stderr, disp, "运行 install.sh 失败："+err.Error(), "Failed to run install.sh: "+err.Error())
+		say(os.Stderr, disp, "运行 Go 安装器失败："+err.Error(), "Failed to run the Go installer: "+err.Error())
 		return 1
 	}
 	return 0
 }
 
-func scrapePkgVersion(path string) string {
-	b, err := os.ReadFile(path)
+func validateUpgradeArchive(tarPath, pkgdir string) error {
+	return dist.CheckArchive(tarPath, pkgdir)
+}
+
+func selectUpgradeBinary(extractDir, expectedVersion, goos, goarch string) (string, error) {
+	packageVersion, err := readPackageVersion(filepath.Join(extractDir, "VERSION"))
 	if err != nil {
-		return ""
+		return "", err
 	}
-	if m := pkgVersionRe.FindSubmatch(b); m != nil {
-		return strings.TrimSpace(string(m[1]))
+	if packageVersion != expectedVersion {
+		return "", fmt.Errorf("package version %q does not match requested version %q", packageVersion, expectedVersion)
 	}
-	return ""
+	identity, ok := releaseELFIdentities[goarch]
+	if goos != "linux" || !ok {
+		return "", fmt.Errorf("release does not support %s/%s", goos, goarch)
+	}
+
+	path := filepath.Join(extractDir, "files", "security-update-notify-linux-"+goarch)
+	info, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("release is missing the linux/%s binary", goarch)
+		}
+		return "", fmt.Errorf("inspect linux/%s binary: %w", goarch, err)
+	}
+	if !info.Mode().IsRegular() || info.Size() <= 0 {
+		return "", fmt.Errorf("linux/%s binary is empty or not a regular file", goarch)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		return "", fmt.Errorf("linux/%s binary is not executable", goarch)
+	}
+	if err := validateUpgradeELF(path, identity); err != nil {
+		return "", fmt.Errorf("invalid linux/%s binary: %w", goarch, err)
+	}
+	return path, nil
+}
+
+func validateUpgradeELF(path string, want releaseELFIdentity) error {
+	f, err := elf.Open(path)
+	if err != nil {
+		return fmt.Errorf("not an ELF executable: %w", err)
+	}
+	defer f.Close()
+	if f.Machine != want.machine || f.Class != want.class || f.Data != want.data {
+		return fmt.Errorf("ELF identity is machine=%s class=%s data=%s", f.Machine, f.Class, f.Data)
+	}
+	return nil
+}
+
+type boundedUpgradeOutput struct {
+	buf      bytes.Buffer
+	overflow bool
+}
+
+func (w *boundedUpgradeOutput) Write(p []byte) (int, error) {
+	if remaining := maxUpgradeVersionOutputBytes + 1 - w.buf.Len(); remaining > 0 {
+		if len(p) < remaining {
+			remaining = len(p)
+		}
+		_, _ = w.buf.Write(p[:remaining])
+	}
+	if w.buf.Len() > maxUpgradeVersionOutputBytes {
+		w.overflow = true
+	}
+	return len(p), nil
+}
+
+func validateUpgradeBinaryVersion(binary, extractDir, expectedVersion string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binary, "--version")
+	cmd.Dir = extractDir
+	cmd.Env = upgradeChildEnvironment(os.Environ(), false)
+	stdout, stderr := &boundedUpgradeOutput{}, &boundedUpgradeOutput{}
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("version probe timed out")
+		}
+		return fmt.Errorf("version probe failed: %w", err)
+	}
+	if stdout.overflow || stderr.overflow {
+		return fmt.Errorf("version probe output exceeds %d bytes", maxUpgradeVersionOutputBytes)
+	}
+	want := "security-update-notify " + expectedVersion + "\n"
+	if stdout.buf.String() != want || stderr.buf.Len() != 0 {
+		return fmt.Errorf("binary reported unexpected version output %q", stdout.buf.String())
+	}
+	return nil
+}
+
+func readPackageVersion(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", errors.New("release is missing root VERSION")
+		}
+		return "", fmt.Errorf("inspect root VERSION: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > 256 {
+		return "", errors.New("root VERSION is empty, oversized, or not a regular file")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open root VERSION: %w", err)
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, 257))
+	if err != nil {
+		return "", fmt.Errorf("read root VERSION: %w", err)
+	}
+	const prefix = `VERSION="`
+	const suffix = "\"\n"
+	if len(b) <= len(prefix)+len(suffix) || len(b) > 256 ||
+		!strings.HasPrefix(string(b), prefix) || !strings.HasSuffix(string(b), suffix) {
+		return "", errors.New(`root VERSION must have the exact form VERSION="<version>"`)
+	}
+	value := string(b[len(prefix) : len(b)-len(suffix)])
+	if !latestVersionRe.MatchString(value) || string(b) != prefix+value+suffix {
+		return "", errors.New("root VERSION contains an invalid version")
+	}
+	return value, nil
+}
+
+func upgradeInstallCommand(binary, extractDir string, disp i18n.Lang) *exec.Cmd {
+	cmd := exec.Command(binary, "install", "--non-interactive", "-y", "--lang", string(disp))
+	cmd.Dir = extractDir
+	cmd.Env = upgradeChildEnvironment(os.Environ(), true)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd
+}
+
+func upgradeInstallerExitCode(err error) (int, bool) {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if code := exitErr.ExitCode(); code >= 0 {
+			return code, true
+		}
+	}
+	return 0, false
+}
+
+func upgradeChildEnvironment(env []string, markUpgrade bool) []string {
+	keep := map[string]bool{
+		"HTTP_PROXY": true, "HTTPS_PROXY": true, "NO_PROXY": true,
+		"http_proxy": true, "https_proxy": true, "no_proxy": true,
+		"TERM": true, "TZ": true, "SECURITY_UPDATE_NOTIFY_LOCK_WAIT_SECONDS": true,
+	}
+	out := make([]string, 0, len(keep)+6)
+	for _, item := range env {
+		key, _, ok := strings.Cut(item, "=")
+		if ok && keep[key] {
+			out = append(out, item)
+		}
+	}
+	out = append(out,
+		"HOME=/root",
+		"USER=root",
+		"LOGNAME=root",
+		"PATH="+privilegedUpgradePath,
+		"LC_ALL=C",
+	)
+	if markUpgrade {
+		out = append(out, "SECURITY_UPDATE_NOTIFY_UPGRADE=1")
+	}
+	return out
+}
+
+func envWithOverride(env []string, key, value string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env)+1)
+	for _, item := range env {
+		if !strings.HasPrefix(item, prefix) {
+			out = append(out, item)
+		}
+	}
+	return append(out, prefix+value)
 }

@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/xxvcc/security-update-notify/internal/httpx"
 )
 
 const defaultBaseURL = "https://open.feishu.cn"
@@ -23,9 +25,11 @@ const (
 	truncatedTextRunes  = 19900
 	truncationSuffix    = "\n…(truncated)"
 	maxCardRequestBytes = 30 * 1024
+	apiRateLimitCode    = 99991400
 )
 
-var retryStatus = map[int]bool{429: true, 500: true, 502: true, 503: true, 504: true}
+func retryableStatus(status int) bool { return status == 429 || (status >= 500 && status < 600) }
+
 var openIDPattern = regexp.MustCompile(`^ou_[A-Za-z0-9_-]+$`)
 
 var (
@@ -33,6 +37,27 @@ var (
 	errCardSchema      = errors.New("Feishu card schema must be 2.0")
 	errCardTooLarge    = errors.New("Feishu card request exceeds 30 KB")
 )
+
+type temporaryError struct{ err error }
+
+func (e *temporaryError) Error() string   { return e.err.Error() }
+func (e *temporaryError) Unwrap() error   { return e.err }
+func (e *temporaryError) Temporary() bool { return true }
+
+// IsTemporary reports transport, timeout, rate-limit, malformed-response, and
+// server-side failures so installers do not mistake API unavailability for
+// rejected credentials or an invalid recipient.
+func IsTemporary(err error) bool {
+	var temporary interface{ Temporary() bool }
+	return errors.As(err, &temporary) && temporary.Temporary()
+}
+
+func temporary(err error) error {
+	if err == nil || IsTemporary(err) {
+		return err
+	}
+	return &temporaryError{err: err}
+}
 
 // Client carries an injectable HTTP client, API base URL, and sleeper for tests.
 type Client struct {
@@ -125,7 +150,7 @@ func validateMessageTarget(appID, appSecret, receiveID string) error {
 	if appID == "" || appSecret == "" || receiveID == "" {
 		return fmt.Errorf("missing Feishu app id, app secret, or receive id")
 	}
-	if !openIDPattern.MatchString(receiveID) {
+	if len(receiveID) > 256 || !openIDPattern.MatchString(receiveID) {
 		return fmt.Errorf("invalid Feishu open_id")
 	}
 	return nil
@@ -151,11 +176,19 @@ func (c *Client) tenantToken(ctx context.Context, appID, appSecret string) (stri
 	if appID == "" || appSecret == "" {
 		return "", fmt.Errorf("missing Feishu app id or app secret")
 	}
+	base := c.base()
+	if err := httpx.GuardAPIBase(base); err != nil {
+		return "", err
+	}
 	body, err := json.Marshal(map[string]string{"app_id": appID, "app_secret": appSecret})
 	if err != nil {
 		return "", err
 	}
-	endpoint := c.base() + "/open-apis/auth/v3/tenant_access_token/internal"
+	endpoint := base + "/open-apis/auth/v3/tenant_access_token/internal"
+	client, err := httpx.NoRedirects(c.HTTP)
+	if err != nil {
+		return "", err
+	}
 	var token string
 	err = c.retry(ctx, func() (bool, time.Duration, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
@@ -163,27 +196,39 @@ func (c *Client) tenantToken(ctx context.Context, appID, appSecret string) (stri
 			return false, 0, err
 		}
 		req.Header.Set("Content-Type", "application/json; charset=utf-8")
-		resp, err := c.HTTP.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			return true, 0, fmt.Errorf("Feishu token request failed: %w", err)
 		}
 		defer resp.Body.Close()
 		respBody, err := readResponseBody(resp.Body)
 		if err != nil {
-			return false, 0, err
+			return false, 0, temporary(err)
 		}
-		if retryStatus[resp.StatusCode] {
+		if retryableStatus(resp.StatusCode) {
 			return true, retryAfter(resp), fmt.Errorf("Feishu token HTTP %d", resp.StatusCode)
 		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return false, 0, fmt.Errorf("Feishu token HTTP %d", resp.StatusCode)
+		}
 		var v struct {
-			Code              int    `json:"code"`
+			Code              *int   `json:"code"`
 			TenantAccessToken string `json:"tenant_access_token"`
 		}
 		if err := json.Unmarshal(respBody, &v); err != nil {
-			return false, 0, fmt.Errorf("invalid Feishu token response")
+			return false, 0, temporary(fmt.Errorf("invalid Feishu token response"))
 		}
-		if resp.StatusCode >= 400 || v.Code != 0 || v.TenantAccessToken == "" {
-			return false, 0, fmt.Errorf("Feishu token failed: code=%d", v.Code)
+		if v.Code == nil {
+			return false, 0, temporary(fmt.Errorf("invalid Feishu token response"))
+		}
+		if *v.Code == apiRateLimitCode {
+			return true, retryAfter(resp), fmt.Errorf("Feishu token temporarily unavailable")
+		}
+		if *v.Code != 0 {
+			return false, 0, fmt.Errorf("Feishu token failed: code=%d", *v.Code)
+		}
+		if v.TenantAccessToken == "" || len(v.TenantAccessToken) > 8192 {
+			return false, 0, temporary(fmt.Errorf("invalid Feishu token response"))
 		}
 		token = v.TenantAccessToken
 		return false, 0, nil
@@ -192,6 +237,10 @@ func (c *Client) tenantToken(ctx context.Context, appID, appSecret string) (stri
 }
 
 func (c *Client) doJSON(ctx context.Context, endpoint, token string, body []byte) error {
+	client, err := httpx.NoRedirects(c.HTTP)
+	if err != nil {
+		return err
+	}
 	return c.retry(ctx, func() (bool, time.Duration, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if err != nil {
@@ -199,26 +248,35 @@ func (c *Client) doJSON(ctx context.Context, endpoint, token string, body []byte
 		}
 		req.Header.Set("Content-Type", "application/json; charset=utf-8")
 		req.Header.Set("Authorization", "Bearer "+token)
-		resp, err := c.HTTP.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			return true, 0, fmt.Errorf("Feishu message request failed: %w", err)
 		}
 		defer resp.Body.Close()
 		respBody, err := readResponseBody(resp.Body)
 		if err != nil {
-			return false, 0, err
+			return false, 0, temporary(err)
 		}
-		if retryStatus[resp.StatusCode] {
+		if retryableStatus(resp.StatusCode) {
 			return true, retryAfter(resp), fmt.Errorf("Feishu message HTTP %d", resp.StatusCode)
 		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return false, 0, fmt.Errorf("Feishu message HTTP %d", resp.StatusCode)
+		}
 		var v struct {
-			Code int `json:"code"`
+			Code *int `json:"code"`
 		}
 		if err := json.Unmarshal(respBody, &v); err != nil {
-			return false, 0, fmt.Errorf("invalid Feishu message response")
+			return false, 0, temporary(fmt.Errorf("invalid Feishu message response"))
 		}
-		if resp.StatusCode >= 400 || v.Code != 0 {
-			return false, 0, fmt.Errorf("Feishu message failed: code=%d", v.Code)
+		if v.Code == nil {
+			return false, 0, temporary(fmt.Errorf("invalid Feishu message response"))
+		}
+		if *v.Code == apiRateLimitCode {
+			return true, retryAfter(resp), fmt.Errorf("Feishu message temporarily unavailable")
+		}
+		if *v.Code != 0 {
+			return false, 0, fmt.Errorf("Feishu message failed: code=%d", *v.Code)
 		}
 		return false, 0, nil
 	})
@@ -233,7 +291,7 @@ func (c *Client) retry(ctx context.Context, attempt func() (bool, time.Duration,
 		}
 		last = err
 		if !retryable {
-			break
+			return err
 		}
 		if i < 2 {
 			if delay <= 0 {
@@ -242,7 +300,7 @@ func (c *Client) retry(ctx context.Context, attempt func() (bool, time.Duration,
 			c.sleep(delay)
 		}
 	}
-	return last
+	return temporary(last)
 }
 
 func readResponseBody(r io.Reader) ([]byte, error) {

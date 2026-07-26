@@ -13,9 +13,11 @@
 
 **security-update-notify**（简称 **SUN**）是一个轻量 Linux 工具，适合维护服务器、VPS 或小型基础设施的人使用。
 
-它使用发行版原生更新机制，通过 systemd timer 定时运行，只发起出站 HTTPS 请求：提醒按配置发往 Telegram Bot API 和/或飞书开放平台；默认还会向公网 IP 探测服务（api.ipify.org / ifconfig.me）获取出口 IP（可用 `INCLUDE_PUBLIC_IP=0` 关闭或用 `PUBLIC_IP` 手动指定）；自升级时访问 GitHub。没有 Web 面板，没有常驻控制端口，也不接收消息命令。
+它使用发行版原生更新机制，通过 systemd timer 定时运行，只发起出站 HTTPS 请求：提醒按配置发往 Telegram Bot API 和/或飞书开放平台；默认还会向公网 IP 探测服务（api.ipify.org / ifconfig.me）获取出口 IP（可用 `INCLUDE_PUBLIC_IP=0` 关闭或用 `PUBLIC_IP` 手动指定）；安装和自升级优先访问 `dl.ll.cd` 发布镜像，传输不可用时回退 GitHub。没有 Web 面板，没有常驻控制端口，也不接收消息命令。
 
-> 自 **2.0** 起，运行时是一个静态编译的 **Go 二进制**，按架构分发（amd64/arm64/386/ppc64le/s390x）；未构建的架构自动回退到自包含的 Bash 运行时。**Go 二进制运行时**不依赖 `python3` 或 `curl`；而 Bash 回退运行时仍依赖 `python3`（用于通知 API 与版本/日期计算）。安装器 `install.sh` 在接收平台预检时也使用 `python3`。
+> 自 **3.0** 起，安装、配置、运行、诊断、测试、卸载、自升级和发布打包均由 Go 实现；唯一维护的 Shell 产品实现是首次安装引导器 `sun.sh`。3.0 发布包会由 Go 打包器额外生成一个仅供 2.x 跨大版本自升级的 `install.sh` 启动器，它只选择并 `exec` 已验签的 Go 安装器，不会安装到系统，也不是第二套安装实现。正式包固定提供 linux/amd64、arm64、386、ppc64le、s390x 五个二进制，不再提供 Bash 运行时或未列架构回退；不支持的架构会在 Go 安装器运行前明确拒绝（引导器可能已补齐自身的下载/验签依赖）。
+
+已安装的 Go 二进制不依赖 `python3`、`curl` 或 `tar` 完成日常检查与通知；自升级验签仍调用 `gpg`，系统状态与补丁管理仍按需调用发行版的 apt/dnf、needrestart/needs-restarting 和 systemd 命令。
 
 **语言 / Languages**：中文 | [English](README.en.md)
 
@@ -158,13 +160,21 @@ Telegram：
 curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash
 ```
 
+引导器需要 `curl`、`tar`、`sha256sum`、`mktemp`、`python3`、`env`、`gpg` 和 `timeout`。缺少命令时，它会先通过 apt、dnf 或 yum 安装对应引导依赖，再重新逐项检查；没有受支持的包管理器或补齐后仍缺命令时会在下载/安装前失败。GPG 签名默认强制校验。
+
 如果你更想从源码运行，也可以：
 
 ```bash
 git clone https://github.com/xxvcc/security-update-notify.git
 cd security-update-notify
-sudo ./install.sh
+source ./VERSION
+arch="$(go env GOARCH)"
+case "$arch" in amd64|arm64|386|ppc64le|s390x) ;; *) echo "unsupported architecture: $arch" >&2; exit 1 ;; esac
+./build/build.sh linux "$arch" "$VERSION" ./security-update-notify
+sudo ./security-update-notify install
 ```
+
+源码构建需要仓库 `go.mod` 固定的 Go 工具链，且当前机器必须属于上述五个发布架构。`build/build.sh` 会把根 `VERSION` 注入二进制；不要直接用未注入版本的 `go run` 或普通 `go build` 产物安装。
 
 安装器会先让你选择界面语言（中文或英文，默认中文），然后选择 Telegram、飞书或双平台。随后按所选接收平台询问：
 
@@ -183,14 +193,14 @@ sudo ./install.sh
 
 扫描结果受飞书应用“通讯录数据范围”限制。扫描失败或没有可见员工时，交互安装器允许重试、手动输入当前应用下的 `open_id`，或中止安装；非交互模式必须显式提供 `--feishu-receive-id`。
 
-首次交互配置飞书或更换应用、Secret、接收人时，安装器默认发送一条仅飞书的验证消息，用于确认所选 `open_id` 位于机器人的可用范围内；输入 `n` 可跳过。验证会等待现有检查释放运行锁（最多 60 秒），确认发送成功后才启用 SUN timer；超时或发送失败都会回滚，不能把“未发送”误判为成功。非交互安装不会自动发送。显式使用 `--send-test` 或 `test.sh --send-test` 仍会测试全部已配置接收平台。
+首次交互配置飞书或更换应用、Secret、接收人时，安装器默认发送一条仅飞书的验证消息，用于确认所选 `open_id` 位于机器人的可用范围内；输入 `n` 可跳过。验证会等待现有检查释放运行锁（最多 60 秒），确认发送成功后才启用 SUN timer；超时或发送失败都会回滚，不能把“未发送”误判为成功。非交互安装不会自动发送。显式使用 `--send-test` 或 `security-update-notify test --send-test` 仍会测试全部已配置接收平台。
 
 ### 3. 验证
 
 ```bash
-sudo ./test.sh
-sudo ./test.sh --send-test --no-dedupe
-sudo ./test.sh --simulate-reboot --no-dedupe
+sudo security-update-notify test
+sudo security-update-notify test --send-test --no-dedupe
+sudo security-update-notify test --simulate-reboot --no-dedupe
 ```
 
 模拟重启测试只会发送测试提醒，**不会真的重启服务器**。
@@ -200,7 +210,7 @@ sudo ./test.sh --simulate-reboot --no-dedupe
 适合放进初始化脚本、云服务器模板或批量部署流程：
 
 ```bash
-sudo ./install.sh \
+curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- install \
   --notify-channels telegram \
   --telegram-token '123456:ABC...' \
   --telegram-chat-id 'CHAT_ID' \
@@ -221,7 +231,8 @@ cp .env.example .env
 chmod 600 .env
 sudoedit .env
 
-sudo ./install.sh --env-file .env --non-interactive -y
+curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | \
+  sudo bash -s -- install --env-file "$PWD/.env" --non-interactive -y
 ```
 
 也可以只把 token 单独放进 root-only 文件：
@@ -230,7 +241,7 @@ sudo ./install.sh --env-file .env --non-interactive -y
 sudo install -m 600 /dev/null /root/.security-update-notify-token
 sudoedit /root/.security-update-notify-token
 
-sudo ./install.sh \
+curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- install \
   --telegram-token-file /root/.security-update-notify-token \
   --telegram-chat-id 'CHAT_ID' \
   --non-interactive \
@@ -243,7 +254,7 @@ sudo ./install.sh \
 sudo install -m 600 /dev/null /root/.security-update-notify-feishu-secret
 sudoedit /root/.security-update-notify-feishu-secret
 
-sudo ./install.sh \
+curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- install \
   --notify-channels feishu \
   --feishu-app-id 'cli_xxx' \
   --feishu-receive-id 'ou_xxx' \
@@ -278,12 +289,14 @@ App Secret 源文件必须是 root 所有的普通文件，不能是符号链接
 --notify-upgrade 1        # 升级成功后向已配置接收平台发送通知；默认 0
 --skip-post-install-check # 跳过安装/升级后自检
 --allow-best-effort        # 允许尽力支持的发行版
---configure-notifications  # 交互管理消息通知设置（仅限已有安装）
+--lock-wait SECONDS       # 运行锁屏障等待 0..3600 秒，默认 60
 --send-test                # 安装完成后测试全部已配置接收平台
 --skip-telegram-test       # 跳过 Telegram 预检
 --skip-feishu-test         # 跳过独立凭据预检；未指定接收人时仍需扫描选人
 --skip-notify-test         # 跳过所有渠道预检
 ```
+
+已安装 SUN 后，可用 `sudo security-update-notify install [选项]` 直接执行同一 Go 安装器；管理已有安装的消息通知设置使用 `sudo security-update-notify configure notifications`。
 
 
 ### 升级
@@ -294,11 +307,11 @@ App Secret 源文件必须是 root 所有的普通文件，不能是符号链接
 curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- upgrade --non-interactive -y
 ```
 
-已安装 SUN 后，也可以直接运行 `sudo security-update-notify --upgrade`。一键安装器和内置升级都会优先读取 `https://dl.ll.cd/security-update-notify/latest.json` 并从同一镜像下载签名资产；镜像索引或完整资产集合传输失败时自动回退 GitHub。下载完成后仍会校验 `.sha256`，并用内置 pin 的指纹强制校验 GPG 签名（默认 fail-closed，缺签名即拒绝）后才升级。镜像只提供传输可用性，不是信任根。
+已安装 SUN 后，也可以直接运行 `sudo security-update-notify upgrade`。一键安装器和内置升级都会优先读取 `https://dl.ll.cd/security-update-notify/latest.json` 并从同一镜像下载签名资产；镜像索引或完整资产集合传输失败时自动回退 GitHub。下载完成后仍会校验 `.sha256`，并用内置 pin 的指纹强制校验 GPG 签名（默认 fail-closed，缺签名即拒绝）后才升级。镜像只提供传输可用性，不是信任根。
 
 每个正式 GitHub Release 发布后，`Mirror signed release` 工作流会重新验签并同步版本化目录。签名资产和从验签归档提取的版本化 `sun.sh` 从 `dl.ll.cd` 回读校验成功后，才依次更新稳定 `sun.sh` 和最后的 `latest.json`；手动重跑旧版本只补齐其版本目录，不会覆盖当前稳定入口或 Latest。
 
-如果已安装过 SUN，安装器会自动读取 `/etc/security-update-notify/telegram.env` 和现有 timer 时间，显示当前通知方式，并默认保持现有消息通知设置；选择修改后可以更改接收平台、Telegram 配置、飞书应用、App Secret 或接收人。主菜单也提供独立的“消息通知设置”入口。移除接收平台会删除其保存凭据，新增或修改只重复验证受影响的平台；任一步失败都会随安装事务回滚。旧配置没有 `NOTIFY_CHANNELS` 时自动按 `telegram` 处理，未显式覆盖的其他选项继续沿用。
+如果已安装过 SUN，安装器会自动读取 `/etc/security-update-notify/telegram.env` 和现有 timer 时间，并复用未显式覆盖的设置。运行 `sudo security-update-notify configure notifications` 可以事务化更改接收平台、Telegram 配置、飞书应用、App Secret 或接收人。移除接收平台会删除其保存凭据，新增或修改只重复验证受影响的平台；任一步失败都会随安装事务回滚。旧配置没有 `NOTIFY_CHANNELS` 时自动按 `telegram` 处理，未显式覆盖的其他选项继续沿用。
 
 升级前会备份关键文件到 `/var/backups/security-update-notify/<timestamp>`，但飞书 App Secret 不进入该备份；升级失败会尝试自动回滚，并恢复 SUN timer 安装前的启用链接与 active 状态。升级后默认运行自检；可用 `--notify-upgrade 1` 向已配置接收平台发送升级通知。升级通知采用 best-effort 语义，不会因通知失败回滚已经完成的升级，也不会整体重试双发而重复已成功平台。
 
@@ -333,10 +346,10 @@ curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- upgr
 | `PENDING_ALERT_DAYS` | `3` | 待安装安全更新连续存在多少天后告警；设为 `0` 关闭补丁滞留告警。首次发现时间保存在 root-only 状态文件中，补丁清空后自动移除。 |
 | `RESTART_ALERT_DAYS` | `7` | 整机或服务重启需求持续多少天后升级告警；设为 `0` 关闭时长升级。不会自动重启机器或服务。 |
 | `CHECK_SELF_UPDATE` | `1` | 周期检查 SUN 新版本；只提示，不自动升级。 |
-| `SELF_UPDATE_CHECK_DAYS` | `7` | SUN 版本检查间隔；成功结果会缓存，`--doctor` 可强制只读刷新。 |
+| `SELF_UPDATE_CHECK_DAYS` | `7` | SUN 版本检查间隔；成功结果会缓存，`security-update-notify doctor` 可强制只读刷新。 |
 | `CHECK_EOL` | `1` | 发行版安全支持终止（EOL）提醒：已过 EOL 触发提醒，临近（90 天内）仅作信息展示。若已购买 Ubuntu ESM 等延长支持，可设 `0` 关闭。 |
 
-待安装数量在阈值以内仍是信息项；达到 `PENDING_ALERT_DAYS` 后才转为风险告警。DNF 的高危子计数同时包含 `critical` 和 `important`。可随时用 `security-update-notify --doctor` 查看七项检测、当前待装数量和 SUN 版本结果；诊断不会写入时长或版本缓存状态。`--test-ok`、`--test-reboot` 和 Go 运行时的 `--dry-run` 不写这些状态，也不会发起周期版本请求。
+待安装数量在阈值以内仍是信息项；达到 `PENDING_ALERT_DAYS` 后才转为风险告警。DNF 的高危子计数同时包含 `critical` 和 `important`。可随时用 `security-update-notify doctor` 查看七项检测、当前待装数量和 SUN 版本结果；诊断不会写入时长或版本缓存状态。`security-update-notify test` 的模拟模式和 `security-update-notify run --dry-run` 不写这些状态，也不会发起周期版本请求。
 
 ## 安装后写入的内容
 
@@ -372,7 +385,7 @@ SUN 会配置或使用：
 - `apt-listchanges`
 - apt periodic timers
 
-安装器会启用 unattended-upgrades 的安全更新周期任务。每次覆盖 `/etc/apt/apt.conf.d/20auto-upgrades` 前都会保存一份带时间戳的 SUN 专用备份；首次安装时还会保留一份固定名称备份，`--purge-config` 会在该备份存在时恢复它。
+安装器会启用 unattended-upgrades 的安全更新周期任务。每次覆盖 `/etc/apt/apt.conf.d/20auto-upgrades` 前都会保存一份带时间戳的 SUN 专用备份；首次安装时还会保留一份固定名称备份。`--purge-config` 会在固定备份存在时恢复它，并删除 SUN 创建的固定及时间戳备份。
 
 检测方式：
 
@@ -386,7 +399,7 @@ SUN 会配置或使用：
 
 - `dnf-automatic`
 - `yum-utils` 或 `dnf-utils`
-- `python3`、`ca-certificates`
+- `ca-certificates`
 
 检测方式：
 
@@ -394,7 +407,7 @@ SUN 会配置或使用：
 - `needs-restarting -s`（列出需要重启的 systemd 服务；不再用裸 `needs-restarting` 的整表进程，避免误报）
 - `dnf updateinfo list security updates`
 
-如果 `/etc/dnf/automatic.conf` 存在，SUN 会先保存一份带时间戳的备份，再将其配置为只安装安全更新；`--purge-config` 会尝试恢复最新一份 SUN 创建的备份。
+如果 `/etc/dnf/automatic.conf` 存在，SUN 会先保存一份带时间戳的备份，再将其配置为只安装安全更新；`--purge-config` 会尝试恢复最新一份 SUN 创建的备份，并删除 SUN 专用的时间戳备份。
 
 ```ini
 upgrade_type = security
@@ -422,14 +435,14 @@ sudoedit /etc/security-update-notify/telegram.env
 # 设置 NOTIFY_LANG=zh（中文）或 NOTIFY_LANG=en（English）
 ```
 
-切换接收平台、飞书应用或接收人时，请重新运行一键安装器并选择“消息通知设置”。安装器会验证 App ID 与应用级 `open_id` 的绑定，并负责创建、迁移或清理 App Secret 凭据；不要只手工修改 `NOTIFY_CHANNELS` 绕过这些步骤。
+切换接收平台、飞书应用或接收人时，请运行 `sudo security-update-notify configure notifications`。Go 安装器会验证 App ID 与应用级 `open_id` 的绑定，并负责创建、迁移或清理 App Secret 凭据；不要只手工修改 `NOTIFY_CHANNELS` 绕过这些步骤。
 
 运行内置诊断：
 
 ```bash
 security-update-notify --version
-security-update-notify --check-upgrade
-sudo security-update-notify --doctor
+security-update-notify check-upgrade
+sudo security-update-notify doctor
 ```
 
 查看日志：
@@ -443,22 +456,22 @@ sudo tail -n 100 /var/log/security-update-notify.log
 移除程序与 systemd/logrotate 集成，但保留配置和状态：
 
 ```bash
-sudo ./uninstall.sh
+sudo security-update-notify uninstall
 ```
 
 同时删除配置和状态：
 
 ```bash
-sudo ./uninstall.sh --purge-config
+sudo security-update-notify uninstall --purge-config
 ```
 
 作为依赖安装的软件包会保留，不会自动卸载。`--purge-config` 会删除 SUN 的配置、Telegram/飞书凭据、状态、升级备份（其中可能含 bot token 副本）以及轮转日志，并在备份存在时恢复 apt/dnf 自动更新配置。
 
 ## Release 签名
 
-发布包始终包含 `.sha256` 校验文件。`package.sh` 支持在存在 GPG 私钥时自动生成 `.tar.gz.asc` detached signature；`sun.sh` 默认以 `required` 模式校验签名，`auto` 仅作为兼容别名保留，也会要求 gpg 与 `.asc` 签名同时存在；只有显式传入 `--verify-signature off` 才会跳过签名校验。
+发布包始终包含 `.sha256` 校验文件。`go run ./cmd/sun-release package` 在可用时生成 `.tar.gz.asc` detached signature；正式发布或已有对应 tag 时强制签名。`sun.sh` 默认以 `required` 模式校验签名，`auto` 仅作为兼容别名保留，也会要求 gpg 与 `.asc` 签名同时存在；只有显式传入 `--verify-signature off` 才会跳过签名校验。
 
-正式发布（存在对应 `vX.Y.Z` tag，或显式设置 `RELEASE=1` 的构建）**强制签名**：`package.sh` 会要求 GPG 签名，没有私钥则构建失败；release 发布后 CI 会用仓库内公钥校验产物的签名与指纹，缺签名/不匹配即让该 release 的检查失败。私钥不进入 CI，仍由维护者离线持有。此外，`security-update-notify --upgrade` 默认 **fail-closed**：从固定发布镜像优先下载、GitHub 回退，校验 sha256，并在解包前用内置公钥与 pin 指纹强制校验 GPG 签名后才升级（应急可设 `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` 仅按 sha256 升级）。
+根 `VERSION` 是唯一版本源，格式必须严格为 `VERSION="X.Y.Z"`。正式发布（存在对应 `vX.Y.Z` tag，或显式设置 `RELEASE=1`）**强制签名并固定包含五架构 Go 二进制**：Go 发布工具会绑定根版本、唯一 `CHANGELOG` 标题、tag、包内版本和每个二进制的 `--version`，且架构集合不可覆盖；缺少 Go、Bash（仅用于检查 `sun.sh` 语法）、任一 amd64/arm64/386/ppc64le/s390x 架构产物，或固定指纹对应的 GPG 私钥都会失败。release 发布后 CI 只接受与 tag 同版本且恰好由 tarball、checksum、签名组成的一套资产，并用仓库内公钥校验签名与指纹。私钥不进入 CI，仍由维护者离线持有。此外，`security-update-notify upgrade` 默认 **fail-closed**：从固定发布镜像优先下载、GitHub 回退，校验 sha256，并在解包前用内置公钥与 pin 指纹强制校验 GPG 签名后才升级（应急可设 `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` 仅按 sha256 升级）。
 
 ## 安全说明
 
@@ -478,34 +491,32 @@ SUN 的范围刻意保持很小：
 在源码目录运行：
 
 ```bash
-bash -n install.sh menu.sh test.sh uninstall.sh package.sh sun.sh files/security-update-notify \
-  build/compat-test.sh build/rollback-test.sh build/bash-feishu-test.sh \
-  build/install-feishu-onboarding-test.sh build/install-notification-settings-test.sh \
-  build/install-telegram-preflight-test.sh \
-  build/runtime-lock-test.sh
+bash -n sun.sh build/*.sh
+shellcheck -s bash -S warning sun.sh build/*.sh
+unformatted="$(rg --files cmd internal -g '*.go' -0 | xargs -0 gofmt -l)"
+test -z "$unformatted"
 go vet ./...
 go test -race -cover ./...
-build/bash-feishu-test.sh
-build/install-feishu-onboarding-test.sh
-build/install-notification-settings-test.sh
-build/install-telegram-preflight-test.sh
+build/archive-safety-test.sh
 build/runtime-lock-test.sh
-build/compat-test.sh
-build/rollback-test.sh
-./package.sh
+build/reproducibility-check.sh linux amd64
+docker run --rm -v "$PWD:/src:ro" debian:12 bash /src/build/compat-test.sh
+docker run --rm -v "$PWD:/src:ro" debian:12 bash /src/build/rollback-test.sh
+go run ./cmd/sun-release package
 cd dist && sha256sum -c security-update-notify-*.tar.gz.sha256
 ```
 
-`build/compat-test.sh` 和 `build/rollback-test.sh` 使用 Docker；其余命令使用项目声明的 Go 工具链和本机 shell 工具。
+`build/compat-test.sh` 和 `build/rollback-test.sh` 会修改系统路径，只能按上面的命令在一次性 Docker 容器中运行，禁止直接在宿主机执行。正式发布还必须完成 CI 的五架构实跑、恶意归档、签名和公开资产复验门禁。
 
 生成文件：
 
 ```text
 dist/security-update-notify-VERSION.tar.gz
 dist/security-update-notify-VERSION.tar.gz.sha256
+dist/security-update-notify-VERSION.tar.gz.asc  # 签名构建
 ```
 
-发布压缩包只包含面向用户的安装、诊断、引导和文档文件。`sun.sh` 包含在签名压缩包中，镜像工作流会从验签后的归档提取并发布到稳定地址。
+发布压缩包只包含面向用户的安装、诊断、引导、迁移兼容和文档文件。`sun.sh` 包含在签名压缩包中，镜像工作流会从验签后的归档提取并发布到稳定地址。`install.sh` 与 `files/security-update-notify` 是 Go 打包器为旧 2.x 自升级客户端生成的最小启动器和版本标记，不包含旧安装或运行时逻辑，也不会落到已安装系统。
 
 发布包内容：
 
@@ -515,12 +526,19 @@ CHANGELOG.md
 LICENSE
 README.md
 README.en.md
-install.sh
-menu.sh
+VERSION
 sun.sh
-test.sh
-uninstall.sh
-files/
+install.sh                              # 仅 2.x -> 3.0 的 Go 启动器
+files/needrestart-report-only.conf
+files/release-signing.pub.asc
+files/security-update-notify            # 仅旧客户端读取的版本标记
+files/security-update-notify.logrotate
+files/security-update-notify.service
+files/security-update-notify-linux-amd64
+files/security-update-notify-linux-arm64
+files/security-update-notify-linux-386
+files/security-update-notify-linux-ppc64le
+files/security-update-notify-linux-s390x
 ```
 
 ## 许可证

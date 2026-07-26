@@ -3,11 +3,14 @@ package dist
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
 	"github.com/xxvcc/security-update-notify/internal/httpx"
 )
+
+const maxReleaseJSONBytes = 1 << 20
 
 // DefaultReleaseMirrorBase 是发布镜像的固定 HTTPS 根路径。镜像只改善可用性，不是信任根；
 // 下载后的发布包仍必须通过内置公钥和固定指纹验签。
@@ -41,21 +44,23 @@ func LatestRelease(client *http.Client, repo string) (string, error) {
 func latestFromMirror(client *http.Client) (string, error) {
 	base := strings.TrimRight(releaseMirrorBase, "/")
 	url := base + "/latest.json"
-	resp, err := getReleaseJSON(client, url, "application/json")
+	body, err := getReleaseJSON(client, url, "application/json")
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
 	var manifest struct {
 		Version string `json:"version"`
 		Tag     string `json:"tag"`
 		BaseURL string `json:"base_url"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
+	if err := json.Unmarshal(body, &manifest); err != nil {
 		return "", err
 	}
 	if manifest.Version == "" || manifest.Tag != "v"+manifest.Version {
 		return "", fmt.Errorf("mirror manifest has inconsistent version/tag")
+	}
+	if !validReleaseVersion(manifest.Version) {
+		return "", fmt.Errorf("mirror manifest has invalid version")
 	}
 	if manifest.BaseURL != base+"/"+manifest.Tag {
 		return "", fmt.Errorf("mirror manifest has unexpected base_url")
@@ -65,25 +70,43 @@ func latestFromMirror(client *http.Client) (string, error) {
 
 func latestFromGitHub(client *http.Client, repo string) (string, error) {
 	url := githubAPIBase + "/repos/" + repo + "/releases/latest"
-	resp, err := getReleaseJSON(client, url, "application/vnd.github+json")
+	body, err := getReleaseJSON(client, url, "application/vnd.github+json")
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
 	var v struct {
 		TagName string `json:"tag_name"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+	if err := json.Unmarshal(body, &v); err != nil {
 		return "", err
 	}
 	tag := strings.TrimPrefix(v.TagName, "v")
 	if tag == "" {
 		return "", fmt.Errorf("empty tag_name")
 	}
+	if !validReleaseVersion(tag) {
+		return "", fmt.Errorf("invalid tag_name")
+	}
 	return tag, nil
 }
 
-func getReleaseJSON(client *http.Client, url, accept string) (*http.Response, error) {
+func validReleaseVersion(v string) bool {
+	if len(v) == 0 || len(v) > 128 || !isReleaseVersionAlphaNum(v[0]) {
+		return false
+	}
+	for i := 1; i < len(v); i++ {
+		if !isReleaseVersionAlphaNum(v[i]) && v[i] != '.' && v[i] != '_' && v[i] != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func isReleaseVersionAlphaNum(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z'
+}
+
+func getReleaseJSON(client *http.Client, url, accept string) ([]byte, error) {
 	if err := httpx.GuardHTTPS(url); err != nil {
 		return nil, err
 	}
@@ -107,7 +130,15 @@ func getReleaseJSON(client *http.Client, url, accept string) (*http.Response, er
 		resp.Body.Close()
 		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
 	}
-	return resp, nil
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxReleaseJSONBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxReleaseJSONBytes {
+		return nil, fmt.Errorf("release JSON exceeds size limit")
+	}
+	return body, nil
 }
 
 // ReleaseBases 返回同一已签名版本的下载根路径，按镜像优先、GitHub 回退排序。

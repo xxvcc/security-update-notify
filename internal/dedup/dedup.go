@@ -1,11 +1,11 @@
 // Package dedup 复刻告警去重：alert_hash 是对 11 个稳定字段做 sha256（每个字段后跟一个 '\n'，
 // 末尾也有 '\n'），ShouldSend 实现 once/daily/interval 抑制，Store 以“临时文件 + 原子重命名”落盘状态
-// （hash 先于时间戳，崩溃只会更倾向发送，绝不静默抑制真实告警）。这是全 Go 端口 make-or-break 的核心：
+// （时间戳先于 hash，崩溃只会更倾向发送，绝不静默抑制真实告警）。这是全 Go 端口 make-or-break 的核心：
 // 任一字段的一字节漂移都会让每台已装机器在升级后重复告警一次。
 //
 // Package dedup reproduces alert deduplication: alert_hash is sha256 over 11 stable fields (each followed
 // by '\n', with a trailing '\n' after the last), ShouldSend implements once/daily/interval suppression,
-// and Store persists state via temp-file + atomic rename (hash before timestamp, so a crash only biases
+// and Store persists state via temp-file + atomic rename (timestamp before hash, so a crash only biases
 // toward sending). Make-or-break: a one-byte drift in any field re-alerts every installed host once.
 package dedup
 
@@ -71,8 +71,14 @@ func ShouldSend(noDedupe bool, curHash, lastHash string, lastSent, now int64, mo
 	case "once", "always":
 		return false
 	case "daily":
+		if lastSent <= 0 || lastSent > now {
+			return true
+		}
 		return localDay(lastSent) != localDay(now)
 	default: // interval 及未知模式兜底
+		if lastSent <= 0 || lastSent > now {
+			return true
+		}
 		if intervalDays < 1 {
 			intervalDays = 3
 		}
@@ -127,19 +133,13 @@ func (s *Store) ReadLast() (hash string, sentAt int64) {
 	return hash, sentAt
 }
 
-// Write 原子写状态：临时文件 + rename，hash 先于时间戳落盘；任一步失败回退到显式 0600 直写，保持
-// 与运行时一致的健壮性（崩溃/磁盘满不留下被截断的状态文件）。
+// Write 用临时文件 + rename 写状态。时间戳先提交、hash 后提交：若第二次 rename 失败，旧 hash
+// 仍与当前告警不匹配，下一轮会重发而不会被新时间戳静默抑制。调用方仍会收到错误。
 func (s *Store) Write(hash string, now int64) error {
-	if err := s.atomic(s.HashFile, hash+"\n"); err == nil {
-		if err := s.atomic(s.TimeFile, strconv.FormatInt(now, 10)+"\n"); err == nil {
-			return nil
-		}
-	}
-	// 回退：显式 0600 直写。
-	if err := os.WriteFile(s.HashFile, []byte(hash+"\n"), 0o600); err != nil {
+	if err := s.atomic(s.TimeFile, strconv.FormatInt(now, 10)+"\n"); err != nil {
 		return err
 	}
-	return os.WriteFile(s.TimeFile, []byte(strconv.FormatInt(now, 10)+"\n"), 0o600)
+	return s.atomic(s.HashFile, hash+"\n")
 }
 
 func (s *Store) atomic(dest, content string) error {

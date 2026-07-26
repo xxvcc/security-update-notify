@@ -2,9 +2,8 @@ package run
 
 import "os"
 
-// 运行时路径。默认与 Bash 运行时一致；可用环境变量覆盖，便于隔离测试（差分/黄金）而不触碰真实状态。
-// Runtime paths. Defaults match the Bash runtime; overridable via env for isolated testing (differential/
-// golden) without touching real state.
+// 运行时路径保留稳定的 2.x 磁盘契约；可用环境变量覆盖，便于隔离测试而不触碰真实状态。
+// Runtime paths retain the stable 2.x on-disk contract and are overridable for isolated tests.
 const (
 	defaultStateDir = "/var/lib/security-update-notify"
 	defaultLockFile = "/run/security-update-notify.lock"

@@ -1,13 +1,11 @@
-// Package golden 提供由“真·Bash 运行时”捕获的黄金向量（known-answer vectors）：给定受控场景，
-// files/security-update-notify 实际写入 STATE_FILE 的去重 alert_hash，以及归一化后的 Telegram 正文。
-// 这是全 Go 端口 make-or-break 的 oracle——Phase 1 的 internal/dedup 与 internal/notify 必须逐字节复刻。
-// 向量由 build/golden/capture.sh 生成；不要手改 testdata/scenarios.json。
+// Package golden 提供迁移期间从 2.x Bash 运行时捕获并冻结的黄金向量（known-answer vectors）：
+// 给定受控场景，记录其 STATE_FILE 去重 alert_hash 与归一化后的 Telegram 正文。这些向量用于阻止
+// 全 Go 实现意外改变兼容输出；原捕获器和 Bash 运行时已在 3.0.0 中删除。
 //
-// Package golden provides known-answer vectors captured from the REAL Bash runtime: for a controlled
-// scenario, the dedup alert_hash that files/security-update-notify actually writes to STATE_FILE, plus the
-// normalized Telegram body. This is the make-or-break oracle for the full Go port — Phase 1's
-// internal/dedup and internal/notify must reproduce both byte-for-byte. Regenerate via
-// build/golden/capture.sh; do not hand-edit testdata/scenarios.json.
+// Package golden provides frozen known-answer vectors captured from the 2.x Bash runtime during the
+// migration. They record the dedup alert_hash and normalized Telegram body for controlled scenarios and
+// prevent the all-Go implementation from accidentally changing compatible output. The capture tool and
+// Bash runtime were removed in 3.0.0.
 package golden
 
 import (

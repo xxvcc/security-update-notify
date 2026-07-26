@@ -151,6 +151,22 @@ Unattended-Upgrade::Automatic-Reboot "false";`
 	if issues := CheckAPTPolicy(strings.Replace(apt, `"1"`, `"0"`, 1), false); len(issues) < 2 {
 		t.Fatalf("drifted apt policy issues=%v", issues)
 	}
+	for _, value := range []string{"1", "true", "yes", "on"} {
+		aptEquivalentTrue := `APT::Periodic::Update-Package-Lists "` + value + `";
+APT::Periodic::Unattended-Upgrade "` + value + `";
+Unattended-Upgrade::Origins-Pattern:: "origin=Debian,label=Debian-Security";
+Unattended-Upgrade::Automatic-Reboot "false";`
+		if issues := CheckAPTPolicy(aptEquivalentTrue, true); len(issues) != 0 {
+			t.Errorf("APT true value %q issues=%v", value, issues)
+		}
+	}
+	for _, value := range []string{"1", "true", "yes", "on"} {
+		aptAutoReboot := strings.Replace(apt, `"false"`, `"`+value+`"`, 1)
+		issues := CheckAPTPolicy(aptAutoReboot, true)
+		if len(issues) != 1 || issues[0].Code != "apt-auto-reboot-enabled" {
+			t.Errorf("APT automatic-reboot value %q issues=%v", value, issues)
+		}
+	}
 	dnf := "[commands]\nupgrade_type = security\napply_updates = yes\n"
 	if issues := CheckDNFPolicy(dnf); len(issues) != 0 {
 		t.Fatalf("healthy dnf policy issues=%v", issues)

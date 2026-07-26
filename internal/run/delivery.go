@@ -3,6 +3,7 @@ package run
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +29,7 @@ const (
 	feishuCredentialName           = "feishu_app_secret"
 	defaultFeishuEncryptedCredPath = "/etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred"
 	defaultFeishuPlainCredPath     = "/etc/security-update-notify/credentials/feishu-app-secret"
+	maxFeishuSecretBytes           = 64 << 10
 )
 
 type telegramSender struct {
@@ -109,51 +111,107 @@ func senderFor(cfg *config.Config, name string) (delivery.Sender, error) {
 
 func readFeishuSecret() (string, error) {
 	if dir := os.Getenv("CREDENTIALS_DIRECTORY"); dir != "" {
-		if secret, err := readSecretFile(filepath.Join(dir, feishuCredentialName)); err == nil {
-			return secret, nil
-		}
+		// systemd's credential directory is authoritative. Falling back after a missing or unreadable
+		// LoadCredential entry could silently use stale host credentials that the unit did not load.
+		return readSecretFile(filepath.Join(dir, feishuCredentialName))
 	}
 	if path := os.Getenv(feishuSecretFileEnv); path != "" {
 		return readSecretFile(path)
 	}
-	path := os.Getenv(feishuEncryptedCredentialEnv)
-	if path == "" {
+	path, encryptedPathSet := os.LookupEnv(feishuEncryptedCredentialEnv)
+	if !encryptedPathSet {
 		path = defaultFeishuEncryptedCredPath
 	}
-	if _, err := os.Stat(path); err == nil {
-		cmd := exec.Command("systemd-creds", "decrypt", "--name="+feishuCredentialName, path, "-")
-		out, err := cmd.Output()
-		if err != nil {
-			return "", fmt.Errorf("failed to decrypt Feishu app secret credential")
+	if path != "" {
+		if err := validateSecretPath(path); err == nil {
+			return decryptFeishuSecret(path)
+		} else if !os.IsNotExist(err) || encryptedPathSet {
+			return "", fmt.Errorf("Feishu app secret credential is unavailable")
 		}
-		secret := strings.TrimRight(string(out), "\r\n")
-		if secret == "" {
-			return "", fmt.Errorf("Feishu app secret credential is empty")
-		}
-		return secret, nil
-	} else if !os.IsNotExist(err) {
-		return "", fmt.Errorf("Feishu app secret credential is unavailable")
 	}
-	plainPath := os.Getenv(feishuPlainCredentialEnv)
-	if plainPath == "" {
+	plainPath, plainPathSet := os.LookupEnv(feishuPlainCredentialEnv)
+	if !plainPathSet {
 		plainPath = defaultFeishuPlainCredPath
 	}
-	if _, err := os.Stat(plainPath); err == nil {
-		return readSecretFile(plainPath)
-	} else if !os.IsNotExist(err) {
-		return "", fmt.Errorf("Feishu app secret credential is unavailable")
+	if plainPath != "" {
+		if err := validateSecretPath(plainPath); err == nil {
+			return readSecretFile(plainPath)
+		} else if !os.IsNotExist(err) || plainPathSet {
+			return "", fmt.Errorf("Feishu app secret credential is unavailable")
+		}
 	}
 	return "", fmt.Errorf("Feishu app secret credential is unavailable")
 }
 
+func validateSecretPath(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("Feishu app secret credential is not a regular file")
+	}
+	return nil
+}
+
+type limitedSecretOutput struct {
+	data []byte
+}
+
+func (w *limitedSecretOutput) Write(p []byte) (int, error) {
+	if remaining := maxFeishuSecretBytes + 1 - len(w.data); remaining > 0 {
+		if len(p) < remaining {
+			remaining = len(p)
+		}
+		w.data = append(w.data, p[:remaining]...)
+	}
+	return len(p), nil
+}
+
+func decryptFeishuSecret(path string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "systemd-creds", "decrypt", "--name="+feishuCredentialName, path, "-")
+	out := &limitedSecretOutput{}
+	cmd.Stdout = out
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to decrypt Feishu app secret credential")
+	}
+	return normalizeFeishuSecret(out.data)
+}
+
 func readSecretFile(path string) (string, error) {
-	b, err := os.ReadFile(path)
+	before, err := os.Lstat(path)
+	if err != nil || !before.Mode().IsRegular() {
+		return "", fmt.Errorf("cannot read Feishu app secret credential")
+	}
+	f, err := os.Open(path)
 	if err != nil {
 		return "", fmt.Errorf("cannot read Feishu app secret credential")
+	}
+	defer f.Close()
+	after, err := f.Stat()
+	if err != nil || !after.Mode().IsRegular() || !os.SameFile(before, after) {
+		return "", fmt.Errorf("cannot read Feishu app secret credential")
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxFeishuSecretBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("cannot read Feishu app secret credential")
+	}
+	return normalizeFeishuSecret(b)
+}
+
+func normalizeFeishuSecret(b []byte) (string, error) {
+	if len(b) > maxFeishuSecretBytes {
+		return "", fmt.Errorf("Feishu app secret credential is too large")
 	}
 	secret := strings.TrimRight(string(b), "\r\n")
 	if secret == "" {
 		return "", fmt.Errorf("Feishu app secret credential is empty")
+	}
+	if strings.ContainsAny(secret, "\x00\r\n") {
+		return "", fmt.Errorf("Feishu app secret credential contains invalid line breaks")
 	}
 	return secret, nil
 }

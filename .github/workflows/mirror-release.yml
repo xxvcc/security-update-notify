@@ -35,7 +35,7 @@ jobs:
           MIRROR_KNOWN_HOSTS: ${{ secrets.MIRROR_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
-          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z.-]+)?$ ]] || {
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z]+)?$ && "${#TAG}" -le 65 ]] || {
             echo "::error::invalid release tag: $TAG"
             exit 2
           }
@@ -43,10 +43,44 @@ jobs:
             echo "::error::invalid MIRROR_BASE_URL"
             exit 2
           }
-          [[ -n "$MIRROR_HOST" && "$MIRROR_PORT" =~ ^[0-9]+$ && -n "$MIRROR_USER" ]] || {
+          [[ "$MIRROR_USER" =~ ^[A-Za-z_][A-Za-z0-9._-]{0,31}$ ]] || {
             echo "::error::mirror SSH variables are incomplete"
             exit 2
           }
+          python3 - "$MIRROR_BASE_URL" "$MIRROR_HOST" "$MIRROR_PORT" <<'PY'
+          import ipaddress
+          import re
+          import sys
+          import urllib.parse
+
+          base_url, ssh_host, ssh_port = sys.argv[1:]
+          try:
+              parsed = urllib.parse.urlsplit(base_url)
+              port = parsed.port
+          except ValueError as exc:
+              raise SystemExit(f"invalid MIRROR_BASE_URL: {exc}")
+          if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+                  or parsed.query or parsed.fragment or port is not None and not 1 <= port <= 65535):
+              raise SystemExit("invalid MIRROR_BASE_URL components")
+          if any(part in (".", "..") for part in parsed.path.split("/")):
+              raise SystemExit("MIRROR_BASE_URL must not contain dot path segments")
+
+          if not ssh_host or len(ssh_host) > 253 or ":" in ssh_host:
+              raise SystemExit("invalid MIRROR_HOST")
+          if re.fullmatch(r"[0-9.]+", ssh_host):
+              try:
+                  if ipaddress.ip_address(ssh_host).version != 4:
+                      raise ValueError
+              except ValueError:
+                  raise SystemExit("invalid IPv4 MIRROR_HOST")
+          else:
+              labels = ssh_host.rstrip(".").split(".")
+              if any(not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                     for label in labels):
+                  raise SystemExit("invalid DNS MIRROR_HOST")
+          if not re.fullmatch(r"[0-9]{1,5}", ssh_port) or not 1 <= int(ssh_port) <= 65535:
+              raise SystemExit("invalid MIRROR_PORT")
+          PY
           [[ -n "$MIRROR_SSH_KEY" && -n "$MIRROR_KNOWN_HOSTS" ]] || {
             echo "::error::mirror SSH secrets are incomplete"
             exit 2
@@ -69,6 +103,11 @@ jobs:
           set -euo pipefail
           version="${TAG#v}"
           tarball="security-update-notify-${version}.tar.gz"
+          source_version="$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' VERSION)"
+          [[ "$source_version" == "$version" && "$(wc -l < VERSION)" -eq 1 ]] || {
+            echo "::error::released source VERSION is not bound to $TAG"
+            exit 1
+          }
           [[ -f "rel/$tarball" && -f "rel/$tarball.sha256" && -f "rel/$tarball.asc" ]] || {
             echo "::error::release must contain exactly the signed asset set for $tarball"
             exit 1
@@ -77,15 +116,54 @@ jobs:
             echo "::error::unexpected release asset set"
             exit 1
           }
-          pin="$(awk -F= '/^RELEASE_SIGNING_FINGERPRINT=/{gsub(/["'\''[:space:]]/, "", $2); print $2; exit}' files/security-update-notify)"
-          [[ "$pin" =~ ^[0-9A-Fa-f]{40}$ ]] || { echo "::error::invalid pinned fingerprint"; exit 1; }
-          export GNUPGHOME="$(mktemp -d)"
+          [[ "$(stat -c %s "rel/$tarball")" -gt 0 && "$(stat -c %s "rel/$tarball")" -le 268435456 ]] || {
+            echo "::error::release tarball has an invalid size"
+            exit 1
+          }
+          for metadata in "$tarball.sha256" "$tarball.asc"; do
+            [[ "$(stat -c %s "rel/$metadata")" -gt 0 && "$(stat -c %s "rel/$metadata")" -le 1048576 ]] || {
+              echo "::error::$metadata has an invalid size"
+              exit 1
+            }
+          done
+          [[ "$(wc -l < "rel/$tarball.sha256")" -eq 1 ]] || {
+            echo "::error::checksum manifest must contain exactly one line"
+            exit 1
+          }
+          read -r expected_sha expected_name extra < "rel/$tarball.sha256"
+          [[ "$expected_sha" =~ ^[0-9a-f]{64}$ \
+             && "$expected_name" == "$tarball" \
+             && -z "${extra:-}" ]] || {
+            echo "::error::checksum manifest is not bound to $tarball"
+            exit 1
+          }
+          pin="$(sed -n 's/^RELEASE_SIGNING_FINGERPRINT="\([0-9A-Fa-f]\{40\}\)"$/\1/p' sun.sh)"
+          [[ "$pin" =~ ^[0-9A-Fa-f]{40}$ \
+             && "$(grep -c '^RELEASE_SIGNING_FINGERPRINT=' sun.sh)" -eq 1 ]] \
+            || { echo "::error::invalid pinned fingerprint"; exit 1; }
+          GNUPGHOME="$(mktemp -d)"
+          export GNUPGHOME
           chmod 700 "$GNUPGHOME"
           gpg --batch --import files/release-signing.pub.asc
-          have="$(gpg --batch --with-colons --list-keys | awk -F: '$1=="fpr" {print $10; exit}')"
-          [[ "$have" == "$pin" ]] || { echo "::error::public key fingerprint mismatch"; exit 1; }
-          (cd rel && sha256sum -c "$tarball.sha256")
-          gpg --batch --verify "rel/$tarball.asc" "rel/$tarball"
+          mapfile -t primary_fingerprints < <(
+            gpg --batch --with-colons --list-keys |
+              awk -F: '$1 == "pub" {want = 1; next} want && $1 == "fpr" {print $10; want = 0}'
+          )
+          [[ "${#primary_fingerprints[@]}" -eq 1 && "${primary_fingerprints[0]}" == "$pin" ]] || {
+            echo "::error::release keyring is not exactly the pinned primary key"
+            exit 1
+          }
+          actual_sha="$(sha256sum "rel/$tarball" | awk '{print $1}')"
+          [[ "$actual_sha" == "$expected_sha" ]] || { echo "::error::checksum mismatch"; exit 1; }
+          verify_log="$(mktemp)"
+          status="$(gpg --batch --status-fd=1 --verify "rel/$tarball.asc" "rel/$tarball" 2>"$verify_log")" || {
+            cat "$verify_log" >&2
+            exit 1
+          }
+          awk -v pin="$pin" '$1 == "[GNUPG:]" && $2 == "VALIDSIG" && ($3 == pin || $NF == pin) {valid = 1} END {exit !valid}' \
+            <<<"$status" || { echo "::error::signature is not bound to the pinned primary key"; exit 1; }
+          epoch="$(git show -s --format=%ct HEAD)"
+          python3 build/release-archive-test.py "rel/$tarball" "$version" "$epoch" .
           printf 'VERSION=%s\nTARBALL=%s\nPIN=%s\n' "$version" "$tarball" "$pin" >> "$GITHUB_ENV"
 
       - name: Prepare immutable release directory and latest files
@@ -167,14 +245,28 @@ jobs:
               --proto '=https' --proto-redir '=https' \
               --output "public-check/$asset" \
               "$MIRROR_BASE_URL/$TAG/$asset?run=$GITHUB_RUN_ID"
+            cmp "deploy/$TAG/$asset" "public-check/$asset"
           done
           (cd public-check && sha256sum -c "$TARBALL.sha256")
-          export GNUPGHOME="$(mktemp -d)"
+          GNUPGHOME="$(mktemp -d)"
+          export GNUPGHOME
           chmod 700 "$GNUPGHOME"
           gpg --batch --import files/release-signing.pub.asc
-          have="$(gpg --batch --with-colons --list-keys | awk -F: '$1=="fpr" {print $10; exit}')"
-          [[ "$have" == "$PIN" ]] || { echo "::error::public verification key fingerprint mismatch"; exit 1; }
-          gpg --batch --verify "public-check/$TARBALL.asc" "public-check/$TARBALL"
+          mapfile -t primary_fingerprints < <(
+            gpg --batch --with-colons --list-keys |
+              awk -F: '$1 == "pub" {want = 1; next} want && $1 == "fpr" {print $10; want = 0}'
+          )
+          [[ "${#primary_fingerprints[@]}" -eq 1 && "${primary_fingerprints[0]}" == "$PIN" ]] || {
+            echo "::error::public verification keyring is not exactly the pinned primary key"
+            exit 1
+          }
+          verify_log="$(mktemp)"
+          status="$(gpg --batch --status-fd=1 --verify "public-check/$TARBALL.asc" "public-check/$TARBALL" 2>"$verify_log")" || {
+            cat "$verify_log" >&2
+            exit 1
+          }
+          awk -v pin="$PIN" '$1 == "[GNUPG:]" && $2 == "VALIDSIG" && ($3 == pin || $NF == pin) {valid = 1} END {exit !valid}' \
+            <<<"$status" || { echo "::error::public signature is not bound to the pinned primary key"; exit 1; }
           if [[ "$BOOTSTRAP_PRESENT" == "1" ]]; then
             cmp "deploy/$TAG/sun.sh" public-check/sun.sh
           fi

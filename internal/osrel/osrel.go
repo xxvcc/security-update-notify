@@ -1,11 +1,9 @@
-// Package osrel 解析 /etc/os-release 并做后端探测与支持分级，取代 files/lib.sh 与运行时内联的
-// os-release 解析。AutoBackend 复刻“运行时”的 BACKEND=auto 语义（BACKEND 是去重 hash 字段，必须一致）；
-// SupportTier 复刻安装器 lib.sh 的 supported/best-effort/unsupported 分级。
+// Package osrel 解析 /etc/os-release 并做后端探测与支持分级。AutoBackend 保留稳定的 BACKEND=auto
+// 语义（BACKEND 是去重 hash 字段，必须一致）；SupportTier 提供 supported/best-effort/unsupported 分级。
 //
-// Package osrel parses /etc/os-release and does backend detection + support tiering, replacing files/lib.sh
-// and the runtime's inline os-release parsing. AutoBackend reproduces the RUNTIME's BACKEND=auto semantics
-// (BACKEND is a dedup-hash field, so it must match); SupportTier reproduces the installer's lib.sh
-// supported/best-effort/unsupported tiering.
+// Package osrel parses /etc/os-release and performs backend detection plus support tiering. AutoBackend
+// retains the stable BACKEND=auto semantics (BACKEND is a dedup-hash field, so it must match); SupportTier
+// provides the supported/best-effort/unsupported classification.
 package osrel
 
 import (
@@ -23,7 +21,7 @@ type OSRelease struct {
 }
 
 // Read 解析 os-release 文件（缺失返回零值）。只取 ID/VERSION_ID/PRETTY_NAME/ID_LIKE，剥离一层引号，
-// 复刻运行时与 lib.sh 的解析（不做变量展开）。
+// 保留 2.x 的兼容解析语义（不做变量展开）。
 func Read(path string) OSRelease {
 	var o OSRelease
 	f, err := os.Open(path)
@@ -55,8 +53,8 @@ func Read(path string) OSRelease {
 	return o
 }
 
-// unquote 顺序剥离（先双引号再单引号），与 files/lib.sh 与运行时 os-release 解析的两条连续
-// 语句一致：值 "'debian'" 会被剥成 debian（早返回则只剥一层，导致与 Bash 侧 BACKEND 解析分歧）。
+// unquote 顺序剥离（先双引号再单引号），保留 2.x 配置与 os-release 解析语义：值
+// "'debian'" 会被剥成 debian；早返回只剥一层，会改变既有 BACKEND 自动判定结果。
 func unquote(v string) string {
 	if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
 		v = v[1 : len(v)-1]
@@ -67,7 +65,7 @@ func unquote(v string) string {
 	return v
 }
 
-// AutoBackend 复刻运行时 BACKEND=auto 的判定：debian/ubuntu→apt；rhel/rocky/almalinux/fedora/centos/
+// AutoBackend 保留 BACKEND=auto 的既有判定：debian/ubuntu→apt；rhel/rocky/almalinux/fedora/centos/
 // amzn→dnf；否则用 ID_LIKE 兜底（*debian*/*ubuntu*→apt，*rhel*/*fedora*/*centos*→dnf），仍无则 unknown。
 func AutoBackend(o OSRelease) string {
 	switch o.ID {

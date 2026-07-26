@@ -1,6 +1,7 @@
 package run
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -85,6 +86,29 @@ func TestDeliverChannelsPartialFailureDoesNotRepeatSuccess(t *testing.T) {
 				t.Fatalf("failed %s channel must not persist delivery state", failed)
 			}
 		})
+	}
+}
+
+func TestDeliverChannelsReportsStatePersistenceFailure(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(statePath, []byte("marker\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SECURITY_UPDATE_NOTIFY_STATE_DIR", statePath)
+	t.Setenv("SECURITY_UPDATE_NOTIFY_LOG_FILE", filepath.Join(t.TempDir(), "notify.log"))
+	cfg := loadDeliveryConfig(t, "NOTIFY_CHANNELS=telegram\nDEDUP_MODE=once\n")
+	sends := 0
+	factory := func(_ *config.Config, name string) (delivery.Sender, error) {
+		return &fakeSender{name: name, sends: &sends}, nil
+	}
+
+	rc := deliverChannels(cfg, []string{"telegram"}, delivery.Message{Text: "message"}, "hash", "apt", "host", true, true, false, 100, factory)
+	if rc != 1 || sends != 1 {
+		t.Fatalf("rc=%d sends=%d want 1,1", rc, sends)
+	}
+	contents, err := os.ReadFile(statePath)
+	if err != nil || string(contents) != "marker\n" {
+		t.Fatalf("state path changed: contents=%q err=%v", contents, err)
 	}
 }
 
@@ -205,11 +229,70 @@ func TestReadFeishuSecretFromPlainCredentialFallback(t *testing.T) {
 	}
 	t.Setenv("CREDENTIALS_DIRECTORY", "")
 	t.Setenv(feishuSecretFileEnv, "")
-	t.Setenv(feishuEncryptedCredentialEnv, filepath.Join(t.TempDir(), "missing-encrypted"))
+	t.Setenv(feishuEncryptedCredentialEnv, "")
 	t.Setenv(feishuPlainCredentialEnv, path)
 	got, err := readFeishuSecret()
 	if err != nil || got != "plain-secret" {
 		t.Fatalf("secret=%q err=%v", got, err)
+	}
+}
+
+func TestCredentialDirectoryFailureDoesNotFallBack(t *testing.T) {
+	dir := t.TempDir()
+	fallback := filepath.Join(t.TempDir(), "fallback-secret")
+	if err := os.WriteFile(fallback, []byte("stale-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CREDENTIALS_DIRECTORY", dir)
+	t.Setenv(feishuSecretFileEnv, fallback)
+	if _, err := readFeishuSecret(); err == nil {
+		t.Fatal("missing systemd credential unexpectedly fell back to a host credential")
+	}
+}
+
+func TestExplicitEncryptedCredentialFailureDoesNotFallBack(t *testing.T) {
+	plain := filepath.Join(t.TempDir(), "plain-secret")
+	if err := os.WriteFile(plain, []byte("stale-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CREDENTIALS_DIRECTORY", "")
+	t.Setenv(feishuSecretFileEnv, "")
+	t.Setenv(feishuEncryptedCredentialEnv, filepath.Join(t.TempDir(), "missing-encrypted"))
+	t.Setenv(feishuPlainCredentialEnv, plain)
+	if _, err := readFeishuSecret(); err == nil {
+		t.Fatal("missing explicit encrypted credential unexpectedly fell back to plaintext")
+	}
+}
+
+func TestReadFeishuSecretRejectsOversizedAndMultilineValues(t *testing.T) {
+	for name, body := range map[string][]byte{
+		"oversized": bytes.Repeat([]byte("x"), maxFeishuSecretBytes+1),
+		"multiline": []byte("first\nsecond"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "secret")
+			if err := os.WriteFile(path, body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readSecretFile(path); err == nil {
+				t.Fatal("invalid secret was accepted")
+			}
+		})
+	}
+}
+
+func TestReadFeishuSecretRejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	link := filepath.Join(dir, "link")
+	if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readSecretFile(link); err == nil {
+		t.Fatal("symlinked secret was accepted")
 	}
 }
 

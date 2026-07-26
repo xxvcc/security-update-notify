@@ -36,6 +36,40 @@ func TestSendMissingChat(t *testing.T) {
 	}
 }
 
+func TestRejectsRemotePlaintextBaseURL(t *testing.T) {
+	c := &Client{HTTP: http.DefaultClient, BaseURL: "http://api.example.com"}
+	if err := c.GetMe(context.Background(), "123456:fake_TOKEN"); err == nil {
+		t.Fatal("GetMe accepted a remote plaintext base URL")
+	}
+	if err := c.SendMessage(context.Background(), "123456:fake_TOKEN", "123", "text"); err == nil {
+		t.Fatal("SendMessage accepted a remote plaintext base URL")
+	}
+}
+
+func TestDoesNotFollowCredentialBearingRedirect(t *testing.T) {
+	var targetRequests int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&targetRequests, 1)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer target.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", target.URL)
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+	c := &Client{HTTP: source.Client(), BaseURL: source.URL}
+	if err := c.GetMe(context.Background(), "123:secret"); err == nil {
+		t.Fatal("GetMe accepted a redirect")
+	}
+	if err := c.SendMessage(context.Background(), "123:secret", "-100", "text"); err == nil {
+		t.Fatal("SendMessage accepted a redirect")
+	}
+	if got := atomic.LoadInt32(&targetRequests); got != 0 {
+		t.Fatalf("credential-bearing redirect reached target %d times", got)
+	}
+}
+
 func TestSendSuccess(t *testing.T) {
 	var n int32
 	c, srv, _ := newTestClient(func(w http.ResponseWriter, r *http.Request) {
@@ -60,6 +94,8 @@ func TestSendOKFalseNoRetry(t *testing.T) {
 	defer srv.Close()
 	if err := c.SendMessage(context.Background(), "123:abc", "-100", "hi"); err == nil {
 		t.Error("expected error on ok=false")
+	} else if IsTemporary(err) {
+		t.Errorf("ok=false error=%v, want permanent", err)
 	}
 	if n != 1 {
 		t.Errorf("requests=%d want 1 (ok=false is not retried)", n)
@@ -95,17 +131,36 @@ func TestSend5xxExhausts(t *testing.T) {
 	var n int32
 	c, srv, slept := newTestClient(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&n, 1)
-		w.WriteHeader(503)
+		w.WriteHeader(520)
 	})
 	defer srv.Close()
 	if err := c.SendMessage(context.Background(), "123:abc", "-100", "hi"); err == nil {
 		t.Error("expected error after exhausting retries")
+	} else if !IsTemporary(err) {
+		t.Errorf("exhausted 5xx error=%v, want temporary", err)
 	}
 	if n != 3 {
 		t.Errorf("requests=%d want 3", n)
 	}
 	if *slept != 2 {
 		t.Errorf("slept=%d want 2", *slept)
+	}
+}
+
+func TestOversizedResponseRejected(t *testing.T) {
+	c, srv, _ := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, strings.Repeat("x", maxRespBytes+1))
+	})
+	defer srv.Close()
+	if err := c.GetMe(context.Background(), "123:abc"); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("GetMe error=%v want too large", err)
+	} else if !IsTemporary(err) {
+		t.Fatalf("GetMe oversized response error=%v, want temporary", err)
+	}
+	if err := c.SendMessage(context.Background(), "123:abc", "-100", "hi"); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("SendMessage error=%v want too large", err)
+	} else if !IsTemporary(err) {
+		t.Fatalf("SendMessage oversized response error=%v, want temporary", err)
 	}
 }
 
@@ -122,6 +177,33 @@ func TestSend4xxPermanent(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("requests=%d want 1 (400 is permanent)", n)
+	}
+}
+
+func TestSendRejectsNon2xxOKResponse(t *testing.T) {
+	var n int32
+	c, srv, slept := newTestClient(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&n, 1)
+		w.WriteHeader(http.StatusMultipleChoices)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	})
+	defer srv.Close()
+	if err := c.SendMessage(context.Background(), "123:abc", "-100", "hi"); err == nil {
+		t.Fatal("3xx response with ok=true was accepted")
+	}
+	if n != 1 || *slept != 0 {
+		t.Fatalf("requests=%d sleeps=%d want 1,0", n, *slept)
+	}
+}
+
+func TestSendTruncatesOKFalseError(t *testing.T) {
+	c, srv, _ := newTestClient(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"ok":false,"description":"`+strings.Repeat("x", 1000)+`"}`)
+	})
+	defer srv.Close()
+	err := c.SendMessage(context.Background(), "123:abc", "-100", "hi")
+	if err == nil || len(err.Error()) > 300 {
+		t.Fatalf("error length=%d err=%v", len(err.Error()), err)
 	}
 }
 
@@ -162,4 +244,53 @@ func TestGetMe(t *testing.T) {
 	if err := c.GetMe(context.Background(), "bad token"); err != ErrBadToken {
 		t.Errorf("err=%v want ErrBadToken", err)
 	}
+}
+
+func TestGetMeTemporaryClassification(t *testing.T) {
+	t.Run("server failure", func(t *testing.T) {
+		var requests int32
+		c, srv, _ := newTestClient(func(w http.ResponseWriter, _ *http.Request) {
+			atomic.AddInt32(&requests, 1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+		})
+		defer srv.Close()
+		err := c.GetMe(context.Background(), "123:abc")
+		if !IsTemporary(err) {
+			t.Fatalf("error=%v, want temporary", err)
+		}
+		if requests != 3 {
+			t.Fatalf("requests=%d, want 3", requests)
+		}
+	})
+
+	t.Run("invalid response", func(t *testing.T) {
+		c, srv, _ := newTestClient(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, "not-json")
+		})
+		defer srv.Close()
+		err := c.GetMe(context.Background(), "123:abc")
+		if !IsTemporary(err) {
+			t.Fatalf("error=%v, want temporary", err)
+		}
+	})
+
+	t.Run("network failure", func(t *testing.T) {
+		c, srv, _ := newTestClient(func(http.ResponseWriter, *http.Request) {})
+		srv.Close()
+		err := c.GetMe(context.Background(), "123:abc")
+		if !IsTemporary(err) {
+			t.Fatalf("error=%v, want temporary", err)
+		}
+	})
+
+	t.Run("credential rejection", func(t *testing.T) {
+		c, srv, _ := newTestClient(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+		})
+		defer srv.Close()
+		err := c.GetMe(context.Background(), "123:abc")
+		if err == nil || IsTemporary(err) {
+			t.Fatalf("error=%v temporary=%v, want permanent", err, IsTemporary(err))
+		}
+	})
 }

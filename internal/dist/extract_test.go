@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -42,20 +43,20 @@ func TestExtractGood(t *testing.T) {
 	tgz := filepath.Join(dir, "a.tar.gz")
 	writeTarGz(t, tgz, []*tar.Header{
 		{Name: "top/", Typeflag: tar.TypeDir, Mode: 0o755},
-		{Name: "top/install.sh", Typeflag: tar.TypeReg, Mode: 0o6755}, // setuid 位应被剥离
+		{Name: "top/files/runtime", Typeflag: tar.TypeReg, Mode: 0o6755}, // setuid 位应被剥离
 		{Name: "top/files/x", Typeflag: tar.TypeReg, Mode: 0o644},
-	}, map[string]string{"top/install.sh": "#!/bin/sh\n", "top/files/x": "hi"})
+	}, map[string]string{"top/files/runtime": "runtime", "top/files/x": "hi"})
 
 	dest := filepath.Join(dir, "out")
 	os.MkdirAll(dest, 0o755)
 	if err := Extract(tgz, dest); err != nil {
 		t.Fatal(err)
 	}
-	b, err := os.ReadFile(filepath.Join(dest, "top/install.sh"))
-	if err != nil || string(b) != "#!/bin/sh\n" {
-		t.Errorf("install.sh content=%q err=%v", b, err)
+	b, err := os.ReadFile(filepath.Join(dest, "top/files/runtime"))
+	if err != nil || string(b) != "runtime" {
+		t.Errorf("runtime content=%q err=%v", b, err)
 	}
-	fi, _ := os.Stat(filepath.Join(dest, "top/install.sh"))
+	fi, _ := os.Stat(filepath.Join(dest, "top/files/runtime"))
 	if fi.Mode()&os.ModeSetuid != 0 {
 		t.Error("setuid bit was not stripped")
 	}
@@ -94,9 +95,30 @@ func TestVerifySHA256(t *testing.T) {
 	if err := VerifySHA256(data, shaFile); err != nil {
 		t.Errorf("VerifySHA256 good: %v", err)
 	}
-	os.WriteFile(shaFile, []byte("deadbeef\n"), 0o644)
+	malformed := map[string]string{
+		"short digest":   "deadbeef\n",
+		"wrong filename": hex.EncodeToString(sum[:]) + "  other.tar.gz\n",
+		"multiple lines": hex.EncodeToString(sum[:]) + "  pkg.tar.gz\n" + hex.EncodeToString(sum[:]) + "  other.tar.gz\n",
+		"one space":      hex.EncodeToString(sum[:]) + " pkg.tar.gz\n",
+		"binary marker":  hex.EncodeToString(sum[:]) + " *pkg.tar.gz\n",
+		"no newline":     hex.EncodeToString(sum[:]) + "  pkg.tar.gz",
+		"trailing space": hex.EncodeToString(sum[:]) + "  pkg.tar.gz \n",
+	}
+	for name, contents := range malformed {
+		t.Run(name, func(t *testing.T) {
+			if err := os.WriteFile(shaFile, []byte(contents), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := VerifySHA256(data, shaFile); err == nil {
+				t.Fatal("malformed checksum file was accepted")
+			}
+		})
+	}
+	if err := os.WriteFile(shaFile, []byte(strings.Repeat("x", maxReleaseMetadataBytes+1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := VerifySHA256(data, shaFile); err == nil {
-		t.Error("VerifySHA256 should reject non-64-hex")
+		t.Error("oversized checksum file was accepted")
 	}
 }
 
