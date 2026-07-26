@@ -31,7 +31,7 @@ func TestUninstallNormalRemovesRuntimeAndPreservesUserData(t *testing.T) {
 	}
 
 	var calls [][]string
-	report, err := Uninstall(Options{
+	report, err := uninstallAsRoot(Options{
 		RootDir: root,
 		RunCommand: func(name string, args ...string) sysexec.Result {
 			calls = append(calls, append([]string{name}, args...))
@@ -97,7 +97,7 @@ func TestPurgeRestoresFixedAPTBackupAndRemovesSensitiveData(t *testing.T) {
 		writeFixture(t, root, path, "secret")
 	}
 
-	report, err := Uninstall(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner})
+	report, err := uninstallAsRoot(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner})
 	if err != nil {
 		t.Fatalf("Uninstall(purge) error = %v", err)
 	}
@@ -132,7 +132,7 @@ func TestPurgeDoesNotRestoreAPTTimestampWhenFixedBackupMissing(t *testing.T) {
 	setMtime(t, old, time.Unix(100, 0))
 	setMtime(t, newer, time.Unix(200, 0))
 
-	report, err := Uninstall(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner})
+	report, err := uninstallAsRoot(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner})
 	if err != nil {
 		t.Fatalf("Uninstall(purge) error = %v", err)
 	}
@@ -154,7 +154,7 @@ func TestPurgeRestoresNewestProjectDNFBackupAndCleansProjectBackups(t *testing.T
 	setMtime(t, newer, time.Unix(200, 0))
 	setMtime(t, legacy, time.Unix(300, 0))
 
-	report, err := Uninstall(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner})
+	report, err := uninstallAsRoot(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner})
 	if err != nil {
 		t.Fatalf("Uninstall(purge) error = %v", err)
 	}
@@ -177,7 +177,7 @@ func TestPurgeFallsBackToNewestLegacyDNFBackupWithoutDeletingIt(t *testing.T) {
 	setMtime(t, old, time.Unix(100, 0))
 	setMtime(t, newer, time.Unix(200, 0))
 
-	report, err := Uninstall(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner})
+	report, err := uninstallAsRoot(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner})
 	if err != nil {
 		t.Fatalf("Uninstall(purge) error = %v", err)
 	}
@@ -200,7 +200,7 @@ func TestPurgeRejectsSymlinkBackupAndPreservesIt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := Uninstall(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner})
+	_, err := uninstallAsRoot(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner})
 	if err == nil || (!strings.Contains(err.Error(), "not a regular file") && !strings.Contains(err.Error(), "symlinked path")) {
 		t.Fatalf("error = %v, want symlink/non-regular backup error", err)
 	}
@@ -211,7 +211,7 @@ func TestPurgeRejectsSymlinkBackupAndPreservesIt(t *testing.T) {
 }
 
 func TestUninstallRejectsRelativeRoot(t *testing.T) {
-	_, err := Uninstall(Options{RootDir: "relative", RunCommand: successfulRunner})
+	_, err := uninstallAsRoot(Options{RootDir: "relative", RunCommand: successfulRunner})
 	if err == nil || !strings.Contains(err.Error(), "must be absolute") {
 		t.Fatalf("error = %v, want absolute-root error", err)
 	}
@@ -225,7 +225,7 @@ func TestUninstallRefusesUnexpectedDirectoryButContinuesCleanup(t *testing.T) {
 	}
 	writeFixture(t, root, "/etc/systemd/system/security-update-notify.service", "unit")
 
-	_, err := Uninstall(Options{RootDir: root, RunCommand: successfulRunner})
+	_, err := uninstallAsRoot(Options{RootDir: root, RunCommand: successfulRunner})
 	if err == nil || !strings.Contains(err.Error(), "refusing to remove directory") {
 		t.Fatalf("error = %v, want directory refusal", err)
 	}
@@ -245,7 +245,7 @@ func TestPurgeSupportsRootContainingGlobMetacharacters(t *testing.T) {
 	writeFixture(t, root, "/etc/apt/apt.conf.d/20auto-upgrades", "managed")
 	writeFixture(t, root, "/var/log/security-update-notify.log.1", "rotated")
 
-	report, err := Uninstall(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner})
+	report, err := uninstallAsRoot(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner})
 	if err != nil {
 		t.Fatalf("Uninstall(purge) error = %v", err)
 	}
@@ -260,7 +260,7 @@ func TestUninstallLockOrderAndTemporaryFailures(t *testing.T) {
 	t.Run("order", func(t *testing.T) {
 		root := t.TempDir()
 		var events []string
-		_, err := Uninstall(Options{
+		_, err := uninstallAsRoot(Options{
 			RootDir: root,
 			Lock: func(path string, wait time.Duration) (func() error, error) {
 				events = append(events, "lock:"+filepath.Base(path))
@@ -289,7 +289,7 @@ func TestUninstallLockOrderAndTemporaryFailures(t *testing.T) {
 		t.Run(busyLock, func(t *testing.T) {
 			root := t.TempDir()
 			runs := 0
-			_, err := Uninstall(Options{
+			_, err := uninstallAsRoot(Options{
 				RootDir: root,
 				Lock: func(path string, _ time.Duration) (func() error, error) {
 					if filepath.Base(path) == busyLock {
@@ -320,7 +320,7 @@ func TestUninstallRejectsNonRootBeforeLocksOrCommands(t *testing.T) {
 
 func TestUninstallPrivateRootDefaultsToNoHostSystemctl(t *testing.T) {
 	root := t.TempDir()
-	if _, err := Uninstall(Options{RootDir: root}); err != nil {
+	if _, err := uninstallAsRoot(Options{RootDir: root}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -335,7 +335,7 @@ func TestUninstallRejectsSymlinkedParentWithoutEscapingRoot(t *testing.T) {
 	if err := os.Symlink(external, filepath.Join(root, "etc")); err != nil {
 		t.Fatal(err)
 	}
-	_, err := Uninstall(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner})
+	_, err := uninstallAsRoot(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner})
 	if err == nil || !strings.Contains(err.Error(), "symlinked path component") {
 		t.Fatalf("error=%v, want symlink rejection", err)
 	}
@@ -392,7 +392,7 @@ func TestPurgeUnlinksLeafSymlinkWithoutFollowingIt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := Uninstall(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner}); err != nil {
+	if _, err := uninstallAsRoot(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(linked); !errors.Is(err, os.ErrNotExist) {
@@ -405,6 +405,11 @@ func TestPurgeUnlinksLeafSymlinkWithoutFollowingIt(t *testing.T) {
 
 func successfulRunner(string, ...string) sysexec.Result {
 	return sysexec.Result{Code: 0}
+}
+
+func uninstallAsRoot(options Options) (Report, error) {
+	options.EffectiveUID = func() int { return 0 }
+	return Uninstall(options)
 }
 
 func writeFixture(t *testing.T, root, logical, content string) string {

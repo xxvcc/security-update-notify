@@ -30,7 +30,7 @@ func (i *Installer) ReadFeishuSecretFile(name string) ([]byte, error) {
 	if info.Mode().Perm()&0o077 != 0 {
 		return nil, invalid("Feishu App Secret file must not be accessible by group or other users")
 	}
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Uid != 0 {
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Uid != i.rootOwnerUID {
 		return nil, invalid("Feishu App Secret file must be owned by root")
 	}
 	data = trimTerminalNewlines(data)

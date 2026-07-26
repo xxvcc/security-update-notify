@@ -496,7 +496,7 @@ func (i *Installer) regularCredentialExists(name string) (bool, error) {
 	if info.Mode().Perm()&0o077 != 0 {
 		return false, failure("inspect Feishu credential", errors.New("credential must not be accessible by group or other users"))
 	}
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Uid != 0 {
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Uid != i.rootOwnerUID {
 		return false, failure("inspect Feishu credential", errors.New("credential must be owned by root"))
 	}
 	limit := int64(64 << 10)

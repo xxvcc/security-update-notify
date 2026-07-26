@@ -39,7 +39,7 @@ func New(dependencies Dependencies) (*Installer, error) {
 	}
 	return &Installer{
 		fs: dependencies.FS, runner: dependencies.Runner, locker: dependencies.Locker,
-		uid: dependencies.EffectiveUID, now: dependencies.Now,
+		uid: dependencies.EffectiveUID, rootOwnerUID: dependencies.RootOwnerUID, now: dependencies.Now,
 	}, nil
 }
 

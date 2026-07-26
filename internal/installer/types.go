@@ -219,13 +219,17 @@ type Dependencies struct {
 	Runner       Runner
 	Locker       Locker
 	EffectiveUID func() int
+	// RootOwnerUID is the host UID representing root inside a private test root.
+	// Production callers leave it zero.
+	RootOwnerUID uint32
 	Now          func() time.Time
 }
 
 type Installer struct {
-	fs     FileSystem
-	runner Runner
-	locker Locker
-	uid    func() int
-	now    func() time.Time
+	fs           FileSystem
+	runner       Runner
+	locker       Locker
+	uid          func() int
+	rootOwnerUID uint32
+	now          func() time.Time
 }

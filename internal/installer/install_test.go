@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path"
 	"strings"
 	"sync"
@@ -203,7 +204,8 @@ func setupInstaller(t *testing.T, release string) (*Installer, *RootFS, *fakeRun
 	locker := &fakeLocker{}
 	installer, err := New(Dependencies{
 		FS: root, Runner: runner, Locker: locker, EffectiveUID: func() int { return 0 },
-		Now: func() time.Time { return time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC) },
+		RootOwnerUID: uint32(os.Geteuid()),
+		Now:          func() time.Time { return time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC) },
 	})
 	if err != nil {
 		t.Fatal(err)
