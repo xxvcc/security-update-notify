@@ -179,13 +179,26 @@ jobs:
           from pathlib import Path
 
           workflow = Path('.github/workflows/mirror-release.yml').read_text(encoding='utf-8')
+          workflow_sha_ref = 'ref: $' + '{{ github.workflow_sha }}'
+          release_sha_ref = 'ref: $' + '{{ github.event.workflow_run.head_sha || inputs.tag }}'
+          upstream_sha_env = 'EXPECTED_HEAD_SHA: $' + '{{ github.event.workflow_run.head_sha }}'
+          tag_concurrency = 'group: signed-release-mirror-$' + \
+              '{{ github.event.workflow_run.head_branch || inputs.tag || github.run_id }}'
           required = [
-              'group: signed-release-mirror-stable',
               "workflows: ['CI']",
               'environment: release-mirror',
+              tag_concurrency,
               '- name: Require immutable release state',
-              'ref: $' + '{{ github.workflow_sha }}',
+              workflow_sha_ref,
+              release_sha_ref,
               'path: released-source',
+              '- name: Bind release tag to the verified commit',
+              upstream_sha_env,
+              '- name: Install runtime verification tools',
+              '- name: Verify every packaged runtime',
+              '/usr/bin/qemu-aarch64-static',
+              'readelf -W -l "$runtime"',
+              'env -i LC_ALL=C PATH=/usr/bin:/bin',
               '"rel/$tarball" "$version" "$epoch" released-source',
               'cmp "deploy/$TAG/$asset" "public-check/$asset"',
               '- name: Confirm GitHub Latest before stable update',
@@ -197,15 +210,34 @@ jobs:
           for item in required:
               if item not in workflow:
                   raise SystemExit(f'mirror workflow invariant missing: {item}')
-          positions = [workflow.index(item) for item in required[3:]]
+          ordered = [
+              '- name: Require immutable release state',
+              '- name: Checkout the trusted workflow revision',
+              '- name: Checkout the released tag as untrusted data',
+              '- name: Bind release tag to the verified commit',
+              '- name: Install runtime verification tools',
+              '- name: Download release assets',
+              '- name: Verify checksum and pinned GPG signature',
+              '- name: Verify every packaged runtime',
+              '- name: Prepare immutable release directory and latest files',
+              '- name: Configure pinned SSH identity',
+              '- name: Upload immutable signed release files',
+              '- name: Verify release files through the public mirror',
+              '- name: Confirm GitHub Latest before stable update',
+              '- name: Publish stable bootstrap',
+              '- name: Publish latest manifest last',
+          ]
+          positions = [workflow.index(item) for item in ordered]
           if positions != sorted(positions):
               raise SystemExit('stable mirror publication order changed')
           if '\n  release:\n' in workflow or 'python3 released-source/' in workflow:
               raise SystemExit('mirror workflow must not run directly from a release tag')
+          if 'GH_TOKEN:' in workflow.split('    steps:', 1)[0]:
+              raise SystemExit('mirror job must not expose GITHUB_TOKEN to every verification step')
 
           canary = Path('.github/workflows/live-canary.yml').read_text(encoding='utf-8')
-          if 'workflow_call:' not in canary or 'workflow_run:' in canary:
-              raise SystemExit('release-triggered canary must be called by the completed mirror workflow')
+          if 'workflow_call:' not in canary or 'workflow_run:' in canary or '\nconcurrency:' in canary:
+              raise SystemExit('release canary must be directly callable without dropping pending runs')
           PY
 
   package:
@@ -417,7 +449,7 @@ jobs:
             esac
           fi
 
-      - name: Checkout the trusted workflow revision
+      - name: Checkout the release verifier revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.workflow_sha }}
@@ -581,8 +613,20 @@ jobs:
           for arch in amd64 arm64 386 ppc64le s390x; do
             runtime="$package_dir/files/security-update-notify-linux-$arch"
             [[ -x "$runtime" ]] || { echo "::error::missing executable linux/$arch runtime"; exit 1; }
-            if readelf -l "$runtime" | grep -q 'INTERP'; then
-              echo "::error::linux/$arch runtime is dynamically linked"
+            program_headers="$(LC_ALL=C readelf -W -l "$runtime")" || {
+              echo "::error::could not inspect linux/$arch program headers"
+              exit 1
+            }
+            if grep -Eq '(^|[[:space:]])INTERP([[:space:]]|$)' <<<"$program_headers"; then
+              echo "::error::linux/$arch runtime has a dynamic interpreter"
+              exit 1
+            fi
+            dynamic_section="$(LC_ALL=C readelf -W -d "$runtime")" || {
+              echo "::error::could not inspect linux/$arch dynamic section"
+              exit 1
+            }
+            if grep -Fq '(NEEDED)' <<<"$dynamic_section"; then
+              echo "::error::linux/$arch runtime has shared-library dependencies"
               exit 1
             fi
           done

@@ -428,7 +428,7 @@ curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- upgr
 
 已安装 SUN 后，也可以直接运行 `sudo security-update-notify upgrade`。一键安装器和内置升级都会优先读取 `https://dl.ll.cd/security-update-notify/latest.json` 并从同一镜像下载签名资产；镜像索引或完整资产集合传输失败时自动回退 GitHub。下载完成后仍会校验 `.sha256`，并用内置 pin 的指纹强制校验 GPG 签名（默认 fail-closed，缺签名即拒绝）后才升级。镜像只提供传输可用性，不是信任根。
 
-每个正式 GitHub Release 的 CI 全部通过后，`Mirror signed release` 工作流才会重新验签并同步版本化目录。它使用默认分支 workflow revision 中固定的验证器和离线指纹，release tag 只作为不执行的数据；部署密钥位于仅允许 `main` 的 GitHub Environment。新版发布还必须包含 Go 打包器用同一离线密钥生成且绑定明确版本的 `sun.sh.asc`；工作流从已验签归档提取 `sun.sh` 和公钥，复验脚本签名与版本 notation，并从 `dl.ll.cd` 回读完整版本化集合后，才依次更新兼容用稳定 `sun.sh` 和最后的 `latest.json`。手动重跑旧版本只补齐其版本目录，不会覆盖当前稳定入口或 Latest。仓库已经启用不可变 Release；每次镜像成功后以及每周一，独立 GitHub 托管 Ubuntu 22.04/24.04 真机 canary 还会从两个公网源重新下载并实测验签、安装、doctor、dry-run、timer、卸载和 APT 配置恢复。
+正式 GitHub Release 的无部署权限 CI 完成后，`Mirror signed release` 才开始同步；该 CI 只是事件信号和纵深检查，不能自行授权发布。真正的部署门禁来自受保护默认分支的 workflow revision：自动路径按成功 CI 的固定 `head_sha` 检出源码并确认 tag 仍指向同一提交，随后用默认分支固定的离线指纹和验证器重新校验精确资产集、归档、五架构 ELF 身份、静态链接及每个二进制的实际 `--version`，release tag 始终只是不执行的数据。部署密钥只存在于仅允许 `main` 的 GitHub Environment，不再保留仓库级副本；旧的可变 Release 只能从 `main` 手动修复。新版还必须包含 Go 打包器用同一离线密钥生成且绑定明确版本的 `sun.sh.asc`；工作流从已验签归档提取 `sun.sh` 和公钥，复验脚本签名与版本 notation，并从 `dl.ll.cd` 回读完整版本化集合后，才依次更新兼容用稳定 `sun.sh` 和最后的 `latest.json`。手动重跑旧版本只补齐其版本目录，不会覆盖当前稳定入口或 Latest。仓库已经启用不可变 Release；每次镜像成功后以及每周一，独立 GitHub 托管 Ubuntu 22.04/24.04 真机 canary 还会从两个公网源重新下载并实测验签、安装、doctor、dry-run、timer、卸载和 APT 配置恢复。
 
 如果已安装过 SUN，安装器会自动读取 `/etc/security-update-notify/telegram.env` 和现有 timer 时间，并复用未显式覆盖的设置。运行 `sudo security-update-notify configure notifications` 可以事务化更改接收平台、Telegram 配置、飞书应用、App Secret 或接收人。移除接收平台会删除其保存凭据，新增或修改只重复验证受影响的平台；任一步失败都会随安装事务回滚。旧配置没有 `NOTIFY_CHANNELS` 时自动按 `telegram` 处理，未显式覆盖的其他选项继续沿用。
 
@@ -590,7 +590,7 @@ sudo security-update-notify uninstall --purge-config
 
 发布包始终包含 `.sha256` 校验文件。`go run ./cmd/sun-release package` 在可用时生成归档的 `.tar.gz.asc` 和引导器的 `sun.sh.asc` 两份 detached signature；后者还在签名 hashed 子包中写入关键的版本 notation。正式发布或已有对应 tag 时强制两份签名，并会在创建任何 `dist` 文件前拒绝显式 `--sign off`。`sun.sh` 默认以 `required` 模式校验下载的 Release，`auto` 仅作为兼容别名保留，也会要求 gpg 与归档 `.asc` 同时存在；只有显式传入 `--verify-signature off` 才会跳过 Release 签名校验。
 
-根 `VERSION` 是唯一版本源，格式必须严格为 `VERSION="X.Y.Z"`。正式发布（存在对应 `vX.Y.Z` tag，或显式设置 `RELEASE=1`）**强制签名并固定包含五架构 Go 二进制**：Go 发布工具会绑定根版本、唯一 `CHANGELOG` 标题、tag、包内版本和每个二进制的 `--version`，且架构集合不可覆盖；缺少 Go、Bash（仅用于检查 `sun.sh` 语法）、任一 amd64/arm64/386/ppc64le/s390x 架构产物，或固定指纹对应的 GPG 私钥都会失败。正式 GitHub Release 的显式资产是 tarball、checksum、tarball signature 和 `sun.sh.asc`；发布 CI 与镜像门禁都会精确校验这四件资产，并把脚本签名同时绑定到验签归档中的 `sun.sh`、固定主密钥和明确版本。私钥不进入 CI，仍由维护者离线持有。此外，`security-update-notify upgrade` 默认 **fail-closed**：从固定发布镜像优先下载、GitHub 回退，校验 sha256，并在解包前用内置公钥与 pin 指纹强制校验 GPG 签名后才升级（应急可设 `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` 仅按 sha256 升级）。
+根 `VERSION` 是唯一版本源，格式必须严格为 `VERSION="X.Y.Z"`。正式发布（存在对应 `vX.Y.Z` tag，或显式设置 `RELEASE=1`）**强制签名并固定包含五架构 Go 二进制**：Go 发布工具会绑定根版本、唯一 `CHANGELOG` 标题、tag、包内版本和每个二进制的 `--version`，且架构集合不可覆盖；缺少 Go、Bash（仅用于检查 `sun.sh` 语法）、任一 amd64/arm64/386/ppc64le/s390x 架构产物，或固定指纹对应的 GPG 私钥都会失败。正式 GitHub Release 的显式资产是 tarball、checksum、tarball signature 和 `sun.sh.asc`；无特权 release CI 提供前置纵深检查，默认分支上的镜像门禁再独立精确校验这四件资产，并把脚本签名同时绑定到验签归档中的 `sun.sh`、固定主密钥和明确版本。只有后者持有受 Environment 约束的部署能力。私钥不进入 CI，仍由维护者离线持有。此外，`security-update-notify upgrade` 默认 **fail-closed**：从固定发布镜像优先下载、GitHub 回退，校验 sha256，并在解包前用内置公钥与 pin 指纹强制校验 GPG 签名后才升级（应急可设 `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` 仅按 sha256 升级）。
 
 ## 安全说明
 

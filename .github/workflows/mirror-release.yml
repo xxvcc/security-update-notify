@@ -7,16 +7,12 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to mirror, for example v3.0.1
+        description: Release tag to mirror, for example v3.0.2
         required: true
         type: string
 
 permissions:
   contents: read
-
-concurrency:
-  group: signed-release-mirror-stable
-  cancel-in-progress: false
 
 jobs:
   verify-and-sync:
@@ -25,10 +21,12 @@ jobs:
       (github.event.workflow_run.event == 'release' &&
        github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     environment: release-mirror
+    concurrency:
+      group: signed-release-mirror-${{ github.event.workflow_run.head_branch || inputs.tag || github.run_id }}
+      cancel-in-progress: false
     env:
-      GH_TOKEN: ${{ github.token }}
       TAG: ${{ github.event.workflow_run.head_branch || inputs.tag }}
       MIRROR_BASE_URL: ${{ vars.MIRROR_BASE_URL }}
       MIRROR_HOST: ${{ vars.MIRROR_HOST }}
@@ -36,9 +34,6 @@ jobs:
       MIRROR_USER: ${{ vars.MIRROR_USER }}
     steps:
       - name: Validate deployment configuration
-        env:
-          MIRROR_SSH_KEY: ${{ secrets.MIRROR_SSH_KEY }}
-          MIRROR_KNOWN_HOSTS: ${{ secrets.MIRROR_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z]+)?$ && "${#TAG}" -le 65 ]] || {
@@ -87,19 +82,20 @@ jobs:
           if not re.fullmatch(r"[0-9]{1,5}", ssh_port) or not 1 <= int(ssh_port) <= 65535:
               raise SystemExit("invalid MIRROR_PORT")
           PY
-          [[ -n "$MIRROR_SSH_KEY" && -n "$MIRROR_KNOWN_HOSTS" ]] || {
-            echo "::error::mirror SSH secrets are incomplete"
-            exit 2
-          }
-
       - name: Require immutable release state
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           immutable="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .immutable)"
           if [[ "$immutable" != "true" ]]; then
             case "$TAG" in
               v3.0.0|v3.0.1)
-                echo "::notice::mirroring a release published before immutability was enabled: $TAG"
+                [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]] || {
+                  echo "::error::legacy mutable releases may only be repaired by a manual main-branch dispatch"
+                  exit 1
+                }
+                echo "::notice::manually repairing a release published before immutability was enabled: $TAG"
                 ;;
               *)
                 echo "::error::release $TAG is not immutable"
@@ -118,12 +114,51 @@ jobs:
       - name: Checkout the released tag as untrusted data
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.workflow_run.head_branch || inputs.tag }}
+          ref: ${{ github.event.workflow_run.head_sha || inputs.tag }}
           path: released-source
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Bind release tag to the verified commit
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          released_sha="$(git -C released-source rev-parse --verify 'HEAD^{commit}')"
+          [[ "$released_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::released checkout did not resolve to a commit"
+            exit 1
+          }
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_run" ]]; then
+            [[ "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ && "$released_sha" == "$EXPECTED_HEAD_SHA" ]] || {
+              echo "::error::released source $released_sha is not the successful CI commit $EXPECTED_HEAD_SHA"
+              exit 1
+            }
+          fi
+          direct_sha=""
+          peeled_sha=""
+          while read -r object ref; do
+            case "$ref" in
+              "refs/tags/$TAG") direct_sha="$object" ;;
+              "refs/tags/$TAG^{}") peeled_sha="$object" ;;
+            esac
+          done < <(git -C released-source ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          tag_sha="${peeled_sha:-$direct_sha}"
+          [[ "$tag_sha" =~ ^[0-9a-f]{40}$ && "$tag_sha" == "$released_sha" ]] || {
+            echo "::error::release tag $TAG no longer resolves to checked commit $released_sha"
+            exit 1
+          }
+
+      - name: Install runtime verification tools
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+            binutils qemu-user-static
+
       - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir rel
@@ -293,7 +328,64 @@ jobs:
           fi
           printf 'VERSION=%s\nTARBALL=%s\nPIN=%s\n' "$version" "$tarball" "$pin" >> "$GITHUB_ENV"
 
+      - name: Verify every packaged runtime
+        run: |
+          set -euo pipefail
+          release_work="$(mktemp -d)"
+          trap 'rm -rf -- "$release_work"' EXIT
+          env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT \
+            tar --no-same-owner --no-same-permissions -xzf "rel/$TARBALL" -C "$release_work"
+          package_dir="$release_work/security-update-notify-$VERSION"
+          run_arch() {
+            local arch="$1"
+            local runtime="$package_dir/files/security-update-notify-linux-$arch"
+            local program_headers dynamic_section got
+            local -a command
+            [[ -x "$runtime" ]] || {
+              echo "::error::missing executable linux/$arch runtime"
+              return 1
+            }
+            program_headers="$(LC_ALL=C readelf -W -l "$runtime")" || {
+              echo "::error::could not inspect linux/$arch program headers"
+              return 1
+            }
+            if grep -Eq '(^|[[:space:]])INTERP([[:space:]]|$)' <<<"$program_headers"; then
+              echo "::error::linux/$arch runtime has a dynamic interpreter"
+              return 1
+            fi
+            dynamic_section="$(LC_ALL=C readelf -W -d "$runtime")" || {
+              echo "::error::could not inspect linux/$arch dynamic section"
+              return 1
+            }
+            if grep -Fq '(NEEDED)' <<<"$dynamic_section"; then
+              echo "::error::linux/$arch runtime has shared-library dependencies"
+              return 1
+            fi
+            case "$arch" in
+              amd64|386) command=("$runtime") ;;
+              arm64) command=(/usr/bin/qemu-aarch64-static "$runtime") ;;
+              ppc64le) command=(/usr/bin/qemu-ppc64le-static "$runtime") ;;
+              s390x) command=(/usr/bin/qemu-s390x-static "$runtime") ;;
+              *) echo "::error::unknown release architecture: $arch"; return 2 ;;
+            esac
+            got="$(env -i LC_ALL=C PATH=/usr/bin:/bin \
+              /usr/bin/timeout --signal=TERM --kill-after=2s 10s \
+              "${command[@]}" --version)" || {
+              echo "::error::linux/$arch runtime version probe failed"
+              return 1
+            }
+            [[ "$got" == "security-update-notify $VERSION" ]] || {
+              echo "::error::linux/$arch runtime reports an unexpected version"
+              return 1
+            }
+          }
+          for arch in amd64 arm64 386 ppc64le s390x; do
+            run_arch "$arch"
+          done
+
       - name: Prepare immutable release directory and latest files
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tar_clean_env() { env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT tar "$@"; }
@@ -373,6 +465,10 @@ jobs:
           MIRROR_KNOWN_HOSTS: ${{ secrets.MIRROR_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
+          [[ -n "$MIRROR_SSH_KEY" && -n "$MIRROR_KNOWN_HOSTS" ]] || {
+            echo "::error::mirror SSH secrets are incomplete"
+            exit 2
+          }
           install -d -m 0700 "$HOME/.ssh"
           printf '%s\n' "$MIRROR_SSH_KEY" > "$HOME/.ssh/mirror_key"
           printf '%s\n' "$MIRROR_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
@@ -457,6 +553,8 @@ jobs:
           fi
 
       - name: Confirm GitHub Latest before stable update
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           latest_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"

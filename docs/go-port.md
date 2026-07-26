@@ -230,7 +230,7 @@ CI/发布门禁包括：
 - 恶意归档、错误 checksum、错误签名/密钥/指纹和 HTTPS 重定向拒绝；
 - 一次性容器中的全新安装、旧配置升级、失败回滚、测试和卸载；
 - GitHub Release 公开资产及镜像公开回读的 SHA-256、GPG、指纹和版本复验。
-- 所有 GitHub Actions 固定完整 commit SHA，正式 Release 不可变；镜像只在 release CI 全部通过后从默认分支的受信 workflow revision 启动，tag 仅作为不执行的数据，并使用仅允许 `main` 部署的 `release-mirror` Environment 密钥；每次镜像成功后及每周在 GitHub 托管 Ubuntu 22.04/24.04 真机执行公网下载、安装、诊断、timer、卸载和 APT 基线恢复 canary。
+- 所有 GitHub Actions 固定完整 commit SHA，正式 Release 不可变；无权限 release CI 仅作为事件信号，镜像由默认分支的受信 workflow revision 按固定 `head_sha` 独立复验 tag、签名、归档、五架构静态运行时与版本，tag 仅作为不执行的数据；部署密钥只存在于仅允许 `main` 的 `release-mirror` Environment，旧可变 Release 只允许手动修复；每次镜像成功后及每周在 GitHub 托管 Ubuntu 22.04/24.04 真机执行公网下载、安装、诊断、timer、卸载和 APT 基线恢复 canary。
 
 容器兼容与回滚脚本会改系统路径，必须只在一次性容器中运行，禁止直接在宿主机执行。
 

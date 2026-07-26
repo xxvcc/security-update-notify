@@ -9,10 +9,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: live-release-canary
-  cancel-in-progress: false
-
 jobs:
   ubuntu-host:
     strategy:
