@@ -139,7 +139,7 @@ jobs:
         run: build/archive-safety-test.sh
 
       - name: Bootstrap argument and dependency gate
-        run: build/bootstrap-test.sh
+        run: sudo build/bootstrap-test.sh
 
       - name: Build current installer for Rocky minimal lifecycle gate
         run: |
