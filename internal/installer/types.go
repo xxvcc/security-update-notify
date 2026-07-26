@@ -210,6 +210,7 @@ type Result struct {
 	PreviousVersion   string
 	BackupDir         string
 	CredentialStorage string
+	PostInstallTest   *CommandResult
 	PostInstallDoctor *CommandResult
 }
 

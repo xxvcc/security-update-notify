@@ -3,8 +3,12 @@
 # installation in place with the 3.x Go installer.
 set -euo pipefail
 
-[[ -f /.dockerenv || "${SUN_CONTAINER_TEST:-0}" == 1 ]] || {
+[[ -f /.dockerenv && "${SUN_CONTAINER_TEST:-0}" == 1 ]] || {
   echo "build/compat-test.sh must run only in a disposable container" >&2
+  exit 2
+}
+awk '$5 == "/src" && $6 ~ /(^|,)ro(,|$)/ { found = 1 } END { exit !found }' /proc/self/mountinfo || {
+  echo "build/compat-test.sh requires /src to be mounted read-only" >&2
   exit 2
 }
 
@@ -20,15 +24,16 @@ ok() {
 export DEBIAN_FRONTEND=noninteractive
 mkdir -p /run/systemd/system /etc/systemd/system /usr/local/sbin \
   /etc/security-update-notify /var/lib/security-update-notify /var/log /etc/logrotate.d \
-  /tmp/mock-systemd /usr/local/bin
+  /etc/apt/apt.conf.d /tmp/mock-systemd /usr/local/bin
 
 cat >/usr/local/bin/systemctl <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 state=/tmp/mock-systemd
+link=/etc/systemd/system/timers.target.wants/security-update-notify.timer
 case "${1:-}" in
   is-enabled)
-    if [[ -e "$state/enabled" ]]; then echo enabled; exit 0; fi
+    if [[ -L "$link" ]]; then echo enabled; exit 0; fi
     echo disabled
     exit 1
     ;;
@@ -36,11 +41,13 @@ case "${1:-}" in
     [[ -e "$state/active" ]]
     ;;
   disable)
-    rm -f "$state/enabled" "$state/active"
+    rm -f "$link" /run/systemd/system/timers.target.wants/security-update-notify.timer \
+      "$state/active"
     ;;
   enable)
     if [[ " $* " == *" security-update-notify.timer "* ]]; then
-      touch "$state/enabled"
+      mkdir -p "$(dirname "$link")"
+      ln -sfn ../security-update-notify.timer "$link"
       [[ " $* " == *" --now "* ]] && touch "$state/active"
     fi
     ;;
@@ -50,6 +57,10 @@ case "${1:-}" in
   stop|daemon-reload)
     ;;
   list-timers)
+    if [[ "${FAIL_LIST_TIMERS:-0}" == 1 ]]; then
+      echo "forced compatibility list-timers failure" >&2
+      exit 1
+    fi
     echo "security-update-notify.timer mock"
     ;;
   *)
@@ -62,14 +73,14 @@ chmod 0755 /usr/local/bin/systemctl
 printf '#!/usr/bin/env bash\nexit 0\n' >/usr/local/bin/systemd-analyze
 chmod 0755 /usr/local/bin/systemd-analyze
 
-tarball="$(find /src/dist -maxdepth 1 -type f -name 'security-update-notify-*.tar.gz' -print -quit)"
-[[ -n "$tarball" ]] || { echo "release tarball missing under /src/dist" >&2; exit 1; }
 version="$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' /src/VERSION)"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z]+)?$ \
    && "$(wc -l </src/VERSION)" -eq 1 ]] || {
   echo "invalid canonical VERSION" >&2
   exit 1
 }
+tarball="/src/dist/security-update-notify-${version}.tar.gz"
+[[ -f "$tarball" ]] || { echo "release tarball missing: $tarball" >&2; exit 1; }
 work=/tmp/sun-compat-release
 mkdir -p "$work"
 tar -xzf "$tarball" -C "$work"
@@ -105,9 +116,44 @@ printf 'legacy-runtime\n' >/usr/local/sbin/security-update-notify
 chmod 0755 /usr/local/sbin/security-update-notify
 printf '[Unit]\nDescription=legacy\n' >/etc/systemd/system/security-update-notify.service
 printf '[Timer]\nOnCalendar=*-*-* 08:30:00\n' >/etc/systemd/system/security-update-notify.timer
+printf 'security-update-notify: original file absent\n' \
+  >/etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.absent
+printf 'legacy APT backup\n' \
+  >/etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak.20260725010203
 printf '%s\n' '67937ecd9dc8b78bb7bbb248d4ef6ef6ec0ac64ad65de2141dc171faec1803cd' \
   >/var/lib/security-update-notify/last-alert.sha256
-touch /tmp/mock-systemd/enabled /tmp/mock-systemd/active
+mkdir -p /etc/systemd/system/timers.target.wants
+ln -s ../security-update-notify.timer \
+  /etc/systemd/system/timers.target.wants/security-update-notify.timer
+touch /tmp/mock-systemd/active
+
+echo "### Failed compatibility upgrade restores legacy APT metadata"
+set +e
+(
+  cd "$package_dir"
+  FAIL_LIST_TIMERS=1 ./install.sh --skip-notify-test --non-interactive -y \
+    --skip-post-install-check --lang en
+) >/tmp/sun-compat-failure.out 2>&1
+failure_rc=$?
+set -e
+ok "[[ '$failure_rc' -eq 1 ]]" "late compatibility failure returned 1"
+ok "grep -Fq 'forced compatibility list-timers failure' /tmp/sun-compat-failure.out" \
+  "late compatibility failure retained its cause"
+ok "! grep -Fq 'rollback was incomplete' /tmp/sun-compat-failure.out" \
+  "late compatibility rollback completed"
+ok "grep -Fxq 'legacy-runtime' /usr/local/sbin/security-update-notify" \
+  "legacy runtime restored"
+ok "grep -qF \"CONFIG_VERSION='3'\" /etc/security-update-notify/telegram.env" \
+  "schema 3 configuration restored"
+ok "test -f /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.absent && \
+    test -f /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak.20260725010203" \
+  "legacy APT metadata restored"
+ok "test ! -e /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.absent.bak && \
+    test ! -e /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.20260725010203.bak" \
+  "migrated APT metadata rolled back"
+ok "test -L /etc/systemd/system/timers.target.wants/security-update-notify.timer && \
+    test -e /tmp/mock-systemd/active" \
+  "legacy timer state restored"
 
 echo "### Upgrade representative 2.x state through the generated 3.x compatibility bridge"
 (
@@ -134,7 +180,17 @@ ok "grep -qF \"CHECK_SELF_UPDATE='1'\" /etc/security-update-notify/telegram.env"
 ok "grep -q '^67937ecd' /var/lib/security-update-notify/last-alert.sha256" \
   "deduplication state preserved"
 ok "test -s /var/backups/security-update-notify/latest" "transaction backup created"
-ok "test -e /tmp/mock-systemd/enabled && test -e /tmp/mock-systemd/active" \
+ok "test -L /etc/systemd/system/timers.target.wants/security-update-notify.timer && \
+    test -e /tmp/mock-systemd/active" \
   "project timer enabled and active"
+ok "test ! -e /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.absent && \
+    test ! -e /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak.20260725010203" \
+  "legacy APT metadata names migrated"
+ok "test -f /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.absent.bak && \
+    test -f /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.20260725010203.bak" \
+  "migrated APT metadata retained"
+apt-config dump >/tmp/sun-compat-apt-config.out 2>&1
+ok "! grep -Fq \"Ignoring file '20auto-upgrades.security-update-notify\" /tmp/sun-compat-apt-config.out" \
+  "migrated APT metadata is silently ignored"
 
 echo "3.0 compatibility upgrade test passed"

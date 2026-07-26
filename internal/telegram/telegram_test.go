@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -293,4 +294,28 @@ func TestGetMeTemporaryClassification(t *testing.T) {
 			t.Fatalf("error=%v temporary=%v, want permanent", err, IsTemporary(err))
 		}
 	})
+}
+
+func TestRetryDelayHonorsContext(t *testing.T) {
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	c := &Client{HTTP: srv.Client(), BaseURL: srv.URL}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := c.GetMe(ctx, "123:abc")
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) || !IsTemporary(err) {
+		t.Fatalf("error=%v, want temporary context deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("context cancellation took %s", elapsed)
+	}
+	if got := atomic.LoadInt32(&requests); got != 1 {
+		t.Fatalf("requests=%d, want 1 before cancellation", got)
+	}
 }

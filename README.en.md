@@ -24,10 +24,11 @@ The installed Go binary needs no `python3`, `curl`, or `tar` for routine checks 
 ## One-line install
 
 ```bash
+set -o pipefail
 curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash
 ```
 
-The bootstrap requires `curl`, `tar`, `sha256sum`, `mktemp`, `python3`, `env`, `gpg`, and `timeout`. When commands are missing, it first installs the corresponding bootstrap dependencies through apt, dnf, or yum, then checks each command again. It fails before download/installation if no supported package manager exists or a command is still missing. GPG verification is mandatory by default.
+The bootstrap requires `curl`, `tar`, `sha256sum`, `mktemp`, `python3`, `env`, `uname`, `gpg`, and `timeout`. When commands are missing, it first installs the corresponding bootstrap dependencies through apt, dnf, microdnf, or yum, then checks each command again. It fails before download/installation if no supported package manager exists or a command is still missing. GPG verification is mandatory by default.
 
 ---
 
@@ -159,8 +160,11 @@ During an interactive install, SUN accepts the App ID and a hidden App Secret, t
 Recommended: use the website-hosted bootstrap installer. It downloads the latest signed Release, verifies the `.sha256` file and GPG signature (required by default), then opens the interactive menu:
 
 ```bash
+set -o pipefail
 curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash
 ```
+
+When starting from the URL, `curl` must already be installed: the bootstrap cannot install a command before the script itself has been obtained. `set -o pipefail` makes a missing `curl`, DNS/TLS error, or failed download fail the complete pipeline instead of allowing the trailing `bash` to read empty input and report success. Once running, the bootstrap requires `curl`, `tar`, `sha256sum`, `mktemp`, `python3`, `env`, `uname`, `gpg`, and `timeout`. It installs only the packages corresponding to missing commands through apt, dnf, microdnf, or yum and then checks each command again; this avoids replacing `curl-minimal/coreutils-single` with conflicting full packages on minimal RPM systems. It fails before downloading or installing SUN when no supported package manager exists or a command is still missing. GPG verification is required by default.
 
 If you prefer running from source:
 
@@ -193,7 +197,7 @@ Before writing the config, it performs receiving-platform preflight checks:
 
 Results are limited by the Feishu application's directory data scope. If scanning fails or returns no visible employees, the interactive installer can retry, accept a current-app `open_id` manually, or abort. Non-interactive mode requires `--feishu-receive-id` explicitly.
 
-On the first interactive Feishu setup or after changing the app, App Secret, or recipient, the installer sends a Feishu-only verification message by default to confirm that the selected `open_id` is within the bot availability; enter `n` to skip it. Verification waits up to 60 seconds for an existing check to release the runtime lock and enables the SUN timer only after a confirmed send; a timeout or send failure rolls the install back, so “not sent” cannot be mistaken for success. Non-interactive installs send nothing automatically. Explicit `--send-test` or `security-update-notify test --send-test` still tests every configured receiving platform.
+On the first Feishu setup or after changing the app, App Secret, or recipient, the installer sends a Feishu-only strong verification message by default to confirm that the selected `open_id` is within the bot availability; enter `n` in interactive mode, use `--skip-feishu-test`, or use `--skip-notify-test` to skip it explicitly. Non-interactive mode does not prompt, but performs the same strong verification by default. Strong verification waits up to 60 seconds for the runtime lock and rolls the transaction back on timeout or send failure, so “not sent” cannot be mistaken for success. Explicit `--send-test` additionally tests every configured receiving platform after installation and overrides skip only for that extra send; this extra test is advisory, so failure warns without rolling back the completed core installation or disabling its timer. The standalone `security-update-notify test --send-test` command still reports its own send result through its exit code.
 
 ### 3. Verify
 
@@ -210,6 +214,7 @@ The simulated reboot test only sends a test alert. It does **not** reboot the se
 Useful for provisioning scripts:
 
 ```bash
+set -o pipefail
 curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- install \
   --notify-channels telegram \
   --telegram-token '123456:ABC...' \
@@ -230,6 +235,7 @@ For non-interactive Feishu installation, provide the App Secret through a separa
 sudo install -m 600 /dev/null /root/.security-update-notify-feishu-secret
 sudoedit /root/.security-update-notify-feishu-secret
 
+set -o pipefail
 curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- install \
   --notify-channels feishu \
   --feishu-app-id 'cli_xxx' \
@@ -252,6 +258,7 @@ cp .env.example .env
 chmod 600 .env
 sudoedit .env
 
+set -o pipefail
 curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | \
   sudo bash -s -- install --env-file "$PWD/.env" --non-interactive -y
 ```
@@ -262,6 +269,7 @@ You can also keep only the token in a root-only file:
 sudo install -m 600 /dev/null /root/.security-update-notify-token
 sudoedit /root/.security-update-notify-token
 
+set -o pipefail
 curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- install \
   --telegram-token-file /root/.security-update-notify-token \
   --telegram-chat-id 'CHAT_ID' \
@@ -290,10 +298,10 @@ Common options:
 --skip-post-install-check # skip post-install/upgrade self-check
 --allow-best-effort        # allow best-effort distro versions
 --lock-wait SECONDS       # runtime-lock barrier, 0..3600 seconds; default 60
---send-test                # test every configured receiving platform after installation
+--send-test                # extra all-platform test; failure warns but does not roll back installation
 --skip-telegram-test       # skip Telegram preflight validation
---skip-feishu-test         # skip separate credential preflight; selection still scans if needed
---skip-notify-test         # skip all receiving-platform preflight validation
+--skip-feishu-test         # skip Feishu preflight/default strong verification; selection still scans if needed
+--skip-notify-test         # skip all preflights/default Feishu verification; explicit --send-test still sends
 ```
 
 Once SUN is installed, `sudo security-update-notify install [options]` runs the same Go installer directly. Use `sudo security-update-notify configure notifications` to manage message notification settings transactionally on an existing installation.
@@ -304,6 +312,7 @@ Once SUN is installed, `sudo security-update-notify install [options]` runs the 
 Rerun the one-line installer to upgrade to the latest release:
 
 ```bash
+set -o pipefail
 curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- upgrade --non-interactive -y
 ```
 
@@ -385,7 +394,7 @@ SUN configures or uses:
 - `apt-listchanges`
 - apt periodic timers
 
-The installer enables unattended-upgrades security update timers. Before each overwrite of `/etc/apt/apt.conf.d/20auto-upgrades`, it saves a timestamped SUN-specific backup; on first install it also keeps a fixed-name backup. `--purge-config` restores that fixed backup when it exists and removes SUN's fixed and timestamped backups.
+The installer enables unattended-upgrades security update timers. Before each overwrite of `/etc/apt/apt.conf.d/20auto-upgrades`, it saves a timestamped SUN-specific backup. If the file existed before SUN, the first install also preserves a fixed original baseline; if it was absent, SUN records a validated, rollback-protected absence marker before package-manager writes. Metadata stored in the APT configuration directory ends in `.bak`, so apt silently ignores it instead of printing invalid-extension notices; upgrades migrate the older names. `--purge-config` restores the fixed baseline or removes the file to restore original absence, then deletes SUN's baseline, marker, and timestamped backups.
 
 It checks:
 
@@ -407,7 +416,7 @@ It checks:
 - `needs-restarting -s` (systemd services that need a restart; no longer the raw `needs-restarting` process list, which caused false alerts)
 - `dnf updateinfo list security updates`
 
-If `/etc/dnf/automatic.conf` exists, SUN first saves a timestamped backup, then configures security-only automatic updates; `--purge-config` attempts to restore the newest SUN-created backup and removes SUN-specific timestamped backups.
+If `/etc/dnf/automatic.conf` exists, SUN preserves one fixed original baseline when it first takes ownership, saves an additional timestamped copy before each overwrite, then configures security-only automatic updates. An upgrade from an older installation migrates the earliest SUN timestamped backup into that baseline; a normal uninstall followed by reinstall does not replace it. `--purge-config` restores the fixed original baseline and removes SUN's fixed and timestamped backups.
 
 ```ini
 upgrade_type = security
@@ -469,7 +478,7 @@ Packages installed as dependencies are left in place. `--purge-config` removes S
 
 ## Release signatures
 
-Release packages always include a `.sha256` checksum file. `go run ./cmd/sun-release package` creates a detached `.tar.gz.asc` signature when the key is available, and requires it for an official release or an existing version tag. `sun.sh` defaults to `required` signature verification; `auto` is kept only as a compatibility alias and also requires both gpg and the `.asc` signature. Only an explicit `--verify-signature off` skips signature verification.
+Release packages always include a `.sha256` checksum file. `go run ./cmd/sun-release package` creates a detached `.tar.gz.asc` signature when the key is available, and requires it for an official release or an existing version tag; an explicit `--sign off` is rejected before any `dist` file is created in either case. `sun.sh` defaults to `required` signature verification; `auto` is kept only as a compatibility alias and also requires both gpg and the `.asc` signature. Only an explicit `--verify-signature off` skips signature verification.
 
 Root `VERSION`, in the exact form `VERSION="X.Y.Z"`, is the single source of truth. Official releases (a corresponding `vX.Y.Z` tag or `RELEASE=1`) are **signed and fixed to all five Go architectures**. The Go release tool binds that root version to the unique CHANGELOG heading, tag, packaged version, and every binary's `--version`; the architecture set cannot be overridden. It fails when Go, Bash (used only to syntax-check `sun.sh`), any amd64/arm64/386/ppc64le/s390x build, or the GPG private key matching the pinned fingerprint is missing. After publication, CI accepts exactly one tag-matched asset set containing the tarball, checksum, and signature, then verifies its signature and fingerprint against the repository public key. The private key never enters CI; it stays offline with the maintainer. In addition, `security-update-notify upgrade` is **fail-closed** by default: it prefers the fixed release mirror and falls back to GitHub, verifies sha256, and requires a GPG signature against an embedded public key and pinned fingerprint before extracting and upgrading (set `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` to upgrade on sha256 only in an emergency).
 
@@ -500,8 +509,8 @@ go test -race -cover ./...
 build/archive-safety-test.sh
 build/runtime-lock-test.sh
 build/reproducibility-check.sh linux amd64
-docker run --rm -v "$PWD:/src:ro" debian:12 bash /src/build/compat-test.sh
-docker run --rm -v "$PWD:/src:ro" debian:12 bash /src/build/rollback-test.sh
+docker run --rm -e SUN_CONTAINER_TEST=1 -v "$PWD:/src:ro" debian:12 bash /src/build/compat-test.sh
+docker run --rm -e SUN_CONTAINER_TEST=1 -v "$PWD:/src:ro" debian:12 bash /src/build/rollback-test.sh
 go run ./cmd/sun-release package
 cd dist && sha256sum -c security-update-notify-*.tar.gz.sha256
 ```

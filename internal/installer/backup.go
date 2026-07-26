@@ -19,10 +19,14 @@ var managedPaths = []string{
 	PersistentTimerLink,
 	RuntimeTimerLink,
 	LogrotatePath,
-	"/etc/apt/apt.conf.d/20auto-upgrades",
+	aptAbsentMarkerPath,
+	aptLegacyAbsentPath,
+	aptPeriodicPath,
+	aptStableBackupPath,
 	"/etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify",
 	"/etc/needrestart/conf.d/99-security-update-notify-report-only.conf",
 	"/etc/dnf/automatic.conf",
+	"/etc/dnf/automatic.conf.security-update-notify.bak",
 }
 
 type nodeSnapshot struct {
@@ -31,9 +35,11 @@ type nodeSnapshot struct {
 }
 
 type backup struct {
-	dir       string
-	manifest  []string
-	snapshots map[string]nodeSnapshot
+	dir                       string
+	manifest                  []string
+	paths                     []string
+	snapshots                 map[string]nodeSnapshot
+	skipDependencyCapturePath map[string]bool
 }
 
 type privateSnapshot struct {
@@ -72,8 +78,13 @@ func (i *Installer) createBackup() (*backup, error) {
 			_ = i.fs.RemoveAll(dir)
 		}
 	}()
-	b := &backup{dir: dir, snapshots: make(map[string]nodeSnapshot, len(managedPaths))}
-	for _, source := range managedPaths {
+	b := &backup{
+		dir:                       dir,
+		paths:                     append([]string(nil), managedPaths...),
+		snapshots:                 make(map[string]nodeSnapshot, len(managedPaths)),
+		skipDependencyCapturePath: make(map[string]bool),
+	}
+	for _, source := range b.paths {
 		exists, err := i.exists(source)
 		if err != nil {
 			return nil, failure("inspect managed path", err)
@@ -101,9 +112,33 @@ func (i *Installer) createBackup() (*backup, error) {
 	return b, nil
 }
 
+func (i *Installer) snapshotAdditionalPath(b *backup, source string) error {
+	if _, tracked := b.snapshots[source]; tracked {
+		return nil
+	}
+	exists, err := i.exists(source)
+	if err != nil {
+		return failure("inspect additional transaction path", err)
+	}
+	snapshot := nodeSnapshot{exists: exists}
+	if exists {
+		snapshot.backupPath = path.Join(b.dir, strings.TrimPrefix(source, "/"))
+		if err := i.copyNode(source, snapshot.backupPath); err != nil {
+			return failure("backup "+source, err)
+		}
+		b.manifest = append(b.manifest, strings.TrimPrefix(source, "/"))
+	}
+	b.paths = append(b.paths, source)
+	b.snapshots[source] = snapshot
+	return i.writeManifest(b)
+}
+
 func (i *Installer) captureDependencyDefaults(b *backup) error {
 	changed := false
 	for _, source := range managedPaths {
+		if b.skipDependencyCapturePath[source] {
+			continue
+		}
 		snapshot := b.snapshots[source]
 		if snapshot.exists {
 			continue
@@ -210,7 +245,7 @@ func (i *Installer) restoreBackup(b *backup, private map[string]privateSnapshot,
 	if err := i.quiesceForRollback(lockWait, timer); err != nil {
 		return err
 	}
-	for _, destination := range managedPaths {
+	for _, destination := range b.paths {
 		snapshot := b.snapshots[destination]
 		if err := i.fs.Remove(destination); err != nil {
 			return failure("remove changed path during rollback", err)

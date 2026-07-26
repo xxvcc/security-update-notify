@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -303,7 +305,24 @@ func TestInteractiveDependencyConfirmation(t *testing.T) {
 	}
 }
 
-func TestInteractiveFeishuDirectorySelectionPersistsOpenID(t *testing.T) {
+func TestDependencyConfirmationRetriesAndReportsInstallStage(t *testing.T) {
+	command, _, stdout, stderr := newInstallTestCommand(t, nil, "maybe\ny\n", nil)
+	parsed := installArguments{lang: "zh"}
+	approved, err := command.confirmDependencies(&parsed)(context.Background(), installer.DependencyRequest{
+		Backend: "apt", Packages: []string{"needrestart", "ca-certificates"},
+	})
+	if err != nil || !approved {
+		t.Fatalf("confirmation=(%v, %v), want approved", approved, err)
+	}
+	if !strings.Contains(stderr.String(), "请输入 y 或 n") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "正在安装依赖软件包: needrestart ca-certificates") {
+		t.Fatalf("stdout=%q", stdout.String())
+	}
+}
+
+func TestInteractiveFeishuDirectorySelectionPersistsOpenIDWithoutSkippedDelivery(t *testing.T) {
 	feishuClient := &fakeFeishuPreflight{users: []feishu.DirectoryUser{{Name: "User", OpenID: "ou_selected"}}}
 	command, fake, _, _ := newInstallTestCommand(t, nil, "\n\n\n1\n", []string{"app-secret"})
 	command.feishu = feishuClient
@@ -321,7 +340,7 @@ func TestInteractiveFeishuDirectorySelectionPersistsOpenID(t *testing.T) {
 	if feishuClient.scans != 1 {
 		t.Fatalf("directory scans=%d", feishuClient.scans)
 	}
-	if fake.options.SendTest || len(feishuClient.sendIDs) != 1 || feishuClient.sendIDs[0] != "ou_selected" {
+	if fake.options.SendTest || len(feishuClient.sendIDs) != 0 {
 		t.Fatalf("sendTest=%v Feishu delivery IDs=%v", fake.options.SendTest, feishuClient.sendIDs)
 	}
 }
@@ -364,6 +383,20 @@ func TestConfigureWithoutChangesAvoidsInstallation(t *testing.T) {
 	}
 }
 
+func TestNonInteractiveConfigureAllowsScheduleOnlyChange(t *testing.T) {
+	existing := map[string]string{
+		"CONFIG_VERSION": "4", "NOTIFY_CHANNELS": "telegram", "TELEGRAM_BOT_TOKEN": "123:old",
+		"TELEGRAM_CHAT_ID": "-100", "NOTIFY_LANG": "zh", "DEDUP_MODE": "daily",
+	}
+	command, fake, _, stderr := newInstallTestCommand(t, existing, "", nil)
+	code := command.run([]string{
+		"--lang", "zh", "--non-interactive", "--time", "08:15", "--skip-notify-test",
+	}, true)
+	if code != 0 || fake.installCalls != 1 || fake.options.CheckTime != "08:15" {
+		t.Fatalf("code=%d installs=%d time=%q stderr=%q", code, fake.installCalls, fake.options.CheckTime, stderr.String())
+	}
+}
+
 func TestTelegramCredentialRetryUpdatesPreparedConfig(t *testing.T) {
 	telegramClient := &fakeTelegramPreflight{getMeErrors: []error{errors.New("rejected"), nil}}
 	command, fake, _, _ := newInstallTestCommand(t, nil, "\n\n\ny\n-200\n", []string{"456:new-token"})
@@ -397,6 +430,226 @@ func TestInteractiveInstallCollectsScheduleReminderAndTestPreferences(t *testing
 	if fake.options.CheckTime != "08:30" || fake.options.Config["DEDUP_MODE"] != "interval" ||
 		fake.options.Config["DEDUP_INTERVAL_DAYS"] != "5" || !fake.options.SendTest {
 		t.Fatalf("checkTime=%q sendTest=%v config=%v", fake.options.CheckTime, fake.options.SendTest, fake.options.Config)
+	}
+}
+
+func TestInteractiveInputStateMachineRetriesInvalidValues(t *testing.T) {
+	input := strings.Join([]string{
+		"9", "1",
+		"25:00", "08:30",
+		"9", "3",
+		"0", "abc", "5",
+		"maybe", "n",
+	}, "\n") + "\n"
+	command, fake, _, stderr := newInstallTestCommand(t, nil, input, nil)
+	fake.token = "123:token"
+	code := command.run([]string{
+		"--lang", "zh", "--telegram-token-file", "/run/token",
+		"--telegram-chat-id", "-100", "--skip-telegram-test",
+	}, false)
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%q", code, stderr.String())
+	}
+	if fake.options.Config["NOTIFY_CHANNELS"] != "telegram" || fake.options.CheckTime != "08:30" ||
+		fake.options.Config["DEDUP_MODE"] != "interval" || fake.options.Config["DEDUP_INTERVAL_DAYS"] != "5" ||
+		fake.options.SendTest {
+		t.Fatalf("options=%+v", fake.options)
+	}
+	for _, want := range []string{"无效选择，请重新输入。", "时间无效", "请输入大于 0 的整数。", "请输入 y 或 n"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("stderr missing %q: %q", want, stderr.String())
+		}
+	}
+	for _, unwanted := range []string{"invalid receiving-platform choice", "invalid same-alert reminder mode", "expected y or n"} {
+		if strings.Contains(stderr.String(), unwanted) {
+			t.Errorf("Chinese interaction leaked %q: %q", unwanted, stderr.String())
+		}
+	}
+}
+
+func TestInteractiveRequiredAndHiddenInputsRetryWhenEmpty(t *testing.T) {
+	command, fake, _, stderr := newInstallTestCommand(t, nil, "\n-100\n\n\nn\n", []string{"", "123:token"})
+	code := command.run([]string{
+		"--lang", "zh", "--notify-channels", "telegram", "--skip-telegram-test",
+	}, false)
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%q", code, stderr.String())
+	}
+	if fake.options.Config["TELEGRAM_BOT_TOKEN"] != "123:token" || fake.options.Config["TELEGRAM_CHAT_ID"] != "-100" {
+		t.Fatalf("config=%v", fake.options.Config)
+	}
+	if got := strings.Count(stderr.String(), "输入不能为空，请重新输入。"); got != 2 {
+		t.Fatalf("empty-input retries=%d stderr=%q", got, stderr.String())
+	}
+}
+
+func TestInteractiveStateMachineSharesHiddenAndVisibleInputStream(t *testing.T) {
+	input := strings.Join([]string{
+		"", "123:token",
+		"", "-100",
+		"25:00", "08:30",
+		"9", "3",
+		"0", "5",
+		"maybe", "n",
+	}, "\n") + "\n"
+	command, fake, stdout, stderr := newInstallTestCommand(t, nil, input, nil)
+	command.console.readSecret = func(prompt string) (string, error) {
+		if _, err := fmt.Fprint(command.console.out, prompt); err != nil {
+			return "", err
+		}
+		return command.console.in.ReadString('\n')
+	}
+	code := command.run([]string{
+		"--lang", "zh", "--notify-channels", "telegram",
+	}, false)
+	if code != 0 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if fake.options.Config["TELEGRAM_BOT_TOKEN"] != "123:token" || fake.options.Config["TELEGRAM_CHAT_ID"] != "-100" ||
+		fake.options.CheckTime != "08:30" || fake.options.Config["DEDUP_MODE"] != "interval" ||
+		fake.options.Config["DEDUP_INTERVAL_DAYS"] != "5" || fake.options.SendTest {
+		t.Fatalf("options=%+v", fake.options)
+	}
+	for _, want := range []string{"输入隐藏", "输入不能为空", "时间无效", "无效选择", "大于 0", "输入 y 或 n"} {
+		combined := stdout.String() + stderr.String()
+		if !strings.Contains(combined, want) {
+			t.Errorf("interaction output missing %q: %q", want, combined)
+		}
+	}
+}
+
+func TestInteractiveEOFIsLocalizedCancellation(t *testing.T) {
+	command, fake, _, stderr := newInstallTestCommand(t, nil, "", nil)
+	code := command.run([]string{"--lang", "zh"}, false)
+	if code != 2 || fake.installCalls != 0 {
+		t.Fatalf("code=%d installs=%d stderr=%q", code, fake.installCalls, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "已取消。") || strings.Contains(stderr.String(), "EOF") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+}
+
+func TestLanguageChoiceRetriesInvalidInput(t *testing.T) {
+	command, _, _, stderr := newInstallTestCommand(t, nil, "9\n2\n", nil)
+	lang, err := command.chooseLanguage("", false)
+	if err != nil || lang != "en" {
+		t.Fatalf("lang=%q err=%v", lang, err)
+	}
+	if !strings.Contains(stderr.String(), "无效选择，请重新输入。") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+}
+
+func TestSkipNotifyTestSuppressesFreshFeishuDefaultUnlessSendTestIsExplicit(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		extra    []string
+		wantSend bool
+	}{
+		{name: "skip", extra: []string{"--skip-notify-test"}},
+		{name: "explicit send", extra: []string{"--skip-notify-test", "--send-test"}, wantSend: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			command, fake, _, _ := newInstallTestCommand(t, nil, "", nil)
+			fake.secret = []byte("app-secret")
+			args := []string{
+				"--lang", "zh", "--non-interactive", "-y", "--notify-channels", "feishu",
+				"--feishu-app-id", "cli_new", "--feishu-app-secret-file", "/run/secret",
+				"--feishu-receive-id", "ou_receiver",
+			}
+			args = append(args, test.extra...)
+			if code := command.run(args, false); code != 0 {
+				t.Fatalf("code=%d", code)
+			}
+			if fake.options.SendTest != test.wantSend {
+				t.Fatalf("SendTest=%v, want %v", fake.options.SendTest, test.wantSend)
+			}
+			if fake.options.Preflight != nil {
+				t.Fatal("skip-notify-test unexpectedly retained receiving-platform preflight")
+			}
+		})
+	}
+}
+
+func TestFreshFeishuRecipientStrongVerificationStillBlocksOnFailure(t *testing.T) {
+	feishuClient := &fakeFeishuPreflight{sendErr: errors.New("recipient unavailable")}
+	command, fake, _, _ := newInstallTestCommand(t, nil, "\n\n\n", nil)
+	command.feishu = feishuClient
+	fake.secret = []byte("app-secret")
+	code := command.run([]string{
+		"--lang", "zh", "--notify-channels", "feishu", "--feishu-app-id", "cli_new",
+		"--feishu-app-secret-file", "/run/secret", "--feishu-receive-id", "ou_receiver",
+	}, false)
+	if code != 2 || len(feishuClient.sendIDs) != 1 {
+		t.Fatalf("code=%d send IDs=%v", code, feishuClient.sendIDs)
+	}
+}
+
+func TestNonInteractiveFreshFeishuRecipientStrongVerificationStillBlocksOnFailure(t *testing.T) {
+	feishuClient := &fakeFeishuPreflight{sendErr: errors.New("recipient unavailable")}
+	command, fake, _, _ := newInstallTestCommand(t, nil, "", nil)
+	command.feishu = feishuClient
+	fake.secret = []byte("app-secret")
+	code := command.run([]string{
+		"--lang", "zh", "--non-interactive", "-y", "--notify-channels", "feishu",
+		"--feishu-app-id", "cli_new", "--feishu-app-secret-file", "/run/secret",
+		"--feishu-receive-id", "ou_receiver",
+	}, false)
+	if code != 2 || len(feishuClient.sendIDs) != 1 || fake.installCalls != 1 {
+		t.Fatalf("code=%d sends=%v installs=%d", code, feishuClient.sendIDs, fake.installCalls)
+	}
+}
+
+func TestExplicitAllPlatformTestDoesNotWeakenFreshFeishuVerification(t *testing.T) {
+	feishuClient := &fakeFeishuPreflight{sendErr: errors.New("recipient unavailable")}
+	command, fake, _, _ := newInstallTestCommand(t, nil, "", nil)
+	command.feishu = feishuClient
+	fake.secret = []byte("app-secret")
+	code := command.run([]string{
+		"--lang", "zh", "--non-interactive", "-y", "--notify-channels", "feishu",
+		"--feishu-app-id", "cli_new", "--feishu-app-secret-file", "/run/secret",
+		"--feishu-receive-id", "ou_receiver", "--send-test",
+	}, false)
+	if code != 2 || len(feishuClient.sendIDs) != 1 {
+		t.Fatalf("code=%d send IDs=%v", code, feishuClient.sendIDs)
+	}
+}
+
+func TestExplicitAdditionalTestFailureIsAdvisoryToCLI(t *testing.T) {
+	command, fake, _, stderr := newInstallTestCommand(t, nil, "", nil)
+	fake.token = "123:token"
+	fake.result.PostInstallTest = &installer.CommandResult{
+		Stderr: []byte("delivery detail\n"), Code: 75, Err: context.DeadlineExceeded,
+	}
+	code := command.run([]string{
+		"--lang", "zh", "--non-interactive", "-y", "--notify-channels", "telegram",
+		"--telegram-token-file", "/run/token", "--telegram-chat-id", "-100",
+		"--skip-notify-test", "--send-test",
+	}, false)
+	if code != 0 || fake.installCalls != 1 {
+		t.Fatalf("code=%d installs=%d", code, fake.installCalls)
+	}
+	for _, want := range []string{"delivery detail", "额外测试消息无法完成", "核心安装和定时任务未回滚"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("stderr missing %q: %q", want, stderr.String())
+		}
+	}
+}
+
+func TestTelegramTemporaryFailureSkipKeepsUnverifiedInput(t *testing.T) {
+	telegramClient := &fakeTelegramPreflight{getMeErrors: []error{temporaryTestError{"connection reset"}}}
+	command, fake, stdout, _ := newInstallTestCommand(t, nil, "\n\nn\n2\n", nil)
+	command.telegram = telegramClient
+	fake.token = "123:token"
+	code := command.run([]string{
+		"--lang", "zh", "--notify-channels", "telegram", "--telegram-token-file", "/run/token",
+		"--telegram-chat-id", "-100",
+	}, false)
+	if code != 0 {
+		t.Fatalf("code=%d", code)
+	}
+	if !strings.Contains(stdout.String(), "保留当前输入，但尚未验证") || strings.Contains(stdout.String(), "凭据保持不变") {
+		t.Fatalf("stdout=%q", stdout.String())
 	}
 }
 
@@ -468,6 +721,28 @@ func TestReadHiddenLineFallsBackForPipe(t *testing.T) {
 	got, err := readHiddenLine(readFile, bufio.NewReader(readFile), &output, "Secret: ")
 	if err != nil || got != "secret\n" || output.String() != "Secret: " {
 		t.Fatalf("got=%q err=%v output=%q", got, err, output.String())
+	}
+}
+
+func TestPromptSecretAcceptsFinalLineAtEOF(t *testing.T) {
+	command, _, _, _ := newInstallTestCommand(t, nil, "", nil)
+	command.console.readSecret = func(string) (string, error) { return "secret-without-newline", io.EOF }
+	value, err := command.promptSecret("zh", "Secret")
+	if err != nil || value != "secret-without-newline" {
+		t.Fatalf("value=%q err=%v", value, err)
+	}
+}
+
+func TestPromptSecretLocalizesUnderlyingReadError(t *testing.T) {
+	command, _, _, _ := newInstallTestCommand(t, nil, "", nil)
+	underlying := errors.New("low-level English input failure")
+	command.console.readSecret = func(string) (string, error) { return "", underlying }
+	_, err := command.promptSecret("zh", "Secret")
+	if err == nil || err.Error() != "读取输入失败。" || !errors.Is(err, underlying) {
+		t.Fatalf("err=%v", err)
+	}
+	if strings.Contains(err.Error(), underlying.Error()) {
+		t.Fatalf("localized error leaked underlying message: %q", err)
 	}
 }
 

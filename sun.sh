@@ -29,6 +29,7 @@ usage() {
   if [ "${UI_LANG:-zh}" = en ]; then
     cat <<'EOF'
 Usage:
+  set -o pipefail
   curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash
   curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- install [install args]
 
@@ -52,6 +53,7 @@ EOF
   else
     cat <<'EOF'
 用法:
+  set -o pipefail
   curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash
   curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- install [安装参数]
 
@@ -92,6 +94,70 @@ curl_retry() {
     "${CURL_RETRY_OPTIONS[@]}" "$@"
 }
 tar_clean_env() { env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT tar "$@"; }
+
+append_bootstrap_package() {
+  local package="$1" existing
+  for existing in "${BOOTSTRAP_PACKAGES[@]:-}"; do
+    [[ "$existing" == "$package" ]] && return 0
+  done
+  BOOTSTRAP_PACKAGES+=("$package")
+}
+
+resolve_bootstrap_packages() {
+  local family="$1" command package
+  shift
+  BOOTSTRAP_PACKAGES=()
+  append_bootstrap_package ca-certificates
+  for command in "$@"; do
+    case "$command" in
+      curl) package=curl ;;
+      tar) package=tar ;;
+      sha256sum|mktemp|env|uname|timeout) package=coreutils ;;
+      python3) package=python3 ;;
+      gpg)
+        case "$family" in
+          apt) package=gnupg ;;
+          rpm) package=gnupg2 ;;
+          *) return 2 ;;
+        esac
+        ;;
+      *) return 2 ;;
+    esac
+    append_bootstrap_package "$package"
+  done
+}
+
+gpg_primary_fingerprints() {
+  local line want_fingerprint=0
+  local -a fields=()
+  while IFS= read -r line; do
+    IFS=: read -r -a fields <<<"$line"
+    case "${fields[0]:-}" in
+      pub) want_fingerprint=1 ;;
+      fpr)
+        if [[ "$want_fingerprint" -eq 1 ]]; then
+          [[ "${#fields[@]}" -gt 9 && -n "${fields[9]}" ]] && printf '%s\n' "${fields[9]}"
+          want_fingerprint=0
+        fi
+        ;;
+    esac
+  done
+}
+
+gpg_status_has_pinned_signature() {
+  local pin="$1" line last
+  local -a fields=()
+  while IFS= read -r line; do
+    read -r -a fields <<<"$line"
+    [[ "${#fields[@]}" -ge 3 ]] || continue
+    last="${fields[${#fields[@]}-1]}"
+    if [[ "${fields[0]}" == '[GNUPG:]' && "${fields[1]}" == VALIDSIG \
+       && ( "${fields[2]}" == "$pin" || "$last" == "$pin" ) ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
 
 parse_mirror_latest() {
   python3 -c '
@@ -203,22 +269,40 @@ while [[ $# -gt 0 ]]; do
     --repo) require_arg "$1" "${2:-}"; REPO="$2"; shift 2 ;;
     --base-url) require_arg "$1" "${2:-}"; BASE_URL="$2"; shift 2 ;;
     --verify-signature) require_arg "$1" "${2:-}"; VERIFY_SIGNATURE="$2"; shift 2 ;;
-    install|upgrade|configure|doctor|check-upgrade|test|uninstall|menu) RUN_MODE="$1"; shift; INSTALL_ARGS+=("$@"); break ;;
+    install|upgrade|configure|doctor|check-upgrade|test|uninstall|menu)
+      RUN_MODE="$1"
+      shift
+      # --lang is a bootstrap option even when users naturally place it after
+      # the subcommand. Consume it here and pass the selected language through
+      # UI_LANG instead of forwarding a duplicate flag to the Go command.
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --lang) require_arg "$1" "${2:-}"; UI_LANG="$2"; shift 2 ;;
+          *) INSTALL_ARGS+=("$1"); shift ;;
+        esac
+      done
+      break
+      ;;
     -h|--help) usage; exit 0 ;;
     *) INSTALL_ARGS+=("$1"); shift ;;
   esac
 done
 
-# 仅在显式且有效时导出语言，让目标脚本沿用；否则交给目标脚本（菜单）提示选择。
-# Export the language only when explicitly set and valid, so the target script reuses it;
-# otherwise leave it to the target script (the menu) to prompt for selection.
+# 仅在显式且有效时导出语言，让目标脚本沿用；否则交给交互选择。
+# Export the language only when explicitly set and valid, so the target command reuses it;
+# otherwise leave it to the interactive selector.
 case "${UI_LANG:-}" in
   zh|en) export UI_LANG ;;
   "") ;;
-  *) say "无效语言: ${UI_LANG}（应为 zh 或 en），将忽略" "Invalid language: ${UI_LANG} (expected zh or en), ignoring" >&2; UI_LANG="" ;;
+  *) say "无效语言: ${UI_LANG}（应为 zh 或 en）" "Invalid language: ${UI_LANG} (expected zh or en)" >&2; exit 2 ;;
 esac
 
-[[ "$(id -u)" -eq 0 ]] || { say "请使用 sudo/root 运行" "Please run with sudo/root" >&2; exit 1; }
+case "$VERIFY_SIGNATURE" in
+  auto|required|off) ;;
+  *) say "无效签名校验模式: $VERIFY_SIGNATURE" "Invalid signature verification mode: $VERIFY_SIGNATURE" >&2; exit 2 ;;
+esac
+
+(( EUID == 0 )) || { say "请使用 sudo/root 运行" "Please run with sudo/root" >&2; exit 1; }
 
 # 第一步：交互选择语言。仅当未显式指定语言、有可用终端、且目标不是 --non-interactive 时弹出。
 # 用 `read < /dev/tty` 只读一行终端输入，不影响 bash 继续从 stdin（curl 管道）读取脚本本身。
@@ -231,13 +315,46 @@ if [[ -z "${UI_LANG:-}" ]]; then
     for a in "${INSTALL_ARGS[@]}"; do [[ "$a" == "--non-interactive" ]] && sun_noninteractive=1; done
   fi
   if [[ "$sun_noninteractive" -eq 0 ]] && { : < /dev/tty; } 2>/dev/null; then
-    printf '%s\n' "请选择语言 / Choose a language:"
-    printf '%s\n' "  1) 中文 (default)"
-    printf '%s\n' "  2) English"
-    read -r -p "[1]: " sun_lang_choice < /dev/tty || sun_lang_choice=1
-    case "${sun_lang_choice:-1}" in 2) UI_LANG=en ;; *) UI_LANG=zh ;; esac
+    while true; do
+      printf '%s\n' "请选择语言 / Choose a language:"
+      printf '%s\n' "  1) 中文 (default)"
+      printf '%s\n' "  2) English"
+      if ! read -r -p "[1]: " sun_lang_choice < /dev/tty; then
+        say "已取消。" "Cancelled." >&2
+        exit 2
+      fi
+      case "${sun_lang_choice:-1}" in
+        1|'') UI_LANG=zh; break ;;
+        2) UI_LANG=en; break ;;
+        *) printf '%s\n' "无效选择，请输入 1 或 2。 / Invalid choice; enter 1 or 2." >&2 ;;
+      esac
+    done
     export UI_LANG
   fi
+fi
+
+# Validate every option that does not require curl/python before invoking a
+# package manager. The language prompt stays first so diagnostics use the
+# user's selected language, but invalid input can never trigger apt/dnf writes.
+[[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
+  say "无效 REPO 格式: $REPO" "Invalid REPO format: $REPO" >&2
+  exit 2
+}
+if [[ "$VERSION" != "latest" ]]; then
+  validate_version "$VERSION"
+fi
+if [[ -n "$BASE_URL" ]]; then
+  { [[ "$BASE_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]] && [[ "$BASE_URL" != *".."* ]]; } || {
+    say "--base-url 必须是干净的 https URL（不含 .. 等）: $BASE_URL" \
+        "--base-url must be a clean https URL (no ..): $BASE_URL" >&2
+    exit 2
+  }
+fi
+if [[ "$VERSION" == "latest" || -z "$BASE_URL" ]]; then
+  [[ "$REPO" != "YOUR_GITHUB_USER/security-update-notify" ]] || {
+    say "发布前请传入 --repo 或编辑引导脚本 REPO。" "Pass --repo or edit bootstrap REPO before publishing." >&2
+    exit 2
+  }
 fi
 
 REQUIRED_COMMANDS=(curl tar sha256sum mktemp python3 env uname)
@@ -250,16 +367,39 @@ if [[ "${#missing_commands[@]}" -gt 0 ]]; then
   say "正在通过系统包管理器补齐引导依赖: ${missing_commands[*]}" \
       "Installing missing bootstrap dependencies through the system package manager: ${missing_commands[*]}"
   if command -v apt-get >/dev/null 2>&1; then
+    resolve_bootstrap_packages apt "${missing_commands[@]}" || {
+      say "无法解析缺失命令对应的软件包。" "Could not resolve packages for the missing commands." >&2
+      exit 1
+    }
     DEBIAN_FRONTEND=noninteractive apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      ca-certificates curl tar coreutils python3 gnupg
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${BOOTSTRAP_PACKAGES[@]}"
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y ca-certificates curl tar coreutils python3 gnupg2
+    resolve_bootstrap_packages rpm "${missing_commands[@]}" || {
+      say "无法解析缺失命令对应的软件包。" "Could not resolve packages for the missing commands." >&2
+      exit 1
+    }
+    dnf install -y "${BOOTSTRAP_PACKAGES[@]}"
+  elif command -v microdnf >/dev/null 2>&1; then
+    resolve_bootstrap_packages rpm "${missing_commands[@]}" || {
+      say "无法解析缺失命令对应的软件包。" "Could not resolve packages for the missing commands." >&2
+      exit 1
+    }
+    if ! microdnf install -y "${BOOTSTRAP_PACKAGES[@]}"; then
+      if [[ " ${missing_commands[*]} " == *" gpg "* ]]; then
+        say "microdnf 安装失败且 gpg 缺失；若上方出现 Invalid crypto engine，请先通过发行版救援环境或可信软件包缓存恢复 gnupg2，再重试。" \
+            "microdnf failed while gpg is missing; if the error above contains Invalid crypto engine, restore gnupg2 from distribution rescue media or a trusted package cache, then retry." >&2
+      fi
+      exit 1
+    fi
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y ca-certificates curl tar coreutils python3 gnupg2
+    resolve_bootstrap_packages rpm "${missing_commands[@]}" || {
+      say "无法解析缺失命令对应的软件包。" "Could not resolve packages for the missing commands." >&2
+      exit 1
+    }
+    yum install -y "${BOOTSTRAP_PACKAGES[@]}"
   else
-    say "缺少必需命令且没有可用的 apt/dnf/yum: ${missing_commands[*]}" \
-        "Required commands are missing and apt/dnf/yum is unavailable: ${missing_commands[*]}" >&2
+    say "缺少必需命令且没有可用的 apt/dnf/microdnf/yum: ${missing_commands[*]}" \
+        "Required commands are missing and apt/dnf/microdnf/yum is unavailable: ${missing_commands[*]}" >&2
     exit 1
   fi
   for c in "${REQUIRED_COMMANDS[@]}"; do
@@ -272,10 +412,7 @@ fi
 
 configure_curl_retry_options
 
-[[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { say "无效 REPO 格式: $REPO" "Invalid REPO format: $REPO" >&2; exit 2; }
-
 if [[ "$VERSION" == "latest" ]]; then
-  [[ "$REPO" != "YOUR_GITHUB_USER/security-update-notify" ]] || { say "发布前请传入 --repo 或编辑引导脚本 REPO。" "Pass --repo or edit bootstrap REPO before publishing." >&2; exit 2; }
   if ! VERSION="$(curl_retry --max-filesize 1048576 -fsSL "${RELEASE_MIRROR_BASE%/}/latest.json" 2>/dev/null | parse_mirror_latest 2>/dev/null)"; then
     say "发布镜像版本索引不可用，正在回退 GitHub。" "Release mirror index unavailable; falling back to GitHub."
     api="https://api.github.com/repos/${REPO}/releases/latest"
@@ -288,15 +425,8 @@ PKG="security-update-notify-${VERSION}.tar.gz"
 PKG_DIR="security-update-notify-${VERSION}"
 DOWNLOAD_BASES=()
 if [[ -n "$BASE_URL" ]]; then
-  # 自定义下载源必须是干净的 https URL：完整锚定，拒绝 http:// / file:// / ftp:// 等协议，
-  # 且不含 .. 路径穿越片段（正则右端锚定，不再是仅前缀匹配）。
-  # A custom download source must be a clean https URL: fully anchored, rejecting http:// / file:// / ftp://,
-  # and containing no ".." traversal segment (the regex is end-anchored, not just a prefix match).
-  { [[ "$BASE_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]] && [[ "$BASE_URL" != *".."* ]]; } \
-    || { say "--base-url 必须是干净的 https URL（不含 .. 等）: $BASE_URL" "--base-url must be a clean https URL (no ..): $BASE_URL" >&2; exit 2; }
   DOWNLOAD_BASES+=("${BASE_URL%/}")
 else
-  [[ "$REPO" != "YOUR_GITHUB_USER/security-update-notify" ]] || { say "发布前请传入 --repo 或编辑引导脚本 REPO。" "Pass --repo or edit bootstrap REPO before publishing." >&2; exit 2; }
   DOWNLOAD_BASES+=("${RELEASE_MIRROR_BASE%/}/v${VERSION}")
   DOWNLOAD_BASES+=("https://github.com/${REPO}/releases/download/v${VERSION}")
 fi
@@ -304,8 +434,6 @@ fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 cd "$TMP"
-
-case "$VERIFY_SIGNATURE" in auto|required|off) ;; *) say "无效签名校验模式: $VERIFY_SIGNATURE" "Invalid signature verification mode: $VERIFY_SIGNATURE" >&2; exit 2 ;; esac
 
 download_release_set() {
   local base
@@ -350,7 +478,7 @@ verify_signature_if_available() {
   release_signing_public_key | gpg_release "$gpg_home" --import >/dev/null 2>&1 || { say "导入签名公钥失败" "Failed to import signing public key" >&2; exit 1; }
   mapfile -t primary_fingerprints < <(
     gpg_release "$gpg_home" --with-colons --list-keys 2>/dev/null |
-      awk -F: '$1 == "pub" {want = 1; next} want && $1 == "fpr" {print $10; want = 0}'
+      gpg_primary_fingerprints
   )
   [[ -n "$RELEASE_SIGNING_FINGERPRINT" && "${#primary_fingerprints[@]}" -eq 1 \
      && "${primary_fingerprints[0]}" == "$RELEASE_SIGNING_FINGERPRINT" ]] || {
@@ -362,8 +490,7 @@ verify_signature_if_available() {
     say "签名校验失败；拒绝继续" "Signature verification failed; refusing to continue" >&2
     exit 1
   }
-  printf '%s\n' "$status" | awk -v pin="$RELEASE_SIGNING_FINGERPRINT" \
-    '$1 == "[GNUPG:]" && $2 == "VALIDSIG" && ($3 == pin || $NF == pin) {valid = 1} END {exit !valid}' || {
+  gpg_status_has_pinned_signature "$RELEASE_SIGNING_FINGERPRINT" <<<"$status" || {
     say "签名未绑定固定指纹；拒绝继续" "Signature is not bound to the pinned primary key; refusing to continue" >&2
     exit 1
   }
@@ -444,7 +571,10 @@ run_menu() {
     say "3) 卸载" "3) Uninstall"
     say "4) 检查或诊断" "4) Check or diagnose"
     say "0) 退出" "0) Exit"
-    read -r -p "$(m '请输入选项 [1-4/0]: ' 'Enter choice [1-4/0]: ')" choice < /dev/tty || exit 1
+    if ! read -r -p "$(m '请输入选项 [1-4/0]: ' 'Enter choice [1-4/0]: ')" choice < /dev/tty; then
+      say "已取消。" "Cancelled." >&2
+      exit 2
+    fi
     case "$choice" in
       1) run_go install "${INSTALL_ARGS[@]}" ;;
       2)
@@ -461,7 +591,10 @@ run_menu() {
         say "1) 只移除程序，保留配置" "1) Remove program only, keep configuration"
         say "2) 移除程序并删除配置和状态" "2) Remove program and delete configuration/state"
         say "0) 返回" "0) Back"
-        read -r -p "$(m '请输入选项 [1/2/0]: ' 'Enter choice [1/2/0]: ')" uninstall_choice < /dev/tty || exit 1
+        if ! read -r -p "$(m '请输入选项 [1/2/0]: ' 'Enter choice [1/2/0]: ')" uninstall_choice < /dev/tty; then
+          say "已取消。" "Cancelled." >&2
+          exit 2
+        fi
         case "$uninstall_choice" in
           1) run_go uninstall ;;
           2) run_go uninstall --purge-config ;;
@@ -477,7 +610,10 @@ run_menu() {
         say "3) 发送普通测试消息" "3) Send normal test message"
         say "4) 发送模拟重启提醒（不会真的重启）" "4) Send simulated reboot alert (does not reboot)"
         say "0) 返回" "0) Back"
-        read -r -p "$(m '请输入选项 [1/2/3/4/0]: ' 'Enter choice [1/2/3/4/0]: ')" check_choice < /dev/tty || exit 1
+        if ! read -r -p "$(m '请输入选项 [1/2/3/4/0]: ' 'Enter choice [1/2/3/4/0]: ')" check_choice < /dev/tty; then
+          say "已取消。" "Cancelled." >&2
+          exit 2
+        fi
         case "$check_choice" in
           1) run_go doctor ;;
           2) run_go check-upgrade ;;

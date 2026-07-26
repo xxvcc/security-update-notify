@@ -18,6 +18,16 @@ APT::Periodic::AutocleanInterval "7";
 APT::Periodic::Unattended-Upgrade "1";
 `
 
+const (
+	aptPeriodicPath         = "/etc/apt/apt.conf.d/20auto-upgrades"
+	aptStableBackupPath     = aptPeriodicPath + ".security-update-notify.bak"
+	aptAbsentMarkerPath     = aptPeriodicPath + ".security-update-notify.absent.bak"
+	aptLegacyAbsentPath     = aptPeriodicPath + ".security-update-notify.absent"
+	aptAbsentMarkerContents = "security-update-notify: original file absent\n"
+	dnfAutomaticPath        = "/etc/dnf/automatic.conf"
+	dnfStableBackupPath     = dnfAutomaticPath + ".security-update-notify.bak"
+)
+
 const aptUnattendedPolicy = `// 本地策略：永不自动重启。发行版软件包保留其默认 Origins-Pattern 安全规则。
 // Local policy: never reboot automatically. The distribution package keeps
 // its default Origins-Pattern security rules.
@@ -178,7 +188,11 @@ func (i *Installer) installDependencies(ctx context.Context, plan installPlan, c
 			args = []string{"-q", pkg}
 		}
 		result := i.runner.Run(ctx, Command{Name: probe, Args: args, Timeout: 30 * time.Second})
-		if result.Err != nil || result.Code != 0 {
+		installed := result.Err == nil && result.Code == 0
+		if probe == "dpkg" {
+			installed = installed && dpkgStatusInstalled(result.Stdout)
+		}
+		if !installed {
 			missing = append(missing, pkg)
 		}
 	}
@@ -204,14 +218,154 @@ func (i *Installer) installDependencies(ctx context.Context, plan installPlan, c
 			Env: map[string]string{"DEBIAN_FRONTEND": "noninteractive"}, Timeout: 30 * time.Minute,
 		})
 	}
-	manager := "dnf"
-	if !i.runner.LookPath(manager) {
-		manager = "yum"
+	manager := ""
+	for _, candidate := range []string{"dnf", "microdnf", "yum"} {
+		if i.runner.LookPath(candidate) {
+			manager = candidate
+			break
+		}
 	}
-	if !i.runner.LookPath(manager) {
-		return failure("install dependencies", errors.New("dnf or yum is required"))
+	if manager == "" {
+		return failure("install dependencies", errors.New("dnf, microdnf, or yum is required"))
 	}
 	return i.requiredCommandContext(ctx, "install dnf dependencies", Command{Name: manager, Args: append([]string{"install", "-y"}, missing...), Timeout: 30 * time.Minute})
+}
+
+func dpkgStatusInstalled(output []byte) bool {
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.TrimSpace(line) == "Status: install ok installed" {
+			return true
+		}
+	}
+	return false
+}
+
+// migrateAPTMetadata moves older SUN metadata to names ending in .bak. APT
+// silently ignores that suffix; the former .absent and .bak.<timestamp> names
+// produced a notice during every apt invocation.
+func (i *Installer) migrateAPTMetadata(b *backup) error {
+	if err := i.ensureDir(path.Dir(aptPeriodicPath), 0o755); err != nil {
+		return failure("create apt configuration directory", err)
+	}
+	legacyMarker, err := i.validAPTAbsentMarkerAt(aptLegacyAbsentPath)
+	if err != nil {
+		return failure("inspect legacy apt absence marker", err)
+	}
+	if legacyMarker {
+		currentMarker, err := i.validAPTAbsentMarkerAt(aptAbsentMarkerPath)
+		if err != nil {
+			return failure("inspect apt absence marker", err)
+		}
+		if !currentMarker {
+			if err := i.fs.WriteFileAtomic(aptAbsentMarkerPath, []byte(aptAbsentMarkerContents), 0o600); err != nil {
+				return failure("migrate apt absence marker", err)
+			}
+			// This is a transaction-owned rename, not a package-created default.
+			// Restoring it together with the legacy marker would leave both names.
+			b.skipDependencyCapturePath[aptAbsentMarkerPath] = true
+		}
+		if err := i.fs.Remove(aptLegacyAbsentPath); err != nil {
+			return failure("remove legacy apt absence marker", err)
+		}
+	}
+
+	entries, err := i.fs.ReadDir(path.Dir(aptPeriodicPath))
+	if err != nil {
+		return failure("list apt configuration backups", err)
+	}
+	legacyPrefix := path.Base(aptStableBackupPath) + "."
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, legacyPrefix) || len(name) == len(legacyPrefix) {
+			continue
+		}
+		suffix := strings.TrimPrefix(name, legacyPrefix)
+		if !validBackupTimestamp(suffix) {
+			continue
+		}
+		source := path.Join(path.Dir(aptPeriodicPath), name)
+		destination := aptPeriodicPath + ".security-update-notify." + suffix + ".bak"
+		if err := i.snapshotAdditionalPath(b, source); err != nil {
+			return err
+		}
+		if err := i.snapshotAdditionalPath(b, destination); err != nil {
+			return err
+		}
+		sourceExists, err := i.validBaselineFile(source)
+		if err != nil || !sourceExists {
+			if err == nil {
+				err = errors.New("legacy apt backup disappeared")
+			}
+			return failure("inspect legacy apt backup", err)
+		}
+		destinationExists, err := i.validBaselineFile(destination)
+		if err != nil {
+			return failure("inspect migrated apt backup", err)
+		}
+		if destinationExists {
+			sourceData, _, sourceErr := i.fs.ReadRegularFile(source, 4<<20)
+			destinationData, _, destinationErr := i.fs.ReadRegularFile(destination, 4<<20)
+			if sourceErr != nil || destinationErr != nil || !bytes.Equal(sourceData, destinationData) {
+				return failure("migrate apt backup", errors.New("legacy and migrated backups differ: "+name))
+			}
+		} else if err := i.copyNode(source, destination); err != nil {
+			return failure("migrate apt backup", err)
+		}
+		if err := i.fs.Remove(source); err != nil {
+			return failure("remove legacy apt backup", err)
+		}
+	}
+	return nil
+}
+
+func (i *Installer) recordAPTAbsentBaseline() error {
+	if err := i.ensureDir(path.Dir(aptAbsentMarkerPath), 0o755); err != nil {
+		return failure("create apt configuration directory", err)
+	}
+	stable, err := i.validBaselineFile(aptStableBackupPath)
+	if err != nil {
+		return failure("inspect stable apt backup", err)
+	}
+	marker, err := i.validAPTAbsentMarkerAt(aptAbsentMarkerPath)
+	if err != nil {
+		return failure("inspect apt absence marker", err)
+	}
+	if stable || marker {
+		return nil
+	}
+	if err := i.fs.WriteFileAtomic(aptAbsentMarkerPath, []byte(aptAbsentMarkerContents), 0o600); err != nil {
+		return failure("record absent apt periodic config", err)
+	}
+	return nil
+}
+
+func (i *Installer) validAPTAbsentMarkerAt(markerPath string) (bool, error) {
+	exists, err := i.validBaselineFile(markerPath)
+	if err != nil || !exists {
+		return exists, err
+	}
+	data, _, err := i.fs.ReadRegularFile(markerPath, 256)
+	if err != nil {
+		return false, err
+	}
+	if string(data) != aptAbsentMarkerContents {
+		return false, errors.New("apt absence marker has invalid contents")
+	}
+	return true, nil
+}
+
+func (i *Installer) validBaselineFile(name string) (bool, error) {
+	info, err := i.fs.Lstat(name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if info.Mode()&fs.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > 4<<20 {
+		return false, fmt.Errorf("%s must be a regular file no larger than 4 MiB", name)
+	}
+	return true, nil
 }
 
 func (i *Installer) installFiles(ctx context.Context, plan installPlan, options Options, secret []byte) (string, error) {
@@ -294,28 +448,35 @@ func (i *Installer) installBackendPolicy(plan installPlan, payload Payload) erro
 		if err := i.fs.WriteFileAtomic("/etc/needrestart/conf.d/99-security-update-notify-report-only.conf", payload.Needrestart, 0o644); err != nil {
 			return failure("install needrestart policy", err)
 		}
-		if exists, err := i.exists("/etc/apt/apt.conf.d/20auto-upgrades"); err != nil {
+		if exists, err := i.exists(aptPeriodicPath); err != nil {
 			return failure("inspect apt periodic config", err)
 		} else if exists {
-			info, err := i.fs.Lstat("/etc/apt/apt.conf.d/20auto-upgrades")
+			info, err := i.fs.Lstat(aptPeriodicPath)
 			if err != nil {
 				return failure("inspect apt periodic config", err)
 			}
 			if info.Mode()&fs.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() > 4<<20 {
 				return failure("inspect apt periodic config", errors.New("20auto-upgrades must be a regular file no larger than 4 MiB"))
 			}
-			if err := i.copyNode("/etc/apt/apt.conf.d/20auto-upgrades", "/etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak."+stamp); err != nil {
+			timestampBackup := aptPeriodicPath + ".security-update-notify." + stamp + ".bak"
+			if err := i.copyNode(aptPeriodicPath, timestampBackup); err != nil {
 				return failure("backup apt periodic config", err)
 			}
-			if stable, err := i.exists("/etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak"); err != nil {
+			stable, err := i.validBaselineFile(aptStableBackupPath)
+			if err != nil {
 				return failure("inspect stable apt backup", err)
-			} else if !stable {
-				if err := i.copyNode("/etc/apt/apt.conf.d/20auto-upgrades", "/etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak"); err != nil {
+			}
+			marker, err := i.validAPTAbsentMarkerAt(aptAbsentMarkerPath)
+			if err != nil {
+				return failure("inspect apt absence marker", err)
+			}
+			if !stable && !marker {
+				if err := i.copyNode(aptPeriodicPath, aptStableBackupPath); err != nil {
 					return failure("create stable apt backup", err)
 				}
 			}
 		}
-		if err := i.fs.WriteFileAtomic("/etc/apt/apt.conf.d/20auto-upgrades", []byte(aptPeriodicConfig), 0o644); err != nil {
+		if err := i.fs.WriteFileAtomic(aptPeriodicPath, []byte(aptPeriodicConfig), 0o644); err != nil {
 			return failure("install apt periodic config", err)
 		}
 		if err := i.fs.WriteFileAtomic("/etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify", []byte(aptUnattendedPolicy), 0o644); err != nil {
@@ -324,7 +485,7 @@ func (i *Installer) installBackendPolicy(plan installPlan, payload Payload) erro
 		return nil
 	}
 
-	const automatic = "/etc/dnf/automatic.conf"
+	const automatic = dnfAutomaticPath
 	exists, err := i.exists(automatic)
 	if err != nil {
 		return failure("inspect dnf automatic config", err)
@@ -341,6 +502,22 @@ func (i *Installer) installBackendPolicy(plan installPlan, payload Payload) erro
 	}
 	if info.Size() < 0 || info.Size() > 4<<20 {
 		return failure("inspect dnf automatic config", errors.New("automatic.conf exceeds 4 MiB"))
+	}
+	stable, err := i.validBaselineFile(dnfStableBackupPath)
+	if err != nil {
+		return failure("inspect stable dnf backup", err)
+	}
+	if !stable {
+		baseline, err := i.oldestDNFProjectBackup()
+		if err != nil {
+			return failure("select original dnf backup", err)
+		}
+		if baseline == "" {
+			baseline = automatic
+		}
+		if err := i.copyNode(baseline, dnfStableBackupPath); err != nil {
+			return failure("create stable dnf backup", err)
+		}
 	}
 	if err := i.copyNode(automatic, automatic+".security-update-notify.bak."+stamp); err != nil {
 		return failure("backup dnf automatic config", err)
@@ -361,6 +538,51 @@ func (i *Installer) installBackendPolicy(plan installPlan, payload Payload) erro
 		return failure("install dnf automatic policy", err)
 	}
 	return nil
+}
+
+func (i *Installer) oldestDNFProjectBackup() (string, error) {
+	entries, err := i.fs.ReadDir(path.Dir(dnfAutomaticPath))
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	prefix := path.Base(dnfStableBackupPath) + "."
+	oldest := ""
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, prefix) || len(name) == len(prefix) {
+			continue
+		}
+		if !validBackupTimestamp(strings.TrimPrefix(name, prefix)) {
+			continue
+		}
+		candidate := path.Join(path.Dir(dnfAutomaticPath), name)
+		info, err := i.fs.Lstat(candidate)
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&fs.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > 4<<20 {
+			return "", fmt.Errorf("%s must be a regular file no larger than 4 MiB", candidate)
+		}
+		if oldest == "" || candidate < oldest {
+			oldest = candidate
+		}
+	}
+	return oldest, nil
+}
+
+func validBackupTimestamp(value string) bool {
+	if len(value) != len("20060102150405") {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func setINI(data []byte, section, key, value string) []byte {

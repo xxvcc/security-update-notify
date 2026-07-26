@@ -43,7 +43,7 @@ func Extract(tarball, destDir string) error {
 			return fmt.Errorf("archive exceeds entry limit (%d)", maxArchiveEntries)
 		}
 		switch hdr.Typeflag {
-		case tar.TypeReg, tar.TypeRegA, tar.TypeDir:
+		case tar.TypeReg, legacyTarTypeReg, tar.TypeDir:
 		default:
 			return fmt.Errorf("unsupported archive entry type %q for %q", string(hdr.Typeflag), hdr.Name)
 		}
@@ -60,7 +60,10 @@ func Extract(tarball, destDir string) error {
 		if target != destDir && !strings.HasPrefix(target, destDir+string(os.PathSeparator)) {
 			return fmt.Errorf("entry escapes destination: %q", hdr.Name)
 		}
-		perm := os.FileMode(hdr.Mode).Perm() // 剥离 setuid/setgid/sticky 与类型位
+		if hdr.Mode < 0 || hdr.Mode > 0o7777 {
+			return fmt.Errorf("invalid archive mode %#o for %q", hdr.Mode, hdr.Name)
+		}
+		perm := os.FileMode(hdr.Mode).Perm() // 剥离 setuid/setgid/sticky
 		if hdr.Typeflag == tar.TypeDir {
 			if err := os.MkdirAll(target, perm); err != nil {
 				return err

@@ -794,9 +794,13 @@ func removeAllAt(parent *os.File, name string) error {
 	if closeErr != nil {
 		return closeErr
 	}
+	namePointer, err := syscall.BytePtrFromString(name)
+	if err != nil {
+		return err
+	}
 	_, _, errno := syscall.Syscall6(
 		syscall.SYS_UNLINKAT,
-		parent.Fd(), uintptr(unsafe.Pointer(syscall.StringBytePtr(name))), atRemoveDir, 0, 0, 0,
+		parent.Fd(), uintptr(unsafe.Pointer(namePointer)), atRemoveDir, 0, 0, 0,
 	)
 	if errno != 0 && !errors.Is(errno, fs.ErrNotExist) {
 		return errno

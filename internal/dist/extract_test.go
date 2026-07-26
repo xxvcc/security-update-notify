@@ -85,6 +85,26 @@ func TestExtractRejectsSpecialAndTraversal(t *testing.T) {
 	}
 }
 
+func TestExtractRejectsOutOfRangeModes(t *testing.T) {
+	dir := t.TempDir()
+	for name, mode := range map[string]int64{
+		"negative":  -1,
+		"oversized": 0o10000,
+	} {
+		t.Run(name, func(t *testing.T) {
+			tgz := filepath.Join(dir, name+".tar.gz")
+			writeTarGz(t, tgz, []*tar.Header{{Name: "top/file", Typeflag: tar.TypeReg, Mode: mode}}, nil)
+			dest := filepath.Join(dir, name+"-out")
+			if err := os.MkdirAll(dest, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := Extract(tgz, dest); err == nil {
+				t.Fatalf("Extract accepted archive mode %#o", mode)
+			}
+		})
+	}
+}
+
 func TestVerifySHA256(t *testing.T) {
 	dir := t.TempDir()
 	data := filepath.Join(dir, "pkg.tar.gz")

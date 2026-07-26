@@ -24,6 +24,7 @@
 ## 一键安装
 
 ```bash
+set -o pipefail
 curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash
 ```
 
@@ -157,10 +158,11 @@ Telegram：
 推荐使用网站引导安装器。它会下载最新签名 Release、校验 `.sha256` 与 GPG 签名（默认必须通过），然后启动交互式菜单：
 
 ```bash
+set -o pipefail
 curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash
 ```
 
-引导器需要 `curl`、`tar`、`sha256sum`、`mktemp`、`python3`、`env`、`gpg` 和 `timeout`。缺少命令时，它会先通过 apt、dnf 或 yum 安装对应引导依赖，再重新逐项检查；没有受支持的包管理器或补齐后仍缺命令时会在下载/安装前失败。GPG 签名默认强制校验。
+从网址启动引导器时，机器必须预先装有 `curl`，因为脚本尚未取得前不可能自行补装它。`set -o pipefail` 让缺少 `curl`、DNS/TLS 或下载失败成为整条管道的非零退出，而不是让末端 `bash` 读取空输入后误报成功。脚本运行后需要 `curl`、`tar`、`sha256sum`、`mktemp`、`python3`、`env`、`uname`、`gpg` 和 `timeout`；缺少命令时只通过 apt、dnf、microdnf 或 yum 安装对应的软件包，再逐项复查，避免在 RPM 极简系统上用完整 `curl/coreutils` 替换已安装的 `curl-minimal/coreutils-single`。没有受支持的包管理器或补齐后仍缺命令时会在下载/安装前失败。GPG 签名默认强制校验。
 
 如果你更想从源码运行，也可以：
 
@@ -193,7 +195,7 @@ sudo ./security-update-notify install
 
 扫描结果受飞书应用“通讯录数据范围”限制。扫描失败或没有可见员工时，交互安装器允许重试、手动输入当前应用下的 `open_id`，或中止安装；非交互模式必须显式提供 `--feishu-receive-id`。
 
-首次交互配置飞书或更换应用、Secret、接收人时，安装器默认发送一条仅飞书的验证消息，用于确认所选 `open_id` 位于机器人的可用范围内；输入 `n` 可跳过。验证会等待现有检查释放运行锁（最多 60 秒），确认发送成功后才启用 SUN timer；超时或发送失败都会回滚，不能把“未发送”误判为成功。非交互安装不会自动发送。显式使用 `--send-test` 或 `security-update-notify test --send-test` 仍会测试全部已配置接收平台。
+首次配置飞书或更换应用、Secret、接收人时，安装器默认发送一条仅飞书的强验证消息，用于确认所选 `open_id` 位于机器人的可用范围内；交互模式输入 `n`，或使用 `--skip-feishu-test`、`--skip-notify-test`，可明确跳过。非交互模式不会弹出确认，但同样默认执行强验证。强验证会等待现有检查释放运行锁（最多 60 秒），超时或发送失败都会回滚，不能把“未发送”误判为成功。显式 `--send-test` 会在安装后额外测试全部已配置接收平台，并覆盖 skip 对“额外发送”的抑制；这条额外测试是咨询项，失败会显示警告但不会回滚已经完成的核心安装或关闭 timer。独立命令 `security-update-notify test --send-test` 仍以发送结果决定自身退出码。
 
 ### 3. 验证
 
@@ -210,6 +212,7 @@ sudo security-update-notify test --simulate-reboot --no-dedupe
 适合放进初始化脚本、云服务器模板或批量部署流程：
 
 ```bash
+set -o pipefail
 curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- install \
   --notify-channels telegram \
   --telegram-token '123456:ABC...' \
@@ -231,6 +234,7 @@ cp .env.example .env
 chmod 600 .env
 sudoedit .env
 
+set -o pipefail
 curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | \
   sudo bash -s -- install --env-file "$PWD/.env" --non-interactive -y
 ```
@@ -241,6 +245,7 @@ curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | \
 sudo install -m 600 /dev/null /root/.security-update-notify-token
 sudoedit /root/.security-update-notify-token
 
+set -o pipefail
 curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- install \
   --telegram-token-file /root/.security-update-notify-token \
   --telegram-chat-id 'CHAT_ID' \
@@ -254,6 +259,7 @@ curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- inst
 sudo install -m 600 /dev/null /root/.security-update-notify-feishu-secret
 sudoedit /root/.security-update-notify-feishu-secret
 
+set -o pipefail
 curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- install \
   --notify-channels feishu \
   --feishu-app-id 'cli_xxx' \
@@ -290,10 +296,10 @@ App Secret 源文件必须是 root 所有的普通文件，不能是符号链接
 --skip-post-install-check # 跳过安装/升级后自检
 --allow-best-effort        # 允许尽力支持的发行版
 --lock-wait SECONDS       # 运行锁屏障等待 0..3600 秒，默认 60
---send-test                # 安装完成后测试全部已配置接收平台
+--send-test                # 安装后额外测试全部平台；失败告警但不回滚安装
 --skip-telegram-test       # 跳过 Telegram 预检
---skip-feishu-test         # 跳过独立凭据预检；未指定接收人时仍需扫描选人
---skip-notify-test         # 跳过所有渠道预检
+--skip-feishu-test         # 跳过飞书预检及默认强验证；未指定接收人时仍需扫描选人
+--skip-notify-test         # 跳过全部预检及默认飞书强验证；显式 --send-test 仍发送
 ```
 
 已安装 SUN 后，可用 `sudo security-update-notify install [选项]` 直接执行同一 Go 安装器；管理已有安装的消息通知设置使用 `sudo security-update-notify configure notifications`。
@@ -304,6 +310,7 @@ App Secret 源文件必须是 root 所有的普通文件，不能是符号链接
 重新运行一键安装器即可升级到最新 release：
 
 ```bash
+set -o pipefail
 curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- upgrade --non-interactive -y
 ```
 
@@ -385,7 +392,7 @@ SUN 会配置或使用：
 - `apt-listchanges`
 - apt periodic timers
 
-安装器会启用 unattended-upgrades 的安全更新周期任务。每次覆盖 `/etc/apt/apt.conf.d/20auto-upgrades` 前都会保存一份带时间戳的 SUN 专用备份；首次安装时还会保留一份固定名称备份。`--purge-config` 会在固定备份存在时恢复它，并删除 SUN 创建的固定及时间戳备份。
+安装器会启用 unattended-upgrades 的安全更新周期任务。每次覆盖 `/etc/apt/apt.conf.d/20auto-upgrades` 前都会保存一份带时间戳的 SUN 专用备份；如果安装前已有该文件，首次安装还会固定保存原始基线；如果原本不存在，则在包管理器写入前记录一个受校验、可回滚的“原始缺失”标记。APT 目录内的标记和时间戳备份都以 `.bak` 结尾，避免 apt 对非配置文件输出扩展名提示；升级会迁移旧命名。`--purge-config` 会恢复固定基线，或按标记把该文件恢复为不存在，然后删除 SUN 的基线、标记和时间戳备份。
 
 检测方式：
 
@@ -407,7 +414,7 @@ SUN 会配置或使用：
 - `needs-restarting -s`（列出需要重启的 systemd 服务；不再用裸 `needs-restarting` 的整表进程，避免误报）
 - `dnf updateinfo list security updates`
 
-如果 `/etc/dnf/automatic.conf` 存在，SUN 会先保存一份带时间戳的备份，再将其配置为只安装安全更新；`--purge-config` 会尝试恢复最新一份 SUN 创建的备份，并删除 SUN 专用的时间戳备份。
+如果 `/etc/dnf/automatic.conf` 存在，SUN 会在第一次管理时固定保存原始基线，每次覆盖前另存时间戳备份，再将其配置为只安装安全更新。升级旧安装时会从最早的 SUN 时间戳备份迁移原始基线；普通卸载和随后重装不会改写它。`--purge-config` 恢复这份固定原始基线，并删除 SUN 的固定及时间戳备份。
 
 ```ini
 upgrade_type = security
@@ -469,7 +476,7 @@ sudo security-update-notify uninstall --purge-config
 
 ## Release 签名
 
-发布包始终包含 `.sha256` 校验文件。`go run ./cmd/sun-release package` 在可用时生成 `.tar.gz.asc` detached signature；正式发布或已有对应 tag 时强制签名。`sun.sh` 默认以 `required` 模式校验签名，`auto` 仅作为兼容别名保留，也会要求 gpg 与 `.asc` 签名同时存在；只有显式传入 `--verify-signature off` 才会跳过签名校验。
+发布包始终包含 `.sha256` 校验文件。`go run ./cmd/sun-release package` 在可用时生成 `.tar.gz.asc` detached signature；正式发布或已有对应 tag 时强制签名，并会在创建任何 `dist` 文件前拒绝显式 `--sign off`。`sun.sh` 默认以 `required` 模式校验签名，`auto` 仅作为兼容别名保留，也会要求 gpg 与 `.asc` 签名同时存在；只有显式传入 `--verify-signature off` 才会跳过签名校验。
 
 根 `VERSION` 是唯一版本源，格式必须严格为 `VERSION="X.Y.Z"`。正式发布（存在对应 `vX.Y.Z` tag，或显式设置 `RELEASE=1`）**强制签名并固定包含五架构 Go 二进制**：Go 发布工具会绑定根版本、唯一 `CHANGELOG` 标题、tag、包内版本和每个二进制的 `--version`，且架构集合不可覆盖；缺少 Go、Bash（仅用于检查 `sun.sh` 语法）、任一 amd64/arm64/386/ppc64le/s390x 架构产物，或固定指纹对应的 GPG 私钥都会失败。release 发布后 CI 只接受与 tag 同版本且恰好由 tarball、checksum、签名组成的一套资产，并用仓库内公钥校验签名与指纹。私钥不进入 CI，仍由维护者离线持有。此外，`security-update-notify upgrade` 默认 **fail-closed**：从固定发布镜像优先下载、GitHub 回退，校验 sha256，并在解包前用内置公钥与 pin 指纹强制校验 GPG 签名后才升级（应急可设 `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` 仅按 sha256 升级）。
 
@@ -500,8 +507,8 @@ go test -race -cover ./...
 build/archive-safety-test.sh
 build/runtime-lock-test.sh
 build/reproducibility-check.sh linux amd64
-docker run --rm -v "$PWD:/src:ro" debian:12 bash /src/build/compat-test.sh
-docker run --rm -v "$PWD:/src:ro" debian:12 bash /src/build/rollback-test.sh
+docker run --rm -e SUN_CONTAINER_TEST=1 -v "$PWD:/src:ro" debian:12 bash /src/build/compat-test.sh
+docker run --rm -e SUN_CONTAINER_TEST=1 -v "$PWD:/src:ro" debian:12 bash /src/build/rollback-test.sh
 go run ./cmd/sun-release package
 cd dist && sha256sum -c security-update-notify-*.tar.gz.sha256
 ```

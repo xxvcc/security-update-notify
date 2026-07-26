@@ -29,7 +29,7 @@ jobs:
       - name: Set up pinned Go toolchain
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26.4'
+          go-version: '1.26.5'
           check-latest: false
           cache: false
 
@@ -48,6 +48,12 @@ jobs:
 
       - name: go vet
         run: go vet ./...
+
+      - name: Static analysis
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+
+      - name: Go vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
       - name: Race tests and coverage
         run: |
@@ -82,19 +88,29 @@ jobs:
   bootstrap:
     if: ${{ github.event_name != 'release' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set up pinned Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          check-latest: false
+          cache: false
 
       - name: Syntax-check the retained Shell gates
         run: |
           bash -n \
             sun.sh \
             build/archive-safety-test.sh \
+            build/bootstrap-test.sh \
             build/build.sh \
             build/compat-test.sh \
+            build/interactive-test.sh \
             build/reproducibility-check.sh \
+            build/rocky-bootstrap-test.sh \
             build/rollback-test.sh \
             build/runtime-lock-test.sh
 
@@ -103,17 +119,48 @@ jobs:
           shellcheck -s bash -S warning \
             sun.sh \
             build/archive-safety-test.sh \
+            build/bootstrap-test.sh \
             build/build.sh \
             build/compat-test.sh \
+            build/interactive-test.sh \
             build/reproducibility-check.sh \
+            build/rocky-bootstrap-test.sh \
             build/rollback-test.sh \
             build/runtime-lock-test.sh
 
-      - name: Compile archive allowlist validator
-        run: python3 -m py_compile build/release-archive-test.py
+      - name: Compile Python test helpers
+        run: |
+          python3 -m py_compile \
+            build/fake-notify-api.py \
+            build/pty-driver.py \
+            build/release-archive-test.py
 
       - name: Hostile bootstrap archive gate
         run: build/archive-safety-test.sh
+
+      - name: Bootstrap argument and dependency gate
+        run: build/bootstrap-test.sh
+
+      - name: Build current installer for Rocky minimal lifecycle gate
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' VERSION)"
+          [[ -n "$version" && "$(wc -l <VERSION)" -eq 1 ]]
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w -X main.Version=$version" \
+            -o "$RUNNER_TEMP/security-update-notify-rocky" ./cmd/security-update-notify
+
+      - name: Rocky minimal bootstrap and Go installer lifecycle gate
+        run: |
+          set -euo pipefail
+          for image in rockylinux:8-minimal rockylinux:9-minimal; do
+            docker run --rm \
+              -e SUN_CONTAINER_TEST=1 \
+              -e SUN_INSTALL_BINARY=/sun-bin \
+              -v "$PWD:/src:ro" \
+              -v "$RUNNER_TEMP/security-update-notify-rocky:/sun-bin:ro" \
+              "$image" bash /src/build/rocky-bootstrap-test.sh
+          done
 
       - name: Stable mirror publication invariants
         run: |
@@ -153,7 +200,7 @@ jobs:
       - name: Set up pinned Go toolchain
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26.4'
+          go-version: '1.26.5'
           check-latest: false
           cache: false
 
@@ -221,7 +268,15 @@ jobs:
     if: ${{ github.event_name != 'release' }}
     needs: package
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - debian:12
+          - debian:13
+          - ubuntu:22.04
+          - ubuntu:24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -232,11 +287,14 @@ jobs:
           name: security-update-notify-dist
           path: dist
 
-      - name: Upgrade a schema-3 installation in a Debian container
-        run: docker run --rm -v "$PWD:/src:ro" debian:12 bash /src/build/compat-test.sh
+      - name: Upgrade a schema-3 installation
+        run: docker run --rm -e SUN_CONTAINER_TEST=1 -v "$PWD:/src:ro" "${{ matrix.image }}" bash /src/build/compat-test.sh
 
       - name: Fresh install, failed-upgrade rollback, and uninstall lifecycle
-        run: docker run --rm -v "$PWD:/src:ro" debian:12 bash /src/build/rollback-test.sh
+        run: docker run --rm -e SUN_CONTAINER_TEST=1 -v "$PWD:/src:ro" "${{ matrix.image }}" bash /src/build/rollback-test.sh
+
+      - name: Human-style PTY install and notification lifecycle
+        run: docker run --rm -e SUN_CONTAINER_TEST=1 -v "$PWD:/src:ro" "${{ matrix.image }}" bash /src/build/interactive-test.sh
 
   multiarch:
     if: ${{ github.event_name != 'release' }}

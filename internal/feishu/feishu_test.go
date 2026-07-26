@@ -3,6 +3,7 @@ package feishu
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -306,6 +307,32 @@ func TestExhaustedServerFailureIsTemporary(t *testing.T) {
 	}
 	if requests != 3 || *slept != 2 {
 		t.Fatalf("requests=%d sleeps=%d, want 3,2", requests, *slept)
+	}
+}
+
+func TestRetryDelayHonorsContext(t *testing.T) {
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"code":99991400}`)
+	}))
+	defer srv.Close()
+
+	c := &Client{HTTP: srv.Client(), BaseURL: srv.URL}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := c.Probe(ctx, "cli_app", "secret")
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) || !IsTemporary(err) {
+		t.Fatalf("error=%v, want temporary context deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("context cancellation took %s", elapsed)
+	}
+	if got := atomic.LoadInt32(&requests); got != 1 {
+		t.Fatalf("requests=%d, want 1 before cancellation", got)
 	}
 }
 

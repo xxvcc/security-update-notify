@@ -85,9 +85,7 @@ func parse(r io.Reader) (*Config, error) {
 		if line == "" || isCommentLine(line) {
 			continue
 		}
-		if strings.HasPrefix(line, "export ") { // 仅前缀恰为 "export " 才剥离
-			line = line[len("export "):]
-		}
+		line = strings.TrimPrefix(line, "export ") // 仅前缀恰为 "export " 才剥离
 		i := strings.IndexByte(line, '=')
 		if i < 0 {
 			return nil, fmt.Errorf("invalid config line (no '=')")

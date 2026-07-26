@@ -10,6 +10,7 @@ import (
 	"os"
 
 	"github.com/xxvcc/security-update-notify/internal/cli"
+	"github.com/xxvcc/security-update-notify/internal/sysexec"
 )
 
 // Version 由 -ldflags "-X main.Version=X.Y.Z" 在编译期注入；刻意不可被环境变量覆盖。
@@ -17,5 +18,6 @@ import (
 var Version = "dev"
 
 func main() {
+	sysexec.InstallSignalForwarding()
 	os.Exit(cli.Main(Version, os.Args[1:]))
 }

@@ -8,22 +8,33 @@ package systemd
 
 import (
 	"strings"
+	"time"
 
 	"github.com/xxvcc/security-update-notify/internal/sysexec"
 )
+
+const systemctlCommandTimeout = 15 * time.Second
 
 // Available 报告本机是否有 systemctl。
 func Available() bool { return sysexec.Look("systemctl") }
 
 // IsEnabled 复刻 `systemctl is-enabled <unit>`（退出 0 视为已启用）。
 func IsEnabled(unit string) bool {
-	return sysexec.Run("systemctl", "is-enabled", unit).Code == 0
+	return isEnabledWithTimeout(unit, systemctlCommandTimeout)
+}
+
+func isEnabledWithTimeout(unit string, timeout time.Duration) bool {
+	return sysexec.RunTimeout(timeout, "systemctl", "is-enabled", unit).Code == 0
 }
 
 // ShowValue 复刻 `systemctl show <unit> -p <prop> --value`，去掉尾部换行；失败返回空。
 func ShowValue(unit, prop string) string {
-	r := sysexec.Run("systemctl", "show", unit, "-p", prop, "--value")
-	if r.Code != 0 && r.Err != nil {
+	return showValueWithTimeout(unit, prop, systemctlCommandTimeout)
+}
+
+func showValueWithTimeout(unit, prop string, timeout time.Duration) string {
+	r := sysexec.RunTimeout(timeout, "systemctl", "show", unit, "-p", prop, "--value")
+	if r.Code != 0 {
 		return ""
 	}
 	return strings.TrimRight(r.Stdout, "\n")

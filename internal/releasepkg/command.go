@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/xxvcc/security-update-notify/internal/sysexec"
 )
 
 func findExecutable(name string) (string, error) {
@@ -22,7 +24,7 @@ func findExecutable(name string) (string, error) {
 }
 
 func runCombined(ctx context.Context, dir string, env []string, name string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := sysexec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
 	if env != nil {
 		cmd.Env = env

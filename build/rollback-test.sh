@@ -4,8 +4,12 @@
 # disposable container.
 set -euo pipefail
 
-[[ -f /.dockerenv || "${SUN_CONTAINER_TEST:-0}" == 1 ]] || {
+[[ -f /.dockerenv && "${SUN_CONTAINER_TEST:-0}" == 1 ]] || {
   echo "build/rollback-test.sh must run only in a disposable container" >&2
+  exit 2
+}
+awk '$5 == "/src" && $6 ~ /(^|,)ro(,|$)/ { found = 1 } END { exit !found }' /proc/self/mountinfo || {
+  echo "build/rollback-test.sh requires /src to be mounted read-only" >&2
   exit 2
 }
 
@@ -69,14 +73,14 @@ chmod 0755 /usr/local/bin/systemctl
 printf '#!/usr/bin/env bash\nexit 0\n' >/usr/local/bin/systemd-analyze
 chmod 0755 /usr/local/bin/systemd-analyze
 
-tarball="$(find /src/dist -maxdepth 1 -type f -name 'security-update-notify-*.tar.gz' -print -quit)"
-[[ -n "$tarball" ]] || { echo "release tarball missing under /src/dist" >&2; exit 1; }
 version="$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' /src/VERSION)"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z]+)?$ \
    && "$(wc -l </src/VERSION)" -eq 1 ]] || {
   echo "invalid canonical VERSION" >&2
   exit 1
 }
+tarball="/src/dist/security-update-notify-${version}.tar.gz"
+[[ -f "$tarball" ]] || { echo "release tarball missing: $tarball" >&2; exit 1; }
 work=/tmp/sun-rollback-release
 mkdir -p "$work"
 tar -xzf "$tarball" -C "$work"
@@ -125,6 +129,9 @@ ok "[[ -L /etc/systemd/system/timers.target.wants/security-update-notify.timer ]
 ok "[[ -e /tmp/mock-systemd/active ]]" "timer active"
 ok "[[ -f /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak ]]" \
   "stable APT baseline backup created"
+apt-config dump >/tmp/sun-apt-config.out 2>&1
+ok "! grep -Fq \"Ignoring file '20auto-upgrades.security-update-notify\" /tmp/sun-apt-config.out" \
+  "SUN APT metadata names are silently ignored"
 
 binary_sha="$(sha256sum /usr/local/sbin/security-update-notify | awk '{print $1}')"
 config_sha="$(sha256sum /etc/security-update-notify/telegram.env | awk '{print $1}')"
@@ -176,7 +183,7 @@ ok "[[ ! -e /var/lib/security-update-notify ]]" "state purged"
 ok "[[ ! -e /var/backups/security-update-notify ]]" "transaction backups purged"
 ok "[[ \"$(sha256sum /etc/apt/apt.conf.d/20auto-upgrades | awk '{print $1}')\" == '$baseline_sha' ]]" \
   "APT baseline restored"
-ok "! find /etc/apt/apt.conf.d -maxdepth 1 -name '20auto-upgrades.security-update-notify.bak*' | grep -q ." \
+ok "! find /etc/apt/apt.conf.d -maxdepth 1 -name '20auto-upgrades.security-update-notify*' | grep -q ." \
   "SUN APT backups removed"
 
 echo "Go installer rollback and uninstaller integration test passed"

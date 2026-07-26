@@ -75,6 +75,14 @@ type installArguments struct {
 	help                 bool
 }
 
+type localizedInputError struct {
+	message string
+	cause   error
+}
+
+func (e *localizedInputError) Error() string { return e.message }
+func (e *localizedInputError) Unwrap() error { return e.cause }
+
 func defaultInstallCommand() *installCommand {
 	reader := bufio.NewReader(os.Stdin)
 	return &installCommand{
@@ -124,7 +132,11 @@ func (c *installCommand) run(rawArgs []string, configure bool) int {
 		return 1
 	}
 	defer func() { zeroCLIBytes(parsed.feishuSecret) }()
-	parsed.lang = c.chooseLanguage(parsed.lang, parsed.nonInteractive)
+	parsed.lang, err = c.chooseLanguage(parsed.lang, parsed.nonInteractive)
+	if err != nil {
+		fmt.Fprintln(c.console.errOut, err)
+		return 2
+	}
 
 	current, err := c.loadConfig(defaultEnvFile)
 	if err != nil {
@@ -136,7 +148,7 @@ func (c *installCommand) run(rawArgs []string, configure bool) int {
 		c.say(c.console.errOut, parsed.lang, "尚未检测到已有安装。", "No existing installation was detected.")
 		return 2
 	}
-	if configure && parsed.nonInteractive && len(parsed.config) == 0 && parsed.telegramTokenFile == "" && parsed.feishuSecretFile == "" {
+	if configure && parsed.nonInteractive && len(parsed.config) == 0 && parsed.checkTime == "" && parsed.telegramTokenFile == "" && parsed.feishuSecretFile == "" {
 		c.say(c.console.errOut, parsed.lang, "非交互配置没有提供任何修改。", "No non-interactive configuration changes were supplied.")
 		return 2
 	}
@@ -218,8 +230,27 @@ func (c *installCommand) run(rawArgs []string, configure bool) int {
 	if result.BackupDir != "" {
 		c.say(c.console.out, parsed.lang, "事务备份: "+result.BackupDir, "Transaction backup: "+result.BackupDir)
 	}
+	c.reportPostInstallTest(parsed.lang, result.PostInstallTest)
 	c.reportPostInstallDoctor(parsed.lang, result.PostInstallDoctor)
 	return 0
+}
+
+func (c *installCommand) reportPostInstallTest(lang string, result *installer.CommandResult) {
+	if result == nil {
+		return
+	}
+	writeCommandOutput(c.console.out, result.Stdout)
+	writeCommandOutput(c.console.errOut, result.Stderr)
+	if result.Err == nil && result.Code == 0 {
+		return
+	}
+	if result.Err != nil {
+		fmt.Fprintf(c.console.errOut, "%s: %v\n",
+			c.pick(lang, "额外测试消息无法完成", "Additional test message could not complete"), result.Err)
+	}
+	c.say(c.console.errOut, lang,
+		"警告：安装已完成，但额外测试消息发送失败；核心安装和定时任务未回滚，请检查接收平台配置与网络后重试测试。",
+		"Warning: installation completed, but the additional test message failed; the core installation and timer were not rolled back. Check the receiving-platform settings and network, then retry the test.")
 }
 
 func (c *installCommand) reportPostInstallDoctor(lang string, result *installer.CommandResult) {
@@ -382,7 +413,7 @@ func (c *installCommand) completeRequiredInputs(parsed *installArguments, effect
 		} else {
 			chosen, err := c.promptChannels(parsed.lang, "telegram")
 			if err != nil {
-				return err
+				return invalidCLI(err)
 			}
 			channels = chosen
 		}
@@ -504,12 +535,11 @@ func (c *installCommand) configureWizard(parsed *installArguments, effective map
 	_, feishuAppExplicit := parsed.config["FEISHU_APP_ID"]
 	_, feishuReceiverExplicit := parsed.config["FEISHU_RECEIVE_ID"]
 	if selectedCLIChannel(currentChannels, "feishu") && !feishuAppExplicit && !feishuReceiverExplicit && parsed.feishuSecretFile == "" && len(parsed.feishuSecret) == 0 {
-		fmt.Fprintln(c.console.out, c.pick(parsed.lang, "飞书设置: 1) 保持  2) 更换接收人  3) 更换应用和接收人  4) 更新 App Secret  [1]: ", "Feishu: 1) Keep  2) Change recipient  3) Change app and recipient  4) Update App Secret  [1]: "))
-		choice, readErr := c.readLine()
+		choice, readErr := c.promptFeishuSettings(parsed.lang)
 		if readErr != nil {
 			return false, readErr
 		}
-		switch strings.TrimSpace(choice) {
+		switch choice {
 		case "", "1":
 		case "2":
 			parsed.config["FEISHU_RECEIVE_ID"], effective["FEISHU_RECEIVE_ID"] = "", ""
@@ -532,8 +562,6 @@ func (c *installCommand) configureWizard(parsed *installArguments, effective map
 				return false, secretErr
 			}
 			parsed.feishuSecret, changed = []byte(secret), true
-		default:
-			return false, errors.New("invalid Feishu settings choice")
 		}
 	}
 	return changed, nil
@@ -544,7 +572,7 @@ func (c *installCommand) completeInstallPreferences(parsed *installArguments, ef
 		if parsed.nonInteractive {
 			parsed.checkTime = "09:00"
 		} else {
-			value, err := c.promptDefault(parsed.lang, "每日检查时间 HH:MM", "Daily check time HH:MM", "09:00")
+			value, err := c.promptCheckTime(parsed.lang, "09:00")
 			if err != nil {
 				return invalidCLI(err)
 			}
@@ -557,21 +585,17 @@ func (c *installCommand) completeInstallPreferences(parsed *installArguments, ef
 		if parsed.nonInteractive {
 			mode = "daily"
 		} else {
-			c.say(c.console.out, parsed.lang, "相同告警重复提醒模式:", "Same-alert reminder mode:")
-			c.say(c.console.out, parsed.lang, "1) 仅一次  2) 每天一次（推荐）  3) 每 N 天一次 [2]:", "1) Once  2) Daily (recommended)  3) Every N days [2]:")
-			choice, err := c.readLine()
+			choice, err := c.promptDedupMode(parsed.lang)
 			if err != nil {
 				return invalidCLI(err)
 			}
-			switch strings.TrimSpace(choice) {
+			switch choice {
 			case "1":
 				mode = "once"
 			case "", "2":
 				mode = "daily"
 			case "3":
 				mode = "interval"
-			default:
-				return invalidCLI(errors.New("invalid same-alert reminder mode"))
 			}
 		}
 		parsed.config["DEDUP_MODE"], effective["DEDUP_MODE"] = mode, mode
@@ -583,7 +607,8 @@ func (c *installCommand) completeInstallPreferences(parsed *installArguments, ef
 	if mode == "interval" && effective["DEDUP_INTERVAL_DAYS"] == "" {
 		days := "3"
 		if !parsed.nonInteractive {
-			value, err := c.promptDefault(parsed.lang, "同一告警每 N 天重复提醒", "Repeat the same alert every N days", days)
+			value, err := c.promptPositiveInteger(parsed.lang,
+				"同一告警每 N 天重复提醒", "Repeat the same alert every N days", days)
 			if err != nil {
 				return invalidCLI(err)
 			}
@@ -592,9 +617,6 @@ func (c *installCommand) completeInstallPreferences(parsed *installArguments, ef
 		parsed.config["DEDUP_INTERVAL_DAYS"], effective["DEDUP_INTERVAL_DAYS"] = days, days
 	}
 
-	if parsed.sendTest || parsed.nonInteractive {
-		return nil
-	}
 	channels, _ := normalizeCLIChannels(effective["NOTIFY_CHANNELS"])
 	originalChannels := ""
 	if existing {
@@ -606,8 +628,21 @@ func (c *installCommand) completeInstallPreferences(parsed *installArguments, ef
 	}
 	_, appChanged := parsed.config["FEISHU_APP_ID"]
 	_, receiverChanged := parsed.config["FEISHU_RECEIVE_ID"]
-	feishuNeedsDeliveryTest := selectedCLIChannel(channels, "feishu") &&
+	feishuNeedsDeliveryTest := !parsed.skipFeishu && selectedCLIChannel(channels, "feishu") &&
 		(!existing || !selectedCLIChannel(originalChannels, "feishu") || appChanged || receiverChanged || len(parsed.feishuSecret) > 0 || effective["FEISHU_RECEIVE_ID"] == "")
+	if parsed.sendTest {
+		// An explicit all-platform test does not weaken the transaction-scoped
+		// validation required for a new or changed Feishu recipient.
+		parsed.verifyFeishu = feishuNeedsDeliveryTest
+		return nil
+	}
+	if parsed.nonInteractive {
+		parsed.verifyFeishu = feishuNeedsDeliveryTest
+		return nil
+	}
+	if parsed.skipTelegram && parsed.skipFeishu {
+		return nil
+	}
 	var approved bool
 	var err error
 	if feishuNeedsDeliveryTest {
@@ -674,15 +709,25 @@ func (c *installCommand) confirmDependencies(parsed *installArguments) installer
 			return false, err
 		}
 		if parsed.assumeYes || parsed.nonInteractive {
+			c.say(c.console.out, parsed.lang,
+				"正在安装依赖软件包: "+strings.Join(request.Packages, " "),
+				"Installing dependency packages: "+strings.Join(request.Packages, " "))
 			return true, nil
 		}
 		packages := strings.Join(request.Packages, " ")
 		c.say(c.console.out, parsed.lang,
 			"缺少依赖软件包: "+packages,
 			"Missing dependency packages: "+packages)
-		return c.promptYesNo(parsed.lang,
+		approved, err := c.promptYesNo(parsed.lang,
 			"现在安装这些软件包？[Y/n]: ",
 			"Install these packages now? [Y/n]: ", true)
+		if err != nil || !approved {
+			return approved, err
+		}
+		c.say(c.console.out, parsed.lang,
+			"正在安装依赖软件包: "+packages,
+			"Installing dependency packages: "+packages)
+		return true, nil
 	}
 }
 
@@ -710,20 +755,19 @@ func (c *installCommand) telegramPreflight(parent context.Context, parsed *insta
 			c.say(c.console.errOut, parsed.lang,
 				"Telegram 网络预检暂时失败；这不表示 Bot Token 或 Chat ID 无效。",
 				"Telegram network preflight temporarily failed; this does not mean the Bot Token or Chat ID is invalid.")
-			fmt.Fprintln(c.console.out, c.pick(parsed.lang,
-				"1) 重试连接  2) 跳过本次预检  3) 中止 [1]: ",
-				"1) Retry connection  2) Skip this preflight  3) Abort [1]: "))
-			choice, readErr := c.readLine()
+			choice, readErr := c.promptTemporaryFailureChoice(parsed.lang)
 			if readErr != nil {
 				return invalidCLI(readErr)
 			}
-			switch strings.TrimSpace(choice) {
+			switch choice {
 			case "", "1":
 				continue
 			case "2":
-				c.say(c.console.out, parsed.lang, "已跳过本次 Telegram 预检；凭据保持不变。", "Skipped this Telegram preflight; credentials remain unchanged.")
+				c.say(c.console.out, parsed.lang,
+					"已跳过本次 Telegram 预检；保留当前输入，但尚未验证。",
+					"Skipped this Telegram preflight; the current input was kept but remains unverified.")
 				return nil
-			default:
+			case "3":
 				return &installer.ExitError{Code: 75, Op: "Telegram preflight", Err: err}
 			}
 		}
@@ -731,7 +775,10 @@ func (c *installCommand) telegramPreflight(parent context.Context, parsed *insta
 			return &installer.ExitError{Code: 2, Op: "Telegram preflight", Err: err}
 		}
 		retry, promptErr := c.promptYesNo(parsed.lang, "重新输入 Telegram token 和 chat ID？[Y/n]: ", "Re-enter Telegram token and chat ID? [Y/n]: ", true)
-		if promptErr != nil || !retry {
+		if promptErr != nil {
+			return invalidCLI(promptErr)
+		}
+		if !retry {
 			return &installer.ExitError{Code: 2, Op: "Telegram preflight", Err: err}
 		}
 		token, secretErr := c.promptSecret(parsed.lang, "Telegram Bot Token")
@@ -777,12 +824,11 @@ func (c *installCommand) feishuPreflight(parent context.Context, parsed *install
 					"飞书通讯录网络扫描暂时失败；这不表示权限或凭据无效。",
 					"The Feishu directory scan is temporarily unavailable; this does not mean permissions or credentials are invalid.")
 			}
-			fmt.Fprintln(c.console.out, c.pick(parsed.lang, "1) 重试扫描  2) 手动输入 open_id  3) 中止 [2]: ", "1) Retry scan  2) Enter open_id manually  3) Abort [2]: "))
-			choice, readErr := c.readLine()
+			choice, readErr := c.promptDirectoryFailureChoice(parsed.lang)
 			if readErr != nil {
 				return invalidCLI(readErr)
 			}
-			switch strings.TrimSpace(choice) {
+			switch choice {
 			case "1":
 				continue
 			case "", "2":
@@ -795,7 +841,7 @@ func (c *installCommand) feishuPreflight(parent context.Context, parsed *install
 					return nil
 				}
 				continue
-			default:
+			case "3":
 				code := 2
 				if feishu.IsTemporary(err) {
 					code = 75
@@ -819,19 +865,19 @@ func (c *installCommand) feishuPreflight(parent context.Context, parsed *install
 					c.say(c.console.errOut, parsed.lang,
 						"飞书网络预检暂时失败；这不表示 App ID、Secret 或接收人无效。",
 						"The Feishu network preflight temporarily failed; this does not mean the App ID, secret, or recipient is invalid.")
-					fmt.Fprintln(c.console.out, c.pick(parsed.lang,
-						"1) 重试连接  2) 跳过本次预检  3) 中止 [1]: ",
-						"1) Retry connection  2) Skip this preflight  3) Abort [1]: "))
-					choice, readErr := c.readLine()
+					choice, readErr := c.promptTemporaryFailureChoice(parsed.lang)
 					if readErr != nil {
 						return invalidCLI(readErr)
 					}
-					switch strings.TrimSpace(choice) {
+					switch choice {
 					case "", "1":
 						continue
 					case "2":
+						c.say(c.console.out, parsed.lang,
+							"已跳过本次飞书预检；保留当前输入，但尚未验证。",
+							"Skipped this Feishu preflight; the current input was kept but remains unverified.")
 						return nil
-					default:
+					case "3":
 						return &installer.ExitError{Code: 75, Op: "Feishu preflight", Err: err}
 					}
 				}
@@ -839,7 +885,10 @@ func (c *installCommand) feishuPreflight(parent context.Context, parsed *install
 					return &installer.ExitError{Code: 2, Op: "Feishu preflight", Err: err}
 				}
 				retry, promptErr := c.promptYesNo(parsed.lang, "重新输入飞书凭据？[Y/n]: ", "Re-enter Feishu credentials? [Y/n]: ", true)
-				if promptErr != nil || !retry {
+				if promptErr != nil {
+					return invalidCLI(promptErr)
+				}
+				if !retry {
 					return &installer.ExitError{Code: 2, Op: "Feishu preflight", Err: err}
 				}
 				newApp, inputErr := c.promptRequired(parsed.lang, "飞书 App ID / Feishu App ID")
@@ -890,7 +939,7 @@ func (c *installCommand) selectFeishuUser(parsed *installArguments, users []feis
 	}
 	for {
 		fmt.Fprint(c.console.out, c.pick(parsed.lang, "请选择飞书接收人编号: ", "Choose Feishu recipient number: "))
-		line, err := c.readLine()
+		line, err := c.readPromptLine(parsed.lang)
 		if err != nil {
 			return "", err
 		}
@@ -910,14 +959,12 @@ func (c *installCommand) promptChannels(lang, current string) (string, error) {
 	case "telegram,feishu":
 		defaultChoice = "3"
 	}
-	fmt.Fprintln(c.console.out, c.pick(lang, "接收平台: 1) Telegram  2) 飞书  3) Telegram + 飞书 ["+defaultChoice+"]: ", "Receiving platforms: 1) Telegram  2) Feishu  3) Telegram + Feishu ["+defaultChoice+"]: "))
-	line, err := c.readLine()
+	choice, err := c.promptMenuChoice(lang,
+		"接收平台: 1) Telegram  2) 飞书  3) Telegram + 飞书 ["+defaultChoice+"]: ",
+		"Receiving platforms: 1) Telegram  2) Feishu  3) Telegram + Feishu ["+defaultChoice+"]: ",
+		defaultChoice, "1", "2", "3")
 	if err != nil {
 		return "", err
-	}
-	choice := strings.TrimSpace(line)
-	if choice == "" {
-		choice = defaultChoice
 	}
 	switch choice {
 	case "1":
@@ -926,60 +973,68 @@ func (c *installCommand) promptChannels(lang, current string) (string, error) {
 		return "feishu", nil
 	case "3":
 		return "telegram,feishu", nil
-	default:
-		return "", errors.New("invalid receiving-platform choice")
 	}
+	return "", nil
 }
 
-func (c *installCommand) chooseLanguage(lang string, nonInteractive bool) string {
+func (c *installCommand) chooseLanguage(lang string, nonInteractive bool) (string, error) {
 	if lang == "zh" || lang == "en" {
-		return lang
+		return lang, nil
 	}
 	if env := os.Getenv("UI_LANG"); env == "zh" || env == "en" {
-		return env
+		return env, nil
 	}
 	if env := os.Getenv("SUN_LANG"); env == "zh" || env == "en" {
-		return env
+		return env, nil
 	}
 	if nonInteractive {
-		return "zh"
+		return "zh", nil
 	}
-	fmt.Fprintln(c.console.out, "请选择语言 / Choose a language: 1) 中文  2) English [1]:")
-	line, err := c.readLine()
-	if err == nil && strings.TrimSpace(line) == "2" {
-		return "en"
+	choice, err := c.promptMenuChoice("",
+		"请选择语言 / Choose a language: 1) 中文  2) English [1]:",
+		"请选择语言 / Choose a language: 1) 中文  2) English [1]:",
+		"1", "1", "2")
+	if err != nil {
+		return "zh", err
 	}
-	return "zh"
+	if choice == "2" {
+		return "en", nil
+	}
+	return "zh", nil
 }
 
 func (c *installCommand) promptSecret(lang, label string) (string, error) {
-	value, err := c.console.readSecret(c.pick(lang, label+"（输入隐藏）: ", label+" (input hidden): "))
-	if err != nil {
-		return "", err
+	for {
+		value, err := c.console.readSecret(c.pick(lang, label+"（输入隐藏）: ", label+" (input hidden): "))
+		trimmed := strings.TrimRight(value, "\r\n")
+		if err != nil && !(errors.Is(err, io.EOF) && trimmed != "") {
+			return "", c.localizedInputError(lang, err)
+		}
+		if trimmed != "" {
+			return trimmed, nil
+		}
+		c.say(c.console.errOut, lang, "输入不能为空，请重新输入。", "Input cannot be empty; try again.")
 	}
-	value = strings.TrimRight(value, "\r\n")
-	if value == "" {
-		return "", errors.New(label + " cannot be empty")
-	}
-	return value, nil
 }
 
 func (c *installCommand) promptRequired(lang, label string) (string, error) {
-	fmt.Fprint(c.console.out, c.pick(lang, label+": ", label+": "))
-	line, err := c.readLine()
-	if err != nil {
-		return "", err
+	for {
+		fmt.Fprint(c.console.out, c.pick(lang, label+": ", label+": "))
+		line, err := c.readPromptLine(lang)
+		if err != nil {
+			return "", err
+		}
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return line, nil
+		}
+		c.say(c.console.errOut, lang, "输入不能为空，请重新输入。", "Input cannot be empty; try again.")
 	}
-	line = strings.TrimSpace(line)
-	if line == "" {
-		return "", errors.New(label + " cannot be empty")
-	}
-	return line, nil
 }
 
 func (c *installCommand) promptDefault(lang, zhLabel, enLabel, defaultValue string) (string, error) {
 	fmt.Fprintf(c.console.out, "%s [%s]: ", c.pick(lang, zhLabel, enLabel), defaultValue)
-	line, err := c.readLine()
+	line, err := c.readPromptLine(lang)
 	if err != nil {
 		return "", err
 	}
@@ -990,22 +1045,117 @@ func (c *installCommand) promptDefault(lang, zhLabel, enLabel, defaultValue stri
 	return line, nil
 }
 
+func (c *installCommand) promptCheckTime(lang, defaultValue string) (string, error) {
+	for {
+		value, err := c.promptDefault(lang, "每日检查时间 HH:MM", "Daily check time HH:MM", defaultValue)
+		if err != nil {
+			return "", err
+		}
+		if validCLICheckTime(value) {
+			return value, nil
+		}
+		c.say(c.console.errOut, lang,
+			"时间无效，请使用 HH:MM（00:00 至 23:59）。",
+			"Invalid time; use HH:MM (00:00 through 23:59).")
+	}
+}
+
+func (c *installCommand) promptPositiveInteger(lang, zhLabel, enLabel, defaultValue string) (string, error) {
+	for {
+		value, err := c.promptDefault(lang, zhLabel, enLabel, defaultValue)
+		if err != nil {
+			return "", err
+		}
+		if positiveCLIInteger(value) {
+			return value, nil
+		}
+		c.say(c.console.errOut, lang, "请输入大于 0 的整数。", "Enter an integer greater than 0.")
+	}
+}
+
 func (c *installCommand) promptYesNo(lang, zh, en string, defaultYes bool) (bool, error) {
-	fmt.Fprint(c.console.out, c.pick(lang, zh, en))
+	for {
+		fmt.Fprint(c.console.out, c.pick(lang, zh, en))
+		line, err := c.readPromptLine(lang)
+		if err != nil {
+			return false, err
+		}
+		switch strings.ToLower(strings.TrimSpace(line)) {
+		case "":
+			return defaultYes, nil
+		case "y", "yes":
+			return true, nil
+		case "n", "no":
+			return false, nil
+		default:
+			c.say(c.console.errOut, lang, "无效输入，请输入 y 或 n。", "Invalid input; enter y or n.")
+		}
+	}
+}
+
+func (c *installCommand) promptFeishuSettings(lang string) (string, error) {
+	return c.promptMenuChoice(lang,
+		"飞书设置: 1) 保持  2) 更换接收人  3) 更换应用和接收人  4) 更新 App Secret [1]: ",
+		"Feishu: 1) Keep  2) Change recipient  3) Change app and recipient  4) Update App Secret [1]: ",
+		"1", "1", "2", "3", "4")
+}
+
+func (c *installCommand) promptDedupMode(lang string) (string, error) {
+	c.say(c.console.out, lang, "相同告警重复提醒模式:", "Same-alert reminder mode:")
+	return c.promptMenuChoice(lang,
+		"1) 仅一次  2) 每天一次（推荐）  3) 每 N 天一次 [2]:",
+		"1) Once  2) Daily (recommended)  3) Every N days [2]:",
+		"2", "1", "2", "3")
+}
+
+func (c *installCommand) promptTemporaryFailureChoice(lang string) (string, error) {
+	return c.promptMenuChoice(lang,
+		"1) 重试连接  2) 跳过本次预检  3) 中止 [1]: ",
+		"1) Retry connection  2) Skip this preflight  3) Abort [1]: ",
+		"1", "1", "2", "3")
+}
+
+func (c *installCommand) promptDirectoryFailureChoice(lang string) (string, error) {
+	return c.promptMenuChoice(lang,
+		"1) 重试扫描  2) 手动输入 open_id  3) 中止 [2]: ",
+		"1) Retry scan  2) Enter open_id manually  3) Abort [2]: ",
+		"2", "1", "2", "3")
+}
+
+func (c *installCommand) promptMenuChoice(lang, zh, en, defaultChoice string, valid ...string) (string, error) {
+	for {
+		fmt.Fprintln(c.console.out, c.pick(lang, zh, en))
+		line, err := c.readPromptLine(lang)
+		if err != nil {
+			return "", err
+		}
+		choice := strings.TrimSpace(line)
+		if choice == "" {
+			choice = defaultChoice
+		}
+		for _, candidate := range valid {
+			if choice == candidate {
+				return choice, nil
+			}
+		}
+		c.say(c.console.errOut, lang, "无效选择，请重新输入。", "Invalid choice; try again.")
+	}
+}
+
+func (c *installCommand) readPromptLine(lang string) (string, error) {
 	line, err := c.readLine()
 	if err != nil {
-		return false, err
+		return "", c.localizedInputError(lang, err)
 	}
-	switch strings.ToLower(strings.TrimSpace(line)) {
-	case "":
-		return defaultYes, nil
-	case "y", "yes":
-		return true, nil
-	case "n", "no":
-		return false, nil
-	default:
-		return false, errors.New("expected y or n")
+	return line, nil
+}
+
+func (c *installCommand) localizedInputError(lang string, err error) error {
+	message := c.pick(lang, "读取输入失败。", "Unable to read input.")
+	if errors.Is(err, io.EOF) {
+		message = c.pick(lang, "已取消。", "Cancelled.")
 	}
+	return &localizedInputError{message: message, cause: err}
 }
 
 func (c *installCommand) readLine() (string, error) {
@@ -1096,6 +1246,26 @@ func cloneCLIConfig(source map[string]string) map[string]string {
 		clone[key] = value
 	}
 	return clone
+}
+
+func validCLICheckTime(value string) bool {
+	if len(value) != len("HH:MM") || value[2] != ':' {
+		return false
+	}
+	_, err := time.Parse("15:04", value)
+	return err == nil
+}
+
+func positiveCLIInteger(value string) bool {
+	if value == "" || value[0] < '1' || value[0] > '9' {
+		return false
+	}
+	for index := 1; index < len(value); index++ {
+		if value[index] < '0' || value[index] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func invalidCLI(err error) error { return &installer.ExitError{Code: 2, Err: err} }

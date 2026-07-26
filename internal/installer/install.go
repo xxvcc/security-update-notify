@@ -97,6 +97,7 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 	if err != nil {
 		return Result{}, err
 	}
+	aptConfigOriginallyAbsent := plan.backend == "apt" && !b.snapshots[aptPeriodicPath].exists
 	transactionActive := true
 	defer func() {
 		if returnErr == nil || !transactionActive {
@@ -114,11 +115,25 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 	if err := i.quiesceExisting(ctx, plan.upgrade, options.LockWait); err != nil {
 		return Result{}, err
 	}
+	if plan.backend == "apt" {
+		if err := i.migrateAPTMetadata(b); err != nil {
+			return Result{}, err
+		}
+	}
+	if aptConfigOriginallyAbsent {
+		if err := i.recordAPTAbsentBaseline(); err != nil {
+			return Result{}, err
+		}
+	}
 	if !options.SkipDependencies {
 		if err := i.installDependencies(ctx, plan, options.ConfirmDependencies); err != nil {
 			return Result{}, err
 		}
 	}
+	// Package installation is not rolled back. Capture its defaults together
+	// with the absence marker so a late failure and retry retain the original
+	// host baseline. Recording the marker before package-manager writes also
+	// preserves that baseline across an abrupt process or host failure.
 	if err := i.captureDependencyDefaults(b); err != nil {
 		return Result{}, err
 	}
@@ -170,7 +185,7 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 	if err != nil {
 		return Result{}, err
 	}
-	postInstallDoctor, err := i.activateAndVerify(ctx, plan, options, previousVersion)
+	postInstallTest, postInstallDoctor, err := i.activateAndVerify(ctx, plan, options, previousVersion)
 	if err != nil {
 		return Result{}, err
 	}
@@ -178,13 +193,13 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 	return Result{
 		Upgrade: plan.upgrade, Backend: plan.backend, SupportTier: plan.supportTier,
 		PreviousVersion: previousVersion, BackupDir: b.dir, CredentialStorage: storage,
-		PostInstallDoctor: postInstallDoctor,
+		PostInstallTest: postInstallTest, PostInstallDoctor: postInstallDoctor,
 	}, nil
 }
 
-func (i *Installer) activateAndVerify(ctx context.Context, plan installPlan, options Options, previousVersion string) (*CommandResult, error) {
+func (i *Installer) activateAndVerify(ctx context.Context, plan installPlan, options Options, previousVersion string) (*CommandResult, *CommandResult, error) {
 	if err := i.requiredCommandContext(ctx, "reload systemd", Command{Name: "systemctl", Args: []string{"daemon-reload"}, Timeout: 30 * time.Second}); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if plan.backend == "apt" {
 		_ = i.runner.Run(ctx, Command{Name: "systemctl", Args: []string{"enable", "--now", "apt-daily.timer", "apt-daily-upgrade.timer"}, Timeout: 30 * time.Second})
@@ -194,29 +209,29 @@ func (i *Installer) activateAndVerify(ctx context.Context, plan installPlan, opt
 	}
 	if !options.SkipPostInstallCheck {
 		if err := i.requiredCommandContext(ctx, "verify installed runtime", Command{Name: BinaryPath, Args: []string{"--version"}, Timeout: 30 * time.Second}); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if !i.runner.LookPath("systemd-analyze") {
-			return nil, failure("verify systemd units", errors.New("systemd-analyze is required"))
+			return nil, nil, failure("verify systemd units", errors.New("systemd-analyze is required"))
 		}
 		if err := i.requiredCommandContext(ctx, "verify systemd units", Command{
 			Name: "systemd-analyze", Args: []string{"verify", ServicePath, TimerPath}, Timeout: 30 * time.Second,
 		}); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
+	var postInstallTest *CommandResult
 	if options.SendTest {
-		if err := i.requiredCommandContext(ctx, "send post-install test", Command{
+		result := i.runner.Run(ctx, Command{
 			Name: BinaryPath, Args: []string{"--test-ok", "--no-dedupe", "--wait-lock", lockSeconds(options.LockWait)}, Timeout: options.LockWait + 30*time.Second,
-		}); err != nil {
-			return nil, err
-		}
+		})
+		postInstallTest = &result
 	}
 	if err := i.fs.Remove(RuntimeTimerLink); err != nil {
-		return nil, failure("remove stale runtime timer link", err)
+		return postInstallTest, nil, failure("remove stale runtime timer link", err)
 	}
 	if err := i.requiredCommandContext(ctx, "enable project timer", Command{Name: "systemctl", Args: []string{"enable", "--now", "security-update-notify.timer"}, Timeout: 30 * time.Second}); err != nil {
-		return nil, err
+		return postInstallTest, nil, err
 	}
 	var postInstallDoctor *CommandResult
 	if !options.SkipPostInstallCheck {
@@ -228,7 +243,7 @@ func (i *Installer) activateAndVerify(ctx context.Context, plan installPlan, opt
 	if err := i.requiredCommandContext(ctx, "list project timer", Command{
 		Name: "systemctl", Args: []string{"list-timers", "security-update-notify.timer", "--no-pager"}, Timeout: 30 * time.Second,
 	}); err != nil {
-		return nil, err
+		return postInstallTest, postInstallDoctor, err
 	}
 	if plan.upgrade && plan.values["NOTIFY_UPGRADE"] == "1" {
 		newVersion := i.currentInstalledVersion(ctx)
@@ -238,7 +253,7 @@ func (i *Installer) activateAndVerify(ctx context.Context, plan installPlan, opt
 			Timeout: 2 * time.Minute,
 		})
 	}
-	return postInstallDoctor, nil
+	return postInstallTest, postInstallDoctor, nil
 }
 
 func (i *Installer) currentInstalledVersion(ctx context.Context) string {

@@ -5,6 +5,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=15min
 ExecStart=/usr/local/sbin/security-update-notify
 NoNewPrivileges=true
 PrivateTmp=true

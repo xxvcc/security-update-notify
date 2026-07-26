@@ -7,4 +7,4 @@ module github.com/xxvcc/security-update-notify
 // otherwise change every artifact's sha256).
 go 1.23
 
-toolchain go1.26.4
+toolchain go1.26.5

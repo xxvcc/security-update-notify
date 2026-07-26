@@ -18,6 +18,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/xxvcc/security-update-notify/internal/sysexec"
 )
 
 const (
@@ -247,7 +249,7 @@ func runGPGOutput(home string, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), gpgCommandTimeout)
 	defer cancel()
 	baseArgs := []string{"--batch", "--homedir", home}
-	cmd := exec.CommandContext(ctx, gpg, append(baseArgs, args...)...)
+	cmd := sysexec.CommandContext(ctx, gpg, append(baseArgs, args...)...)
 	cmd.Env = []string{"HOME=" + home, "GNUPGHOME=" + home, "PATH=" + trustedSystemPath, "LC_ALL=C"}
 	out := &boundedGPGOutput{}
 	cmd.Stdout = out

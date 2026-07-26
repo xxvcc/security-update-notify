@@ -35,7 +35,7 @@ func AcquireWait(path string, timeout time.Duration) (release func(), acquired b
 		_ = parent.Close()
 		_ = f.Close()
 	}
-	uid := uint32(os.Geteuid())
+	uid := os.Geteuid()
 	if _, err := validateLockFile(f, uid); err != nil {
 		closeHandles()
 		return nil, false, err
@@ -162,19 +162,19 @@ func openLockFile(path string) (*os.File, *os.File, string, error) {
 	return file, parent, name, nil
 }
 
-func validateLockFile(file *os.File, uid uint32) (os.FileInfo, error) {
+func validateLockFile(file *os.File, uid int) (os.FileInfo, error) {
 	info, err := file.Stat()
 	if err != nil {
 		return nil, err
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !info.Mode().IsRegular() || !ok || stat.Nlink != 1 || stat.Uid != uid {
+	if !info.Mode().IsRegular() || !ok || uid < 0 || int64(stat.Uid) != int64(uid) || stat.Nlink != 1 {
 		return nil, fmt.Errorf("runtime lock must be a regular file owned by uid %d with exactly one link", uid)
 	}
 	return info, nil
 }
 
-func validateLockPath(parent *os.File, name string, locked *os.File, uid uint32) error {
+func validateLockPath(parent *os.File, name string, locked *os.File, uid int) error {
 	lockedInfo, err := validateLockFile(locked, uid)
 	if err != nil {
 		return err

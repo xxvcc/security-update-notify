@@ -20,6 +20,7 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/dist"
 	"github.com/xxvcc/security-update-notify/internal/httpx"
 	"github.com/xxvcc/security-update-notify/internal/i18n"
+	"github.com/xxvcc/security-update-notify/internal/sysexec"
 	"github.com/xxvcc/security-update-notify/internal/version"
 )
 
@@ -28,6 +29,7 @@ var latestVersionRe = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$`)
 const (
 	maxUpgradeVersionOutputBytes = 4 << 10
 	privilegedUpgradePath        = "/usr/sbin:/usr/bin:/sbin:/bin"
+	upgradeInstallerTimeout      = time.Hour
 )
 
 type releaseELFIdentity struct {
@@ -163,14 +165,22 @@ func SelfUpgrade(ver string, disp i18n.Lang) int {
 	}
 
 	say(os.Stdout, disp, "正在以已校验的发布包升级...", "Upgrading from the verified release...")
-	cmd := upgradeInstallCommand(installBinary, extractDir, disp)
+	installCtx, cancelInstall := context.WithTimeout(context.Background(), upgradeInstallerTimeout)
+	cmd := upgradeInstallCommand(installCtx, installBinary, extractDir, disp)
 	if err := cmd.Run(); err != nil {
+		installCtxErr := installCtx.Err()
+		cancelInstall()
+		if errors.Is(installCtxErr, context.DeadlineExceeded) {
+			say(os.Stderr, disp, "Go 安装器运行超过 1 小时，升级已中止。", "The Go installer exceeded the 1-hour limit; upgrade aborted.")
+			return 1
+		}
 		if code, ok := upgradeInstallerExitCode(err); ok {
 			return code
 		}
 		say(os.Stderr, disp, "运行 Go 安装器失败："+err.Error(), "Failed to run the Go installer: "+err.Error())
 		return 1
 	}
+	cancelInstall()
 	return 0
 }
 
@@ -244,15 +254,20 @@ func (w *boundedUpgradeOutput) Write(p []byte) (int, error) {
 func validateUpgradeBinaryVersion(binary, extractDir, expectedVersion string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, binary, "--version")
+	return validateUpgradeBinaryVersionContext(ctx, binary, extractDir, expectedVersion)
+}
+
+func validateUpgradeBinaryVersionContext(ctx context.Context, binary, extractDir, expectedVersion string) error {
+	cmd := sysexec.CommandContext(ctx, binary, "--version")
 	cmd.Dir = extractDir
 	cmd.Env = upgradeChildEnvironment(os.Environ(), false)
 	stdout, stderr := &boundedUpgradeOutput{}, &boundedUpgradeOutput{}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return fmt.Errorf("version probe timed out")
-		}
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		return fmt.Errorf("version probe timed out")
+	}
+	if err != nil {
 		return fmt.Errorf("version probe failed: %w", err)
 	}
 	if stdout.overflow || stderr.overflow {
@@ -298,8 +313,8 @@ func readPackageVersion(path string) (string, error) {
 	return value, nil
 }
 
-func upgradeInstallCommand(binary, extractDir string, disp i18n.Lang) *exec.Cmd {
-	cmd := exec.Command(binary, "install", "--non-interactive", "-y", "--lang", string(disp))
+func upgradeInstallCommand(ctx context.Context, binary, extractDir string, disp i18n.Lang) *sysexec.Cmd {
+	cmd := sysexec.CommandContext(ctx, binary, "install", "--non-interactive", "-y", "--lang", string(disp))
 	cmd.Dir = extractDir
 	cmd.Env = upgradeChildEnvironment(os.Environ(), true)
 	cmd.Stdin = os.Stdin

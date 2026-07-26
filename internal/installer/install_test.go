@@ -8,12 +8,15 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	configpkg "github.com/xxvcc/security-update-notify/internal/config"
+	"github.com/xxvcc/security-update-notify/internal/sysexec"
+	"github.com/xxvcc/security-update-notify/internal/uninstaller"
 )
 
 type fakeLocker struct {
@@ -21,6 +24,18 @@ type fakeLocker struct {
 	busyPath string
 	calls    []string
 	waits    []time.Duration
+}
+
+type failMarkerBackupFS struct {
+	FileSystem
+	enabled bool
+}
+
+func (f *failMarkerBackupFS) CopyRegularFileAtomic(source, destination string, maxBytes int64) error {
+	if f.enabled && source == aptAbsentMarkerPath && strings.HasPrefix(destination, BackupRoot+"/") {
+		return errors.New("forced marker backup failure")
+	}
+	return f.FileSystem.CopyRegularFileAtomic(source, destination, maxBytes)
 }
 
 func (l *fakeLocker) Acquire(_ context.Context, lockPath string, wait time.Duration) (UnlockFunc, error) {
@@ -60,12 +75,16 @@ type fakeRunner struct {
 	mu                      sync.Mutex
 	commands                []string
 	missingPackages         map[string]bool
+	dpkgStatuses            map[string]string
 	missingCommands         map[string]bool
 	systemdCreds            bool
 	timerActive             bool
 	failListTimers          bool
 	createAPTDefaultInstall bool
+	aptMarkerBeforeWrite    bool
+	aptWriteObserved        bool
 	doctorResult            CommandResult
+	testResult              CommandResult
 }
 
 func (r *fakeRunner) LookPath(name string) bool {
@@ -83,15 +102,40 @@ func (r *fakeRunner) Run(_ context.Context, command Command) CommandResult {
 	switch command.Name {
 	case "systemctl":
 		return r.systemctl(command.Args)
-	case "dpkg", "rpm":
+	case "dpkg":
+		if len(command.Args) < 2 {
+			return CommandResult{Code: 2, Stderr: []byte("missing package argument")}
+		}
+		if len(command.Args) >= 2 && r.missingPackages[command.Args[1]] {
+			result.Code = 1
+			return result
+		}
+		status := "install ok installed"
+		if len(command.Args) >= 2 && r.dpkgStatuses[command.Args[1]] != "" {
+			status = r.dpkgStatuses[command.Args[1]]
+		}
+		result.Stdout = []byte("Package: " + command.Args[1] + "\nStatus: " + status + "\n")
+		return result
+	case "rpm":
 		if len(command.Args) >= 2 && r.missingPackages[command.Args[1]] {
 			result.Code = 1
 		}
 		return result
-	case "apt-get", "dnf", "yum":
+	case "apt-get", "dnf", "microdnf", "yum":
+		if command.Name == "apt-get" && len(command.Args) > 0 && (command.Args[0] == "update" || command.Args[0] == "install") {
+			data, err := r.fs.ReadFile(aptAbsentMarkerPath)
+			markerValid := err == nil && string(data) == aptAbsentMarkerContents
+			if !r.aptWriteObserved {
+				r.aptMarkerBeforeWrite = markerValid
+			} else {
+				r.aptMarkerBeforeWrite = r.aptMarkerBeforeWrite && markerValid
+			}
+			r.aptWriteObserved = true
+		}
 		if len(command.Args) > 0 && command.Args[0] == "install" {
 			for _, pkg := range command.Args[2:] {
 				delete(r.missingPackages, pkg)
+				delete(r.dpkgStatuses, pkg)
 			}
 			if r.createAPTDefaultInstall {
 				_ = r.fs.MkdirAll("/etc/apt/apt.conf.d", 0o755)
@@ -118,6 +162,9 @@ func (r *fakeRunner) Run(_ context.Context, command Command) CommandResult {
 		}
 		if len(command.Args) > 0 && command.Args[0] == "--doctor" {
 			return r.doctorResult
+		}
+		if len(command.Args) > 0 && command.Args[0] == "--test-ok" {
+			return r.testResult
 		}
 		return result
 	default:
@@ -200,7 +247,9 @@ func setupInstaller(t *testing.T, release string) (*Installer, *RootFS, *fakeRun
 	if err := root.WriteFileAtomic("/etc/os-release", []byte(release), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	runner := &fakeRunner{fs: root, missingPackages: map[string]bool{}, missingCommands: map[string]bool{}}
+	runner := &fakeRunner{
+		fs: root, missingPackages: map[string]bool{}, dpkgStatuses: map[string]string{}, missingCommands: map[string]bool{},
+	}
 	locker := &fakeLocker{}
 	installer, err := New(Dependencies{
 		FS: root, Runner: runner, Locker: locker, EffectiveUID: func() int { return 0 },
@@ -287,6 +336,34 @@ func TestPostInstallDoctorFailureIsAdvisoryAndReturned(t *testing.T) {
 	}
 }
 
+func TestExplicitPostInstallTestFailureIsAdvisoryAndReturned(t *testing.T) {
+	installer, root, runner, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\nPRETTY_NAME=Debian 13\n")
+	runner.testResult = CommandResult{
+		Stderr: []byte("temporary delivery failure\n"),
+		Code:   75,
+		Err:    context.DeadlineExceeded,
+	}
+	options := telegramOptions()
+	options.SendTest = true
+
+	result, err := installer.Install(context.Background(), options)
+	if err != nil {
+		t.Fatalf("advisory test result rolled back installation: %v", err)
+	}
+	if result.PostInstallTest == nil {
+		t.Fatal("post-install test result was not returned")
+	}
+	if got := string(result.PostInstallTest.Stderr); got != "temporary delivery failure\n" {
+		t.Fatalf("test stderr=%q", got)
+	}
+	if result.PostInstallTest.Code != 75 || !errors.Is(result.PostInstallTest.Err, context.DeadlineExceeded) {
+		t.Fatalf("test result=%+v", *result.PostInstallTest)
+	}
+	if !existsNoErr(root, PersistentTimerLink) || !runner.timerActive {
+		t.Fatal("advisory test failure rolled back or disabled the project timer")
+	}
+}
+
 func TestInstallReadsStandardOSReleaseSymlink(t *testing.T) {
 	installer, root, _, _ := setupInstaller(t, "ID=placeholder\nVERSION_ID=0\n")
 	if err := root.Remove("/etc/os-release"); err != nil {
@@ -338,6 +415,50 @@ func TestFreshDNFInstall(t *testing.T) {
 	}
 	if commandIndex(runner.commands, "systemctl enable --now dnf-automatic.timer") < 0 {
 		t.Fatal("dnf-automatic.timer was not enabled")
+	}
+}
+
+func TestDNFDependencyInstallFallsBackToMicrodnf(t *testing.T) {
+	installer, root, runner, _ := setupInstaller(t, "ID=rocky\nVERSION_ID=9.6\nPRETTY_NAME='Rocky Linux 9.6'\n")
+	write(t, root, dnfAutomaticPath, "[commands]\nupgrade_type = default\napply_updates = no\n", 0o644)
+	for _, pkg := range []string{"dnf-automatic", "ca-certificates", "yum-utils"} {
+		runner.missingPackages[pkg] = true
+	}
+	runner.missingCommands["dnf"] = true
+	runner.missingCommands["yum"] = true
+
+	options := telegramOptions()
+	options.SkipPostInstallCheck = true
+	options.ConfirmDependencies = func(_ context.Context, request DependencyRequest) (bool, error) {
+		want := []string{"dnf-automatic", "ca-certificates", "yum-utils"}
+		if request.Backend != "dnf" || !reflect.DeepEqual(request.Packages, want) {
+			return false, fmt.Errorf("unexpected dependency request: %+v", request)
+		}
+		return true, nil
+	}
+	if _, err := installer.Install(context.Background(), options); err != nil {
+		t.Fatal(err)
+	}
+	want := "microdnf install -y dnf-automatic ca-certificates yum-utils"
+	if commandIndex(runner.commands, want) < 0 {
+		t.Fatalf("microdnf fallback was not used; commands:\n%s", strings.Join(runner.commands, "\n"))
+	}
+}
+
+func TestDNFDependencyInstallReportsAllSupportedManagers(t *testing.T) {
+	installer, root, runner, _ := setupInstaller(t, "ID=rocky\nVERSION_ID=9.6\n")
+	write(t, root, dnfAutomaticPath, "[commands]\n", 0o644)
+	runner.missingPackages["dnf-automatic"] = true
+	for _, manager := range []string{"dnf", "microdnf", "yum"} {
+		runner.missingCommands[manager] = true
+	}
+	options := telegramOptions()
+	options.SkipPostInstallCheck = true
+	options.ConfirmDependencies = func(context.Context, DependencyRequest) (bool, error) { return true, nil }
+
+	_, err := installer.Install(context.Background(), options)
+	if err == nil || !strings.Contains(err.Error(), "dnf, microdnf, or yum is required") {
+		t.Fatalf("error = %v, want supported-manager diagnostic", err)
 	}
 }
 
@@ -434,7 +555,8 @@ func TestDependencyInstallRequiresApprovalBeforePackageManagerWrites(t *testing.
 		t.Fatalf("declined dependency install err=%v", err)
 	}
 	for _, command := range runner.commands {
-		if strings.HasPrefix(command, "apt-get ") || strings.HasPrefix(command, "dnf ") || strings.HasPrefix(command, "yum ") {
+		if strings.HasPrefix(command, "apt-get ") || strings.HasPrefix(command, "dnf ") ||
+			strings.HasPrefix(command, "microdnf ") || strings.HasPrefix(command, "yum ") {
 			t.Fatalf("package manager wrote before approval: %s", command)
 		}
 	}
@@ -449,6 +571,369 @@ func TestMissingDependencyWithoutConfirmationDoesNotWrite(t *testing.T) {
 	}
 	if commandIndex(runner.commands, "apt-get update") >= 0 {
 		t.Fatal("apt-get update ran without dependency confirmation")
+	}
+}
+
+func TestAPTConfigFilesPackageStateIsReinstalled(t *testing.T) {
+	installer, _, runner, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	runner.dpkgStatuses["unattended-upgrades"] = "deinstall ok config-files"
+	options := telegramOptions()
+	options.SkipPostInstallCheck = true
+	options.ConfirmDependencies = func(_ context.Context, request DependencyRequest) (bool, error) {
+		if request.Backend != "apt" || !reflect.DeepEqual(request.Packages, []string{"unattended-upgrades"}) {
+			return false, fmt.Errorf("unexpected dependency request: %+v", request)
+		}
+		return true, nil
+	}
+	if _, err := installer.Install(context.Background(), options); err != nil {
+		t.Fatal(err)
+	}
+	if commandIndex(runner.commands, "apt-get install -y unattended-upgrades") < 0 {
+		t.Fatalf("config-files package was not reinstalled:\n%s", strings.Join(runner.commands, "\n"))
+	}
+}
+
+func TestFreshAPTAbsentBaselineIsRemovedByPurge(t *testing.T) {
+	installer, root, runner, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	runner.missingPackages["unattended-upgrades"] = true
+	runner.createAPTDefaultInstall = true
+	options := telegramOptions()
+	options.SkipPostInstallCheck = true
+	options.ConfirmDependencies = func(_ context.Context, request DependencyRequest) (bool, error) {
+		return reflect.DeepEqual(request.Packages, []string{"unattended-upgrades"}), nil
+	}
+	if _, err := installer.Install(context.Background(), options); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, root, aptAbsentMarkerPath); got != aptAbsentMarkerContents {
+		t.Fatalf("APT absence marker = %q", got)
+	}
+	if existsNoErr(root, aptStableBackupPath) {
+		t.Fatal("dependency-created APT default was incorrectly recorded as the original baseline")
+	}
+	if _, err := uninstaller.Uninstall(uninstaller.Options{
+		RootDir: root.Root, PurgeConfig: true, EffectiveUID: func() int { return 0 },
+		RunCommand: func(string, ...string) sysexec.Result { return sysexec.Result{} },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if existsNoErr(root, aptPeriodicPath) || existsNoErr(root, aptAbsentMarkerPath) {
+		t.Fatal("purge did not restore the originally absent APT configuration")
+	}
+}
+
+func TestAPTAbsentMarkerPrecedesPackageManagerWrites(t *testing.T) {
+	installer, _, runner, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	runner.missingPackages["unattended-upgrades"] = true
+	options := telegramOptions()
+	options.SkipPostInstallCheck = true
+	options.ConfirmDependencies = func(_ context.Context, _ DependencyRequest) (bool, error) { return true, nil }
+	if _, err := installer.Install(context.Background(), options); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.aptWriteObserved || !runner.aptMarkerBeforeWrite {
+		t.Fatal("APT absence marker was not durable before package-manager writes")
+	}
+}
+
+func TestLegacyAPTMetadataMigratesToSilentNames(t *testing.T) {
+	installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	legacyTimestamp := aptStableBackupPath + ".20260725010203"
+	currentTimestamp := aptPeriodicPath + ".security-update-notify.20260725010203.bak"
+	write(t, root, aptLegacyAbsentPath, aptAbsentMarkerContents, 0o600)
+	write(t, root, legacyTimestamp, "legacy timestamp\n", 0o600)
+	options := telegramOptions()
+	options.SkipPostInstallCheck = true
+	if _, err := installer.Install(context.Background(), options); err != nil {
+		t.Fatal(err)
+	}
+	if existsNoErr(root, aptLegacyAbsentPath) || existsNoErr(root, legacyTimestamp) {
+		t.Fatal("legacy APT metadata names survived migration")
+	}
+	if got := readFile(t, root, aptAbsentMarkerPath); got != aptAbsentMarkerContents {
+		t.Fatalf("migrated APT marker = %q", got)
+	}
+	if got := readFile(t, root, currentTimestamp); got != "legacy timestamp\n" {
+		t.Fatalf("migrated APT timestamp backup = %q", got)
+	}
+	for _, name := range []string{path.Base(aptAbsentMarkerPath), path.Base(currentTimestamp)} {
+		if !strings.HasSuffix(name, ".bak") {
+			t.Fatalf("APT metadata name is not silently ignored: %s", name)
+		}
+	}
+}
+
+func TestLegacyAPTMetadataMigrationRejectsSymlink(t *testing.T) {
+	installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	legacyTimestamp := aptStableBackupPath + ".20260725010203"
+	if err := root.Symlink("/etc/passwd", legacyTimestamp); err != nil {
+		t.Fatal(err)
+	}
+	options := telegramOptions()
+	options.SkipPostInstallCheck = true
+	_, err := installer.Install(context.Background(), options)
+	if err == nil || !strings.Contains(err.Error(), "inspect legacy apt backup") {
+		t.Fatalf("install error = %v, want unsafe legacy-backup rejection", err)
+	}
+	if target, readErr := root.Readlink(legacyTimestamp); readErr != nil || target != "/etc/passwd" {
+		t.Fatalf("legacy symlink changed during failed migration: target=%q err=%v", target, readErr)
+	}
+	if existsNoErr(root, BinaryPath) {
+		t.Fatal("failed metadata migration installed the runtime")
+	}
+}
+
+func TestLegacyAPTMetadataMigrationIgnoresUnknownSuffix(t *testing.T) {
+	installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	unknown := aptStableBackupPath + ".not-a-timestamp"
+	write(t, root, unknown, "unrelated\n", 0o600)
+	options := telegramOptions()
+	options.SkipPostInstallCheck = true
+	if _, err := installer.Install(context.Background(), options); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, root, unknown); got != "unrelated\n" {
+		t.Fatalf("unknown APT metadata was changed: %q", got)
+	}
+	unexpectedDestination := aptPeriodicPath + ".security-update-notify.not-a-timestamp.bak"
+	if existsNoErr(root, unexpectedDestination) {
+		t.Fatal("unknown APT metadata suffix was migrated")
+	}
+}
+
+func TestLegacyAPTMetadataMigrationRollsBackOnLateFailure(t *testing.T) {
+	installer, root, runner, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	legacyTimestamp := aptStableBackupPath + ".20260725010203"
+	currentTimestamp := aptPeriodicPath + ".security-update-notify.20260725010203.bak"
+	write(t, root, aptLegacyAbsentPath, aptAbsentMarkerContents, 0o600)
+	write(t, root, legacyTimestamp, "legacy timestamp\n", 0o600)
+	runner.failListTimers = true
+	options := telegramOptions()
+	options.SkipPostInstallCheck = true
+
+	_, err := installer.Install(context.Background(), options)
+	if err == nil || !strings.Contains(err.Error(), "forced list-timers failure") {
+		t.Fatalf("install error = %v, want late activation failure", err)
+	}
+	if got := readFile(t, root, aptLegacyAbsentPath); got != aptAbsentMarkerContents {
+		t.Fatalf("legacy APT marker after rollback = %q", got)
+	}
+	if existsNoErr(root, aptAbsentMarkerPath) {
+		t.Fatal("migrated APT marker survived rollback")
+	}
+	if got := readFile(t, root, legacyTimestamp); got != "legacy timestamp\n" {
+		t.Fatalf("legacy APT timestamp after rollback = %q", got)
+	}
+	if existsNoErr(root, currentTimestamp) {
+		t.Fatal("migrated APT timestamp survived rollback")
+	}
+}
+
+func TestLegacyAPTMetadataMigrationRollsBackExactlyOnLateFailure(t *testing.T) {
+	installer, root, runner, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	legacyTimestamp := aptStableBackupPath + ".20260725010203"
+	currentTimestamp := aptPeriodicPath + ".security-update-notify.20260725010203.bak"
+	write(t, root, aptLegacyAbsentPath, aptAbsentMarkerContents, 0o600)
+	write(t, root, legacyTimestamp, "legacy timestamp\n", 0o600)
+	runner.failListTimers = true
+	options := telegramOptions()
+	options.SkipPostInstallCheck = true
+
+	_, err := installer.Install(context.Background(), options)
+	if err == nil || !strings.Contains(err.Error(), "forced list-timers failure") {
+		t.Fatalf("install error = %v, want late activation failure", err)
+	}
+	if got := readFile(t, root, aptLegacyAbsentPath); got != aptAbsentMarkerContents {
+		t.Fatalf("legacy APT marker after rollback = %q", got)
+	}
+	if got := readFile(t, root, legacyTimestamp); got != "legacy timestamp\n" {
+		t.Fatalf("legacy APT timestamp after rollback = %q", got)
+	}
+	for _, unexpected := range []string{aptAbsentMarkerPath, currentTimestamp, aptPeriodicPath} {
+		if existsNoErr(root, unexpected) {
+			t.Fatalf("migration artifact survived rollback: %s", unexpected)
+		}
+	}
+}
+
+func TestCaptureDependencyDefaultsPreservesAnyManagedPathCreatedAfterSnapshot(t *testing.T) {
+	installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	b, err := installer.createBackup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, root, ServicePath, "package-created default\n", 0o644)
+	if err := installer.captureDependencyDefaults(b); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := b.snapshots[ServicePath]
+	if !snapshot.exists {
+		t.Fatal("managed path created after the transaction snapshot was not captured")
+	}
+	if got := readFile(t, root, snapshot.backupPath); got != "package-created default\n" {
+		t.Fatalf("captured managed path = %q", got)
+	}
+}
+
+func TestFreshAPTAbsentBaselineSurvivesFailedInstallRetryAndPurge(t *testing.T) {
+	installer, root, runner, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	runner.missingPackages["unattended-upgrades"] = true
+	runner.createAPTDefaultInstall = true
+	runner.failListTimers = true
+	options := telegramOptions()
+	options.SkipPostInstallCheck = true
+	options.ConfirmDependencies = func(_ context.Context, request DependencyRequest) (bool, error) {
+		return reflect.DeepEqual(request.Packages, []string{"unattended-upgrades"}), nil
+	}
+
+	if _, err := installer.Install(context.Background(), options); err == nil || !strings.Contains(err.Error(), "forced list-timers failure") {
+		t.Fatalf("first install error = %v, want late failure", err)
+	}
+	if got := readFile(t, root, aptPeriodicPath); got != "dependency-default\n" {
+		t.Fatalf("dependency-created APT default after rollback = %q", got)
+	}
+	if got := readFile(t, root, aptAbsentMarkerPath); got != aptAbsentMarkerContents {
+		t.Fatalf("APT absence marker after rollback = %q", got)
+	}
+
+	runner.failListTimers = false
+	if _, err := installer.Install(context.Background(), options); err != nil {
+		t.Fatalf("retry install: %v", err)
+	}
+	if existsNoErr(root, aptStableBackupPath) {
+		t.Fatal("retry replaced the original absent baseline with a stable file backup")
+	}
+	if _, err := uninstaller.Uninstall(uninstaller.Options{
+		RootDir: root.Root, PurgeConfig: true, EffectiveUID: func() int { return 0 },
+		RunCommand: func(string, ...string) sysexec.Result { return sysexec.Result{} },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if existsNoErr(root, aptPeriodicPath) || existsNoErr(root, aptAbsentMarkerPath) {
+		t.Fatal("purge after a failed first attempt and retry did not restore the originally absent APT configuration")
+	}
+}
+
+func TestAPTAbsentBaselineSurvivesMarkerCaptureFailureRetryAndPurge(t *testing.T) {
+	installer, root, runner, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	faults := &failMarkerBackupFS{FileSystem: root, enabled: true}
+	installer.fs = faults
+	runner.missingPackages["unattended-upgrades"] = true
+	runner.createAPTDefaultInstall = true
+	options := telegramOptions()
+	options.SkipPostInstallCheck = true
+	options.ConfirmDependencies = func(_ context.Context, request DependencyRequest) (bool, error) {
+		return reflect.DeepEqual(request.Packages, []string{"unattended-upgrades"}), nil
+	}
+
+	if _, err := installer.Install(context.Background(), options); err == nil || !strings.Contains(err.Error(), "forced marker backup failure") {
+		t.Fatalf("first install error = %v, want marker capture failure", err)
+	}
+	if existsNoErr(root, aptPeriodicPath) || existsNoErr(root, aptAbsentMarkerPath) {
+		t.Fatal("failed marker capture did not roll back to the original absent state")
+	}
+
+	faults.enabled = false
+	if _, err := installer.Install(context.Background(), options); err != nil {
+		t.Fatalf("retry install: %v", err)
+	}
+	if existsNoErr(root, aptStableBackupPath) {
+		t.Fatal("retry recorded the dependency default as the original APT baseline")
+	}
+	if _, err := uninstaller.Uninstall(uninstaller.Options{
+		RootDir: root.Root, PurgeConfig: true, EffectiveUID: func() int { return 0 },
+		RunCommand: func(string, ...string) sysexec.Result { return sysexec.Result{} },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if existsNoErr(root, aptPeriodicPath) || existsNoErr(root, aptAbsentMarkerPath) {
+		t.Fatal("purge after marker capture failure and retry did not restore the original absent state")
+	}
+}
+
+func TestInstallRejectsInvalidAPTAbsenceMarker(t *testing.T) {
+	installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	write(t, root, aptAbsentMarkerPath, "invalid\n", 0o600)
+	options := telegramOptions()
+	options.SkipPostInstallCheck = true
+	_, err := installer.Install(context.Background(), options)
+	if err == nil || !strings.Contains(err.Error(), "invalid contents") {
+		t.Fatalf("error = %v, want invalid marker failure", err)
+	}
+	if got := readFile(t, root, aptAbsentMarkerPath); got != "invalid\n" {
+		t.Fatalf("invalid pre-existing marker was changed during rollback: %q", got)
+	}
+	if existsNoErr(root, BinaryPath) || existsNoErr(root, aptPeriodicPath) {
+		t.Fatal("failed install left managed files")
+	}
+}
+
+func TestDNFOriginalBaselineSurvivesNormalUninstallAndReinstall(t *testing.T) {
+	installer, root, _, _ := setupInstaller(t, "ID=fedora\nVERSION_ID=42\nPRETTY_NAME='Fedora Linux 42'\n")
+	vendor := "[commands]\nupgrade_type = default\napply_updates = no\n"
+	write(t, root, dnfAutomaticPath, vendor, 0o644)
+	options := telegramOptions()
+	options.SkipPostInstallCheck = true
+	if _, err := installer.Install(context.Background(), options); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, root, dnfStableBackupPath); got != vendor {
+		t.Fatalf("initial DNF baseline = %q", got)
+	}
+	uninstall := func(purge bool) error {
+		_, err := uninstaller.Uninstall(uninstaller.Options{
+			RootDir: root.Root, PurgeConfig: purge, EffectiveUID: func() int { return 0 },
+			RunCommand: func(string, ...string) sysexec.Result { return sysexec.Result{} },
+		})
+		return err
+	}
+	if err := uninstall(false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := installer.Install(context.Background(), options); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, root, dnfStableBackupPath); got != vendor {
+		t.Fatalf("reinstall replaced DNF baseline = %q", got)
+	}
+	if err := uninstall(true); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, root, dnfAutomaticPath); got != vendor {
+		t.Fatalf("purge restored DNF config = %q, want vendor baseline", got)
+	}
+}
+
+func TestDNFLegacyTimestampBackupsMigrateToStableOriginalBaseline(t *testing.T) {
+	installer, root, _, _ := setupInstaller(t, "ID=fedora\nVERSION_ID=42\n")
+	write(t, root, dnfAutomaticPath, "managed-current", 0o644)
+	write(t, root, dnfStableBackupPath+".20260725000000", "vendor-original", 0o644)
+	write(t, root, dnfStableBackupPath+".20260726000000", "managed-previous", 0o644)
+	options := telegramOptions()
+	options.SkipPostInstallCheck = true
+	if _, err := installer.Install(context.Background(), options); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, root, dnfStableBackupPath); got != "vendor-original" {
+		t.Fatalf("migrated DNF baseline = %q, want first project backup", got)
+	}
+}
+
+func TestDNFLegacyMigrationIgnoresUnknownBackupSuffix(t *testing.T) {
+	installer, root, _, _ := setupInstaller(t, "ID=fedora\nVERSION_ID=42\n")
+	write(t, root, dnfAutomaticPath, "vendor-original", 0o644)
+	unknown := dnfStableBackupPath + ".not-a-timestamp"
+	write(t, root, unknown, "unrelated", 0o644)
+	options := telegramOptions()
+	options.SkipPostInstallCheck = true
+	if _, err := installer.Install(context.Background(), options); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, root, dnfStableBackupPath); got != "vendor-original" {
+		t.Fatalf("stable DNF baseline = %q, want vendor original", got)
+	}
+	if got := readFile(t, root, unknown); got != "unrelated" {
+		t.Fatalf("unknown DNF backup was changed: %q", got)
 	}
 }
 

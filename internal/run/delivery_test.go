@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/xxvcc/security-update-notify/internal/config"
 	"github.com/xxvcc/security-update-notify/internal/delivery"
@@ -38,6 +39,26 @@ func loadDeliveryConfig(t *testing.T, body string) *config.Config {
 		t.Fatal(err)
 	}
 	return cfg
+}
+
+func TestDecryptFeishuSecretKillsDescendants(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "descendant-survived")
+	command := filepath.Join(dir, "systemd-creds")
+	body := "#!/bin/sh\n(/bin/sleep 0.2; printf survived > '" + marker + "') &\nwait\n"
+	if err := os.WriteFile(command, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if _, err := decryptFeishuSecretContext(ctx, filepath.Join(dir, "credential")); err == nil {
+		t.Fatal("timed-out credential decrypt succeeded")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("systemd-creds descendant survived timeout: %v", err)
+	}
 }
 
 func TestDeliverChannelsPartialFailureDoesNotRepeatSuccess(t *testing.T) {

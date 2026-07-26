@@ -100,7 +100,7 @@ func TestValidateLockPathDetectsReplacementAndNewHardlink(t *testing.T) {
 		if err := os.WriteFile(path, nil, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := validateLockPath(parent, name, file, uint32(os.Geteuid())); err == nil {
+		if err := validateLockPath(parent, name, file, os.Geteuid()); err == nil {
 			t.Fatal("replacement lock path was accepted")
 		}
 	})
@@ -116,7 +116,7 @@ func TestValidateLockPathDetectsReplacementAndNewHardlink(t *testing.T) {
 		if err := os.Link(path, path+".alias"); err != nil {
 			t.Fatal(err)
 		}
-		if err := validateLockPath(parent, name, file, uint32(os.Geteuid())); err == nil {
+		if err := validateLockPath(parent, name, file, os.Geteuid()); err == nil {
 			t.Fatal("hard link added after open was accepted")
 		}
 	})

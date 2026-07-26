@@ -104,6 +104,42 @@ func TestBuildRejectsVersionAssertionMismatchBeforePackaging(t *testing.T) {
 	}
 }
 
+func TestBuildRejectsSignOffForOfficialRelease(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git unavailable")
+	}
+	for _, test := range []struct {
+		name    string
+		release bool
+		tag     bool
+	}{
+		{name: "explicit release flag", release: true},
+		{name: "annotated version tag", tag: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := sourceFixture(t, "3.0.0")
+			gitRun(t, root, "init", "-q")
+			gitRun(t, root, "config", "user.name", "SUN test")
+			gitRun(t, root, "config", "user.email", "sun@example.invalid")
+			gitRun(t, root, "add", ".")
+			gitRun(t, root, "commit", "-qm", "release fixture")
+			if test.tag {
+				gitRun(t, root, "tag", "-am", "v3.0.0", "v3.0.0")
+			}
+
+			_, err := Build(context.Background(), Options{
+				Root: root, DistDir: filepath.Join(root, "dist"), Release: test.release, Sign: SignOff,
+			})
+			if err == nil || !strings.Contains(err.Error(), "official releases cannot disable signing") {
+				t.Fatalf("Build() error=%v, want official SignOff rejection", err)
+			}
+			if _, statErr := os.Stat(filepath.Join(root, "dist")); !os.IsNotExist(statErr) {
+				t.Fatalf("official SignOff created dist before rejection: %v", statErr)
+			}
+		})
+	}
+}
+
 func TestParseSignMode(t *testing.T) {
 	t.Parallel()
 	for input, want := range map[string]SignMode{

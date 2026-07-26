@@ -2,6 +2,8 @@ package run
 
 import (
 	"io"
+	"math"
+	"math/bits"
 	"net"
 	"os"
 	"strconv"
@@ -20,8 +22,10 @@ import (
 )
 
 const (
-	osReleasePath      = "/etc/os-release"
-	maxRebootPkgsBytes = 1 << 20
+	osReleasePath              = "/etc/os-release"
+	maxRebootPkgsBytes         = 1 << 20
+	restartProbeCommandTimeout = 30 * time.Second
+	identityCommandTimeout     = 5 * time.Second
 )
 
 // Flags 是影响采集/决策的运行时标志。
@@ -120,11 +124,15 @@ func testRebootState(be string) backend.RestartState {
 }
 
 func collectAPT() backend.RestartState {
+	return collectAPTWithTimeout(restartProbeCommandTimeout)
+}
+
+func collectAPTWithTimeout(timeout time.Duration) backend.RestartState {
 	pkgs := readFilePrefix("/var/run/reboot-required.pkgs", maxRebootPkgsBytes)
 	hasNR := sysexec.Look("needrestart")
 	nrb := ""
 	if hasNR {
-		nrb = sysexec.Run("needrestart", "-b").Stdout
+		nrb = sysexec.RunTimeout(timeout, "needrestart", "-b").Stdout
 	}
 	return backend.ParseAPT(backend.APTInput{
 		RebootRequiredExists: fileExists("/var/run/reboot-required"),
@@ -148,18 +156,22 @@ func readFilePrefix(path string, limit int64) string {
 }
 
 func collectDNF() backend.RestartState {
+	return collectDNFWithTimeout(restartProbeCommandTimeout)
+}
+
+func collectDNFWithTimeout(timeout time.Duration) backend.RestartState {
 	hasNR := sysexec.Look("needs-restarting")
 	var nrR, nrS string
 	var rcR int
 	hasS := false
 	if hasNR {
-		r := sysexec.Run("needs-restarting", "-r") // Bash 用 2>&1
+		r := sysexec.RunTimeout(timeout, "needs-restarting", "-r") // Bash 用 2>&1
 		nrR = r.Stdout + r.Stderr
 		rcR = r.Code
-		help := sysexec.Run("needs-restarting", "--help")
+		help := sysexec.RunTimeout(timeout, "needs-restarting", "--help")
 		hasS = strings.Contains(help.Stdout+help.Stderr, "-s")
 		if hasS {
-			nrS = sysexec.Run("needs-restarting", "-s").Stdout
+			nrS = sysexec.RunTimeout(timeout, "needs-restarting", "-s").Stdout
 		}
 	}
 	return backend.ParseDNF(backend.DNFInput{
@@ -217,19 +229,39 @@ func collectDisks() []watchdog.DiskAvail {
 		if bs == 0 {
 			bs = int64(st.Bsize)
 		}
-		availKB := int64(st.Bavail) * bs / 1024
+		availKB := diskAvailableKB(st.Bavail, bs)
 		out = append(out, watchdog.DiskAvail{Mount: mp, AvailKB: availKB})
 	}
 	return out
 }
 
+func diskAvailableKB(blocks uint64, blockSize int64) int64 {
+	if blockSize <= 0 {
+		return 0
+	}
+	hi, lo := bits.Mul64(blocks, uint64(blockSize))
+	// Divide the 128-bit byte count by 1024 without first overflowing uint64.
+	if hi >= 1<<10 {
+		return math.MaxInt64
+	}
+	kb := hi<<54 | lo>>10
+	if kb > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(kb)
+}
+
 // parseSystemdTime 复刻 `date -d "$ts" +%s`：保留一个极小的 date exec 以精确匹配 systemd 人类时间戳
 // 到 epoch 的换算（该值进入 HEALTH_SIG，属去重 hash，故要求字节级一致）。空/解析失败返回 0。
 func parseSystemdTime(ts string) int64 {
+	return parseSystemdTimeWithTimeout(ts, identityCommandTimeout)
+}
+
+func parseSystemdTimeWithTimeout(ts string, timeout time.Duration) int64 {
 	if ts == "" {
 		return 0
 	}
-	r := sysexec.Run("date", "-d", ts, "+%s")
+	r := sysexec.RunTimeout(timeout, "date", "-d", ts, "+%s")
 	if r.Code != 0 {
 		return 0
 	}
@@ -241,15 +273,19 @@ func parseSystemdTime(ts string) int64 {
 }
 
 func hostLabel(cfg *config.Config) string {
+	return hostLabelWithTimeout(cfg, identityCommandTimeout)
+}
+
+func hostLabelWithTimeout(cfg *config.Config, timeout time.Duration) string {
 	if v := cfg.Get("HOST_LABEL"); v != "" {
 		return v
 	}
-	if r := sysexec.Run("hostname", "-f"); r.Code == 0 {
+	if r := sysexec.RunTimeout(timeout, "hostname", "-f"); r.Code == 0 {
 		if h := strings.TrimSpace(r.Stdout); h != "" {
 			return h
 		}
 	}
-	if r := sysexec.Run("hostname"); r.Code == 0 {
+	if r := sysexec.RunTimeout(timeout, "hostname"); r.Code == 0 {
 		if h := strings.TrimSpace(r.Stdout); h != "" {
 			return h
 		}
@@ -258,7 +294,11 @@ func hostLabel(cfg *config.Config) string {
 }
 
 func kernelRelease() string {
-	if r := sysexec.Run("uname", "-r"); r.Code == 0 {
+	return kernelReleaseWithTimeout(identityCommandTimeout)
+}
+
+func kernelReleaseWithTimeout(timeout time.Duration) string {
+	if r := sysexec.RunTimeout(timeout, "uname", "-r"); r.Code == 0 {
 		if k := strings.TrimSpace(r.Stdout); k != "" {
 			return k
 		}
@@ -291,14 +331,6 @@ func fetchPublicIP() string {
 func fileExists(p string) bool {
 	_, err := os.Stat(p)
 	return err == nil
-}
-
-func firstNLines(s string, n int) string {
-	lines := strings.Split(s, "\n")
-	if len(lines) > n {
-		lines = lines[:n]
-	}
-	return strings.Join(lines, "\n")
 }
 
 func orDefault(v, d string) string {

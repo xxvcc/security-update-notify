@@ -3,6 +3,7 @@ package run
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/xxvcc/security-update-notify/internal/i18n"
 )
@@ -217,7 +219,7 @@ func TestUpgradeInstallCommandUsesGoInstallerEntrypoint(t *testing.T) {
 	t.Setenv("SECURITY_UPDATE_NOTIFY_LOCK_WAIT_SECONDS", "120")
 	binary := filepath.Join(t.TempDir(), "security-update-notify-linux-amd64")
 	extractDir := t.TempDir()
-	cmd := upgradeInstallCommand(binary, extractDir, i18n.EN)
+	cmd := upgradeInstallCommand(context.Background(), binary, extractDir, i18n.EN)
 	wantArgs := []string{binary, "install", "--non-interactive", "-y", "--lang", "en"}
 	if strings.Join(cmd.Args, "\x00") != strings.Join(wantArgs, "\x00") {
 		t.Fatalf("args=%q, want %q", cmd.Args, wantArgs)
@@ -257,6 +259,32 @@ func TestUpgradeInstallCommandUsesGoInstallerEntrypoint(t *testing.T) {
 	}
 }
 
+func TestUpgradeInstallCommandHonorsContext(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "verified-installer")
+	escaped := filepath.Join(dir, "escaped")
+	body := "#!/bin/sh\n(/bin/sleep 0.25; printf escaped > '" + escaped + "') &\nwait\n"
+	if err := os.WriteFile(binary, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := upgradeInstallCommand(ctx, binary, t.TempDir(), i18n.EN).Run()
+	if err == nil || !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("timed installer error=%v context=%v", err, ctx.Err())
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("timed installer returned after %s", elapsed)
+	}
+	time.Sleep(400 * time.Millisecond)
+	if _, err := os.Stat(escaped); err == nil {
+		t.Fatal("installer descendant survived context cancellation")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+}
+
 func TestValidateUpgradeBinaryVersionIsExactAndBounded(t *testing.T) {
 	dir := t.TempDir()
 	writeProbe := func(name, body string) string {
@@ -283,6 +311,27 @@ func TestValidateUpgradeBinaryVersionIsExactAndBounded(t *testing.T) {
 				t.Fatal("invalid binary version output was accepted")
 			}
 		})
+	}
+}
+
+func TestValidateUpgradeBinaryVersionKillsDescendants(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "version-probe")
+	escaped := filepath.Join(dir, "escaped")
+	body := "#!/bin/sh\nprintf 'security-update-notify 3.0.0\\n'\n(/bin/sleep 0.25; printf escaped > '" + escaped + "') &\nwait\n"
+	if err := os.WriteFile(binary, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if err := validateUpgradeBinaryVersionContext(ctx, binary, dir, "3.0.0"); err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("version probe error=%v, want timeout", err)
+	}
+	time.Sleep(400 * time.Millisecond)
+	if _, err := os.Stat(escaped); err == nil {
+		t.Fatal("version-probe descendant survived context cancellation")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
 	}
 }
 

@@ -27,6 +27,17 @@ func TestEmbeddedAssetsNonEmpty(t *testing.T) {
 	}
 }
 
+func TestEmbeddedServiceHasBoundedStartTimeout(t *testing.T) {
+	const directive = "TimeoutStartSec=15min"
+	unit := string(SystemdServiceUnit())
+	if !strings.Contains(unit, "\n"+directive+"\n") {
+		t.Fatalf("embedded service is missing %q", directive)
+	}
+	if strings.Count(unit, "TimeoutStartSec=") != 1 {
+		t.Fatalf("embedded service has an ambiguous start timeout:\n%s", unit)
+	}
+}
+
 // 内置公钥的实际指纹必须等于 pin 常量（复刻 Bash CI 的 hardening 校验，Go 侧对齐）。gpg 缺失则跳过。
 func TestEmbeddedKeyFingerprintMatchesPin(t *testing.T) {
 	if _, err := exec.LookPath("gpg"); err != nil {

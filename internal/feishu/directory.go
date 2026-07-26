@@ -1,3 +1,4 @@
+//lint:file-ignore ST1005 Feishu API errors intentionally retain the product's official capitalization.
 package feishu
 
 import (

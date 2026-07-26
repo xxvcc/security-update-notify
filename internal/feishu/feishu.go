@@ -1,4 +1,6 @@
 // Package feishu implements tenant-token authentication and bot message delivery.
+//
+//lint:file-ignore ST1005 Feishu API errors intentionally retain the product's official capitalization.
 package feishu
 
 import (
@@ -73,12 +75,19 @@ func (c *Client) base() string {
 	return defaultBaseURL
 }
 
-func (c *Client) sleep(d time.Duration) {
+func (c *Client) sleep(ctx context.Context, d time.Duration) error {
 	if c.Sleep != nil {
 		c.Sleep(d)
-		return
+		return ctx.Err()
 	}
-	time.Sleep(d)
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // Probe validates the app credentials without sending a message.
@@ -297,7 +306,9 @@ func (c *Client) retry(ctx context.Context, attempt func() (bool, time.Duration,
 			if delay <= 0 {
 				delay = time.Second
 			}
-			c.sleep(delay)
+			if err := c.sleep(ctx, delay); err != nil {
+				return temporary(err)
+			}
 		}
 	}
 	return temporary(last)

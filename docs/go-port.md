@@ -1,9 +1,9 @@
-# security-update-notify 3.0 全 Go 架构 / 3.0 all-Go architecture
+# security-update-notify 3.x 全 Go 架构 / 3.x all-Go architecture
 
-本文是 3.0.0 迁移完成后的设计、兼容与发布约束。它描述当前实现，不是待办清单。
+本文记录 3.0.0 完成迁移后、由 3.0.1 加固的 3.x 设计、兼容与发布约束。它描述当前实现，不是待办清单。
 
-This document records the completed 3.0.0 migration and its compatibility, security, and release
-constraints. It describes the current implementation rather than a future plan.
+This document records the 3.x design after the completed 3.0.0 migration and its 3.0.1 hardening,
+including compatibility, security, and release constraints. It describes the current implementation.
 
 ## 结论 / Bottom line
 
@@ -32,6 +32,15 @@ Two boundaries remain explicit:
 2. OS/trust commands such as `apt-get`, `dpkg`, `dnf`, `rpm`, `needrestart`, `needs-restarting`,
    `systemctl`, `systemd-creds`, and `gpg` remain authoritative inputs executed with bounded timeouts and
    a sanitized environment.
+
+这些外部命令统一在独立 Linux 进程组中运行；context 超时会终止整个组，入口进程也会把 `Ctrl+C`、
+`SIGHUP` 和 `SIGTERM` 转发给所有活动组，并在父进程异常死亡时触发直接子进程死亡信号。这样既限制等待时间，
+也避免中断安装、诊断或发布时遗留后台子进程。
+
+All external commands run in dedicated Linux process groups. Context deadlines terminate the complete
+group, entrypoints forward `Ctrl+C`, `SIGHUP`, and `SIGTERM` to every active group, and direct children
+receive a parent-death signal on abnormal termination. This bounds waits without orphaning background
+work when installation, diagnostics, or release packaging is interrupted.
 
 ## 命令面 / Command surface
 
@@ -88,10 +97,13 @@ Go 安装器保留并收紧了既有运维契约：
   静止任务、恢复文件、凭据以及 timer 的 persistent/runtime enablement 和 active 状态。
 - 配置、systemd unit、logrotate、needrestart 与自动更新策略均以临时文件加原子替换提交；文件系统访问
   拒绝符号链接祖先、RootFS 越界和检查后替换竞态。
+- APT 原始配置缺失标记先于包管理器写入持久化并纳入事务快照；APT 配置目录中的标记和时间戳备份使用
+  静默忽略的 `.bak` 后缀，旧的提示型文件名在升级时保内容迁移。
 - 飞书 App Secret 优先转存为加密 systemd credential；旧 systemd 回退到独立 `0600` root-only 文件。
   Secret 不进入普通配置、命令行、日志或升级备份。
-- 非交互安装默认不发送测试；显式 `--send-test` 才测试全部已配置接收平台。首次或变更飞书接收人时，
-  交互安装默认进行飞书单平台确认发送，失败会回滚。
+- 首次或变更飞书接收人时，交互和非交互安装都默认进行事务内飞书单平台强验证，失败会回滚；交互模式可
+  输入 `n`，或使用 `--skip-feishu-test`、`--skip-notify-test`，明确抑制该默认发送。显式 `--send-test`
+  还会在安装后额外测试全部已配置接收平台，其失败只作为咨询告警返回，不回滚核心安装。
 - 运行锁屏障默认等待 60 秒，可用 `--lock-wait 0..3600` 或进程环境
   `SECURITY_UPDATE_NOTIFY_LOCK_WAIT_SECONDS` 调整；等待耗尽以临时失败码 `75` 回滚。
 - 装后诊断是咨询式；主机磁盘、EOL 等环境问题不会回滚一个文件层面正确的安装。
@@ -99,7 +111,10 @@ Go 安装器保留并收紧了既有运维契约：
 The Go installer serializes transactions, quiesces the old timer before managed or dependency writes,
 crosses the runtime-lock barrier, snapshots and atomically commits managed state, and restores files,
 credentials, and exact timer enablement/activity on failure. Secrets remain outside normal config and
-backups. Non-interactive installs never send implicitly; only an explicit test request does so.
+backups. A new or changed Feishu recipient is strongly verified by default in both interactive and
+non-interactive modes unless explicitly skipped; a separate all-platform post-install test remains opt-in and advisory.
+An originally absent APT policy is recorded before package-manager writes, while APT-directory metadata uses
+the silently ignored `.bak` suffix and migrates legacy notice-producing names without losing their contents.
 
 ## 兼容不变量 / Compatibility invariants
 
@@ -191,8 +206,8 @@ GPG 私钥，签名后立即复验。未打 tag 的本地开发包可显式 `--s
 
 CI/发布门禁包括：
 
-- gofmt、vet、race、覆盖率和定向安全测试；
-- `sun.sh` 及保留构建测试脚本的 Bash 语法与 ShellCheck；
+- gofmt、vet、race、覆盖率、固定版本 `govulncheck` 和定向安全测试；
+- `sun.sh` 及保留构建测试脚本的 Bash 语法、ShellCheck、TTY 输入和精确依赖解析；
 - 两次独立构建逐字节一致；
 - Go 发布白名单、固定五架构、版本绑定和唯一三文件资产集；
 - 五架构实际执行（非本机架构通过 QEMU），而不只做交叉编译；

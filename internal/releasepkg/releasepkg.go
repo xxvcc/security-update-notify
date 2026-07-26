@@ -40,7 +40,7 @@ const (
 	SignAuto SignMode = "auto"
 	// SignRequired fails unless the pinned secret key can sign and verify.
 	SignRequired SignMode = "required"
-	// SignOff deliberately produces an unsigned local release set.
+	// SignOff deliberately produces an unsigned, non-official local release set.
 	SignOff SignMode = "off"
 )
 
@@ -204,6 +204,10 @@ func Build(ctx context.Context, opts Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	official := opts.Release || repo.TagExists
+	if official && mode == SignOff {
+		return Result{}, errors.New("official releases cannot disable signing")
+	}
 	if repo.Dirty && (!opts.AllowDirty || opts.SourceDateEpoch == nil) {
 		return Result{}, fmt.Errorf("release sources have uncommitted or untracked changes (%s); allow-dirty also requires an explicit source-date-epoch", strings.Join(repo.DirtyFiles, ", "))
 	}
@@ -215,7 +219,6 @@ func Build(ctx context.Context, opts Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	official := opts.Release || repo.TagExists
 	if mode == SignAuto && official {
 		mode = SignRequired
 	}

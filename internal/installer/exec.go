@@ -10,6 +10,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/xxvcc/security-update-notify/internal/sysexec"
 )
 
 const maxCommandOutput = 8 << 20
@@ -45,7 +47,7 @@ func (ExecRunner) Run(parent context.Context, command Command) CommandResult {
 	}
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, command.Name, command.Args...)
+	cmd := sysexec.CommandContext(ctx, command.Name, command.Args...)
 	cmd.Env = commandEnv(command.Env)
 	cmd.Stdin = bytes.NewReader(command.Stdin)
 	out := &cappedBuffer{max: maxCommandOutput}

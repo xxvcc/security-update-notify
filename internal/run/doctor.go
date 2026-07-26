@@ -3,7 +3,10 @@ package run
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/xxvcc/security-update-notify/internal/backend"
 	"github.com/xxvcc/security-update-notify/internal/config"
@@ -12,6 +15,8 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/sysexec"
 	"github.com/xxvcc/security-update-notify/internal/systemd"
 )
+
+const doctorCommandTimeout = 30 * time.Second
 
 // DoctorOpts 是 --doctor 的选项。
 type DoctorOpts struct {
@@ -29,6 +34,7 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 	out := os.Stdout
 	lang := opts.Lang
 	ok := true
+	backendReady := true
 	fmt.Fprintf(out, "security-update-notify %s\n", opts.Version)
 	say(out, lang, "配置文件: "+opts.EnvPath, "Config: "+opts.EnvPath)
 	if fileReadable(opts.EnvPath) {
@@ -44,12 +50,14 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 		be = osrel.AutoBackend(o)
 	}
 	say(out, lang, "后端: "+be, "Backend: "+be)
-	say(out, lang, "主机: "+hostLabel(cfg), "Host: "+hostLabel(cfg))
+	host := hostLabel(cfg)
+	say(out, lang, "主机: "+host, "Host: "+host)
 	if include, ip := resolvePublicIP(cfg); include {
 		say(out, lang, "公网 IP: "+ip, "Public IP: "+ip)
 	}
 	say(out, lang, "系统: "+orDefault(o.PrettyName, "unknown"), "OS: "+orDefault(o.PrettyName, "unknown"))
-	say(out, lang, "内核: "+kernelRelease(), "Kernel: "+kernelRelease())
+	kernel := kernelRelease()
+	say(out, lang, "内核: "+kernel, "Kernel: "+kernel)
 
 	if fileExists("/run/systemd/system") && sysexec.Look("systemctl") {
 		say(out, lang, "正常：systemd 存在", "OK systemd present")
@@ -66,20 +74,10 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 
 	switch be {
 	case "apt":
-		for _, c := range []string{"apt-get", "dpkg", "needrestart"} {
-			if sysexec.Look(c) {
-				say(out, lang, "正常：命令存在 "+c, "OK command "+c)
-			} else {
-				say(out, lang, "失败：缺少命令 "+c, "FAIL missing command "+c)
-				ok = false
-			}
-		}
-		if sysexec.Run("dpkg", "-s", "unattended-upgrades").Code == 0 {
-			say(out, lang, "正常：unattended-upgrades 已安装", "OK unattended-upgrades installed")
-		} else {
-			say(out, lang, "失败：缺少 unattended-upgrades", "FAIL unattended-upgrades missing")
-			ok = false
-		}
+		backendReady = doctorAPTDependencies(out, lang, sysexec.Look, func(name string, args ...string) sysexec.Result {
+			return sysexec.RunTimeout(doctorCommandTimeout, name, args...)
+		})
+		ok = ok && backendReady
 	case "dnf":
 		switch {
 		case sysexec.Look("dnf"):
@@ -89,12 +87,14 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 		default:
 			say(out, lang, "失败：缺少 dnf/yum", "FAIL missing dnf/yum")
 			ok = false
+			backendReady = false
 		}
 		if sysexec.Look("needs-restarting") {
 			say(out, lang, "正常：命令存在 needs-restarting", "OK command needs-restarting")
 		} else {
 			say(out, lang, "失败：缺少 needs-restarting", "FAIL missing needs-restarting")
 			ok = false
+			backendReady = false
 		}
 		if systemd.IsEnabled("dnf-automatic.timer") {
 			say(out, lang, "正常：dnf-automatic.timer 已启用", "OK dnf-automatic.timer enabled")
@@ -104,6 +104,7 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 	default:
 		say(out, lang, "失败：不支持的后端 "+be, "FAIL unsupported backend "+be)
 		ok = false
+		backendReady = false
 	}
 
 	channels, err := configuredChannels(cfg)
@@ -142,9 +143,11 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 		restart = collectDNF()
 	}
 	health, pending, patch, eol := collectWatchdog(cfg, be, o, restart, opts.Version, false, true, false)
-	if health.Attention {
+	if health.Attention || !backendReady {
 		say(out, lang, "失败：自动安全更新机制异常", "FAIL automatic security-update mechanism issue")
-		say(out, lang, health.TxtZH, health.TxtEN)
+		if health.Attention && (health.TxtZH != "" || health.TxtEN != "") {
+			say(out, lang, health.TxtZH, health.TxtEN)
+		}
 		ok = false
 	} else {
 		say(out, lang, "正常：自动安全更新机制健康", "OK automatic security-update mechanism healthy")
@@ -182,6 +185,37 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 		return 0
 	}
 	return 1
+}
+
+func doctorAPTDependencies(out io.Writer, lang i18n.Lang, look func(string) bool, run func(string, ...string) sysexec.Result) bool {
+	ok := true
+	for _, command := range []string{"apt-get", "dpkg", "needrestart"} {
+		if look(command) {
+			say(out, lang, "正常：命令存在 "+command, "OK command "+command)
+		} else {
+			say(out, lang, "失败：缺少命令 "+command, "FAIL missing command "+command)
+			ok = false
+		}
+	}
+	for _, pkg := range []string{"unattended-upgrades", "needrestart", "apt-listchanges", "ca-certificates"} {
+		result := run("dpkg", "-s", pkg)
+		if result.Err == nil && result.Code == 0 && dpkgStatusIsInstalled(result.Stdout) {
+			say(out, lang, "正常：软件包 "+pkg+" 已完整安装", "OK package "+pkg+" fully installed")
+		} else {
+			say(out, lang, "失败：软件包 "+pkg+" 未完整安装", "FAIL package "+pkg+" not fully installed")
+			ok = false
+		}
+	}
+	return ok
+}
+
+func dpkgStatusIsInstalled(output string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		if strings.TrimSpace(line) == "Status: install ok installed" {
+			return true
+		}
+	}
+	return false
 }
 
 func fileReadable(p string) bool {

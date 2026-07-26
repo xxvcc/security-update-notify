@@ -1,3 +1,4 @@
+//lint:file-ignore ST1005 Telegram and Feishu errors intentionally retain official product capitalization.
 package run
 
 import (
@@ -5,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -15,6 +15,7 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/delivery"
 	"github.com/xxvcc/security-update-notify/internal/feishu"
 	"github.com/xxvcc/security-update-notify/internal/httpx"
+	"github.com/xxvcc/security-update-notify/internal/sysexec"
 	"github.com/xxvcc/security-update-notify/internal/telegram"
 )
 
@@ -171,7 +172,11 @@ func (w *limitedSecretOutput) Write(p []byte) (int, error) {
 func decryptFeishuSecret(path string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "systemd-creds", "decrypt", "--name="+feishuCredentialName, path, "-")
+	return decryptFeishuSecretContext(ctx, path)
+}
+
+func decryptFeishuSecretContext(ctx context.Context, path string) (string, error) {
+	cmd := sysexec.CommandContext(ctx, "systemd-creds", "decrypt", "--name="+feishuCredentialName, path, "-")
 	out := &limitedSecretOutput{}
 	cmd.Stdout = out
 	cmd.Stderr = io.Discard

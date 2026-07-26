@@ -6,6 +6,8 @@
 // net/http, dropping the python3 dependency. Semantics preserved: token regex, rune-based 4096→4000
 // truncation, 3 send attempts 1s apart, retrying ONLY on 429/5xx or a network error (ok=false or other
 // 4xx are permanent, not retried).
+//
+//lint:file-ignore ST1005 Telegram API errors intentionally retain the product's official capitalization.
 package telegram
 
 import (
@@ -59,12 +61,19 @@ func (c *Client) base() string {
 	return defaultBaseURL
 }
 
-func (c *Client) sleep(d time.Duration) {
+func (c *Client) sleep(ctx context.Context, d time.Duration) error {
 	if c.Sleep != nil {
 		c.Sleep(d)
-		return
+		return ctx.Err()
 	}
-	time.Sleep(d)
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // ErrBadToken 表示 token 格式非法（对应运行时的退出码 2 语义）。
@@ -122,7 +131,9 @@ func (c *Client) GetMe(ctx context.Context, token string) error {
 			return err
 		}
 		if attempt < 2 {
-			c.sleep(time.Second)
+			if err := c.sleep(ctx, time.Second); err != nil {
+				return temporary(err)
+			}
 		}
 	}
 	return temporary(last)
@@ -195,7 +206,9 @@ func (c *Client) SendMessage(ctx context.Context, token, chatID, text string) er
 			break
 		}
 		if attempt < 2 {
-			c.sleep(time.Second)
+			if err := c.sleep(ctx, time.Second); err != nil {
+				return temporary(err)
+			}
 		}
 	}
 	if lastErr == "" {

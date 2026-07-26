@@ -12,9 +12,11 @@ import (
 	"strings"
 
 	"github.com/xxvcc/security-update-notify/internal/releasepkg"
+	"github.com/xxvcc/security-update-notify/internal/sysexec"
 )
 
 func main() {
+	sysexec.InstallSignalForwarding()
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr, releasepkg.Build))
 }
 

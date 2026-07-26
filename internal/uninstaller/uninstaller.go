@@ -20,6 +20,13 @@ import (
 const (
 	timerUnit          = "security-update-notify.timer"
 	serviceUnit        = "security-update-notify.service"
+	aptPeriodicLogical = "/etc/apt/apt.conf.d/20auto-upgrades"
+	aptStableLogical   = aptPeriodicLogical + ".security-update-notify.bak"
+	aptAbsentLogical   = aptPeriodicLogical + ".security-update-notify.absent.bak"
+	aptLegacyAbsent    = aptPeriodicLogical + ".security-update-notify.absent"
+	aptAbsentContents  = "security-update-notify: original file absent\n"
+	dnfAutomaticName   = "automatic.conf"
+	dnfStableName      = dnfAutomaticName + ".security-update-notify.bak"
 	installLockLogical = "/run/security-update-notify.install.lock"
 	runtimeLockLogical = "/run/security-update-notify.lock"
 	systemctlTimeout   = 30 * time.Second
@@ -155,10 +162,10 @@ func Uninstall(opts Options) (Report, error) {
 	defer unlockRuntime()
 
 	var report Report
-	if result := run("systemctl", "disable", "--now", timerUnit); result.Code != 0 || result.Err != nil {
+	if result := run("systemctl", "disable", "--now", timerUnit); systemctlCleanupFailed(result, "disable", timerUnit) {
 		report.SystemctlFailureCount++
 	}
-	if result := run("systemctl", "stop", serviceUnit); result.Code != 0 || result.Err != nil {
+	if result := run("systemctl", "stop", serviceUnit); systemctlCleanupFailed(result, "stop", serviceUnit) {
 		report.SystemctlFailureCount++
 	}
 
@@ -190,6 +197,25 @@ func Uninstall(opts Options) (Report, error) {
 		errs = append(errs, purgeErrs...)
 	}
 	return report, errors.Join(errs...)
+}
+
+func systemctlCleanupFailed(result sysexec.Result, operation, unit string) bool {
+	if result.Code == 0 && result.Err == nil {
+		return false
+	}
+	if result.Err != nil || result.Stdout != "" {
+		return true
+	}
+	diagnostic := strings.TrimSuffix(result.Stderr, "\n")
+	diagnostic = strings.TrimSuffix(diagnostic, "\r")
+	switch operation {
+	case "disable":
+		return result.Code != 1 || diagnostic != "Failed to disable unit: Unit file "+unit+" does not exist."
+	case "stop":
+		return result.Code != 5 || diagnostic != "Failed to stop "+unit+": Unit "+unit+" not loaded."
+	default:
+		return true
+	}
 }
 
 func purge(root string, report *Report) []error {
@@ -253,21 +279,35 @@ func purge(root string, report *Report) []error {
 }
 
 func restoreAPT(root string) (string, error) {
-	fixed, err := safePath(root, "/etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak", true)
+	fixed, err := safePath(root, aptStableLogical, true)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", fmt.Errorf("validate apt fixed backup: %w", err)
 	}
 	if fixed == "" {
-		fixed = rooted(root, "/etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak")
+		fixed = rooted(root, aptStableLogical)
 	}
-	destination, err := safePath(root, "/etc/apt/apt.conf.d/20auto-upgrades", false)
+	marker, err := safePath(root, aptAbsentLogical, true)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("validate apt absence marker: %w", err)
+	}
+	if marker == "" {
+		marker = rooted(root, aptAbsentLogical)
+	}
+	legacyMarker, err := safePath(root, aptLegacyAbsent, true)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("validate legacy apt absence marker: %w", err)
+	}
+	if legacyMarker == "" {
+		legacyMarker = rooted(root, aptLegacyAbsent)
+	}
+	destination, err := safePath(root, aptPeriodicLogical, false)
 	if err != nil {
 		return "", fmt.Errorf("validate apt destination: %w", err)
 	}
 	if _, err := safePath(root, "/etc/apt/apt.conf.d", true); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", fmt.Errorf("validate apt directory: %w", err)
 	}
-	timestamps, err := filesWithPrefix(filepath.Dir(fixed), filepath.Base(fixed)+".")
+	timestamps, err := aptTimestampBackups(filepath.Dir(fixed))
 	if err != nil {
 		return "", fmt.Errorf("list apt timestamp backups: %w", err)
 	}
@@ -279,12 +319,26 @@ func restoreAPT(root string) (string, error) {
 		source = fixed
 	}
 
+	markerExists, err := validAbsenceMarker(marker)
+	if err != nil {
+		return "", fmt.Errorf("inspect apt absence marker: %w", err)
+	}
+	legacyMarkerExists, err := validAbsenceMarker(legacyMarker)
+	if err != nil {
+		return "", fmt.Errorf("inspect legacy apt absence marker: %w", err)
+	}
+
 	if source != "" {
 		if err := restoreFile(source, destination); err != nil {
 			return "", fmt.Errorf("restore apt configuration from %s: %w", logicalPath(root, source), err)
 		}
+	} else if markerExists || legacyMarkerExists {
+		if err := removeFile(destination); err != nil {
+			return "", fmt.Errorf("restore absent apt configuration: %w", err)
+		}
 	}
-	if err := removeFiles(append([]string{fixed}, timestamps...)...); err != nil {
+	metadata := append([]string{fixed, marker, legacyMarker}, timestamps...)
+	if err := removeFiles(metadata...); err != nil {
 		return source, fmt.Errorf("clean apt backups: %w", err)
 	}
 	return source, nil
@@ -297,15 +351,30 @@ func restoreDNF(root string) (string, bool, error) {
 	} else if err != nil {
 		return "", false, fmt.Errorf("validate dnf directory: %w", err)
 	}
-	destination := filepath.Join(dnfDir, "automatic.conf")
-	projectBackups, err := filesWithPrefix(dnfDir, "automatic.conf.security-update-notify.bak.")
+	destination := filepath.Join(dnfDir, dnfAutomaticName)
+	fixed, err := safePath(root, "/etc/dnf/"+dnfStableName, true)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", false, fmt.Errorf("validate dnf fixed backup: %w", err)
+	}
+	if fixed == "" {
+		fixed = filepath.Join(dnfDir, dnfStableName)
+	}
+	projectBackups, err := timestampBackups(dnfDir, dnfStableName+".", "")
 	if err != nil {
 		return "", false, fmt.Errorf("list dnf backups: %w", err)
 	}
 
-	source, err := newestRegular(projectBackups)
-	if err != nil {
-		return "", false, fmt.Errorf("select dnf backup: %w", err)
+	var source string
+	if exists, err := regularFileExists(fixed); err != nil {
+		return "", false, fmt.Errorf("inspect dnf fixed backup: %w", err)
+	} else if exists {
+		source = fixed
+	}
+	if source == "" {
+		source, err = oldestRegular(projectBackups)
+		if err != nil {
+			return "", false, fmt.Errorf("select dnf backup: %w", err)
+		}
 	}
 	legacy := false
 	if source == "" {
@@ -327,7 +396,7 @@ func restoreDNF(root string) (string, bool, error) {
 	}
 	// Legacy backups may belong to another administrator. Preserve them, as the
 	// shell uninstaller does, and remove only project-owned backups.
-	if err := removeFiles(projectBackups...); err != nil {
+	if err := removeFiles(append([]string{fixed}, projectBackups...)...); err != nil {
 		return source, legacy, fmt.Errorf("clean dnf backups: %w", err)
 	}
 	return source, legacy, nil
@@ -607,6 +676,56 @@ func regularFileExists(path string) (bool, error) {
 	return true, nil
 }
 
+func validAbsenceMarker(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > 256 {
+		return false, fmt.Errorf("absence marker is not a small regular file: %s", path)
+	}
+	opened, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer opened.Close()
+	openedInfo, err := opened.Stat()
+	if err != nil {
+		return false, err
+	}
+	if !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+		return false, errors.New("absence marker changed while opening")
+	}
+	data, err := io.ReadAll(io.LimitReader(opened, 257))
+	if err != nil {
+		return false, err
+	}
+	if string(data) != aptAbsentContents {
+		return false, errors.New("absence marker has invalid contents")
+	}
+	return true, nil
+}
+
+func oldestRegular(paths []string) (string, error) {
+	oldest := ""
+	for _, path := range paths {
+		info, err := os.Lstat(path)
+		if err != nil {
+			return "", err
+		}
+		if !info.Mode().IsRegular() {
+			return "", fmt.Errorf("backup is not a regular file: %s", path)
+		}
+		if oldest == "" || path < oldest {
+			oldest = path
+		}
+	}
+	return oldest, nil
+}
+
 func newestRegular(paths []string) (string, error) {
 	type candidate struct {
 		path  string
@@ -792,6 +911,54 @@ func filesWithPrefix(dir, prefix string) ([]string, error) {
 	for _, entry := range entries {
 		if strings.HasPrefix(entry.Name(), prefix) {
 			paths = append(paths, filepath.Join(dir, entry.Name()))
+		}
+	}
+	return paths, nil
+}
+
+func aptTimestampBackups(dir string) ([]string, error) {
+	legacy, err := timestampBackups(dir, filepath.Base(aptStableLogical)+".", "")
+	if err != nil {
+		return nil, err
+	}
+	current, err := timestampBackups(
+		dir,
+		filepath.Base(aptPeriodicLogical)+".security-update-notify.",
+		".bak",
+	)
+	if err != nil {
+		return nil, err
+	}
+	return append(legacy, current...), nil
+}
+
+func timestampBackups(dir, prefix, suffix string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0)
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
+			continue
+		}
+		stamp := strings.TrimSuffix(strings.TrimPrefix(name, prefix), suffix)
+		if len(stamp) != len("20060102150405") {
+			continue
+		}
+		valid := true
+		for _, character := range stamp {
+			if character < '0' || character > '9' {
+				valid = false
+				break
+			}
+		}
+		if valid {
+			paths = append(paths, filepath.Join(dir, name))
 		}
 	}
 	return paths, nil

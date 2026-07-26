@@ -144,30 +144,142 @@ func TestPurgeDoesNotRestoreAPTTimestampWhenFixedBackupMissing(t *testing.T) {
 	assertMissing(t, root, "/etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak.20260726000000")
 }
 
-func TestPurgeRestoresNewestProjectDNFBackupAndCleansProjectBackups(t *testing.T) {
+func TestPurgePreservesUnknownProjectBackupSuffixes(t *testing.T) {
+	root := t.TempDir()
+	aptUnknown := writeFixture(t, root, aptStableLogical+".not-a-timestamp", "apt unrelated")
+	dnfUnknown := writeFixture(t, root, "/etc/dnf/"+dnfStableName+".not-a-timestamp", "dnf unrelated")
+	if _, err := uninstallAsRoot(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner}); err != nil {
+		t.Fatal(err)
+	}
+	assertContent(t, root, logicalPath(root, aptUnknown), "apt unrelated")
+	assertContent(t, root, logicalPath(root, dnfUnknown), "dnf unrelated")
+}
+
+func TestPurgeRestoresOldestProjectDNFBackupForLegacyCompatibility(t *testing.T) {
 	root := t.TempDir()
 	writeFixture(t, root, "/etc/dnf/automatic.conf", "managed")
 	old := writeFixture(t, root, "/etc/dnf/automatic.conf.security-update-notify.bak.20260725000000", "old")
 	newer := writeFixture(t, root, "/etc/dnf/automatic.conf.security-update-notify.bak.20260726000000", "newest")
 	legacy := writeFixture(t, root, "/etc/dnf/automatic.conf.bak.99999999999999", "legacy")
-	setMtime(t, old, time.Unix(100, 0))
-	setMtime(t, newer, time.Unix(200, 0))
+	// Backup filenames record creation order. File mtimes belong to the copied
+	// configuration and may be newer or older than the backup itself.
+	setMtime(t, old, time.Unix(300, 0))
+	setMtime(t, newer, time.Unix(100, 0))
 	setMtime(t, legacy, time.Unix(300, 0))
 
 	report, err := uninstallAsRoot(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner})
 	if err != nil {
 		t.Fatalf("Uninstall(purge) error = %v", err)
 	}
-	if report.RestoredDNFFrom != "/etc/dnf/automatic.conf.security-update-notify.bak.20260726000000" {
+	if report.RestoredDNFFrom != "/etc/dnf/automatic.conf.security-update-notify.bak.20260725000000" {
 		t.Fatalf("RestoredDNFFrom = %q", report.RestoredDNFFrom)
 	}
 	if report.UsedLegacyDNFBackup {
 		t.Fatal("UsedLegacyDNFBackup = true, want false")
 	}
-	assertContent(t, root, "/etc/dnf/automatic.conf", "newest")
+	assertContent(t, root, "/etc/dnf/automatic.conf", "old")
 	assertMissing(t, root, "/etc/dnf/automatic.conf.security-update-notify.bak.20260725000000")
 	assertMissing(t, root, "/etc/dnf/automatic.conf.security-update-notify.bak.20260726000000")
 	assertContent(t, root, "/etc/dnf/automatic.conf.bak.99999999999999", "legacy")
+}
+
+func TestPurgePrefersStableDNFBaselineAcrossReinstalls(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "/etc/dnf/automatic.conf", "managed-second-install")
+	writeFixture(t, root, "/etc/dnf/automatic.conf.security-update-notify.bak", "vendor-baseline")
+	writeFixture(t, root, "/etc/dnf/automatic.conf.security-update-notify.bak.20260725000000", "managed-first-install")
+	writeFixture(t, root, "/etc/dnf/automatic.conf.security-update-notify.bak.20260726000000", "managed-second-install")
+
+	report, err := uninstallAsRoot(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.RestoredDNFFrom != "/etc/dnf/automatic.conf.security-update-notify.bak" || report.UsedLegacyDNFBackup {
+		t.Fatalf("report = %#v", report)
+	}
+	assertContent(t, root, "/etc/dnf/automatic.conf", "vendor-baseline")
+	assertMissing(t, root, "/etc/dnf/automatic.conf.security-update-notify.bak")
+	assertMissing(t, root, "/etc/dnf/automatic.conf.security-update-notify.bak.20260725000000")
+	assertMissing(t, root, "/etc/dnf/automatic.conf.security-update-notify.bak.20260726000000")
+}
+
+func TestPurgeRestoresOriginallyAbsentAPTConfiguration(t *testing.T) {
+	root := t.TempDir()
+	currentTimestamp := aptPeriodicLogical + ".security-update-notify.20260726000000.bak"
+	writeFixture(t, root, aptPeriodicLogical, "managed")
+	writeFixture(t, root, aptAbsentLogical, aptAbsentContents)
+	writeFixture(t, root, currentTimestamp, "managed")
+
+	report, err := uninstallAsRoot(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.RestoredAPTFrom != "" {
+		t.Fatalf("RestoredAPTFrom = %q, want empty for absent baseline", report.RestoredAPTFrom)
+	}
+	assertMissing(t, root, aptPeriodicLogical)
+	assertMissing(t, root, aptAbsentLogical)
+	assertMissing(t, root, currentTimestamp)
+}
+
+func TestPurgeSupportsLegacyAPTAbsenceMarker(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, aptPeriodicLogical, "managed")
+	writeFixture(t, root, aptLegacyAbsent, aptAbsentContents)
+	if _, err := uninstallAsRoot(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner}); err != nil {
+		t.Fatal(err)
+	}
+	assertMissing(t, root, aptPeriodicLogical)
+	assertMissing(t, root, aptLegacyAbsent)
+}
+
+func TestPurgeRejectsInvalidAPTAbsenceMarkerWithoutDeletingConfig(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, aptPeriodicLogical, "managed")
+	writeFixture(t, root, aptAbsentLogical, "not-a-valid-marker\n")
+
+	_, err := uninstallAsRoot(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner})
+	if err == nil || !strings.Contains(err.Error(), "invalid contents") {
+		t.Fatalf("error = %v, want invalid marker error", err)
+	}
+	assertContent(t, root, aptPeriodicLogical, "managed")
+}
+
+func TestUninstallIgnoresOnlyExactMissingUnitDiagnostics(t *testing.T) {
+	root := t.TempDir()
+	report, err := uninstallAsRoot(Options{
+		RootDir: root,
+		RunCommand: func(_ string, args ...string) sysexec.Result {
+			switch strings.Join(args, " ") {
+			case "disable --now " + timerUnit:
+				return sysexec.Result{Code: 1, Stderr: "Failed to disable unit: Unit file " + timerUnit + " does not exist.\n"}
+			case "stop " + serviceUnit:
+				return sysexec.Result{Code: 5, Stderr: "Failed to stop " + serviceUnit + ": Unit " + serviceUnit + " not loaded.\n"}
+			default:
+				return sysexec.Result{}
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.SystemctlFailureCount != 0 {
+		t.Fatalf("SystemctlFailureCount = %d, want 0", report.SystemctlFailureCount)
+	}
+
+	for _, result := range []sysexec.Result{
+		{Code: 5, Stderr: "Failed to disable unit: Unit file " + timerUnit + " does not exist.\n"},
+		{Code: 1, Stderr: "Failed to disable unit: Unit file other.timer does not exist.\n"},
+		{Code: 1, Stderr: "Failed to disable unit: Unit file " + timerUnit + " does not exist.\npermission denied\n"},
+		{Code: -1, Err: errors.New("systemctl unavailable"), Stderr: "Failed to disable unit: Unit file " + timerUnit + " does not exist.\n"},
+	} {
+		if !systemctlCleanupFailed(result, "disable", timerUnit) {
+			t.Fatalf("real/mismatched failure was suppressed: %+v", result)
+		}
+	}
+	if result := (sysexec.Result{Code: 1, Stderr: "Failed to stop " + serviceUnit + ": Unit " + serviceUnit + " not loaded.\n"}); !systemctlCleanupFailed(result, "stop", serviceUnit) {
+		t.Fatalf("stop failure with wrong exit code was suppressed: %+v", result)
+	}
 }
 
 func TestPurgeFallsBackToNewestLegacyDNFBackupWithoutDeletingIt(t *testing.T) {
