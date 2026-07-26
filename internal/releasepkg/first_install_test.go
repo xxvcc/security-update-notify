@@ -103,21 +103,69 @@ func TestReleaseCIRequiresBootstrapVersionBinding(t *testing.T) {
 	}
 }
 
-func TestLiveCanarySkipsFakeNotificationCredentialProbe(t *testing.T) {
+func TestLiveCanaryIsolatesRunnerHealthAndSkipsFakeNotificationCredentialProbe(t *testing.T) {
 	root := repositoryRoot(t)
 	script, err := os.ReadFile(filepath.Join(root, "build", "live-canary.sh"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(script, []byte(`security-update-notify doctor --skip-notify --lang en`)) {
-		t.Fatal("live canary doctor must not probe its intentionally fake notification credentials")
+	for _, item := range []string{
+		`install -m 0600 /dev/null "$canary_env"`,
+		`install -m 0600 /dev/null "$telegram_token_file"`,
+		`--env-file "$canary_env"`,
+		`--telegram-token-file "$telegram_token_file"`,
+		`CHECK_UPDATE_HEALTH=0`,
+		`STALE_UPDATE_DAYS=0`,
+		`PENDING_ALERT_DAYS=0`,
+		`RESTART_ALERT_DAYS=0`,
+		`CHECK_EOL=0`,
+		`CHECK_SELF_UPDATE=0`,
+		`matches="$(grep -c "^${key}=" /etc/security-update-notify/telegram.env || :)"`,
+		`grep -qxF "$expected" /etc/security-update-notify/telegram.env`,
+		`apt_check_before_rc="$(capture_bounded_rc "$work/apt-check.before" apt-get check -qq)"`,
+		`dpkg_audit_before_rc="$(capture_bounded_rc "$work/dpkg-audit.before" dpkg --audit)"`,
+	} {
+		if !bytes.Contains(script, []byte(item)) {
+			t.Fatalf("live canary runner-isolation invariant missing: %s", item)
+		}
 	}
 	workflow, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "live-canary.yml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(workflow, []byte("  workflow_call:\n")) || bytes.Contains(workflow, []byte("  workflow_run:\n")) {
+	if !bytes.Contains(workflow, []byte("  workflow_call:\n")) || bytes.Contains(workflow, []byte("  workflow_run:\n")) ||
+		!bytes.Contains(workflow, []byte("- name: Require preinstalled GitHub CLI\n")) ||
+		bytes.Contains(workflow, []byte("apt-get install -y gh")) {
 		t.Fatal("live canary must be invoked as a dependency of a completed mirror job")
+	}
+	requiredInOrder := []string{
+		`apt_check_before_rc="$(capture_bounded_rc "$work/apt-check.before" apt-get check -qq)"`,
+		`bash "$work/stable-sun.sh"`,
+		`grep -qxF "$expected" /etc/security-update-notify/telegram.env ||`,
+		`systemctl is-enabled --quiet security-update-notify.timer || die`,
+		`systemctl is-active --quiet security-update-notify.timer || die`,
+		"systemd-analyze verify \\\n  /etc/systemd/system/security-update-notify.service \\\n  /etc/systemd/system/security-update-notify.timer\n/usr/local/sbin/security-update-notify doctor --skip-notify --lang en\n",
+		`assert_package_state_not_regressed after-install`,
+		`dry_run_output="$(/usr/local/sbin/security-update-notify run`,
+		`grep -q $'^HASH\t' <<<"$dry_run_output" || die`,
+		"/usr/local/sbin/security-update-notify uninstall --purge-config --lang en\n[[ ! -e /usr/local/sbin/security-update-notify ]] || die",
+		`[[ ! -e /etc/security-update-notify ]] || die`,
+		`[[ ! -e /var/lib/security-update-notify ]] || die`,
+		`[[ ! -e /etc/systemd/system/security-update-notify.service ]] || die`,
+		`[[ ! -e /etc/systemd/system/security-update-notify.timer ]] || die`,
+		`assert_package_state_not_regressed after-purge`,
+		`cmp "$work/apt-policy.before" "$apt_policy" || die`,
+		`die "APT policy metadata was not restored"`,
+		`die "originally absent APT policy was not removed"`,
+	}
+	previous := -1
+	for _, item := range requiredInOrder {
+		start := previous + 1
+		relative := bytes.Index(script[start:], []byte(item))
+		if relative < 0 {
+			t.Fatalf("live canary hard lifecycle invariant missing: %s", item)
+		}
+		previous = start + relative
 	}
 }
 

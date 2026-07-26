@@ -31,8 +31,9 @@ cleanup() {
   trap - EXIT
   set +e
   if [[ -x /usr/local/sbin/security-update-notify ]]; then
-    /usr/local/sbin/security-update-notify uninstall --purge-config --lang en
-    [[ $? -eq 0 ]] || cleanup_failed=1
+    if ! /usr/local/sbin/security-update-notify uninstall --purge-config --lang en; then
+      cleanup_failed=1
+    fi
   fi
   rm -rf "$work"
   if [[ "$rc" -eq 0 && "$cleanup_failed" -ne 0 ]]; then
@@ -42,7 +43,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for command in curl gpg gh jq python3 sha256sum stat systemctl systemd-analyze tar; do
+for command in apt-get curl dpkg gpg gh head jq python3 sha256sum stat systemctl systemd-analyze tar timeout; do
   command -v "$command" >/dev/null 2>&1 || die "missing command: $command"
 done
 [[ ! -e /usr/local/sbin/security-update-notify ]] || die "runner is not clean: SUN is already installed"
@@ -55,6 +56,50 @@ if [[ -e "$apt_policy" || -L "$apt_policy" ]]; then
   apt_policy_was_present=1
   cp --preserve=all "$apt_policy" "$work/apt-policy.before"
 fi
+
+capture_bounded_rc() {
+  local output="$1"
+  shift
+  local rc
+  set +e
+  timeout --signal=TERM --kill-after=5s 60s "$@" 2>&1 | head -c 65536 >"$output"
+  rc="${PIPESTATUS[0]}"
+  set -e
+  printf '%s\n' "$rc"
+}
+
+apt_check_before_rc="$(capture_bounded_rc "$work/apt-check.before" apt-get check -qq)"
+dpkg_audit_before_rc="$(capture_bounded_rc "$work/dpkg-audit.before" dpkg --audit)"
+dpkg_audit_before_clean=0
+if [[ "$dpkg_audit_before_rc" -eq 0 && ! -s "$work/dpkg-audit.before" ]]; then
+  dpkg_audit_before_clean=1
+fi
+if [[ "$apt_check_before_rc" -ne 0 ]]; then
+  echo "NOTICE: hosted runner already fails apt-get check (rc=$apt_check_before_rc); output follows." >&2
+  head -c 4096 "$work/apt-check.before" >&2
+fi
+if [[ "$dpkg_audit_before_clean" -ne 1 ]]; then
+  echo "NOTICE: hosted runner already has a non-clean dpkg audit (rc=$dpkg_audit_before_rc); output follows." >&2
+  head -c 4096 "$work/dpkg-audit.before" >&2
+fi
+echo "Canary patch-maintenance diagnostics are isolated from hosted-runner history; package consistency remains gated against the pre-install baseline."
+
+assert_package_state_not_regressed() {
+  local phase="$1"
+  local apt_output="$work/apt-check.$phase"
+  local dpkg_output="$work/dpkg-audit.$phase"
+  local apt_rc dpkg_rc
+  apt_rc="$(capture_bounded_rc "$apt_output" apt-get check -qq)"
+  dpkg_rc="$(capture_bounded_rc "$dpkg_output" dpkg --audit)"
+  if [[ "$apt_check_before_rc" -eq 0 && "$apt_rc" -ne 0 ]]; then
+    head -c 4096 "$apt_output" >&2
+    die "SUN changed a clean apt-get check baseline into a failure during $phase"
+  fi
+  if [[ "$dpkg_audit_before_clean" -eq 1 && ( "$dpkg_rc" -ne 0 || -s "$dpkg_output" ) ]]; then
+    head -c 4096 "$dpkg_output" >&2
+    die "SUN changed a clean dpkg audit baseline during $phase"
+  fi
+}
 
 curl_args=(
   --fail --silent --show-error --location
@@ -212,10 +257,23 @@ if [[ -n "$bootstrap_signature_asset" ]]; then
 fi
 
 echo "Installing public $tag on ${PRETTY_NAME} through the verified stable bootstrap"
+canary_env="$work/canary-install.env"
+telegram_token_file="$work/telegram.token"
+install -m 0600 /dev/null "$canary_env"
+install -m 0600 /dev/null "$telegram_token_file"
+printf '%s\n' \
+  'CHECK_UPDATE_HEALTH=0' \
+  'STALE_UPDATE_DAYS=0' \
+  'PENDING_ALERT_DAYS=0' \
+  'RESTART_ALERT_DAYS=0' \
+  'CHECK_EOL=0' \
+  'CHECK_SELF_UPDATE=0' >"$canary_env"
+printf '%s\n' '123456:canary_ABCDEFGHIJKLMNOPQRSTUVWXYZ' >"$telegram_token_file"
 bash "$work/stable-sun.sh" \
   --lang en --version "$version" --base-url "$base_url" install \
+  --env-file "$canary_env" \
   --notify-channels telegram \
-  --telegram-token '123456:canary_ABCDEFGHIJKLMNOPQRSTUVWXYZ' \
+  --telegram-token-file "$telegram_token_file" \
   --telegram-chat-id '-1001234567890' \
   --host-label "github-canary-${VERSION_ID}" \
   --include-public-ip 0 \
@@ -231,12 +289,26 @@ bash "$work/stable-sun.sh" \
   die "installed runtime ownership or mode mismatch"
 [[ "$(stat -c %U:%G:%a /etc/security-update-notify/telegram.env)" == "root:root:600" ]] ||
   die "installed config ownership or mode mismatch"
+for expected in \
+  "CHECK_UPDATE_HEALTH='0'" \
+  "STALE_UPDATE_DAYS='0'" \
+  "PENDING_ALERT_DAYS='0'" \
+  "RESTART_ALERT_DAYS='0'" \
+  "CHECK_EOL='0'" \
+  "CHECK_SELF_UPDATE='0'"; do
+  key="${expected%%=*}"
+  matches="$(grep -c "^${key}=" /etc/security-update-notify/telegram.env || :)"
+  [[ "$matches" -eq 1 ]] || die "installed canary isolation setting is not unique: $key"
+  grep -qxF "$expected" /etc/security-update-notify/telegram.env ||
+    die "installed canary isolation setting is missing: $key"
+done
 systemctl is-enabled --quiet security-update-notify.timer || die "timer is not enabled"
 systemctl is-active --quiet security-update-notify.timer || die "timer is not active"
 systemd-analyze verify \
   /etc/systemd/system/security-update-notify.service \
   /etc/systemd/system/security-update-notify.timer
 /usr/local/sbin/security-update-notify doctor --skip-notify --lang en
+assert_package_state_not_regressed after-install
 dry_run_output="$(/usr/local/sbin/security-update-notify run \
   --test-reboot --no-dedupe --dry-run --wait-lock 0 --lang en)"
 grep -q $'^HASH\t' <<<"$dry_run_output" || die "dry-run did not produce a stable hash"
@@ -247,6 +319,7 @@ grep -q $'^HASH\t' <<<"$dry_run_output" || die "dry-run did not produce a stable
 [[ ! -e /var/lib/security-update-notify ]] || die "state remained after purge"
 [[ ! -e /etc/systemd/system/security-update-notify.service ]] || die "service remained after purge"
 [[ ! -e /etc/systemd/system/security-update-notify.timer ]] || die "timer remained after purge"
+assert_package_state_not_regressed after-purge
 if [[ "$apt_policy_was_present" -eq 1 ]]; then
   cmp "$work/apt-policy.before" "$apt_policy" || die "APT policy content was not restored"
   [[ "$(stat -c %U:%G:%a "$work/apt-policy.before")" == "$(stat -c %U:%G:%a "$apt_policy")" ]] ||
