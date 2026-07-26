@@ -184,7 +184,7 @@ jobs:
               "workflows: ['CI']",
               'environment: release-mirror',
               '- name: Require immutable release policy',
-              'ref: ${{ github.workflow_sha }}',
+              'ref: $' + '{{ github.workflow_sha }}',
               'path: released-source',
               '"rel/$tarball" "$version" "$epoch" released-source',
               'cmp "deploy/$TAG/$asset" "public-check/$asset"',
