@@ -62,6 +62,32 @@ func TestPackageBuildFailureReturnsOne(t *testing.T) {
 	}
 }
 
+func TestPackageSignedOutputIncludesBootstrapSignature(t *testing.T) {
+	clearReleaseEnv(t)
+	build := func(context.Context, releasepkg.Options) (releasepkg.Result, error) {
+		return releasepkg.Result{
+			Tarball:            "/tmp/security-update-notify-3.0.0.tar.gz",
+			Checksum:           "/tmp/security-update-notify-3.0.0.tar.gz.sha256",
+			Signature:          "/tmp/security-update-notify-3.0.0.tar.gz.asc",
+			BootstrapSignature: "/tmp/sun.sh.asc",
+			SHA256:             strings.Repeat("a", 64),
+			Signed:             true,
+		}, nil
+	}
+	var stdout bytes.Buffer
+	if code := run([]string{"package"}, &stdout, &bytes.Buffer{}, build); code != 0 {
+		t.Fatalf("run code=%d", code)
+	}
+	for _, path := range []string{
+		"/tmp/security-update-notify-3.0.0.tar.gz.asc",
+		"/tmp/sun.sh.asc",
+	} {
+		if !strings.Contains(stdout.String(), path) {
+			t.Fatalf("stdout=%q, want %q", stdout.String(), path)
+		}
+	}
+}
+
 func TestCommandAndUsage(t *testing.T) {
 	clearReleaseEnv(t)
 	neverBuild := func(context.Context, releasepkg.Options) (releasepkg.Result, error) {

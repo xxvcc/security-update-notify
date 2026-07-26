@@ -3,6 +3,7 @@ package releasepkg
 import (
 	"archive/tar"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -115,4 +116,54 @@ func writeDeterministicArchive(target, pkgDir, pkgName string, epoch int64) (err
 	}
 	ok = true
 	return nil
+}
+
+func readArchiveRegularFile(archivePath, member string, maxSize int64) ([]byte, error) {
+	if member == "" || maxSize <= 0 {
+		return nil, errors.New("archive member and positive size limit are required")
+	}
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return nil, fmt.Errorf("open archive for member %q: %w", member, err)
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, fmt.Errorf("open gzip stream for member %q: %w", member, err)
+	}
+	defer gz.Close()
+
+	tr := tar.NewReader(gz)
+	var content []byte
+	count := 0
+	for {
+		header, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read archive for member %q: %w", member, err)
+		}
+		if header.Name != member {
+			continue
+		}
+		count++
+		if count > 1 {
+			return nil, fmt.Errorf("archive contains multiple %q members", member)
+		}
+		if header.Typeflag != tar.TypeReg || header.Size < 0 || header.Size > maxSize {
+			return nil, fmt.Errorf("archive member %q is not a bounded regular file", member)
+		}
+		content, err = io.ReadAll(io.LimitReader(tr, maxSize+1))
+		if err != nil {
+			return nil, fmt.Errorf("read archive member %q: %w", member, err)
+		}
+		if int64(len(content)) != header.Size {
+			return nil, fmt.Errorf("archive member %q size mismatch", member)
+		}
+	}
+	if count != 1 {
+		return nil, fmt.Errorf("archive must contain exactly one %q member", member)
+	}
+	return content, nil
 }

@@ -1,8 +1,8 @@
 # security-update-notify 3.x 全 Go 架构 / 3.x all-Go architecture
 
-本文记录 3.0.0 完成迁移后、由 3.0.1 加固的 3.x 设计、兼容与发布约束。它描述当前实现，不是待办清单。
+本文记录 3.0.0 完成迁移后、持续加固到 3.0.2 的 3.x 设计、兼容与发布约束。它描述当前实现，不是待办清单。
 
-This document records the 3.x design after the completed 3.0.0 migration and its 3.0.1 hardening,
+This document records the 3.x design after the completed 3.0.0 migration and its hardening through 3.0.2,
 including compatibility, security, and release constraints. It describes the current implementation.
 
 ## 结论 / Bottom line
@@ -161,10 +161,11 @@ read-only diagnostic/test behavior as byte-level invariants.
 - `vX.Y.Z` tag（存在或正式发布时）；
 - tar 顶层目录和包内 `VERSION`；
 - 五个 Go 二进制的编译期版本及 `--version` 输出；
-- tarball、checksum 和 detached signature 的文件名。
+- tarball、checksum、归档 detached signature 和 `sun.sh.asc` 的文件名，以及脚本签名中的关键版本 notation。
 
 Root `VERSION` is the sole version source and is bound to the unique changelog heading, tag, archive
-directory, packaged version, all binary versions, and all three asset names.
+directory, packaged version, all binary versions, the four release-asset names, and the critical notation in
+the bootstrap signature.
 
 正式包固定且只支持以下 Linux 架构，集合不可由环境变量或命令行缩小：
 
@@ -186,6 +187,21 @@ SHA-256-only 应急分支仅在本机确实没有 `gpg` 且管理员显式设置
 要求签名，只有显式 `--verify-signature off` 才会关闭。归档检查拒绝绝对路径、`..`、顶层目录外条目、
 链接/特殊文件、过多条目和超出声明上限的内容，并剥离归档所有者及特殊权限。
 
+首次安装另有一条更早的信任边界：便捷 `curl | bash` 必须在脚本能够自验之前先信任 HTTPS。正式发布工具
+因此使用同一离线密钥额外生成 `sun.sh.asc`；其 hashed 子包以关键 notation 绑定根 `VERSION`。镜像将它绑定到
+已验签归档内的 `sun.sh` 和公钥，并只发布在不可变版本目录。高保障文档流程由管理员显式固定目标版本和主密钥指纹，在 root 自有临时目录完成脚本、指纹、critical 标志和版本 notation 的唯一性校验后
+才运行脚本；它刻意不把未签名 `latest.json` 当作版本新鲜度证明。稳定 `sun.sh` 仅保留旧的一行入口兼容性，
+不假装与多文件版本化信任集具有原子更新语义。
+
+First install has an earlier trust boundary: convenient `curl | bash` must trust HTTPS before the script can
+authenticate anything. Official packaging therefore creates `sun.sh.asc` with the same offline key and binds
+the root `VERSION` in a critical notation inside the signature's hashed subpackets. The mirror binds it to
+`sun.sh` and the public key from the verified archive and publishes the set only under an immutable version
+directory. The high-assurance procedure pins both an explicit version and the primary-key fingerprint, then
+checks the unique signature, critical flag, and version notation in a root-owned temporary directory before execution; it deliberately does not treat unsigned
+`latest.json` as a freshness proof. Stable `sun.sh` remains only for one-line compatibility and is not presented
+as an atomically updated multi-file trust set.
+
 The 3.x self-upgrade path selects the exact current-architecture ELF and runs its Go
 `install --non-interactive -y` transaction directly. A 2.x client first invokes the signed migration
 launcher because its released code requires the historical `install.sh` path; that launcher immediately
@@ -206,14 +222,15 @@ GPG 私钥，签名后立即复验。未打 tag 的本地开发包可显式 `--s
 
 CI/发布门禁包括：
 
-- gofmt、vet、race、覆盖率、固定版本 `govulncheck` 和定向安全测试；
+- gofmt、vet、race、至少 75% 的 atomic 总覆盖率、固定版本 `govulncheck` 和定向安全测试；
 - `sun.sh` 及保留构建测试脚本的 Bash 语法、ShellCheck、TTY 输入和精确依赖解析；
 - 两次独立构建逐字节一致；
-- Go 发布白名单、固定五架构、版本绑定和唯一三文件资产集；
+- Go 发布白名单、固定五架构、版本绑定，以及正式发布唯一四文件资产集（归档、checksum、归档签名和带版本 notation 的 `sun.sh.asc`）；
 - 五架构实际执行（非本机架构通过 QEMU），而不只做交叉编译；
 - 恶意归档、错误 checksum、错误签名/密钥/指纹和 HTTPS 重定向拒绝；
 - 一次性容器中的全新安装、旧配置升级、失败回滚、测试和卸载；
 - GitHub Release 公开资产及镜像公开回读的 SHA-256、GPG、指纹和版本复验。
+- 所有 GitHub Actions 固定完整 commit SHA，正式 Release 不可变；镜像只在 release CI 全部通过后从默认分支的受信 workflow revision 启动，tag 仅作为不执行的数据，并使用仅允许 `main` 部署的 `release-mirror` Environment 密钥；每次镜像成功后及每周在 GitHub 托管 Ubuntu 22.04/24.04 真机执行公网下载、安装、诊断、timer、卸载和 APT 基线恢复 canary。
 
 容器兼容与回滚脚本会改系统路径，必须只在一次性容器中运行，禁止直接在宿主机执行。
 

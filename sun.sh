@@ -12,6 +12,12 @@ BASE_URL=""
 RELEASE_MIRROR_BASE="https://dl.ll.cd/security-update-notify"
 VERIFY_SIGNATURE="required"
 RELEASE_SIGNING_FINGERPRINT="C678256ACBFC6491BF5076655F3AE24999921FFC"
+# 发布工具与镜像工作流读取此契约标记；引导器运行时不使用它。
+# Release tooling reads this contract marker; the runtime bootstrap does not.
+# shellcheck disable=SC2034
+BOOTSTRAP_SIGNATURE_ASSET="sun.sh.asc"
+# shellcheck disable=SC2034
+BOOTSTRAP_VERSION_NOTATION="release-version@xxv.cc"
 UI_LANG="${UI_LANG:-${SUN_LANG:-}}"
 RUN_MODE="menu"
 INSTALL_ARGS=()

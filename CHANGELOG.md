@@ -1,5 +1,12 @@
 # 变更记录
 
+## 3.0.2
+
+- 新增高保障首次安装信任链：正式打包使用同一离线固定指纹密钥同时签署发布归档和 `sun.sh`，并在脚本签名的 hashed 子包中用关键 notation 绑定根版本；镜像只在归档、源码、脚本签名、版本、公钥全部一致且公网回读复验成功后发布版本化 `sun.sh`、`sun.sh.asc` 和公钥。文档提供显式版本、root 自有临时目录、固定指纹与版本绑定校验后才执行脚本的流程；原 `curl | bash` 入口保持兼容并明确其第一阶段依赖 HTTPS。
+  Adds a high-assurance first-install trust chain: official packaging signs both the release archive and `sun.sh` with the same offline pinned-fingerprint key and binds the root version in a critical notation inside the bootstrap signature's hashed subpackets. The mirror publishes versioned `sun.sh`, `sun.sh.asc`, and the public key only after archive/source/signature/version/key consistency checks and public read-back verification. Documentation now provides an explicit-version, root-owned temporary-directory flow that executes the bootstrap only after fingerprint and version-binding verification; the existing `curl | bash` entry remains compatible with its first-stage HTTPS trust boundary stated explicitly.
+- 加固供应链和持续验证：GitHub Actions 全部固定到完整 commit SHA，并由 Dependabot 每周汇总更新；仓库启用不可变 Release，发布与镜像门禁要求新版本恰好包含四个签名资产。镜像等待 release CI 全部通过，只执行默认分支 workflow revision 的验证器并把 tag 当作数据；离线固定指纹不再由 tag 自己决定，SSH 密钥迁入仅允许 `main` 部署的 Environment。race/atomic 总覆盖率门槛提高到 75%，并新增每周及镜像完成后在 GitHub 托管 Ubuntu 22.04/24.04 真机运行的公网下载、验签、安装、跳过假通知凭据联网探测的 doctor、dry-run、timer、卸载和 APT 状态恢复 canary。
+  Hardens the supply chain and continuous verification: every GitHub Action is pinned to a full commit SHA with weekly grouped Dependabot updates; repository Release immutability is enabled, and release/mirror gates require exactly four signed assets for new versions. Mirroring waits for release CI, executes only the verifier from the trusted default-branch workflow revision, and treats the tag as data; the offline pinned fingerprint is no longer selected by the tag, and SSH credentials move into an Environment restricted to `main` deployments. The race/atomic total-coverage gate rises to 75%, with a real GitHub-hosted Ubuntu 22.04/24.04 canary running weekly and after mirror completion to exercise public downloads, signatures, installation, doctor without probing its fake notification credentials, dry-run, timer state, uninstall, and APT-state restoration.
+
 ## 3.0.1
 
 - 修复 APT 已卸载但残留 `config-files` 状态被误判为已安装的问题：安装器现在严格要求 `Status: install ok installed` 并补装缺失依赖，doctor 检查全部关键包且不会在依赖缺失时同时报告机制健康。APT 原始配置不存在时使用在包管理器写入前持久化的事务缺失标记，彻底清理可恢复“原本不存在”；标记与时间戳备份统一以 APT 静默忽略的 `.bak` 结尾，并迁移会让每次 apt 调用产生文件扩展名提示的旧命名；迁移后若安装在后续步骤失败，新旧动态元数据也会随事务完整回滚。DNF 使用固定原始基线，跨普通卸载、重装和 purge 仍恢复首次接管前的 `automatic.conf`。

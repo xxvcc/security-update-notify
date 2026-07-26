@@ -1,6 +1,7 @@
 package run
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -10,6 +11,131 @@ import (
 
 	"github.com/xxvcc/security-update-notify/internal/config"
 )
+
+func TestCollectTestModeOrchestratesPackageCollection(t *testing.T) {
+	t.Run("dnf truncates reboot package details", func(t *testing.T) {
+		dir := t.TempDir()
+		var output strings.Builder
+		for i := 0; i < 45; i++ {
+			fmt.Fprintf(&output, "printf 'RHSA-2026:%04d Important/Sec. package%02d.x86_64\\n'\n", i, i)
+		}
+		writeTestCommand(t, dir, "dnf", output.String())
+		writeTestCommand(t, dir, "uname", "printf '%s\\n' '6.12-test'\n")
+		t.Setenv("PATH", dir)
+
+		cfg := patchTestConfig(t, strings.Join([]string{
+			"BACKEND=dnf",
+			"HOST_LABEL=fixture-host",
+			"PUBLIC_IP=203.0.113.9",
+			"INCLUDE_PUBLIC_IP=1",
+			"NOTIFY_LANG=en",
+			"CHECK_UPDATE_HEALTH=0",
+			"CHECK_EOL=0",
+			"CHECK_SELF_UPDATE=0",
+		}, "\n")+"\n")
+		in := Collect(cfg, Flags{TestReboot: true, TestOK: true, Version: "2.7.3"})
+
+		if in.Backend != "dnf" || in.Host != "fixture-host" || in.Kernel != "6.12-test" {
+			t.Fatalf("identity fields: backend=%q host=%q kernel=%q", in.Backend, in.Host, in.Kernel)
+		}
+		if !in.IncludePublicIP || in.PublicIP != "203.0.113.9" || in.NotifyLang != "en" {
+			t.Fatalf("notification fields: includeIP=%v ip=%q lang=%q", in.IncludePublicIP, in.PublicIP, in.NotifyLang)
+		}
+		if in.Pending.Count != 45 || len(in.Pending.Packages) != 45 {
+			t.Fatalf("pending=%d packages=%d", in.Pending.Count, len(in.Pending.Packages))
+		}
+		pkgs := strings.Split(in.Restart.RebootPkgs, "\n")
+		if len(pkgs) != 40 || pkgs[0] != "package00.x86_64" || pkgs[39] != "package39.x86_64" {
+			t.Fatalf("truncated reboot packages (%d): first=%q last=%q", len(pkgs), pkgs[0], pkgs[len(pkgs)-1])
+		}
+		if !in.Restart.RebootRequired || !in.Restart.RestartAttention || !in.SendOK {
+			t.Fatalf("test flags were not preserved: restart=%+v sendOK=%v", in.Restart, in.SendOK)
+		}
+	})
+
+	t.Run("apt keeps fixture reboot details", func(t *testing.T) {
+		dir := t.TempDir()
+		writeTestCommand(t, dir, "apt-get", "printf '%s\\n' 'Inst openssl [1] (2 Debian-Security:stable-security [amd64])'\n")
+		writeTestCommand(t, dir, "uname", "printf '%s\\n' '6.1-test'\n")
+		t.Setenv("PATH", dir)
+
+		cfg := patchTestConfig(t, "BACKEND=apt\nHOST_LABEL=apt-host\nINCLUDE_PUBLIC_IP=0\nCHECK_UPDATE_HEALTH=0\nCHECK_EOL=0\nCHECK_SELF_UPDATE=0\n")
+		in := Collect(cfg, Flags{TestReboot: true})
+		if in.Pending.Count != 1 || in.Restart.RebootPkgs != "linux-image-amd64\nTEST-MODE-no-real-reboot" {
+			t.Fatalf("pending=%d restart packages=%q", in.Pending.Count, in.Restart.RebootPkgs)
+		}
+		if in.IncludePublicIP || in.PublicIP != "" {
+			t.Fatalf("disabled public IP was included: include=%v ip=%q", in.IncludePublicIP, in.PublicIP)
+		}
+	})
+}
+
+func TestCollectHealthUsesSystemdCommandResults(t *testing.T) {
+	dir := t.TempDir()
+	epoch := time.Now().Unix()
+	callLog := filepath.Join(t.TempDir(), "systemctl.calls")
+	writeTestCommand(t, dir, "systemctl", `
+printf '%s\n' "$*" >> "$SUN_SYSTEMCTL_CALL_LOG"
+case "$1:$4" in
+  is-enabled:*) exit 0 ;;
+  show:ExecMainExitTimestamp) printf '%s\n' 'fixture timestamp' ;;
+  show:LastTriggerUSec) printf '%s\n' 'fixture timestamp' ;;
+  show:Result) printf '%s\n' 'success' ;;
+  *) exit 2 ;;
+esac
+`)
+	writeTestCommand(t, dir, "date", fmt.Sprintf("printf '%%s\\n' '%d'\n", epoch))
+	t.Setenv("PATH", dir)
+	t.Setenv("SUN_SYSTEMCTL_CALL_LOG", callLog)
+
+	health := collectHealth("apt", 7)
+	for _, unexpected := range []string{"disabled", "failed", "stale", "never-success"} {
+		if strings.Contains(health.Sig, unexpected) {
+			t.Fatalf("health signal %q contains %q", health.Sig, unexpected)
+		}
+	}
+	calls, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callText := string(calls)
+	for _, want := range []string{
+		"show apt-daily-upgrade.service -p ExecMainExitTimestamp --value",
+		"show apt-daily-upgrade.timer -p LastTriggerUSec --value",
+		"is-enabled apt-daily-upgrade.timer",
+		"show apt-daily-upgrade.service -p Result --value",
+	} {
+		if strings.Count(callText, want+"\n") != 1 {
+			t.Fatalf("systemctl calls missing or repeated %q:\n%s", want, callText)
+		}
+	}
+	if got := collectHealth("unsupported", 7); got.Attention || got.Sig != "" {
+		t.Fatalf("unsupported backend health=%+v", got)
+	}
+}
+
+func TestIdentityCommandErrorFallbacks(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCommand(t, dir, "date", "printf '%s\\n' not-an-epoch\n")
+	writeTestCommand(t, dir, "hostname", `
+if [ "$1" = "-f" ]; then
+  exit 1
+fi
+printf '%s\n' short-host
+`)
+	writeTestCommand(t, dir, "uname", "printf '\\n'\n")
+	t.Setenv("PATH", dir)
+
+	if got := parseSystemdTime("bad timestamp"); got != 0 {
+		t.Fatalf("invalid epoch=%d", got)
+	}
+	if got := hostLabel(loadEmptyConfig(t)); got != "short-host" {
+		t.Fatalf("fallback hostname=%q", got)
+	}
+	if got := kernelRelease(); got != "unknown" {
+		t.Fatalf("empty kernel release=%q", got)
+	}
+}
 
 func TestReadFilePrefixIsBounded(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "reboot-required.pkgs")

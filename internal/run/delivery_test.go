@@ -158,6 +158,12 @@ func TestFeishuSenderFallsBackToTextOnlyForLocalCardFailure(t *testing.T) {
 		appSecret: "secret-value",
 		receiveID: "ou_lanny",
 	}
+	if sender.Name() != "feishu" {
+		t.Fatalf("sender name=%q", sender.Name())
+	}
+	if err := sender.Probe(context.Background()); err != nil {
+		t.Fatalf("probe Feishu credentials: %v", err)
+	}
 	if err := sender.Send(context.Background(), delivery.Message{
 		Text:       "canonical text",
 		FeishuCard: []byte(`{"schema":"1.0"}`),
@@ -185,6 +191,12 @@ func TestTelegramSenderIgnoresFeishuCardAndPreservesText(t *testing.T) {
 		client: &telegram.Client{HTTP: server.Client(), BaseURL: server.URL},
 		token:  "123456:fake_TOKEN",
 		chatID: "-100123",
+	}
+	if sender.Name() != "telegram" {
+		t.Fatalf("sender name=%q", sender.Name())
+	}
+	if err := sender.Probe(context.Background()); err != nil {
+		t.Fatalf("probe Telegram credentials: %v", err)
 	}
 	if err := sender.Send(context.Background(), delivery.Message{
 		Text:       want,
@@ -255,6 +267,39 @@ func TestReadFeishuSecretFromPlainCredentialFallback(t *testing.T) {
 	got, err := readFeishuSecret()
 	if err != nil || got != "plain-secret" {
 		t.Fatalf("secret=%q err=%v", got, err)
+	}
+}
+
+func TestReadFeishuSecretDecryptsCredentialAndBoundsCommandOutput(t *testing.T) {
+	dir := t.TempDir()
+	credential := filepath.Join(dir, "encrypted-credential")
+	if err := os.WriteFile(credential, []byte("encrypted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := filepath.Join(dir, "systemd-creds")
+	if err := os.WriteFile(command, []byte("#!/bin/sh\nprintf 'decrypted-secret\\n'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("CREDENTIALS_DIRECTORY", "")
+	t.Setenv(feishuSecretFileEnv, "")
+	t.Setenv(feishuEncryptedCredentialEnv, credential)
+	t.Setenv(feishuPlainCredentialEnv, "")
+	got, err := readFeishuSecret()
+	if err != nil || got != "decrypted-secret" {
+		t.Fatalf("decrypted secret=%q err=%v", got, err)
+	}
+
+	output := &limitedSecretOutput{}
+	payload := bytes.Repeat([]byte("x"), maxFeishuSecretBytes+2)
+	if n, err := output.Write(payload); n != len(payload) || err != nil {
+		t.Fatalf("bounded write=(%d, %v)", n, err)
+	}
+	if len(output.data) != maxFeishuSecretBytes+1 {
+		t.Fatalf("bounded output length=%d", len(output.data))
+	}
+	if n, err := output.Write([]byte("ignored")); n != len("ignored") || err != nil || len(output.data) != maxFeishuSecretBytes+1 {
+		t.Fatalf("full bounded write=(%d, %v), length=%d", n, err, len(output.data))
 	}
 }
 

@@ -210,6 +210,32 @@ func TestValidateSourcesRejectsEmbeddedAssetAndFingerprintDrift(t *testing.T) {
 	if err := validateSources(root, "3.0.0"); err == nil || !strings.Contains(err.Error(), "public key differs") {
 		t.Fatalf("bootstrap public-key drift error=%v", err)
 	}
+	root = sourceFixture(t, "3.0.0")
+	sun = filepath.Join(root, "sun.sh")
+	b, err = os.ReadFile(sun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b = bytes.Replace(b, []byte(`BOOTSTRAP_SIGNATURE_ASSET="sun.sh.asc"`), []byte(`BOOTSTRAP_SIGNATURE_ASSET="other.asc"`), 1)
+	if err := os.WriteFile(sun, b, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSources(root, "3.0.0"); err == nil || !strings.Contains(err.Error(), "bootstrap signature asset") {
+		t.Fatalf("bootstrap signature-asset drift error=%v", err)
+	}
+	root = sourceFixture(t, "3.0.0")
+	sun = filepath.Join(root, "sun.sh")
+	b, err = os.ReadFile(sun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b = bytes.Replace(b, []byte(`BOOTSTRAP_VERSION_NOTATION="release-version@xxv.cc"`), []byte(`BOOTSTRAP_VERSION_NOTATION="other@xxv.cc"`), 1)
+	if err := os.WriteFile(sun, b, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSources(root, "3.0.0"); err == nil || !strings.Contains(err.Error(), "bootstrap version notation") {
+		t.Fatalf("bootstrap version-notation drift error=%v", err)
+	}
 }
 
 func TestPackageTreeIsExactGoRuntimeAllowlistWithMigrationBridge(t *testing.T) {
@@ -313,6 +339,41 @@ func TestDeterministicArchiveMetadataAndContents(t *testing.T) {
 	wantCount := len(expectedPackagePaths())
 	if len(names) != wantCount {
 		t.Errorf("archive has %d entries, want %d", len(names), wantCount)
+	}
+}
+
+func TestReadArchiveRegularFileReturnsFinalArchivedBytes(t *testing.T) {
+	t.Parallel()
+	root := sourceFixture(t, "3.0.0")
+	pkgName := "security-update-notify-3.0.0"
+	pkg := filepath.Join(t.TempDir(), pkgName)
+	if err := preparePackageTree(root, pkg, "3.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	writeDummyBinaries(t, pkg)
+	archive := filepath.Join(t.TempDir(), pkgName+".tar.gz")
+	if err := writeDeterministicArchive(archive, pkg, pkgName, 1_700_000_000); err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile(filepath.Join(pkg, "sun.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkg, "sun.sh"), []byte("changed after archiving\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readArchiveRegularFile(archive, pkgName+"/sun.sh", maxBootstrapSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("archive member reader returned mutable package-tree bytes")
+	}
+	if _, err := readArchiveRegularFile(archive, pkgName+"/missing", maxBootstrapSize); err == nil {
+		t.Fatal("missing archive member was accepted")
+	}
+	if _, err := readArchiveRegularFile(archive, pkgName+"/sun.sh", 1); err == nil {
+		t.Fatal("oversized archive member was accepted")
 	}
 }
 
@@ -445,6 +506,111 @@ func TestValidSignatureFingerprintAcceptsPrimaryOrSigningSubkey(t *testing.T) {
 	if validSignatureFingerprint(subkeyStatus, strings.Repeat("C", 40)) {
 		t.Fatal("unrelated signature fingerprint was accepted")
 	}
+	if validSignatureFingerprint(append(append([]byte(nil), primaryStatus...), primaryStatus...), primary) {
+		t.Fatal("multiple valid signatures were accepted as one pinned signature")
+	}
+}
+
+func TestValidSignatureNotationRequiresOneExactPair(t *testing.T) {
+	t.Parallel()
+	valid := []byte("[GNUPG:] NOTATION_NAME release-version@xxv.cc\n[GNUPG:] NOTATION_FLAGS 1 1\n[GNUPG:] NOTATION_DATA 3.0.2\n")
+	if !validSignatureNotation(valid, bootstrapVersionNotation, "3.0.2") {
+		t.Fatal("exact release-version notation was rejected")
+	}
+	for _, status := range [][]byte{
+		[]byte("[GNUPG:] NOTATION_NAME release-version@xxv.cc\n[GNUPG:] NOTATION_FLAGS 1 1\n[GNUPG:] NOTATION_DATA 3.0.1\n"),
+		[]byte("[GNUPG:] NOTATION_NAME release-version@xxv.cc\n[GNUPG:] NOTATION_FLAGS 0 1\n[GNUPG:] NOTATION_DATA 3.0.2\n"),
+		[]byte("[GNUPG:] NOTATION_NAME release-version@xxv.cc\n[GNUPG:] NOTATION_DATA 3.0.2\n"),
+		append(append([]byte(nil), valid...), valid...),
+		[]byte("[GNUPG:] NOTATION_NAME other@xxv.cc\n[GNUPG:] NOTATION_FLAGS 1 1\n[GNUPG:] NOTATION_DATA 3.0.2\n"),
+	} {
+		if validSignatureNotation(status, bootstrapVersionNotation, "3.0.2") {
+			t.Fatalf("invalid release-version notation accepted: %q", status)
+		}
+	}
+}
+
+func TestMaybeSignRejectsIncompleteOrUnsafeNotationBeforeGPG(t *testing.T) {
+	t.Parallel()
+	for _, opts := range []signOptions{
+		{Mode: SignRequired, NotationName: bootstrapVersionNotation},
+		{Mode: SignRequired, NotationValue: "3.0.2"},
+		{Mode: SignRequired, NotationName: "bad=name", NotationValue: "3.0.2"},
+		{Mode: SignRequired, NotationName: bootstrapVersionNotation, NotationValue: "3.0.2\nother"},
+	} {
+		if _, err := maybeSign(context.Background(), opts, "missing", "missing.asc"); err == nil || !strings.Contains(err.Error(), "notation") {
+			t.Fatalf("maybeSign(%+v) error=%v, want notation rejection", opts, err)
+		}
+	}
+}
+
+func TestMaybeSignAuthenticatesArbitraryReleaseArtifact(t *testing.T) {
+	gpg, err := exec.LookPath("gpg")
+	if err != nil {
+		t.Skip("gpg unavailable")
+	}
+	home := filepath.Join(t.TempDir(), "gnupg")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	identity := "SUN bootstrap test <sun-bootstrap@example.invalid>"
+	if err := runGPG(ctx, gpg, home,
+		"--pinentry-mode", "loopback", "--passphrase", "",
+		"--quick-generate-key", identity, "ed25519", "sign", "0",
+	); err != nil {
+		t.Fatalf("generate test signing key: %v", err)
+	}
+	fingerprint, err := secretKeyFingerprint(ctx, gpg, home, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(t.TempDir(), "sun.sh")
+	signature := artifact + ".asc"
+	if err := os.WriteFile(artifact, []byte("#!/bin/sh\necho verified\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	signed, err := maybeSign(ctx, signOptions{
+		Mode: SignRequired, GPGKeyID: fingerprint, GPGHome: home,
+		PinnedFingerprint: fingerprint,
+		NotationName:      bootstrapVersionNotation,
+		NotationValue:     "3.0.2",
+	}, artifact, signature)
+	if err != nil || !signed {
+		t.Fatalf("maybeSign()=(%v,%v)", signed, err)
+	}
+	armored, err := os.ReadFile(signature)
+	if err != nil || !bytes.Contains(armored, []byte("BEGIN PGP SIGNATURE")) {
+		t.Fatalf("detached signature is not ASCII armored: %v", err)
+	}
+	if _, err := runGPGOutput(ctx, gpg, home,
+		"--status-fd=1", "--show-notation", "--verify", signature, artifact,
+	); err == nil {
+		t.Fatal("critical release-version notation was accepted without explicit verifier recognition")
+	}
+	status, err := runGPGOutput(ctx, gpg, home,
+		"--status-fd=1", "--known-notation", bootstrapVersionNotation, "--show-notation",
+		"--verify", signature, artifact,
+	)
+	if err != nil || !validSignatureFingerprint(status, fingerprint) ||
+		!validSignatureNotation(status, bootstrapVersionNotation, "3.0.2") {
+		t.Fatalf("verify generated artifact signature: %v", err)
+	}
+	if _, err := runGPGOutput(ctx, gpg, home,
+		"--status-fd=1", "--verify", signature, artifact,
+	); err == nil {
+		t.Fatal("critical version notation was accepted without explicit verifier recognition")
+	}
+	if err := os.WriteFile(artifact, []byte("#!/bin/sh\necho tampered\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGPGOutput(ctx, gpg, home,
+		"--status-fd=1", "--known-notation", bootstrapVersionNotation,
+		"--verify", signature, artifact,
+	); err == nil {
+		t.Fatal("detached signature accepted a modified bootstrap")
+	}
 }
 
 func TestCommitArtifactsCleansPartialCommit(t *testing.T) {
@@ -452,7 +618,8 @@ func TestCommitArtifactsCleansPartialCommit(t *testing.T) {
 	dir := t.TempDir()
 	stageTar := filepath.Join(dir, "stage.tar.gz")
 	stageSHA := stageTar + ".sha256"
-	for _, path := range []string{stageTar, stageSHA} {
+	stageSig := stageTar + ".asc"
+	for _, path := range []string{stageTar, stageSHA, stageSig} {
 		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -460,36 +627,91 @@ func TestCommitArtifactsCleansPartialCommit(t *testing.T) {
 	finalTar := filepath.Join(dir, "final.tar.gz")
 	finalSHA := finalTar + ".sha256"
 	finalSig := finalTar + ".asc"
-	err := commitArtifacts(stageTar, stageSHA, filepath.Join(dir, "missing.asc"), finalTar, finalSHA, finalSig, true)
+	finalBootstrapSig := filepath.Join(dir, bootstrapSignatureName)
+	err := commitArtifacts(
+		stageTar, stageSHA, stageSig, filepath.Join(dir, "missing-bootstrap.asc"),
+		finalTar, finalSHA, finalSig, finalBootstrapSig,
+		true,
+	)
 	if err == nil {
 		t.Fatal("missing staged signature unexpectedly committed")
 	}
-	for _, path := range []string{finalTar, finalSHA, finalSig} {
+	for _, path := range []string{finalTar, finalSHA, finalSig, finalBootstrapSig} {
 		if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
 			t.Errorf("partial artifact remains at %s: %v", path, statErr)
 		}
 	}
 }
 
-func TestClearTargetArtifactsLeavesNoSameVersionReleaseSet(t *testing.T) {
+func TestCommitArtifactsPreservesPreviousSetOnPreflightFailure(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	paths := []string{
-		filepath.Join(dir, "security-update-notify-3.0.0.tar.gz"),
-		filepath.Join(dir, "security-update-notify-3.0.0.tar.gz.sha256"),
-		filepath.Join(dir, "security-update-notify-3.0.0.tar.gz.asc"),
-	}
-	for _, path := range paths {
-		if err := os.WriteFile(path, []byte("stale"), 0o644); err != nil {
+	stageTar := filepath.Join(dir, "stage.tar.gz")
+	stageSHA := stageTar + ".sha256"
+	stageSig := stageTar + ".asc"
+	for _, path := range []string{stageTar, stageSHA, stageSig} {
+		if err := os.WriteFile(path, []byte("new"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := clearTargetArtifacts(paths...); err != nil {
+	finalTar := filepath.Join(dir, "final.tar.gz")
+	finalSHA := finalTar + ".sha256"
+	finalSig := finalTar + ".asc"
+	finalBootstrapSig := filepath.Join(dir, bootstrapSignatureName)
+	for _, path := range []string{finalTar, finalSHA, finalSig, finalBootstrapSig} {
+		if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := commitArtifacts(
+		stageTar, stageSHA, stageSig, filepath.Join(dir, "missing-bootstrap.asc"),
+		finalTar, finalSHA, finalSig, finalBootstrapSig,
+		true,
+	)
+	if err == nil {
+		t.Fatal("missing staged bootstrap signature unexpectedly committed")
+	}
+	for _, path := range []string{finalTar, finalSHA, finalSig, finalBootstrapSig} {
+		if got, readErr := os.ReadFile(path); readErr != nil || string(got) != "old" {
+			t.Errorf("previous artifact %s=(%q,%v), want preserved", path, got, readErr)
+		}
+	}
+}
+
+func TestCommitArtifactsUnsignedReplacesPayloadAndRemovesStaleSignatures(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	stageTar := filepath.Join(dir, "stage.tar.gz")
+	stageSHA := stageTar + ".sha256"
+	for _, path := range []string{stageTar, stageSHA} {
+		if err := os.WriteFile(path, []byte("new"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	finalTar := filepath.Join(dir, "final.tar.gz")
+	finalSHA := finalTar + ".sha256"
+	finalSig := finalTar + ".asc"
+	finalBootstrapSig := filepath.Join(dir, bootstrapSignatureName)
+	for _, path := range []string{finalTar, finalSHA, finalSig, finalBootstrapSig} {
+		if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := commitArtifacts(
+		stageTar, stageSHA, "", "",
+		finalTar, finalSHA, finalSig, finalBootstrapSig,
+		false,
+	); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range paths {
+	for _, path := range []string{finalTar, finalSHA} {
+		if got, err := os.ReadFile(path); err != nil || string(got) != "new" {
+			t.Errorf("committed payload %s=(%q,%v)", path, got, err)
+		}
+	}
+	for _, path := range []string{finalSig, finalBootstrapSig} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
-			t.Errorf("stale artifact remains at %s: %v", path, err)
+			t.Errorf("stale signature remains at %s: %v", path, err)
 		}
 	}
 }
@@ -523,6 +745,8 @@ func sourceFixture(t *testing.T, version string) string {
 			content = []byte("VERSION=\"" + version + "\"\n")
 		} else if spec.Source == "sun.sh" {
 			content = []byte("#!/usr/bin/env bash\nset -eu\nRELEASE_SIGNING_FINGERPRINT=\"" + assets.ReleaseSigningFingerprint + "\"\n" +
+				"BOOTSTRAP_SIGNATURE_ASSET=\"" + bootstrapSignatureName + "\"\n" +
+				"BOOTSTRAP_VERSION_NOTATION=\"" + bootstrapVersionNotation + "\"\n" +
 				"release_signing_public_key() {\n  cat <<'EOF'\n" + string(assets.ReleaseSigningPublicKey()) + "EOF\n}\n")
 		} else {
 			switch spec.Source {

@@ -109,7 +109,7 @@ func runPackage(args []string, stdout, stderr io.Writer, build buildFunc) int {
 	}
 	fmt.Fprintf(stdout, "Created:\n  %s\n  %s\n", result.Tarball, result.Checksum)
 	if result.Signed {
-		fmt.Fprintf(stdout, "  %s\n", result.Signature)
+		fmt.Fprintf(stdout, "  %s\n  %s\n", result.Signature, result.BootstrapSignature)
 	}
 	fmt.Fprintf(stdout, "%s  %s\n", result.SHA256, filepathBase(result.Tarball))
 	return 0

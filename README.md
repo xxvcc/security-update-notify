@@ -155,14 +155,126 @@ Telegram：
 
 ### 2. 安装
 
-推荐使用网站引导安装器。它会下载最新签名 Release、校验 `.sha256` 与 GPG 签名（默认必须通过），然后启动交互式菜单：
+#### 高保障首次安装（生产环境推荐）
+
+下面的流程不会把网络响应直接交给 shell。请先从可信发布公告确认要安装的明确版本，把 `X.Y.Z` 改成该版本；它在 root 自有临时目录中下载版本化 `sun.sh`、detached signature 和公钥，核对固定主密钥指纹及签名内的关键版本 notation，并且只有全部验证成功后才执行脚本。机器必须预先具有 `bash`、`curl` 和 `gpg`；请先通过发行版的软件包管理器或可信离线介质补齐它们。
+
+```bash
+sudo bash <<'SUN_ROOT'
+set -euo pipefail
+
+SUN_VERSION='X.Y.Z' # 必须改为从可信发布公告确认的明确版本
+SUN_PIN='C678256ACBFC6491BF5076655F3AE24999921FFC'
+SUN_NOTATION='release-version@xxv.cc'
+[[ "$SUN_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z]+)?$ \
+   && "${#SUN_VERSION}" -le 64 ]] || {
+  echo '请先把 SUN_VERSION 改为明确版本，例如 3.0.2。' >&2
+  exit 2
+}
+
+SUN_BASE="https://dl.ll.cd/security-update-notify/v${SUN_VERSION}"
+SUN_WORK="$(mktemp -d)"
+trap 'rm -rf "$SUN_WORK"' EXIT
+chmod 0700 "$SUN_WORK"
+mkdir "$SUN_WORK/gnupg"
+chmod 0700 "$SUN_WORK/gnupg"
+
+for asset in sun.sh sun.sh.asc release-signing.pub.asc; do
+  curl --disable --fail --silent --show-error --location \
+    --proto '=https' --proto-redir '=https' \
+    --connect-timeout 20 --retry 4 --retry-delay 1 --retry-max-time 180 \
+    --max-filesize 1048576 \
+    --output "$SUN_WORK/$asset" "$SUN_BASE/$asset"
+done
+
+gpg_cmd=(gpg --no-options --batch --no-tty --homedir "$SUN_WORK/gnupg")
+"${gpg_cmd[@]}" --import "$SUN_WORK/release-signing.pub.asc" >/dev/null 2>&1
+primary_fingerprints=()
+want_primary=0
+while IFS=: read -r -a fields; do
+  case "${fields[0]:-}" in
+    pub) want_primary=1 ;;
+    fpr)
+      if [[ "$want_primary" -eq 1 ]]; then
+        primary_fingerprints+=("${fields[9]:-}")
+        want_primary=0
+      fi
+      ;;
+  esac
+done < <("${gpg_cmd[@]}" --with-colons --list-keys 2>/dev/null)
+[[ "${#primary_fingerprints[@]}" -eq 1 \
+   && "${primary_fingerprints[0]}" == "$SUN_PIN" ]] || {
+  echo '发布公钥不是固定指纹的唯一主密钥；拒绝执行。' >&2
+  exit 1
+}
+
+status="$("${gpg_cmd[@]}" --known-notation "$SUN_NOTATION" --status-fd=1 --show-notation \
+  --verify "$SUN_WORK/sun.sh.asc" "$SUN_WORK/sun.sh" 2>"$SUN_WORK/gpg.log")" || {
+  cat "$SUN_WORK/gpg.log" >&2
+  exit 1
+}
+valid_count=0
+pinned_count=0
+name_count=0
+name_match=0
+flags_count=0
+flags_match=0
+data_count=0
+data_match=0
+while read -r -a fields; do
+  [[ "${fields[0]:-}" == '[GNUPG:]' ]] || continue
+  case "${fields[1]:-}" in
+    VALIDSIG)
+      valid_count=$((valid_count + 1))
+      last="${fields[${#fields[@]}-1]:-}"
+      if [[ "${fields[2]:-}" == "$SUN_PIN" || "$last" == "$SUN_PIN" ]]; then
+        pinned_count=$((pinned_count + 1))
+      fi
+      ;;
+    NOTATION_NAME)
+      name_count=$((name_count + 1))
+      [[ "${#fields[@]}" -eq 3 && "${fields[2]:-}" == "$SUN_NOTATION" ]] &&
+        name_match=$((name_match + 1))
+      ;;
+    NOTATION_FLAGS)
+      flags_count=$((flags_count + 1))
+      [[ "${#fields[@]}" -eq 4 && "${fields[2]:-}" == 1 && "${fields[3]:-}" == 1 ]] &&
+        flags_match=$((flags_match + 1))
+      ;;
+    NOTATION_DATA)
+      data_count=$((data_count + 1))
+      [[ "${#fields[@]}" -eq 3 && "${fields[2]:-}" == "$SUN_VERSION" ]] &&
+        data_match=$((data_match + 1))
+      ;;
+  esac
+done <<<"$status"
+[[ "$valid_count" -eq 1 && "$pinned_count" -eq 1 \
+   && "$name_count" -eq 1 && "$name_match" -eq 1 \
+   && "$flags_count" -eq 1 && "$flags_match" -eq 1 \
+   && "$data_count" -eq 1 && "$data_match" -eq 1 ]] || {
+  echo '引导器签名未唯一绑定固定指纹和目标版本；拒绝执行。' >&2
+  exit 1
+}
+
+chmod 0700 "$SUN_WORK/sun.sh"
+bash "$SUN_WORK/sun.sh" --version "$SUN_VERSION" --base-url "$SUN_BASE"
+SUN_ROOT
+```
+
+使用明确版本是这条路径的一部分：`latest.json` 是可用性索引，不是签名的版本新鲜度证明。`sun.sh.asc` 的 hashed 子包包含关键 notation `release-version@xxv.cc=<版本>`；验签既核对脚本字节，也要求该值与人工确认的版本完全一致，因此旧版合法脚本和签名不能被搬到新版本目录冒充。版本目录中的 `sun.sh`、`sun.sh.asc` 和公钥只有在镜像工作流验签发布归档、核对 tag 源码并从公网回读复验后才会出现；公钥文件本身仍不是信任根，命令中固定且应从独立可信渠道核对的指纹才是。
+
+#### 便捷一行安装（兼容入口）
+
+网站引导器会下载最新签名 Release、校验 `.sha256` 与 GPG 签名（默认必须通过），然后启动交互式菜单：
 
 ```bash
 set -o pipefail
 curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash
 ```
 
-从网址启动引导器时，机器必须预先装有 `curl`，因为脚本尚未取得前不可能自行补装它。`set -o pipefail` 让缺少 `curl`、DNS/TLS 或下载失败成为整条管道的非零退出，而不是让末端 `bash` 读取空输入后误报成功。脚本运行后需要 `curl`、`tar`、`sha256sum`、`mktemp`、`python3`、`env`、`uname`、`gpg` 和 `timeout`；缺少命令时只通过 apt、dnf、microdnf 或 yum 安装对应的软件包，再逐项复查，避免在 RPM 极简系统上用完整 `curl/coreutils` 替换已安装的 `curl-minimal/coreutils-single`。没有受支持的包管理器或补齐后仍缺命令时会在下载/安装前失败。GPG 签名默认强制校验。
+这条命令保持原有体验，但 `curl` 下载的 `sun.sh` 会在自身被 detached signature 验证之前执行，因此首次引导脚本的信任依赖 HTTPS、域名和镜像/CDN；脚本随后对 Release 的校验不能追溯认证已经运行的第一阶段。威胁模型包含下载站或 TLS 终点失陷时，请使用上面的高保障流程。
+
+从网址启动引导器时，机器必须预先装有 `curl`，因为脚本尚未取得前不可能自行补装它。`set -o pipefail` 让缺少 `curl`、DNS/TLS 或下载失败成为整条管道的非零退出，而不是让末端 `bash` 读取空输入后误报成功。脚本运行后需要 `curl`、`tar`、`sha256sum`、`mktemp`、`python3`、`env`、`uname`、`gpg` 和 `timeout`；缺少命令时只通过 apt、dnf、microdnf 或 yum 安装对应的软件包，再逐项复查，避免在 RPM 极简系统上用完整 `curl/coreutils` 替换已安装的 `curl-minimal/coreutils-single`。没有受支持的包管理器或补齐后仍缺命令时会在下载/安装前失败。Release 的 GPG 签名默认强制校验。
 
 如果你更想从源码运行，也可以：
 
@@ -316,7 +428,7 @@ curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- upgr
 
 已安装 SUN 后，也可以直接运行 `sudo security-update-notify upgrade`。一键安装器和内置升级都会优先读取 `https://dl.ll.cd/security-update-notify/latest.json` 并从同一镜像下载签名资产；镜像索引或完整资产集合传输失败时自动回退 GitHub。下载完成后仍会校验 `.sha256`，并用内置 pin 的指纹强制校验 GPG 签名（默认 fail-closed，缺签名即拒绝）后才升级。镜像只提供传输可用性，不是信任根。
 
-每个正式 GitHub Release 发布后，`Mirror signed release` 工作流会重新验签并同步版本化目录。签名资产和从验签归档提取的版本化 `sun.sh` 从 `dl.ll.cd` 回读校验成功后，才依次更新稳定 `sun.sh` 和最后的 `latest.json`；手动重跑旧版本只补齐其版本目录，不会覆盖当前稳定入口或 Latest。
+每个正式 GitHub Release 的 CI 全部通过后，`Mirror signed release` 工作流才会重新验签并同步版本化目录。它使用默认分支 workflow revision 中固定的验证器和离线指纹，release tag 只作为不执行的数据；部署密钥位于仅允许 `main` 的 GitHub Environment。新版发布还必须包含 Go 打包器用同一离线密钥生成且绑定明确版本的 `sun.sh.asc`；工作流从已验签归档提取 `sun.sh` 和公钥，复验脚本签名与版本 notation，并从 `dl.ll.cd` 回读完整版本化集合后，才依次更新兼容用稳定 `sun.sh` 和最后的 `latest.json`。手动重跑旧版本只补齐其版本目录，不会覆盖当前稳定入口或 Latest。仓库已经启用不可变 Release；每次镜像成功后以及每周一，独立 GitHub 托管 Ubuntu 22.04/24.04 真机 canary 还会从两个公网源重新下载并实测验签、安装、doctor、dry-run、timer、卸载和 APT 配置恢复。
 
 如果已安装过 SUN，安装器会自动读取 `/etc/security-update-notify/telegram.env` 和现有 timer 时间，并复用未显式覆盖的设置。运行 `sudo security-update-notify configure notifications` 可以事务化更改接收平台、Telegram 配置、飞书应用、App Secret 或接收人。移除接收平台会删除其保存凭据，新增或修改只重复验证受影响的平台；任一步失败都会随安装事务回滚。旧配置没有 `NOTIFY_CHANNELS` 时自动按 `telegram` 处理，未显式覆盖的其他选项继续沿用。
 
@@ -476,9 +588,9 @@ sudo security-update-notify uninstall --purge-config
 
 ## Release 签名
 
-发布包始终包含 `.sha256` 校验文件。`go run ./cmd/sun-release package` 在可用时生成 `.tar.gz.asc` detached signature；正式发布或已有对应 tag 时强制签名，并会在创建任何 `dist` 文件前拒绝显式 `--sign off`。`sun.sh` 默认以 `required` 模式校验签名，`auto` 仅作为兼容别名保留，也会要求 gpg 与 `.asc` 签名同时存在；只有显式传入 `--verify-signature off` 才会跳过签名校验。
+发布包始终包含 `.sha256` 校验文件。`go run ./cmd/sun-release package` 在可用时生成归档的 `.tar.gz.asc` 和引导器的 `sun.sh.asc` 两份 detached signature；后者还在签名 hashed 子包中写入关键的版本 notation。正式发布或已有对应 tag 时强制两份签名，并会在创建任何 `dist` 文件前拒绝显式 `--sign off`。`sun.sh` 默认以 `required` 模式校验下载的 Release，`auto` 仅作为兼容别名保留，也会要求 gpg 与归档 `.asc` 同时存在；只有显式传入 `--verify-signature off` 才会跳过 Release 签名校验。
 
-根 `VERSION` 是唯一版本源，格式必须严格为 `VERSION="X.Y.Z"`。正式发布（存在对应 `vX.Y.Z` tag，或显式设置 `RELEASE=1`）**强制签名并固定包含五架构 Go 二进制**：Go 发布工具会绑定根版本、唯一 `CHANGELOG` 标题、tag、包内版本和每个二进制的 `--version`，且架构集合不可覆盖；缺少 Go、Bash（仅用于检查 `sun.sh` 语法）、任一 amd64/arm64/386/ppc64le/s390x 架构产物，或固定指纹对应的 GPG 私钥都会失败。release 发布后 CI 只接受与 tag 同版本且恰好由 tarball、checksum、签名组成的一套资产，并用仓库内公钥校验签名与指纹。私钥不进入 CI，仍由维护者离线持有。此外，`security-update-notify upgrade` 默认 **fail-closed**：从固定发布镜像优先下载、GitHub 回退，校验 sha256，并在解包前用内置公钥与 pin 指纹强制校验 GPG 签名后才升级（应急可设 `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` 仅按 sha256 升级）。
+根 `VERSION` 是唯一版本源，格式必须严格为 `VERSION="X.Y.Z"`。正式发布（存在对应 `vX.Y.Z` tag，或显式设置 `RELEASE=1`）**强制签名并固定包含五架构 Go 二进制**：Go 发布工具会绑定根版本、唯一 `CHANGELOG` 标题、tag、包内版本和每个二进制的 `--version`，且架构集合不可覆盖；缺少 Go、Bash（仅用于检查 `sun.sh` 语法）、任一 amd64/arm64/386/ppc64le/s390x 架构产物，或固定指纹对应的 GPG 私钥都会失败。正式 GitHub Release 的显式资产是 tarball、checksum、tarball signature 和 `sun.sh.asc`；发布 CI 与镜像门禁都会精确校验这四件资产，并把脚本签名同时绑定到验签归档中的 `sun.sh`、固定主密钥和明确版本。私钥不进入 CI，仍由维护者离线持有。此外，`security-update-notify upgrade` 默认 **fail-closed**：从固定发布镜像优先下载、GitHub 回退，校验 sha256，并在解包前用内置公钥与 pin 指纹强制校验 GPG 签名后才升级（应急可设 `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` 仅按 sha256 升级）。
 
 ## 安全说明
 
@@ -492,6 +604,8 @@ SUN 的范围刻意保持很小：
 - 尽力支持的发行版必须显式开启。
 
 发布包的 `.sha256` 文件可以防止下载损坏或版本不匹配；如果你的威胁模型包含发布源被攻破，请保持默认签名校验开启，不要使用 `--verify-signature off` 或无签名升级逃生选项。
+
+归档签名认证 Release 内容；`sun.sh.asc` 则在任何首次执行之前认证引导器字节，并通过关键 notation 绑定其发布版本。便捷 `curl | bash` 不能利用后者，因为代码已先运行；高保障流程才把 fixed fingerprint 作为网络之外的初始信任锚。签名不证明“哪个版本是最新”，也不保护已被攻破的本机 root、`gpg` 或 shell，因此高保障流程要求管理员从独立可信渠道确认目标版本和指纹。
 
 ## 构建发布包
 
@@ -521,9 +635,10 @@ cd dist && sha256sum -c security-update-notify-*.tar.gz.sha256
 dist/security-update-notify-VERSION.tar.gz
 dist/security-update-notify-VERSION.tar.gz.sha256
 dist/security-update-notify-VERSION.tar.gz.asc  # 签名构建
+dist/sun.sh.asc                                  # 签名构建，高保障首次安装
 ```
 
-发布压缩包只包含面向用户的安装、诊断、引导、迁移兼容和文档文件。`sun.sh` 包含在签名压缩包中，镜像工作流会从验签后的归档提取并发布到稳定地址。`install.sh` 与 `files/security-update-notify` 是 Go 打包器为旧 2.x 自升级客户端生成的最小启动器和版本标记，不包含旧安装或运行时逻辑，也不会落到已安装系统。
+发布压缩包只包含面向用户的安装、诊断、引导、迁移兼容和文档文件。`sun.sh` 包含在签名压缩包中；签名构建还在压缩包之外生成 `sun.sh.asc`，不会把不确定签名时间写入可复现归档。镜像工作流从验签归档提取脚本和公钥，与 detached signature 一起发布到不可变版本目录；兼容稳定 URL 仍只提供 `sun.sh`。`install.sh` 与 `files/security-update-notify` 是 Go 打包器为旧 2.x 自升级客户端生成的最小启动器和版本标记，不包含旧安装或运行时逻辑，也不会落到已安装系统。
 
 发布包内容：
 

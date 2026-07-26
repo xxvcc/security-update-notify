@@ -157,14 +157,126 @@ During an interactive install, SUN accepts the App ID and a hidden App Secret, t
 
 ### 2. Install
 
-Recommended: use the website-hosted bootstrap installer. It downloads the latest signed Release, verifies the `.sha256` file and GPG signature (required by default), then opens the interactive menu:
+#### High-assurance first install (recommended for production)
+
+This procedure never pipes a network response into a shell. First confirm an explicit version from a trusted release announcement and replace `X.Y.Z` below. It downloads the versioned `sun.sh`, detached signature, and public key into a root-owned temporary directory, checks the pinned primary-key fingerprint and the critical version notation in the signature, and executes the script only after every check succeeds. The machine must already have `bash`, `curl`, and `gpg`; install them first through the distribution package manager or trusted offline media.
+
+```bash
+sudo bash <<'SUN_ROOT'
+set -euo pipefail
+
+SUN_VERSION='X.Y.Z' # replace with an explicit version confirmed through a trusted announcement
+SUN_PIN='C678256ACBFC6491BF5076655F3AE24999921FFC'
+SUN_NOTATION='release-version@xxv.cc'
+[[ "$SUN_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z]+)?$ \
+   && "${#SUN_VERSION}" -le 64 ]] || {
+  echo 'Set SUN_VERSION to an explicit version, for example 3.0.2.' >&2
+  exit 2
+}
+
+SUN_BASE="https://dl.ll.cd/security-update-notify/v${SUN_VERSION}"
+SUN_WORK="$(mktemp -d)"
+trap 'rm -rf "$SUN_WORK"' EXIT
+chmod 0700 "$SUN_WORK"
+mkdir "$SUN_WORK/gnupg"
+chmod 0700 "$SUN_WORK/gnupg"
+
+for asset in sun.sh sun.sh.asc release-signing.pub.asc; do
+  curl --disable --fail --silent --show-error --location \
+    --proto '=https' --proto-redir '=https' \
+    --connect-timeout 20 --retry 4 --retry-delay 1 --retry-max-time 180 \
+    --max-filesize 1048576 \
+    --output "$SUN_WORK/$asset" "$SUN_BASE/$asset"
+done
+
+gpg_cmd=(gpg --no-options --batch --no-tty --homedir "$SUN_WORK/gnupg")
+"${gpg_cmd[@]}" --import "$SUN_WORK/release-signing.pub.asc" >/dev/null 2>&1
+primary_fingerprints=()
+want_primary=0
+while IFS=: read -r -a fields; do
+  case "${fields[0]:-}" in
+    pub) want_primary=1 ;;
+    fpr)
+      if [[ "$want_primary" -eq 1 ]]; then
+        primary_fingerprints+=("${fields[9]:-}")
+        want_primary=0
+      fi
+      ;;
+  esac
+done < <("${gpg_cmd[@]}" --with-colons --list-keys 2>/dev/null)
+[[ "${#primary_fingerprints[@]}" -eq 1 \
+   && "${primary_fingerprints[0]}" == "$SUN_PIN" ]] || {
+  echo 'The release key is not the sole primary key with the pinned fingerprint; refusing to execute.' >&2
+  exit 1
+}
+
+status="$("${gpg_cmd[@]}" --known-notation "$SUN_NOTATION" --status-fd=1 --show-notation \
+  --verify "$SUN_WORK/sun.sh.asc" "$SUN_WORK/sun.sh" 2>"$SUN_WORK/gpg.log")" || {
+  cat "$SUN_WORK/gpg.log" >&2
+  exit 1
+}
+valid_count=0
+pinned_count=0
+name_count=0
+name_match=0
+flags_count=0
+flags_match=0
+data_count=0
+data_match=0
+while read -r -a fields; do
+  [[ "${fields[0]:-}" == '[GNUPG:]' ]] || continue
+  case "${fields[1]:-}" in
+    VALIDSIG)
+      valid_count=$((valid_count + 1))
+      last="${fields[${#fields[@]}-1]:-}"
+      if [[ "${fields[2]:-}" == "$SUN_PIN" || "$last" == "$SUN_PIN" ]]; then
+        pinned_count=$((pinned_count + 1))
+      fi
+      ;;
+    NOTATION_NAME)
+      name_count=$((name_count + 1))
+      [[ "${#fields[@]}" -eq 3 && "${fields[2]:-}" == "$SUN_NOTATION" ]] &&
+        name_match=$((name_match + 1))
+      ;;
+    NOTATION_FLAGS)
+      flags_count=$((flags_count + 1))
+      [[ "${#fields[@]}" -eq 4 && "${fields[2]:-}" == 1 && "${fields[3]:-}" == 1 ]] &&
+        flags_match=$((flags_match + 1))
+      ;;
+    NOTATION_DATA)
+      data_count=$((data_count + 1))
+      [[ "${#fields[@]}" -eq 3 && "${fields[2]:-}" == "$SUN_VERSION" ]] &&
+        data_match=$((data_match + 1))
+      ;;
+  esac
+done <<<"$status"
+[[ "$valid_count" -eq 1 && "$pinned_count" -eq 1 \
+   && "$name_count" -eq 1 && "$name_match" -eq 1 \
+   && "$flags_count" -eq 1 && "$flags_match" -eq 1 \
+   && "$data_count" -eq 1 && "$data_match" -eq 1 ]] || {
+  echo 'The bootstrap signature is not uniquely bound to the pinned fingerprint and target version; refusing to execute.' >&2
+  exit 1
+}
+
+chmod 0700 "$SUN_WORK/sun.sh"
+bash "$SUN_WORK/sun.sh" --version "$SUN_VERSION" --base-url "$SUN_BASE"
+SUN_ROOT
+```
+
+An explicit version is part of this trust boundary: `latest.json` is an availability index, not a signed freshness proof. The hashed subpackets in `sun.sh.asc` contain the critical notation `release-version@xxv.cc=<version>`; verification authenticates the script bytes and requires this value to match the version confirmed by the administrator, so an older valid script and signature cannot be moved into a newer version directory. The versioned `sun.sh`, `sun.sh.asc`, and public key appear only after the mirror workflow verifies the signed archive and tag source, then reads the files back from the public mirror. The downloaded key file is not itself the trust root; the pinned fingerprint, which should also be checked through an independent trusted channel, is.
+
+#### Convenient one-line install (compatibility entry point)
+
+The website-hosted bootstrap downloads the latest signed Release, verifies the `.sha256` file and GPG signature (required by default), then opens the interactive menu:
 
 ```bash
 set -o pipefail
 curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash
 ```
 
-When starting from the URL, `curl` must already be installed: the bootstrap cannot install a command before the script itself has been obtained. `set -o pipefail` makes a missing `curl`, DNS/TLS error, or failed download fail the complete pipeline instead of allowing the trailing `bash` to read empty input and report success. Once running, the bootstrap requires `curl`, `tar`, `sha256sum`, `mktemp`, `python3`, `env`, `uname`, `gpg`, and `timeout`. It installs only the packages corresponding to missing commands through apt, dnf, microdnf, or yum and then checks each command again; this avoids replacing `curl-minimal/coreutils-single` with conflicting full packages on minimal RPM systems. It fails before downloading or installing SUN when no supported package manager exists or a command is still missing. GPG verification is required by default.
+This command preserves the existing experience, but the downloaded `sun.sh` executes before that script has been checked against its detached signature. The first stage therefore trusts HTTPS, the domain, and the mirror/CDN; verifying the Release afterward cannot retroactively authenticate code that already ran. Use the high-assurance procedure above when the threat model includes a compromised download host or TLS endpoint.
+
+When starting from the URL, `curl` must already be installed: the bootstrap cannot install a command before the script itself has been obtained. `set -o pipefail` makes a missing `curl`, DNS/TLS error, or failed download fail the complete pipeline instead of allowing the trailing `bash` to read empty input and report success. Once running, the bootstrap requires `curl`, `tar`, `sha256sum`, `mktemp`, `python3`, `env`, `uname`, `gpg`, and `timeout`. It installs only the packages corresponding to missing commands through apt, dnf, microdnf, or yum and then checks each command again; this avoids replacing `curl-minimal/coreutils-single` with conflicting full packages on minimal RPM systems. It fails before downloading or installing SUN when no supported package manager exists or a command is still missing. Release GPG verification is required by default.
 
 If you prefer running from source:
 
@@ -318,7 +430,7 @@ curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- upgr
 
 Once SUN is installed you can also run `sudo security-update-notify upgrade` directly. Both the bootstrap and built-in upgrade first read `https://dl.ll.cd/security-update-notify/latest.json` and download the signed assets from that mirror; they fall back to GitHub when the mirror index or complete asset-set transfer is unavailable. The downloaded package still must pass `.sha256` and GPG verification against the embedded pinned fingerprint (fail-closed by default; a missing signature is rejected). The mirror improves transport availability but is not a trust root.
 
-After each official GitHub Release is published, the `Mirror signed release` workflow re-verifies and syncs its versioned directory. Only after the signed assets and the versioned `sun.sh` extracted from the verified archive have been read back from `dl.ll.cd` does it update the stable `sun.sh`, followed by `latest.json` last. Manually rerunning an older release only repairs that version directory and cannot replace the stable bootstrap or current Latest manifest.
+Only after all CI checks for an official GitHub Release pass does the `Mirror signed release` workflow re-verify and sync its versioned directory. It uses the verifier and offline fingerprint fixed in the default-branch workflow revision, treats the release tag only as non-executed data, and obtains deployment credentials from a GitHub Environment restricted to `main`. New releases must also contain `sun.sh.asc`, produced by the Go packager with the same offline key and bound to the explicit version. The workflow extracts `sun.sh` and the public key from the verified archive, verifies the bootstrap signature and version notation, and reads the complete versioned set back from `dl.ll.cd` before updating the compatibility stable `sun.sh` and finally `latest.json`. Manually rerunning an older release only repairs that version directory and cannot replace the stable bootstrap or current Latest manifest. Repository Release immutability is enabled; after every successful mirror and each Monday, an independent real GitHub-hosted Ubuntu 22.04/24.04 canary redownloads both public sources and exercises signature verification, installation, doctor, dry-run, timer state, uninstall, and APT-policy restoration.
 
 If SUN is already installed, the installer reads `/etc/security-update-notify/telegram.env` and the existing timer time and keeps every setting that was not explicitly overridden. Run `sudo security-update-notify configure notifications` to change receiving platforms, Telegram credentials, the Feishu app, App Secret, or recipient transactionally. Removing a platform deletes its stored credentials; adding or editing one revalidates only that platform. Any failure rolls the whole installer transaction back. Legacy configs without `NOTIFY_CHANNELS` remain `telegram`, and other options not explicitly overridden keep their old values.
 
@@ -478,9 +590,9 @@ Packages installed as dependencies are left in place. `--purge-config` removes S
 
 ## Release signatures
 
-Release packages always include a `.sha256` checksum file. `go run ./cmd/sun-release package` creates a detached `.tar.gz.asc` signature when the key is available, and requires it for an official release or an existing version tag; an explicit `--sign off` is rejected before any `dist` file is created in either case. `sun.sh` defaults to `required` signature verification; `auto` is kept only as a compatibility alias and also requires both gpg and the `.asc` signature. Only an explicit `--verify-signature off` skips signature verification.
+Release packages always include a `.sha256` checksum file. When the key is available, `go run ./cmd/sun-release package` creates two detached signatures: `.tar.gz.asc` for the archive and `sun.sh.asc` for the first-install bootstrap; the latter also carries a critical version notation in its hashed signature subpackets. Both are required for an official release or an existing version tag; an explicit `--sign off` is rejected before any `dist` file is created in either case. `sun.sh` defaults to `required` verification of the downloaded Release; `auto` is kept only as a compatibility alias and also requires gpg and the archive `.asc`. Only an explicit `--verify-signature off` skips Release signature verification.
 
-Root `VERSION`, in the exact form `VERSION="X.Y.Z"`, is the single source of truth. Official releases (a corresponding `vX.Y.Z` tag or `RELEASE=1`) are **signed and fixed to all five Go architectures**. The Go release tool binds that root version to the unique CHANGELOG heading, tag, packaged version, and every binary's `--version`; the architecture set cannot be overridden. It fails when Go, Bash (used only to syntax-check `sun.sh`), any amd64/arm64/386/ppc64le/s390x build, or the GPG private key matching the pinned fingerprint is missing. After publication, CI accepts exactly one tag-matched asset set containing the tarball, checksum, and signature, then verifies its signature and fingerprint against the repository public key. The private key never enters CI; it stays offline with the maintainer. In addition, `security-update-notify upgrade` is **fail-closed** by default: it prefers the fixed release mirror and falls back to GitHub, verifies sha256, and requires a GPG signature against an embedded public key and pinned fingerprint before extracting and upgrading (set `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` to upgrade on sha256 only in an emergency).
+Root `VERSION`, in the exact form `VERSION="X.Y.Z"`, is the single source of truth. Official releases (a corresponding `vX.Y.Z` tag or `RELEASE=1`) are **signed and fixed to all five Go architectures**. The Go release tool binds that root version to the unique CHANGELOG heading, tag, packaged version, and every binary's `--version`; the architecture set cannot be overridden. It fails when Go, Bash (used only to syntax-check `sun.sh`), any amd64/arm64/386/ppc64le/s390x build, or the GPG private key matching the pinned fingerprint is missing. Explicit GitHub Release assets are the tarball, checksum, tarball signature, and `sun.sh.asc`: both release CI and the mirror gate verify this exact four-asset set and bind the bootstrap signature to `sun.sh` from the verified archive, the pinned primary key, and the explicit release version. The private key never enters CI; it stays offline with the maintainer. In addition, `security-update-notify upgrade` is **fail-closed** by default: it prefers the fixed release mirror and falls back to GitHub, verifies sha256, and requires a GPG signature against an embedded public key and pinned fingerprint before extracting and upgrading (set `SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` to upgrade on sha256 only in an emergency).
 
 ## Security notes
 
@@ -494,6 +606,8 @@ SUN is intentionally narrow:
 - explicit opt-in for best-effort distro support.
 
 The release `.sha256` file protects against accidental corruption or version mismatch. If your threat model includes a compromised download source, keep the default signature verification enabled and do not use `--verify-signature off` or the unsigned-upgrade escape hatch.
+
+The archive signature authenticates Release contents; before any first execution, `sun.sh.asc` authenticates the bootstrap bytes and binds them to their release version through a critical notation. The convenient `curl | bash` path cannot use the latter because it has already run the code; only the high-assurance procedure treats the fixed fingerprint as the initial trust anchor outside the network. Signatures do not prove which version is latest and do not protect a compromised local root account, `gpg`, or shell, so an administrator must confirm the intended version and fingerprint through an independent trusted channel.
 
 ## Build a release package
 
@@ -523,9 +637,10 @@ Generated files:
 dist/security-update-notify-VERSION.tar.gz
 dist/security-update-notify-VERSION.tar.gz.sha256
 dist/security-update-notify-VERSION.tar.gz.asc  # signed build
+dist/sun.sh.asc                                  # signed build, high-assurance first install
 ```
 
-The release archive contains only user-facing installation, diagnostic, bootstrap, migration-compatibility, and documentation files. `sun.sh` is included in the signed archive; the mirror workflow extracts it only after verification and publishes it at the stable URL. `install.sh` and `files/security-update-notify` are generated by the Go packager as a minimal launcher and version marker for old 2.x self-upgrade clients. They contain no legacy installer/runtime logic and are never installed.
+The release archive contains only user-facing installation, diagnostic, bootstrap, migration-compatibility, and documentation files. `sun.sh` is included in the signed archive; signed builds also create `sun.sh.asc` outside the archive so nondeterministic signature time never enters the reproducible tarball. The mirror extracts the script and key from the verified archive and publishes them with the detached signature in the immutable version directory; the compatibility stable URL still serves only `sun.sh`. `install.sh` and `files/security-update-notify` are generated by the Go packager as a minimal launcher and version marker for old 2.x self-upgrade clients. They contain no legacy installer/runtime logic and are never installed.
 
 Release archive contents:
 

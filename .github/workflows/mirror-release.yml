@@ -1,12 +1,13 @@
 name: Mirror signed release
 
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ['CI']
+    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to mirror, for example v2.2.3
+        description: Release tag to mirror, for example v3.0.1
         required: true
         type: string
 
@@ -19,11 +20,16 @@ concurrency:
 
 jobs:
   verify-and-sync:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'release' &&
+       github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    environment: release-mirror
     env:
       GH_TOKEN: ${{ github.token }}
-      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      TAG: ${{ github.event.workflow_run.head_branch || inputs.tag }}
       MIRROR_BASE_URL: ${{ vars.MIRROR_BASE_URL }}
       MIRROR_HOST: ${{ vars.MIRROR_HOST }}
       MIRROR_PORT: ${{ vars.MIRROR_PORT }}
@@ -86,33 +92,111 @@ jobs:
             exit 2
           }
 
-      - name: Checkout the released tag
-        uses: actions/checkout@v7
+      - name: Require immutable release policy
+        run: |
+          set -euo pipefail
+          [[ "$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled)" == "true" ]] || {
+            echo "::error::repository release immutability is disabled"
+            exit 1
+          }
+          immutable="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .immutable)"
+          if [[ "$immutable" != "true" ]]; then
+            case "$TAG" in
+              v3.0.0|v3.0.1)
+                echo "::notice::mirroring a release published before immutability was enabled: $TAG"
+                ;;
+              *)
+                echo "::error::release $TAG is not immutable"
+                exit 1
+                ;;
+            esac
+          fi
+
+      - name: Checkout the trusted workflow revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout the released tag as untrusted data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_branch || inputs.tag }}
+          path: released-source
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Download release assets
         run: |
           set -euo pipefail
           mkdir rel
+          version="${TAG#v}"
+          tarball="security-update-notify-${version}.tar.gz"
+          declaration_count="$(grep -c '^BOOTSTRAP_SIGNATURE_ASSET=' released-source/sun.sh || true)"
+          bootstrap_signature_asset="$(sed -n 's/^BOOTSTRAP_SIGNATURE_ASSET="\([A-Za-z0-9._-]*\)"$/\1/p' released-source/sun.sh)"
+          notation_count="$(grep -c '^BOOTSTRAP_VERSION_NOTATION=' released-source/sun.sh || true)"
+          bootstrap_version_notation="$(sed -n 's/^BOOTSTRAP_VERSION_NOTATION="\([A-Za-z0-9@._-]*\)"$/\1/p' released-source/sun.sh)"
+          if [[ "$declaration_count" -eq 0 ]]; then
+            [[ -z "$bootstrap_signature_asset" && "$notation_count" -eq 0 \
+               && -z "$bootstrap_version_notation" ]]
+            case "$TAG" in
+              v3.0.0|v3.0.1) ;;
+              *)
+                echo "::error::$TAG does not declare the required first-install bootstrap signature"
+                exit 1
+                ;;
+            esac
+          elif [[ "$declaration_count" -eq 1 && "$bootstrap_signature_asset" == "sun.sh.asc" \
+                  && "$notation_count" -eq 1 \
+                  && "$bootstrap_version_notation" == "release-version@xxv.cc" ]]; then
+            :
+          else
+            echo "::error::invalid bootstrap signature asset declaration"
+            exit 1
+          fi
+          expected_assets=("$tarball" "$tarball.sha256" "$tarball.asc")
+          download_patterns=(--pattern 'security-update-notify-*.tar.gz*')
+          if [[ -n "$bootstrap_signature_asset" ]]; then
+            expected_assets+=("$bootstrap_signature_asset")
+            download_patterns+=(--pattern "$bootstrap_signature_asset")
+          fi
+          mapfile -t actual_assets < <(
+            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' |
+              LC_ALL=C sort
+          )
+          mapfile -t expected_assets < <(printf '%s\n' "${expected_assets[@]}" | LC_ALL=C sort)
+          if ! diff -u <(printf '%s\n' "${expected_assets[@]}") <(printf '%s\n' "${actual_assets[@]}"); then
+            echo "::error::unexpected GitHub release asset set"
+            exit 1
+          fi
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir rel \
-            --pattern 'security-update-notify-*.tar.gz*'
+            "${download_patterns[@]}"
+          printf 'BOOTSTRAP_SIGNATURE_ASSET=%s\nBOOTSTRAP_VERSION_NOTATION=%s\n' \
+            "$bootstrap_signature_asset" "$bootstrap_version_notation" >> "$GITHUB_ENV"
 
       - name: Verify checksum and pinned GPG signature
         run: |
           set -euo pipefail
           version="${TAG#v}"
           tarball="security-update-notify-${version}.tar.gz"
-          source_version="$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' VERSION)"
-          [[ "$source_version" == "$version" && "$(wc -l < VERSION)" -eq 1 ]] || {
+          source_version="$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' released-source/VERSION)"
+          [[ "$source_version" == "$version" && "$(wc -l < released-source/VERSION)" -eq 1 ]] || {
             echo "::error::released source VERSION is not bound to $TAG"
             exit 1
           }
-          [[ -f "rel/$tarball" && -f "rel/$tarball.sha256" && -f "rel/$tarball.asc" ]] || {
+          cmp files/release-signing.pub.asc released-source/files/release-signing.pub.asc || {
+            echo "::error::released source verification key differs from the trusted workflow key"
+            exit 1
+          }
+          [[ -f "rel/$tarball" && -f "rel/$tarball.sha256" && -f "rel/$tarball.asc" \
+             && ( -z "$BOOTSTRAP_SIGNATURE_ASSET" || -f "rel/$BOOTSTRAP_SIGNATURE_ASSET" ) ]] || {
             echo "::error::release must contain exactly the signed asset set for $tarball"
             exit 1
           }
-          [[ "$(find rel -maxdepth 1 -type f -name 'security-update-notify-*.tar.gz*' | wc -l)" -eq 3 ]] || {
+          expected_count=3
+          [[ -z "$BOOTSTRAP_SIGNATURE_ASSET" ]] || expected_count=4
+          [[ "$(find rel -maxdepth 1 -type f | wc -l)" -eq "$expected_count" ]] || {
             echo "::error::unexpected release asset set"
             exit 1
           }
@@ -126,6 +210,13 @@ jobs:
               exit 1
             }
           done
+          if [[ -n "$BOOTSTRAP_SIGNATURE_ASSET" ]]; then
+            [[ "$(stat -c %s "rel/$BOOTSTRAP_SIGNATURE_ASSET")" -gt 0 \
+               && "$(stat -c %s "rel/$BOOTSTRAP_SIGNATURE_ASSET")" -le 1048576 ]] || {
+              echo "::error::$BOOTSTRAP_SIGNATURE_ASSET has an invalid size"
+              exit 1
+            }
+          fi
           [[ "$(wc -l < "rel/$tarball.sha256")" -eq 1 ]] || {
             echo "::error::checksum manifest must contain exactly one line"
             exit 1
@@ -137,10 +228,12 @@ jobs:
             echo "::error::checksum manifest is not bound to $tarball"
             exit 1
           }
-          pin="$(sed -n 's/^RELEASE_SIGNING_FINGERPRINT="\([0-9A-Fa-f]\{40\}\)"$/\1/p' sun.sh)"
-          [[ "$pin" =~ ^[0-9A-Fa-f]{40}$ \
-             && "$(grep -c '^RELEASE_SIGNING_FINGERPRINT=' sun.sh)" -eq 1 ]] \
+          expected_pin='C678256ACBFC6491BF5076655F3AE24999921FFC'
+          source_pin="$(sed -n 's/^RELEASE_SIGNING_FINGERPRINT="\([0-9A-Fa-f]\{40\}\)"$/\1/p' released-source/sun.sh)"
+          [[ "$source_pin" == "$expected_pin" \
+             && "$(grep -c '^RELEASE_SIGNING_FINGERPRINT=' released-source/sun.sh)" -eq 1 ]] \
             || { echo "::error::invalid pinned fingerprint"; exit 1; }
+          pin="$expected_pin"
           GNUPGHOME="$(mktemp -d)"
           export GNUPGHOME
           chmod 700 "$GNUPGHOME"
@@ -160,10 +253,48 @@ jobs:
             cat "$verify_log" >&2
             exit 1
           }
-          awk -v pin="$pin" '$1 == "[GNUPG:]" && $2 == "VALIDSIG" && ($3 == pin || $NF == pin) {valid = 1} END {exit !valid}' \
-            <<<"$status" || { echo "::error::signature is not bound to the pinned primary key"; exit 1; }
-          epoch="$(git show -s --format=%ct HEAD)"
-          python3 build/release-archive-test.py "rel/$tarball" "$version" "$epoch" .
+          awk -v pin="$pin" '
+            $1 == "[GNUPG:]" && $2 == "VALIDSIG" {
+              valid_count++
+              if ($3 == pin || $NF == pin) pinned_count++
+            }
+            END { exit !(valid_count == 1 && pinned_count == 1) }
+          ' <<<"$status" || {
+            echo "::error::signature is not uniquely bound to the pinned primary key"
+            exit 1
+          }
+          epoch="$(git -C released-source show -s --format=%ct HEAD)"
+          python3 build/release-archive-test.py \
+            "rel/$tarball" "$version" "$epoch" released-source
+          if [[ -n "$BOOTSTRAP_SIGNATURE_ASSET" ]]; then
+            verify_dir="$(mktemp -d)"
+            top="security-update-notify-$version"
+            env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT \
+              tar -xOzf "rel/$tarball" "$top/sun.sh" > "$verify_dir/sun.sh"
+            env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT \
+              tar -xOzf "rel/$tarball" "$top/files/release-signing.pub.asc" \
+              > "$verify_dir/release-signing.pub.asc"
+            cmp released-source/sun.sh "$verify_dir/sun.sh"
+            cmp released-source/files/release-signing.pub.asc "$verify_dir/release-signing.pub.asc"
+            cmp files/release-signing.pub.asc "$verify_dir/release-signing.pub.asc"
+            bootstrap_status="$(gpg --batch --known-notation "$BOOTSTRAP_VERSION_NOTATION" \
+              --status-fd=1 --show-notation \
+              --verify "rel/$BOOTSTRAP_SIGNATURE_ASSET" "$verify_dir/sun.sh" 2>"$verify_dir/gpg.log")" || {
+              cat "$verify_dir/gpg.log" >&2
+              exit 1
+            }
+            awk -v pin="$pin" -v notation="$BOOTSTRAP_VERSION_NOTATION" -v version="$version" '
+              $1 == "[GNUPG:]" && $2 == "VALIDSIG" { valid_count++; if ($3 == pin || $NF == pin) pinned_count++ }
+              $1 == "[GNUPG:]" && $2 == "NOTATION_NAME" { name_count++; if (NF == 3 && $3 == notation) name_match++ }
+              $1 == "[GNUPG:]" && $2 == "NOTATION_FLAGS" { flags_count++; if (NF == 4 && $3 == 1 && $4 == 1) flags_match++ }
+              $1 == "[GNUPG:]" && $2 == "NOTATION_DATA" { data_count++; if (NF == 3 && $3 == version) data_match++ }
+              END { exit !(valid_count == 1 && pinned_count == 1 && name_count == 1 && name_match == 1 &&
+                           flags_count == 1 && flags_match == 1 && data_count == 1 && data_match == 1) }
+            ' <<<"$bootstrap_status" || {
+              echo "::error::bootstrap signature is not uniquely bound to the pinned key and release version"
+              exit 1
+            }
+          fi
           printf 'VERSION=%s\nTARBALL=%s\nPIN=%s\n' "$version" "$tarball" "$pin" >> "$GITHUB_ENV"
 
       - name: Prepare immutable release directory and latest files
@@ -182,13 +313,39 @@ jobs:
             }
             tar_clean_env -xOzf "rel/$TARBALL" "$bootstrap_member" > "deploy/$TAG/sun.sh"
             chmod 0644 "deploy/$TAG/sun.sh"
-            cmp sun.sh "deploy/$TAG/sun.sh" || {
+            cmp released-source/sun.sh "deploy/$TAG/sun.sh" || {
               echo "::error::bootstrap in signed archive differs from the released tag"
               exit 1
             }
             bootstrap_present=1
+            high_assurance_bootstrap=0
+            if [[ -n "$BOOTSTRAP_SIGNATURE_ASSET" ]]; then
+              key_member="security-update-notify-${VERSION}/files/release-signing.pub.asc"
+              key_count="$(tar_clean_env -tzf "rel/$TARBALL" | awk -v member="$key_member" '$0 == member { count++ } END { print count + 0 }')"
+              [[ "$key_count" -eq 1 ]] || {
+                echo "::error::signed release archive must contain one verification key"
+                exit 1
+              }
+              tar_clean_env -xOzf "rel/$TARBALL" "$key_member" > "deploy/$TAG/release-signing.pub.asc"
+              chmod 0644 "deploy/$TAG/release-signing.pub.asc"
+              cmp released-source/files/release-signing.pub.asc "deploy/$TAG/release-signing.pub.asc" || {
+                echo "::error::verification key in signed archive differs from the released tag"
+                exit 1
+              }
+              cmp files/release-signing.pub.asc "deploy/$TAG/release-signing.pub.asc" || {
+                echo "::error::verification key in signed archive differs from the trusted workflow key"
+                exit 1
+              }
+              install -m 0644 "rel/$BOOTSTRAP_SIGNATURE_ASSET" "deploy/$TAG/$BOOTSTRAP_SIGNATURE_ASSET"
+              high_assurance_bootstrap=1
+            fi
           elif [[ "$bootstrap_count" -eq 0 ]]; then
+            [[ -z "$BOOTSTRAP_SIGNATURE_ASSET" ]] || {
+              echo "::error::release declares a bootstrap signature but its signed archive has no bootstrap"
+              exit 1
+            }
             bootstrap_present=0
+            high_assurance_bootstrap=0
             echo "Legacy release $TAG has no signed sun.sh; repairing its existing assets only."
           else
             echo "::error::signed release archive contains multiple $bootstrap_member entries"
@@ -211,7 +368,8 @@ jobs:
           }, sys.stdout, ensure_ascii=True, separators=(",", ":"))
           sys.stdout.write("\n")
           PY
-          printf 'BOOTSTRAP_PRESENT=%s\n' "$bootstrap_present" >> "$GITHUB_ENV"
+          printf 'BOOTSTRAP_PRESENT=%s\nHIGH_ASSURANCE_BOOTSTRAP=%s\n' \
+            "$bootstrap_present" "$high_assurance_bootstrap" >> "$GITHUB_ENV"
 
       - name: Configure pinned SSH identity
         env:
@@ -240,6 +398,9 @@ jobs:
           if [[ "$BOOTSTRAP_PRESENT" == "1" ]]; then
             assets+=(sun.sh)
           fi
+          if [[ "$HIGH_ASSURANCE_BOOTSTRAP" == "1" ]]; then
+            assets+=("$BOOTSTRAP_SIGNATURE_ASSET" release-signing.pub.asc)
+          fi
           for asset in "${assets[@]}"; do
             curl --fail --location --retry 3 --retry-all-errors \
               --proto '=https' --proto-redir '=https' \
@@ -265,10 +426,38 @@ jobs:
             cat "$verify_log" >&2
             exit 1
           }
-          awk -v pin="$PIN" '$1 == "[GNUPG:]" && $2 == "VALIDSIG" && ($3 == pin || $NF == pin) {valid = 1} END {exit !valid}' \
-            <<<"$status" || { echo "::error::public signature is not bound to the pinned primary key"; exit 1; }
+          awk -v pin="$PIN" '
+            $1 == "[GNUPG:]" && $2 == "VALIDSIG" {
+              valid_count++
+              if ($3 == pin || $NF == pin) pinned_count++
+            }
+            END { exit !(valid_count == 1 && pinned_count == 1) }
+          ' <<<"$status" || {
+            echo "::error::public signature is not uniquely bound to the pinned primary key"
+            exit 1
+          }
           if [[ "$BOOTSTRAP_PRESENT" == "1" ]]; then
             cmp "deploy/$TAG/sun.sh" public-check/sun.sh
+          fi
+          if [[ "$HIGH_ASSURANCE_BOOTSTRAP" == "1" ]]; then
+            cmp files/release-signing.pub.asc public-check/release-signing.pub.asc
+            bootstrap_status="$(gpg --batch --known-notation "$BOOTSTRAP_VERSION_NOTATION" \
+              --status-fd=1 --show-notation \
+              --verify "public-check/$BOOTSTRAP_SIGNATURE_ASSET" public-check/sun.sh 2>"$verify_log")" || {
+              cat "$verify_log" >&2
+              exit 1
+            }
+            awk -v pin="$PIN" -v notation="$BOOTSTRAP_VERSION_NOTATION" -v version="$VERSION" '
+              $1 == "[GNUPG:]" && $2 == "VALIDSIG" { valid_count++; if ($3 == pin || $NF == pin) pinned_count++ }
+              $1 == "[GNUPG:]" && $2 == "NOTATION_NAME" { name_count++; if (NF == 3 && $3 == notation) name_match++ }
+              $1 == "[GNUPG:]" && $2 == "NOTATION_FLAGS" { flags_count++; if (NF == 4 && $3 == 1 && $4 == 1) flags_match++ }
+              $1 == "[GNUPG:]" && $2 == "NOTATION_DATA" { data_count++; if (NF == 3 && $3 == version) data_match++ }
+              END { exit !(valid_count == 1 && pinned_count == 1 && name_count == 1 && name_match == 1 &&
+                           flags_count == 1 && flags_match == 1 && data_count == 1 && data_match == 1) }
+            ' <<<"$bootstrap_status" || {
+              echo "::error::public bootstrap signature is not uniquely bound to the pinned key and release version"
+              exit 1
+            }
           fi
 
       - name: Confirm GitHub Latest before stable update
@@ -280,6 +469,10 @@ jobs:
           if [[ "$TAG" == "$latest_tag" ]]; then
             [[ "$BOOTSTRAP_PRESENT" == "1" ]] || {
               echo "::error::current Latest release has no signed bootstrap"
+              exit 1
+            }
+            [[ -z "$BOOTSTRAP_SIGNATURE_ASSET" || "$HIGH_ASSURANCE_BOOTSTRAP" == "1" ]] || {
+              echo "::error::current Latest release has no verified high-assurance bootstrap set"
               exit 1
             }
             update_latest=1
@@ -312,6 +505,10 @@ jobs:
             "$MIRROR_BASE_URL/latest.json?run=$GITHUB_RUN_ID" > public-latest.json
           cmp latest.json public-latest.json
 
+      - name: Remove SSH identity
+        if: always()
+        run: rm -f "$HOME/.ssh/mirror_key" "$HOME/.ssh/known_hosts"
+
       - name: Mirror summary
         run: |
           {
@@ -320,6 +517,11 @@ jobs:
             echo "- Tag: \`$TAG\`"
             echo "- Assets: \`$MIRROR_BASE_URL/$TAG/\`"
             echo "- Stable bootstrap updated: \`$STABLE_BOOTSTRAP_UPDATED\`"
+            echo "- Versioned high-assurance bootstrap: \`$HIGH_ASSURANCE_BOOTSTRAP\`"
             echo "- Updated latest.json: \`$UPDATE_LATEST\`"
             echo "- Signing fingerprint: \`$PIN\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  public-canary:
+    needs: verify-and-sync
+    uses: ./.github/workflows/live-canary.yml

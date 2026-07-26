@@ -1,0 +1,399 @@
+package installer
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestExecRunnerClassifiesCommandOutcomesAndBoundsOutput(t *testing.T) {
+	runner := ExecRunner{}
+	if !runner.LookPath("sh") || runner.LookPath("security-update-notify-command-that-does-not-exist") {
+		t.Fatal("LookPath did not distinguish an existing command from a missing one")
+	}
+
+	result := runner.Run(context.Background(), Command{
+		Name:  "/bin/sh",
+		Args:  []string{"-c", "IFS= read -r line; printf '%s' \"$SUN_TEST_VALUE:$line\"; printf '%s' warning >&2; exit 7"},
+		Env:   map[string]string{"SUN_TEST_VALUE": "override"},
+		Stdin: []byte("input\n"),
+	})
+	if result.Code != 7 || result.Err != nil || string(result.Stdout) != "override:input" || string(result.Stderr) != "warning" {
+		t.Fatalf("non-zero command result = %+v", result)
+	}
+
+	missing := runner.Run(context.Background(), Command{Name: "/definitely/missing/security-update-notify"})
+	if missing.Code != -1 || missing.Err == nil {
+		t.Fatalf("missing command result = %+v", missing)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	canceled := runner.Run(ctx, Command{Name: "/bin/sh", Args: []string{"-c", "exit 0"}})
+	if canceled.Code != -1 || !errors.Is(canceled.Err, context.Canceled) {
+		t.Fatalf("canceled command result = %+v", canceled)
+	}
+
+	buffer := &cappedBuffer{max: 5}
+	if n, err := buffer.Write([]byte("abc")); n != 3 || err != nil {
+		t.Fatalf("first bounded write = (%d, %v)", n, err)
+	}
+	if n, err := buffer.Write([]byte("defgh")); n != 5 || err != nil || buffer.b.String() != "abcde" {
+		t.Fatalf("truncated bounded write n=%d err=%v data=%q", n, err, buffer.b.String())
+	}
+	if n, err := buffer.Write([]byte("ignored")); n != 7 || err != nil || buffer.b.String() != "abcde" {
+		t.Fatalf("full bounded write n=%d err=%v data=%q", n, err, buffer.b.String())
+	}
+}
+
+func TestInstallerExitErrorsAndCommandDiagnostics(t *testing.T) {
+	base := errors.New("base failure")
+	plain := &ExitError{Code: 2, Err: base}
+	if plain.Error() != "base failure" || !errors.Is(plain, base) {
+		t.Fatalf("plain ExitError = %q, unwrap=%v", plain.Error(), errors.Is(plain, base))
+	}
+	wrapped := &ExitError{Code: 75, Op: "wait", Err: base}
+	if wrapped.Error() != "wait: base failure" || ExitCode(wrapped) != 75 {
+		t.Fatalf("wrapped ExitError = %q code=%d", wrapped.Error(), ExitCode(wrapped))
+	}
+	if ExitCode(nil) != 0 || ExitCode(base) != 1 || ExitCode(invalid("bad %s", "input")) != 2 {
+		t.Fatal("installer exit-code mapping changed")
+	}
+	if got := failure("operation", nil).Error(); got != "operation: operation failed" {
+		t.Fatalf("nil failure = %q", got)
+	}
+	if ExitCode(temporary("lock", ErrLockBusy)) != 75 {
+		t.Fatal("temporary failure did not preserve EX_TEMPFAIL")
+	}
+
+	for _, test := range []struct {
+		name   string
+		result CommandResult
+		want   string
+	}{
+		{name: "underlying error", result: CommandResult{Err: base}, want: "base failure"},
+		{name: "stderr", result: CommandResult{Code: 4, Stderr: []byte(" stderr detail \n")}, want: "stderr detail"},
+		{name: "stdout fallback", result: CommandResult{Code: 5, Stdout: []byte(" stdout detail \n")}, want: "stdout detail"},
+		{name: "status fallback", result: CommandResult{Code: 6}, want: "command exited with status 6"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := commandResultError(test.result).Error(); got != test.want {
+				t.Fatalf("commandResultError()=%q want %q", got, test.want)
+			}
+		})
+	}
+	long := commandResultError(CommandResult{Code: 1, Stderr: []byte(strings.Repeat("x", 5000))}).Error()
+	if len(long) != 4096 {
+		t.Fatalf("bounded command diagnostic length=%d", len(long))
+	}
+}
+
+func TestNormalizeAndValidateConfigRejectsUnsafeAndInconsistentValues(t *testing.T) {
+	valid := func() map[string]string {
+		values := cloneConfig(configDefaults)
+		values["NOTIFY_CHANNELS"] = "telegram"
+		values["TELEGRAM_BOT_TOKEN"] = "123456:valid_token"
+		values["TELEGRAM_CHAT_ID"] = "-100123"
+		return values
+	}
+	tests := []struct {
+		name      string
+		mutate    func(map[string]string)
+		allowOpen bool
+	}{
+		{name: "oversized value", mutate: func(v map[string]string) { v["HOST_LABEL"] = strings.Repeat("x", 65537) }},
+		{name: "line break", mutate: func(v map[string]string) { v["HOST_LABEL"] = "a\nb" }},
+		{name: "nul byte", mutate: func(v map[string]string) { v["HOST_LABEL"] = "a\x00b" }},
+		{name: "mixed quotes", mutate: func(v map[string]string) { v["HOST_LABEL"] = `a'b"c` }},
+		{name: "unknown channel", mutate: func(v map[string]string) { v["NOTIFY_CHANNELS"] = "email" }},
+		{name: "invalid Telegram token", mutate: func(v map[string]string) { v["TELEGRAM_BOT_TOKEN"] = "bad" }},
+		{name: "missing Telegram chat", mutate: func(v map[string]string) { v["TELEGRAM_CHAT_ID"] = "" }},
+		{name: "missing Feishu app", mutate: func(v map[string]string) {
+			v["NOTIFY_CHANNELS"], v["FEISHU_RECEIVE_ID"] = "feishu", "ou_receiver"
+		}},
+		{name: "missing Feishu recipient", mutate: func(v map[string]string) {
+			v["NOTIFY_CHANNELS"], v["FEISHU_APP_ID"], v["FEISHU_RECEIVE_ID"] = "feishu", "cli_app", ""
+		}},
+		{name: "invalid Feishu recipient", mutate: func(v map[string]string) {
+			v["NOTIFY_CHANNELS"], v["FEISHU_APP_ID"], v["FEISHU_RECEIVE_ID"] = "feishu", "cli_app", "user"
+		}},
+		{name: "invalid boolean", mutate: func(v map[string]string) { v["CHECK_EOL"] = "sometimes" }},
+		{name: "invalid language", mutate: func(v map[string]string) { v["NOTIFY_LANG"] = "fr" }},
+		{name: "invalid interval", mutate: func(v map[string]string) {
+			v["DEDUP_MODE"], v["DEDUP_INTERVAL_DAYS"] = "interval", "0"
+		}},
+		{name: "invalid dedup mode", mutate: func(v map[string]string) { v["DEDUP_MODE"] = "hourly" }},
+		{name: "negative stale days", mutate: func(v map[string]string) { v["STALE_UPDATE_DAYS"] = "-1" }},
+		{name: "zero self-update interval", mutate: func(v map[string]string) { v["SELF_UPDATE_CHECK_DAYS"] = "0" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			values := valid()
+			test.mutate(values)
+			if err := normalizeAndValidateConfig(values, test.allowOpen); ExitCode(err) != 2 {
+				t.Fatalf("unsafe config accepted or misclassified: %v", err)
+			}
+		})
+	}
+
+	values := valid()
+	values["NOTIFY_CHANNELS"] = " FEISHU, telegram,feishu "
+	values["FEISHU_APP_ID"] = "cli_app"
+	values["FEISHU_RECEIVE_ID"] = ""
+	values["DEDUP_MODE"] = "always"
+	values["NOTIFY_OK"] = "YES"
+	if err := normalizeAndValidateConfig(values, true); err != nil {
+		t.Fatal(err)
+	}
+	if values["NOTIFY_CHANNELS"] != "telegram,feishu" || values["DEDUP_MODE"] != "once" || values["NOTIFY_OK"] != "1" {
+		t.Fatalf("normalized values = %+v", values)
+	}
+}
+
+func TestApplyPreparedConfigRejectsBrokenPreflightState(t *testing.T) {
+	newPlan := func() installPlan {
+		values := cloneConfig(configDefaults)
+		values["BACKEND"] = "apt"
+		values["TELEGRAM_BOT_TOKEN"] = "123456:valid_token"
+		values["TELEGRAM_CHAT_ID"] = "-100123"
+		return installPlan{values: values, backend: "apt"}
+	}
+	tests := []struct {
+		name    string
+		prepare func(*installPlan) *Prepared
+	}{
+		{name: "nil prepared", prepare: func(*installPlan) *Prepared { return nil }},
+		{name: "nil config", prepare: func(*installPlan) *Prepared { return &Prepared{} }},
+		{name: "removed required key", prepare: func(plan *installPlan) *Prepared {
+			cfg := cloneConfig(plan.values)
+			delete(cfg, "HOST_LABEL")
+			return &Prepared{Config: cfg}
+		}},
+		{name: "added unsupported key", prepare: func(plan *installPlan) *Prepared {
+			cfg := cloneConfig(plan.values)
+			cfg["UNSUPPORTED"] = "x"
+			return &Prepared{Config: cfg}
+		}},
+		{name: "changed backend", prepare: func(plan *installPlan) *Prepared {
+			cfg := cloneConfig(plan.values)
+			cfg["BACKEND"] = "dnf"
+			return &Prepared{Config: cfg}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			plan := newPlan()
+			if err := applyPreparedConfig(&plan, test.prepare(&plan)); ExitCode(err) != 2 {
+				t.Fatalf("broken preflight config accepted or misclassified: %v", err)
+			}
+		})
+	}
+
+	plan := newPlan()
+	cfg := cloneConfig(plan.values)
+	cfg["HOST_LABEL"] = "selected-host"
+	if err := applyPreparedConfig(&plan, &Prepared{Config: cfg}); err != nil {
+		t.Fatal(err)
+	}
+	if plan.values["HOST_LABEL"] != "selected-host" || plan.values["CONFIG_VERSION"] != "4" {
+		t.Fatalf("prepared config not committed: %+v", plan.values)
+	}
+}
+
+func TestPrepareRejectsUnsupportedHostsAndUnsafeInputs(t *testing.T) {
+	tests := []struct {
+		name    string
+		release string
+		mutate  func(*Options)
+		want    string
+	}{
+		{name: "missing runtime", release: "ID=debian\nVERSION_ID=13\n", mutate: func(o *Options) { o.Payload.Runtime = nil }, want: "runtime payload is required"},
+		{name: "unknown config key", release: "ID=debian\nVERSION_ID=13\n", mutate: func(o *Options) { o.Config["UNKNOWN"] = "x" }, want: "unsupported config key"},
+		{name: "invalid check time", release: "ID=debian\nVERSION_ID=13\n", mutate: func(o *Options) { o.CheckTime = "24:00" }, want: "invalid check time"},
+		{name: "unsupported distribution", release: "ID=plan9\nVERSION_ID=1\n", mutate: func(*Options) {}, want: "unsupported distribution"},
+		{name: "best effort requires opt-in", release: "ID=debian\nVERSION_ID=11\nPRETTY_NAME=Debian 11\n", mutate: func(*Options) {}, want: "best-effort"},
+		{name: "invalid backend override", release: "ID=debian\nVERSION_ID=13\n", mutate: func(o *Options) { o.Backend = "rpm" }, want: "invalid or unsupported backend"},
+		{name: "invalid Feishu secret", release: "ID=debian\nVERSION_ID=13\n", mutate: func(o *Options) { o.FeishuSecret = []byte("bad\nsecret") }, want: "Feishu App Secret"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			installer, _, _, _ := setupInstaller(t, test.release)
+			options := telegramOptions()
+			test.mutate(&options)
+			_, err := installer.prepare(options)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("prepare error=%v want substring %q", err, test.want)
+			}
+		})
+	}
+
+	installer, _, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=11\nPRETTY_NAME=Debian 11\n")
+	options := telegramOptions()
+	options.AllowBestEffort = true
+	plan, err := installer.prepare(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.supportTier != "best-effort" || displayOS(plan.osRelease) != "Debian 11" {
+		t.Fatalf("best-effort plan = %+v", plan)
+	}
+	if displayOS(plan.osRelease) != "Debian 11" || displayOS(plan.osRelease) == "" {
+		t.Fatal("displayOS did not prefer PRETTY_NAME")
+	}
+}
+
+func TestLoadFeishuSecretCredentialStateMachine(t *testing.T) {
+	installer, root, runner, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	if _, err := installer.loadFeishuSecret(context.Background()); ExitCode(err) != 2 {
+		t.Fatalf("missing credential error=%v", err)
+	}
+
+	write(t, root, FeishuPlainCredentialPath, "plain-secret", 0o600)
+	secret, err := installer.loadFeishuSecret(context.Background())
+	if err != nil || string(secret) != "plain-secret" {
+		t.Fatalf("plain credential=%q err=%v", secret, err)
+	}
+	write(t, root, FeishuPlainCredentialPath, "bad\nsecret", 0o600)
+	if _, err := installer.loadFeishuSecret(context.Background()); ExitCode(err) != 2 {
+		t.Fatalf("invalid plaintext credential error=%v", err)
+	}
+	if err := root.Remove(FeishuPlainCredentialPath); err != nil {
+		t.Fatal(err)
+	}
+
+	write(t, root, FeishuEncryptedCredPath, "encrypted", 0o600)
+	if _, err := installer.loadFeishuSecret(context.Background()); err == nil || !strings.Contains(err.Error(), "systemd-creds is required") {
+		t.Fatalf("encrypted credential without decryptor error=%v", err)
+	}
+	runner.systemdCreds = true
+	secret, err = installer.loadFeishuSecret(context.Background())
+	if err != nil || string(secret) != "existing-secret" {
+		t.Fatalf("decrypted credential=%q err=%v", secret, err)
+	}
+}
+
+func TestFileLockerHonorsAlreadyCanceledContextBeforeFilesystemAccess(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	unlock, err := (FileLocker{}).Acquire(ctx, InstallLockPath, time.Second)
+	if unlock != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled lock acquisition unlock=%v err=%v", unlock, err)
+	}
+}
+
+func TestRootFSRemoveAllRecursesWithoutFollowingSymlinks(t *testing.T) {
+	rootDir := t.TempDir()
+	root, err := NewRootFS(rootDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := root.MkdirAll("/tree/branch/deep", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, root, "/tree/branch/deep/payload", "remove me", 0o600)
+
+	outside := t.TempDir()
+	marker := filepath.Join(outside, "keep")
+	if err := os.WriteFile(marker, []byte("preserved"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Symlink(outside, "/tree/branch/outside-link"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := root.RemoveAll("/tree"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := root.Lstat("/tree"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recursive tree remained: %v", err)
+	}
+	if data, err := os.ReadFile(marker); err != nil || string(data) != "preserved" {
+		t.Fatalf("symlink target changed: data=%q err=%v", data, err)
+	}
+
+	if err := root.RemoveAll("/missing"); err != nil {
+		t.Fatalf("missing path removal failed: %v", err)
+	}
+	write(t, root, "/leaf", "remove me too", 0o600)
+	if err := root.RemoveAll("/leaf"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := root.Lstat("/leaf"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("regular file remained: %v", err)
+	}
+}
+
+func TestExistingConfigAndTimerRejectUnsafeFiles(t *testing.T) {
+	installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	truncate := func(name string, size int64) {
+		t.Helper()
+		write(t, root, name, "seed", 0o600)
+		file, err := root.OpenFileNoFollow(name, os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := file.Truncate(size); err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	truncate(ConfigPath, (4<<20)+1)
+	if _, _, err := installer.readExistingConfig(); err == nil || !strings.Contains(err.Error(), "exceeds 4 MiB") {
+		t.Fatalf("oversized config error=%v", err)
+	}
+	if err := root.Remove(ConfigPath); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "target")
+	if err := os.WriteFile(target, []byte("target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Symlink(target, ConfigPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := installer.readExistingConfig(); err == nil || !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("symlinked config error=%v", err)
+	}
+	if err := root.Remove(ConfigPath); err != nil {
+		t.Fatal(err)
+	}
+
+	truncate(TimerPath, (1<<20)+1)
+	if _, err := installer.readExistingCheckTime(); err == nil || !strings.Contains(err.Error(), "exceeds 1 MiB") {
+		t.Fatalf("oversized timer error=%v", err)
+	}
+	if err := root.Remove(TimerPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Symlink(target, TimerPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := installer.readExistingCheckTime(); err == nil || !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("symlinked timer error=%v", err)
+	}
+}
+
+func TestCommandEnvironmentOverridesAreUniqueAndDeterministic(t *testing.T) {
+	t.Setenv("SUN_ENV_B", "old-b")
+	t.Setenv("SUN_ENV_A", "old-a")
+	env := commandEnv(map[string]string{"SUN_ENV_B": "new-b", "SUN_ENV_A": "new-a"})
+	joined := strings.Join(env, "\n")
+	if strings.Count(joined, "SUN_ENV_A=") != 1 || strings.Count(joined, "SUN_ENV_B=") != 1 ||
+		!strings.Contains(joined, "SUN_ENV_A=new-a\nSUN_ENV_B=new-b") {
+		t.Fatalf("command environment is not unique and sorted:\n%s", joined)
+	}
+	if strings.Count(joined, "LC_ALL=") != 1 || !strings.Contains(joined, "LC_ALL=C") {
+		t.Fatalf("command environment did not force C locale:\n%s", joined)
+	}
+	if value := os.Getenv("SUN_ENV_A"); value != "old-a" {
+		t.Fatalf("test environment was mutated: %q", value)
+	}
+}

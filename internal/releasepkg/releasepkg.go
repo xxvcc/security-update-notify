@@ -21,8 +21,11 @@ import (
 )
 
 const (
-	productName               = "security-update-notify"
-	maxUncompressedSize int64 = 256 << 20
+	productName                    = "security-update-notify"
+	bootstrapSignatureName         = "sun.sh.asc"
+	bootstrapVersionNotation       = "release-version@xxv.cc"
+	maxBootstrapSize         int64 = 1 << 20
+	maxUncompressedSize      int64 = 256 << 20
 )
 
 var (
@@ -64,15 +67,16 @@ type Options struct {
 
 // Result is the committed release asset set.
 type Result struct {
-	Tarball       string
-	Checksum      string
-	Signature     string
-	SHA256        string
-	Version       string
-	Epoch         int64
-	Signed        bool
-	Official      bool
-	Architectures []string
+	Tarball            string
+	Checksum           string
+	Signature          string
+	BootstrapSignature string
+	SHA256             string
+	Version            string
+	Epoch              int64
+	Signed             bool
+	Official           bool
+	Architectures      []string
 }
 
 // Architectures returns a copy of the non-overridable official architecture
@@ -231,9 +235,7 @@ func Build(ctx context.Context, opts Options) (Result, error) {
 	finalTar := filepath.Join(distDir, tarName)
 	finalSHA := finalTar + ".sha256"
 	finalSig := finalTar + ".asc"
-	if err := clearTargetArtifacts(finalTar, finalSHA, finalSig); err != nil {
-		return Result{}, err
-	}
+	finalBootstrapSig := filepath.Join(distDir, bootstrapSignatureName)
 	stage, err := os.MkdirTemp(distDir, ".sun-release-")
 	if err != nil {
 		return Result{}, fmt.Errorf("create release staging directory: %w", err)
@@ -275,8 +277,36 @@ func Build(ctx context.Context, opts Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	stageBootstrapSig := filepath.Join(stage, bootstrapSignatureName)
+	if signed {
+		bootstrapMember := pkgName + "/sun.sh"
+		bootstrapBytes, err := readArchiveRegularFile(stageTar, bootstrapMember, maxBootstrapSize)
+		if err != nil {
+			return Result{}, fmt.Errorf("read archived first-install bootstrap: %w", err)
+		}
+		archivedBootstrap := filepath.Join(stage, ".archived-sun.sh")
+		if err := os.WriteFile(archivedBootstrap, bootstrapBytes, 0o600); err != nil {
+			return Result{}, fmt.Errorf("stage archived first-install bootstrap: %w", err)
+		}
+		bootstrapSigned, err := maybeSign(ctx, signOptions{
+			Mode: SignRequired, GPGKeyID: opts.GPGKeyID, GPGHome: opts.GPGHome,
+			PinnedFingerprint: assets.ReleaseSigningFingerprint,
+			NotationName:      bootstrapVersionNotation,
+			NotationValue:     opts.Version,
+		}, archivedBootstrap, stageBootstrapSig)
+		if err != nil {
+			return Result{}, fmt.Errorf("sign first-install bootstrap: %w", err)
+		}
+		if !bootstrapSigned {
+			return Result{}, errors.New("sign first-install bootstrap: required signature was not created")
+		}
+	}
 
-	if err := commitArtifacts(stageTar, stageSHA, stageSig, finalTar, finalSHA, finalSig, signed); err != nil {
+	if err := commitArtifacts(
+		stageTar, stageSHA, stageSig, stageBootstrapSig,
+		finalTar, finalSHA, finalSig, finalBootstrapSig,
+		signed,
+	); err != nil {
 		return Result{}, err
 	}
 
@@ -292,6 +322,7 @@ func Build(ctx context.Context, opts Options) (Result, error) {
 	}
 	if signed {
 		result.Signature = finalSig
+		result.BootstrapSignature = finalBootstrapSig
 	}
 	return result, nil
 }
@@ -373,6 +404,20 @@ func validateBootstrapFingerprint(root string) error {
 	if len(fingerprints) != 1 || fingerprints[0] != assets.ReleaseSigningFingerprint {
 		return fmt.Errorf("sun.sh must contain exactly one pinned release fingerprint %s", assets.ReleaseSigningFingerprint)
 	}
+	signatureAssets, err := bootstrapMetadataValues(b, "BOOTSTRAP_SIGNATURE_ASSET")
+	if err != nil {
+		return err
+	}
+	if len(signatureAssets) != 1 || signatureAssets[0] != bootstrapSignatureName {
+		return fmt.Errorf("sun.sh must declare exactly one bootstrap signature asset %s", bootstrapSignatureName)
+	}
+	versionNotations, err := bootstrapMetadataValues(b, "BOOTSTRAP_VERSION_NOTATION")
+	if err != nil {
+		return err
+	}
+	if len(versionNotations) != 1 || versionNotations[0] != bootstrapVersionNotation {
+		return fmt.Errorf("sun.sh must declare exactly one bootstrap version notation %s", bootstrapVersionNotation)
+	}
 	const keyStart = "release_signing_public_key() {\n  cat <<'EOF'\n"
 	const keyEnd = "EOF\n}\n"
 	if bytes.Count(b, []byte(keyStart)) != 1 {
@@ -390,6 +435,22 @@ func validateBootstrapFingerprint(root string) error {
 	return nil
 }
 
+func bootstrapMetadataValues(script []byte, name string) ([]string, error) {
+	prefix := name + `="`
+	var values []string
+	s := bufio.NewScanner(bytes.NewReader(script))
+	for s.Scan() {
+		line := s.Text()
+		if strings.HasPrefix(line, prefix) && strings.HasSuffix(line, `"`) {
+			values = append(values, strings.TrimSuffix(strings.TrimPrefix(line, prefix), `"`))
+		}
+	}
+	if err := s.Err(); err != nil {
+		return nil, fmt.Errorf("read sun.sh %s: %w", name, err)
+	}
+	return values, nil
+}
+
 func fileSHA256(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -403,37 +464,65 @@ func fileSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func commitArtifacts(stageTar, stageSHA, stageSig, finalTar, finalSHA, finalSig string, signed bool) (err error) {
-	committed := make([]string, 0, 3)
-	defer func() {
-		if err != nil {
-			for _, path := range committed {
-				_ = os.Remove(path)
+func commitArtifacts(
+	stageTar, stageSHA, stageSig, stageBootstrapSig string,
+	finalTar, finalSHA, finalSig, finalBootstrapSig string,
+	signed bool,
+) error {
+	pairs := [][2]string{{stageTar, finalTar}, {stageSHA, finalSHA}}
+	if signed {
+		pairs = append(pairs, [2]string{stageSig, finalSig}, [2]string{stageBootstrapSig, finalBootstrapSig})
+	}
+	for _, pair := range pairs {
+		if err := validateRegularSource(pair[0]); err != nil {
+			return fmt.Errorf("preflight release artifact %s: %w", filepath.Base(pair[1]), err)
+		}
+	}
+
+	backupDir, err := os.MkdirTemp(filepath.Dir(stageTar), ".sun-commit-backup-")
+	if err != nil {
+		return fmt.Errorf("create release commit backup: %w", err)
+	}
+	defer os.RemoveAll(backupDir)
+	targets := []string{finalTar, finalSHA, finalSig, finalBootstrapSig}
+	backups := make([][2]string, 0, len(targets))
+	committed := make([]string, 0, len(pairs))
+	rollback := func(cause error) error {
+		errs := []error{cause}
+		for i := len(committed) - 1; i >= 0; i-- {
+			if removeErr := os.Remove(committed[i]); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				errs = append(errs, fmt.Errorf("remove partial artifact %s: %w", filepath.Base(committed[i]), removeErr))
 			}
 		}
-	}()
-	for _, pair := range [][2]string{{stageTar, finalTar}, {stageSHA, finalSHA}} {
-		if err = os.Rename(pair[0], pair[1]); err != nil {
-			return fmt.Errorf("commit release artifact %s: %w", filepath.Base(pair[1]), err)
+		for i := len(backups) - 1; i >= 0; i-- {
+			if restoreErr := os.Rename(backups[i][0], backups[i][1]); restoreErr != nil {
+				errs = append(errs, fmt.Errorf("restore previous artifact %s: %w", filepath.Base(backups[i][1]), restoreErr))
+			}
+		}
+		return errors.Join(errs...)
+	}
+	for i, target := range targets {
+		info, statErr := os.Lstat(target)
+		if errors.Is(statErr, os.ErrNotExist) {
+			continue
+		}
+		if statErr != nil {
+			return rollback(fmt.Errorf("inspect previous release artifact %s: %w", filepath.Base(target), statErr))
+		}
+		if info.IsDir() {
+			return rollback(fmt.Errorf("previous release artifact %s is a directory", filepath.Base(target)))
+		}
+		backup := filepath.Join(backupDir, fmt.Sprintf("%d-%s", i, filepath.Base(target)))
+		if renameErr := os.Rename(target, backup); renameErr != nil {
+			return rollback(fmt.Errorf("back up previous release artifact %s: %w", filepath.Base(target), renameErr))
+		}
+		backups = append(backups, [2]string{backup, target})
+	}
+	for _, pair := range pairs {
+		if err := os.Rename(pair[0], pair[1]); err != nil {
+			return rollback(fmt.Errorf("commit release artifact %s: %w", filepath.Base(pair[1]), err))
 		}
 		committed = append(committed, pair[1])
-	}
-	if signed {
-		if err = os.Rename(stageSig, finalSig); err != nil {
-			return fmt.Errorf("commit release signature: %w", err)
-		}
-		committed = append(committed, finalSig)
-	} else if err = os.Remove(finalSig); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove stale release signature: %w", err)
-	}
-	return nil
-}
-
-func clearTargetArtifacts(paths ...string) error {
-	for _, path := range paths {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove previous release artifact %s: %w", filepath.Base(path), err)
-		}
 	}
 	return nil
 }

@@ -1,0 +1,36 @@
+name: Live release canary
+
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-release-canary
+  cancel-in-progress: false
+
+jobs:
+  ubuntu-host:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout canary and pinned release key
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install GitHub CLI when absent
+        run: command -v gh >/dev/null 2>&1 || sudo apt-get install -y gh
+
+      - name: Exercise the public release on the real host
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_REPOSITORY,GITHUB_RUN_ID,GH_TOKEN \
+            bash build/live-canary.sh
