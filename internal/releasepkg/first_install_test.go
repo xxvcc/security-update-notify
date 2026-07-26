@@ -121,6 +121,28 @@ func TestLiveCanarySkipsFakeNotificationCredentialProbe(t *testing.T) {
 	}
 }
 
+func TestWorkflowImmutableReleaseChecksUseContentsReadAPI(t *testing.T) {
+	root := repositoryRoot(t)
+	for _, name := range []string{
+		".github/workflows/ci.yml",
+		".github/workflows/mirror-release.yml",
+		"build/live-canary.sh",
+	} {
+		t.Run(name, func(t *testing.T) {
+			content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Contains(content, []byte(`/immutable-releases`)) {
+				t.Fatal("workflow must not call the administration-only immutable-releases endpoint")
+			}
+			if !bytes.Contains(content, []byte(`.immutable`)) {
+				t.Fatal("workflow must require the current release immutable state")
+			}
+		})
+	}
+}
+
 func TestDocumentedHighAssuranceBlocksAreShellSyntaxValid(t *testing.T) {
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash unavailable")

@@ -92,13 +92,9 @@ jobs:
             exit 2
           }
 
-      - name: Require immutable release policy
+      - name: Require immutable release state
         run: |
           set -euo pipefail
-          [[ "$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled)" == "true" ]] || {
-            echo "::error::repository release immutability is disabled"
-            exit 1
-          }
           immutable="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .immutable)"
           if [[ "$immutable" != "true" ]]; then
             case "$TAG" in

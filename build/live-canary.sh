@@ -86,8 +86,6 @@ manifest_pin="$(jq -r .signing_fingerprint "$work/latest.json")"
 
 github_latest="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
 [[ "$github_latest" == "$tag" ]] || die "mirror Latest $tag differs from GitHub Latest $github_latest"
-repo_immutable="$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled)"
-[[ "$repo_immutable" == "true" ]] || die "repository release immutability is disabled"
 release_json="$work/release.json"
 gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" >"$release_json"
 release_immutable="$(jq -r .immutable "$release_json")"

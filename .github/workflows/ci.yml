@@ -183,7 +183,7 @@ jobs:
               'group: signed-release-mirror-stable',
               "workflows: ['CI']",
               'environment: release-mirror',
-              '- name: Require immutable release policy',
+              '- name: Require immutable release state',
               'ref: $' + '{{ github.workflow_sha }}',
               'path: released-source',
               '"rel/$tarball" "$version" "$epoch" released-source',
@@ -398,16 +398,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Require immutable release policy
+      - name: Require immutable release state
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          [[ "$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled)" == "true" ]] || {
-            echo "::error::repository release immutability is disabled"
-            exit 1
-          }
           immutable="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .immutable)"
           if [[ "$immutable" != "true" ]]; then
             case "$TAG" in
