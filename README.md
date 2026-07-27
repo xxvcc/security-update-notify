@@ -178,7 +178,7 @@ SUN_PIN='C678256ACBFC6491BF5076655F3AE24999921FFC'
 SUN_NOTATION='release-version@xxv.cc'
 [[ "$SUN_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z]+)?$ \
    && "${#SUN_VERSION}" -le 64 ]] || {
-  echo '请先把 SUN_VERSION 改为明确版本，例如 3.0.2。' >&2
+  echo '请先把 SUN_VERSION 中的 X.Y.Z 替换为从可信发布公告确认的明确版本。' >&2
   exit 2
 }
 
@@ -476,7 +476,7 @@ curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- upgr
 | `RESTART_ALERT_DAYS` | `7` | 整机或服务重启需求持续多少天后升级告警；设为 `0` 关闭时长升级。不会自动重启机器或服务。 |
 | `CHECK_SELF_UPDATE` | `1` | 周期检查 SUN 新版本；只提示，不自动升级。 |
 | `SELF_UPDATE_CHECK_DAYS` | `7` | SUN 版本检查间隔；成功结果会缓存，`security-update-notify doctor` 可强制只读刷新。 |
-| `CHECK_EOL` | `1` | 发行版安全支持终止（EOL）提醒：已过 EOL 触发提醒，临近（90 天内）仅作信息展示。若已购买 Ubuntu ESM 等延长支持，可设 `0` 关闭。 |
+| `CHECK_EOL` | `1` | 发行版安全支持终止（EOL）提醒：已过 EOL 触发提醒，临近（90 天内）仅作信息展示。Ubuntu 20.04 会自动核对本机 `esm-infra` 状态；只有使用 SUN 无法识别的外部延长支持时，才应考虑设 `0`，并接受这会关闭全部 EOL 检查。 |
 
 待安装数量在阈值以内仍是信息项；达到 `PENDING_ALERT_DAYS` 后才转为风险告警。DNF 的高危子计数同时包含 `critical` 和 `important`。可随时用 `security-update-notify doctor` 查看七项检测、当前待装数量和 SUN 版本结果；诊断不会写入时长或版本缓存状态。`security-update-notify test` 的模拟模式和 `security-update-notify run --dry-run` 不写这些状态，也不会发起周期版本请求。
 
@@ -492,8 +492,11 @@ curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- upgr
 /etc/security-update-notify/credentials/feishu-app-secret              # 旧 systemd 回退
 /etc/logrotate.d/security-update-notify
 /var/lib/security-update-notify/
+/var/backups/security-update-notify/
 /var/log/security-update-notify.log
 ```
+
+根据后端，安装器还会管理 apt 的 `/etc/apt/apt.conf.d/20auto-upgrades`、`/etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify` 和 `/etc/needrestart/conf.d/99-security-update-notify-report-only.conf`，或 DNF 的 `/etc/dnf/automatic.conf`。对应原始基线、缺失标记、proof 和时间戳备份与受管配置位于同一配置目录；下文的后端说明给出具体恢复规则。
 
 通知选项、Telegram Bot Token、飞书 App ID 和接收人 `open_id` 保存在：
 
@@ -639,11 +642,17 @@ SUN 的范围刻意保持很小：
 
 ```bash
 bash -n sun.sh build/*.sh
-shellcheck -s bash -S warning sun.sh build/*.sh
-unformatted="$(rg --files cmd internal -g '*.go' -0 | xargs -0 gofmt -l)"
+shellcheck -s bash -S info sun.sh build/*.sh
+unformatted="$(find cmd internal -type f -name '*.go' -print0 | sort -z | xargs -0 gofmt -l)"
 test -z "$unformatted"
+git diff --check
+git diff --check "$(git hash-object -t tree /dev/null)" HEAD --
 go vet ./...
-go test -race -cover ./...
+go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+go test -race -covermode=atomic -coverprofile=coverage.out ./...
+total="$(go tool cover -func=coverage.out | awk '/^total:/ {sub(/%$/, "", $3); print $3}')"
+awk -v total="$total" 'BEGIN { exit !(total + 0 >= 75.0) }'
 build/archive-safety-test.sh
 build/runtime-lock-test.sh
 build/reproducibility-check.sh linux amd64

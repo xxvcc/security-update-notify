@@ -1,9 +1,9 @@
 # security-update-notify 3.x 全 Go 架构 / 3.x all-Go architecture
 
-本文记录 3.0.0 完成迁移后、持续加固到 3.0.2 的 3.x 设计、兼容与发布约束。它描述当前实现，不是待办清单。
+本文记录 3.0.0 完成迁移后、持续加固到 3.1.x 的设计、Linux 兼容、恢复与发布约束。它描述当前实现，不是待办清单。
 
-This document records the 3.x design after the completed 3.0.0 migration and its hardening through 3.0.2,
-including compatibility, security, and release constraints. It describes the current implementation.
+This document records the design after the completed 3.0.0 migration and its hardening through 3.1.x,
+including Linux compatibility, recovery, security, and release constraints. It describes the current implementation.
 
 ## 结论 / Bottom line
 
@@ -22,15 +22,15 @@ Go installer plus a non-executable version marker. Neither is installed or resto
 1. `sun.sh` 在可信 SUN 二进制存在之前运行，因此保留下载、SHA-256、固定指纹 GPG 验签、安全归档检查、
    解包和五架构选择。它是唯一维护的 Shell 产品实现，也是首次安装的引导信任边界。3.0 归档中的迁移启动器
    是签名包内的固定生成物，只把旧客户端交给 Go 安装器，不承担下载、验签或安装逻辑。
-2. `apt-get`、`dpkg`、`dnf`、`rpm`、`needrestart`、`needs-restarting`、`systemctl`、`systemd-creds` 和
+2. `apt-get`、`dpkg`、`dnf`、`dnf5`、`microdnf`、`yum`、`rpm`、`needrestart`、`needs-restarting`、`systemctl`、`systemd-creds` 和
    `gpg` 是操作系统或信任链的数据源。Go 代码以有界超时和净化环境执行它们，而不是不准确地重写它们。
 
 Two boundaries remain explicit:
 
 1. `sun.sh` runs before a trusted SUN binary exists. It therefore retains downloading, SHA-256,
    pinned-fingerprint GPG verification, archive validation, extraction, and five-architecture selection.
-2. OS/trust commands such as `apt-get`, `dpkg`, `dnf`, `rpm`, `needrestart`, `needs-restarting`,
-   `systemctl`, `systemd-creds`, and `gpg` remain authoritative inputs executed with bounded timeouts and
+2. OS/trust commands such as `apt-get`, `dpkg`, `dnf`, `dnf5`, `microdnf`, `yum`, `rpm`, `needrestart`,
+   `needs-restarting`, `systemctl`, `systemd-creds`, and `gpg` remain authoritative inputs executed with bounded timeouts and
    a sanitized environment.
 
 这些外部命令统一在独立 Linux 进程组中运行；context 超时会终止整个组，入口进程也会把 `Ctrl+C`、
@@ -74,7 +74,11 @@ internal/cli/                子命令、交互、隐藏输入、退出码 / com
 internal/installer/          安装计划、锁、备份、提交、回滚 / transactional installer
 internal/uninstaller/        systemd、文件、凭据及可选配置清理 / transactional cleanup
 internal/run/                检查、诊断、通知、自升级 / checks, diagnostics, delivery, upgrade
-internal/backend/            apt/dnf 状态采集与解析 / apt and dnf collection
+internal/backend/            apt/DNF4/DNF5 状态采集与解析 / apt, DNF4, and DNF5 collection
+internal/osrel/              发行版 profile、支持分级与 DNF 代际 / distro profiles and support tiers
+internal/aptconfig/          APT 基线、缺失标记与 proof / APT baseline metadata
+internal/dnfconfig/          DNF4/DNF5 基线、缺失标记与 proof / DNF baseline metadata
+internal/dependencyproof/    依赖创建配置的内容绑定证明 / dependency-default proofs
 internal/watchdog/           补丁、策略、仓库、EOL 与版本提示 / maintenance policy
 internal/config/             schema 4、22 键兼容格式 / schema-4 config
 internal/dedup/              每平台去重状态 / per-platform deduplication
@@ -84,6 +88,26 @@ internal/dist/               下载、校验、验签、安全归档、自升级
 internal/releasepkg/         五架构可复现打包与签名 / reproducible release packaging
 internal/assets/             systemd、logrotate、needrestart、公钥与指纹 / embedded assets
 ```
+
+## 发行版 profile 与支持分级 / Distribution profiles and support tiers
+
+`BACKEND` 是稳定的用户配置值，只有 `apt` 和 `dnf`；内部 profile 另行区分 APT、DNF4 与 DNF5，并把依赖包、包查询、automatic config/timer/service 和 restart probe 绑定到同一 profile。
+
+| 级别 / Tier | 发行版 / Distributions |
+| --- | --- |
+| 正式支持 / supported | Debian 12/13；Ubuntu 22.04/24.04/26.04；RHEL-compatible 8/9/10（Rocky/AlmaLinux 实测）；Fedora 43/44 |
+| 尽力支持 / best-effort | Debian 11；Ubuntu 20.04；CentOS Stream 9/10；Oracle Linux 8/9/10；CloudLinux 8/9/10；Amazon Linux 2023 |
+
+尽力支持必须显式传入 `--allow-best-effort`。未列出的 `ID_LIKE` 衍生版不会因 ancestry 自动升为正式支持：APT ancestry 必须唯一，DNF 系统还必须在任何包安装、备份或配置写入前，从已安装命令的版本输出明确判定 DNF4/DNF5。模糊、冲突或失败的 ancestry/engine 探测失败关闭。这类衍生版不得跳过安装后 doctor，doctor 失败会回滚安装事务。
+
+Fedora 43/44 使用 DNF5 JSON advisory 与实际可执行事务的交集；RHEL-compatible 与尽力支持的 EL 衍生版使用 DNF4。Ubuntu 20.04 只有在 Ubuntu Pro 结构化状态明确显示 `esm-infra` 已启用时，才采用 ESM 支持终止日；不需要因此关闭全部 EOL 检查。
+
+`BACKEND` remains the stable user-facing value (`apt` or `dnf`), while the internal profile distinguishes
+APT, DNF4, and DNF5 and owns their packages, probes, automatic-update configuration, units, and restart
+capabilities. Best-effort systems require explicit opt-in. Unlisted `ID_LIKE` derivatives additionally require
+an unambiguous ancestry or pre-side-effect DNF generation probe and a mandatory post-install doctor; ambiguity
+or a failed doctor rolls the transaction back. Ubuntu 20.04 extends its EOL date only when the structured Ubuntu
+Pro status confirms `esm-infra` locally.
 
 ## 安装事务 / Installation transaction
 
@@ -97,8 +121,11 @@ Go 安装器保留并收紧了既有运维契约：
   静止任务、恢复文件、凭据以及 timer 的 persistent/runtime enablement 和 active 状态。
 - 配置、systemd unit、logrotate、needrestart 与自动更新策略均以临时文件加原子替换提交；文件系统访问
   拒绝符号链接祖先、RootFS 越界和检查后替换竞态。
-- APT 原始配置缺失标记先于包管理器写入持久化并纳入事务快照；APT 配置目录中的标记和时间戳备份使用
-  静默忽略的 `.bak` 后缀，旧的提示型文件名在升级时保内容迁移。
+- APT 原始配置缺失标记先于包管理器写入持久化并纳入事务快照；若本次依赖事务创建 vendor 默认配置，内容绑定 proof 使其成为稳定基线。APT 配置目录中的标记、proof 和时间戳备份都使用静默忽略的 `.bak` 后缀，旧文件名在升级时保内容迁移。
+- DNF4 对依赖创建的 `/etc/dnf/automatic.conf` 使用同样的可验证 vendor 基线；DNF5 的包声明该文件可缺失并提供内置 fallback，因此保留代际绑定的缺失标记。无法建立可信基线、proof 不匹配或元数据组合模糊时，安装、重试和 purge 都不猜测来源。
+- purge 恢复使用目录句柄、无覆盖 rename、内容/元数据复验和 Linux 文件系统 syscall；管理员并发替换目标时
+  保留 `.security-update-notify-restore.*`、`.security-update-notify-purge.*` 或
+  `.security-update-notify-conflict.*` 现场，而不覆盖或删除新文件。
 - 飞书 App Secret 优先转存为加密 systemd credential；旧 systemd 回退到独立 `0600` root-only 文件。
   Secret 不进入普通配置、命令行、日志或升级备份。
 - 首次或变更飞书接收人时，交互和非交互安装都默认进行事务内飞书单平台强验证，失败会回滚；交互模式可
@@ -106,15 +133,18 @@ Go 安装器保留并收紧了既有运维契约：
   还会在安装后额外测试全部已配置接收平台，其失败只作为咨询告警返回，不回滚核心安装。
 - 运行锁屏障默认等待 60 秒，可用 `--lock-wait 0..3600` 或进程环境
   `SECURITY_UPDATE_NOTIFY_LOCK_WAIT_SECONDS` 调整；等待耗尽以临时失败码 `75` 回滚。
-- 装后诊断是咨询式；主机磁盘、EOL 等环境问题不会回滚一个文件层面正确的安装。
+- 对已列出的发行版，装后 doctor 中的磁盘、EOL 等环境问题是咨询式，不回滚文件层面正确的安装；对未列 `ID_LIKE` 衍生版，同一 doctor 是不可跳过的支持门禁，失败必须回滚。
 
 The Go installer serializes transactions, quiesces the old timer before managed or dependency writes,
 crosses the runtime-lock barrier, snapshots and atomically commits managed state, and restores files,
 credentials, and exact timer enablement/activity on failure. Secrets remain outside normal config and
 backups. A new or changed Feishu recipient is strongly verified by default in both interactive and
 non-interactive modes unless explicitly skipped; a separate all-platform post-install test remains opt-in and advisory.
-An originally absent APT policy is recorded before package-manager writes, while APT-directory metadata uses
-the silently ignored `.bak` suffix and migrates legacy notice-producing names without losing their contents.
+Originally absent APT and DNF policies are recorded before package-manager writes. A dependency-created APT
+or DNF4 vendor file is promoted only with trusted transaction provenance and content-bound proof; DNF5 retains
+its generation-bound absence semantics. Purge uses directory handles, no-overwrite renames, and content/metadata
+revalidation to preserve concurrent administrator changes. Post-install doctor findings are advisory on listed
+distributions, but the same doctor is a mandatory rollback-producing support gate for an unlisted derivative.
 
 ## 兼容不变量 / Compatibility invariants
 
@@ -146,6 +176,7 @@ the silently ignored `.bak` suffix and migrates legacy notice-producing names wi
 - 飞书固定向应用级 `open_id` 发送内嵌 Card JSON 2.0，不增加事件订阅或回调。App Secret 只从隐藏输入、
   systemd credential 或已验证的 root-only 普通文件进入内存；Directory v1 扫描只用于选人。更换 App ID
   时必须重新选择或显式提供接收人，不能跨应用复用 `open_id`。
+- DNF5 的 JSON 安全公告必须与实际可执行的 `check-upgrade` 候选取交集；忽略 versionlock/exclude 的查询只使用单次命令选项，不修改持久 DNF 配置。DNF4 安装成功后只保留主 `dnf-automatic.timer` 启用，并禁用三个互斥变体；安装回滚恢复四个 unit 的精确原状态。
 - 退出码保持 `0/1/2/75`：成功或无需动作 / 操作或发送失败 / 参数配置错误 / 显式锁等待超时。默认运行
   锁竞争仍安静返回成功，避免 timer 重叠产生噪声。
 
@@ -222,13 +253,14 @@ GPG 私钥，签名后立即复验。未打 tag 的本地开发包可显式 `--s
 
 CI/发布门禁包括：
 
-- gofmt、vet、race、至少 75% 的 atomic 总覆盖率、固定版本 `govulncheck` 和定向安全测试；
+- gofmt、vet、固定版本 `staticcheck`/`govulncheck`、race、至少 75% 的 atomic 总覆盖率和定向安全测试；
 - `sun.sh` 及保留构建测试脚本的 Bash 语法、ShellCheck、TTY 输入和精确依赖解析；
 - 两次独立构建逐字节一致；
 - Go 发布白名单、固定五架构、版本绑定，以及正式发布唯一四文件资产集（归档、checksum、归档签名和带版本 notation 的 `sun.sh.asc`）；
 - 五架构实际执行（非本机架构通过 QEMU），而不只做交叉编译；
 - 恶意归档、错误 checksum、错误签名/密钥/指纹和 HTTPS 重定向拒绝；
-- 一次性容器中的全新安装、旧配置升级、失败回滚、测试和卸载；
+- 五个正式 APT 版本的 schema-3 迁移、失败回滚/purge 和 PTY 通知生命周期；八个正式 RPM 镜像与八个尽力支持镜像的真实依赖、安装、升级和卸载；
+- amd64、arm64、386、ppc64le、s390x 均实际执行关键恢复 syscall 测试，而不只做交叉编译；
 - GitHub Release 公开资产及镜像公开回读的 SHA-256、GPG、指纹和版本复验。
 - 所有 GitHub Actions 固定完整 commit SHA，正式 Release 不可变；无权限 release CI 仅作为事件信号，镜像由默认分支的受信 workflow revision 按固定 `head_sha` 独立复验 tag、签名、归档、五架构静态运行时与版本，tag 仅作为不执行的数据；部署密钥只存在于仅允许 `main` 的 `release-mirror` Environment，旧可变 Release 只允许手动修复；每次镜像成功后及每周在 GitHub 托管 Ubuntu 22.04/24.04 真机执行公网下载、安装、诊断、timer、卸载和 APT 基线恢复 canary。
 

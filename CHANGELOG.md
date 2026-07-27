@@ -2,6 +2,8 @@
 
 ## 3.1.1
 
+- 同步 3.1.x 文档与当前实现：补齐分级 Linux/DNF5 与并发恢复不变量，明确未列 `ID_LIKE` 衍生版的强制 doctor 回滚门禁、Ubuntu 20.04 `esm-infra` 自动识别及不应整体关闭 EOL 检查，并使本地构建命令与 CI 的 ShellCheck info、静态分析和 75% atomic coverage 门槛一致。
+  Synchronizes the 3.1.x documentation with the implementation: tiered Linux/DNF5 and concurrent-restore invariants, the mandatory rollback-producing doctor gate for unlisted `ID_LIKE` derivatives, automatic Ubuntu 20.04 `esm-infra` recognition without disabling all EOL checks, and local build commands aligned with CI's ShellCheck info severity, static analysis, and 75% atomic-coverage gate.
 - 修正公网发布 canary 对 APT purge 基线的判断：安装前 `20auto-upgrades` 不存在时，若保留的 `unattended-upgrades` 依赖创建了受信任的 vendor 默认配置，canary 现在要求 purge 精确恢复该稳定备份；只有缺失标记时仍要求文件被删除，其他备份、标记或 proof 组合失败关闭。
   Fixes the public-release canary's APT purge baseline: when `20auto-upgrades` was initially absent but the retained `unattended-upgrades` dependency created a trusted vendor default, the canary now requires purge to restore that stable backup exactly. An absence marker still requires removal, while every other backup, marker, or proof combination fails closed.
 - 公网 canary 的只读 `apt-get check` 现在会最多等待 300 秒 dpkg 锁，并受 330 秒外层超时限制，避免将托管 runner 上刚启动的 `unattended-upgr` 竞争误报为包状态损坏；dpkg audit 仍保持原有 60 秒上限，实际依赖错误、锁超时和 audit 异常仍失败关闭。
