@@ -164,6 +164,8 @@ cat >"$MOCK_BIN/systemctl" <<'EOF'
 set -euo pipefail
 state="${SUN_PTY_STATE:?}"
 link=/etc/systemd/system/timers.target.wants/security-update-notify.timer
+enabled_dir="$state/enabled"
+active_dir="$state/active-units"
 command="${1:-}"
 shift || true
 case "$command" in
@@ -175,29 +177,63 @@ case "$command" in
       echo not-found
       exit 1
     fi
-    echo enabled
+    if [[ -e "$enabled_dir/$unit" ]]; then
+      echo enabled
+      exit 0
+    fi
+    echo disabled
+    exit 1
     ;;
   is-active)
     unit="${*: -1}"
-    [[ "$unit" != security-update-notify.timer || -e "$state/timer-active" ]]
+    if [[ "$unit" == security-update-notify.timer && -e "$state/timer-active" ]] || \
+       [[ "$unit" != security-update-notify.timer && -e "$active_dir/$unit" ]]; then
+      echo active
+      exit 0
+    fi
+    echo inactive
+    exit 3
     ;;
   disable)
-    if [[ " $* " == *" security-update-notify.timer "* ]]; then
-      rm -f "$link" /run/systemd/system/timers.target.wants/security-update-notify.timer \
-        "$state/timer-active"
-    fi
+    for unit in "$@"; do
+      [[ "$unit" == -* ]] && continue
+      rm -f "$enabled_dir/$unit"
+      [[ " $* " == *" --now "* ]] && rm -f "$active_dir/$unit"
+      if [[ "$unit" == security-update-notify.timer ]]; then
+        rm -f "$link" /run/systemd/system/timers.target.wants/security-update-notify.timer
+        [[ " $* " == *" --now "* ]] && rm -f "$state/timer-active"
+      fi
+    done
     ;;
   enable)
-    if [[ " $* " == *" security-update-notify.timer "* ]]; then
-      mkdir -p "$(dirname "$link")"
-      ln -sfn ../security-update-notify.timer "$link"
-      [[ " $* " == *" --now "* ]] && touch "$state/timer-active"
-    fi
+    mkdir -p "$enabled_dir" "$active_dir"
+    for unit in "$@"; do
+      [[ "$unit" == -* ]] && continue
+      touch "$enabled_dir/$unit"
+      [[ " $* " == *" --now "* ]] && touch "$active_dir/$unit"
+      if [[ "$unit" == security-update-notify.timer ]]; then
+        mkdir -p "$(dirname "$link")"
+        ln -sfn ../security-update-notify.timer "$link"
+        [[ " $* " == *" --now "* ]] && touch "$state/timer-active"
+      fi
+    done
     ;;
   start)
-    [[ "${1:-}" == security-update-notify.timer ]] && touch "$state/timer-active"
+    unit="${*: -1}"
+    mkdir -p "$active_dir"
+    touch "$active_dir/$unit"
+    if [[ "$unit" == security-update-notify.timer ]]; then
+      touch "$state/timer-active"
+    fi
     ;;
-  stop|daemon-reload|reset-failed)
+  stop)
+    unit="${*: -1}"
+    rm -f "$active_dir/$unit"
+    if [[ "$unit" == security-update-notify.timer ]]; then
+      rm -f "$state/timer-active"
+    fi
+    ;;
+  daemon-reload|reset-failed)
     ;;
   show)
     ;;
@@ -224,7 +260,7 @@ cat >"$MOCK_BIN/dpkg" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "${1:-}" == -s && -n "${2:-}" ]]; then
-  if [[ "$2" == apt-listchanges && ! -e "${SUN_PTY_STATE:?}/dependencies-installed" ]]; then
+  if [[ "$2" == unattended-upgrades && ! -e "${SUN_PTY_STATE:?}/dependencies-installed" ]]; then
     exit 1
   fi
   printf 'Package: %s\nStatus: install ok installed\n' "$2"
@@ -242,6 +278,13 @@ case "${1:-}" in
     exit 0
     ;;
   install)
+    if [[ " $* " == *' unattended-upgrades '* && \
+          ! -e /etc/apt/apt.conf.d/20auto-upgrades ]]; then
+      printf '%s\n' \
+        'APT::Periodic::Update-Package-Lists "1";' \
+        'APT::Periodic::Unattended-Upgrade "1";' \
+        >/etc/apt/apt.conf.d/20auto-upgrades
+    fi
     touch "$SUN_PTY_STATE/dependencies-installed"
     exit 0
     ;;
@@ -255,6 +298,11 @@ EOF
 cat >"$MOCK_BIN/needrestart" <<'EOF'
 #!/usr/bin/env bash
 exit 0
+EOF
+
+cat >"$MOCK_BIN/unattended-upgrade" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == --help ]]
 EOF
 
 chmod 0755 "$MOCK_BIN"/*
@@ -309,7 +357,7 @@ for text in \
   '时间无效，请使用 HH:MM' \
   '请输入大于 0 的整数。' \
   '无效输入，请输入 y 或 n。' \
-  '正在安装依赖软件包: apt-listchanges' \
+  '正在安装依赖软件包: unattended-upgrades' \
   'Telegram 测试消息已发送。' \
   '已安装 security-update-notify。'; do
   assert_contains "$TMP/telegram.out" "$text"
@@ -323,6 +371,13 @@ assert_contains /etc/security-update-notify/telegram.env "DEDUP_INTERVAL_DAYS='5
 assert_contains /etc/systemd/system/security-update-notify.timer 'OnCalendar=*-*-* 08:45:00'
 [[ -L /etc/systemd/system/timers.target.wants/security-update-notify.timer ]] || fail "timer was not enabled"
 [[ -e "$MOCK_STATE/timer-active" ]] || fail "timer was not started"
+[[ -e "$MOCK_STATE/enabled/apt-daily-upgrade.timer" ]] || fail "APT automatic timer was not enabled"
+[[ -f /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak ]] || \
+  fail "dependency-created APT vendor baseline was not preserved"
+[[ ! -e /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.absent.bak && \
+   ! -e /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.dependency-default.bak ]] || \
+  fail "promoted APT baseline retained transient metadata"
+apt_vendor_sha="$(sha256sum /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak | awk '{print $1}')"
 apt-config dump >"$TMP/apt-config.out" 2>&1
 assert_not_contains "$TMP/apt-config.out" "Ignoring file '20auto-upgrades.security-update-notify"
 
@@ -350,6 +405,10 @@ assert_not_contains /etc/security-update-notify/telegram.env 'pty-rollback-must-
 [[ -e "$MOCK_STATE/timer-active" ]] || fail "rollback lost timer activity"
 
 /usr/local/sbin/security-update-notify uninstall --purge-config --lang en >/dev/null
+assert_eq "$(sha256sum /etc/apt/apt.conf.d/20auto-upgrades | awk '{print $1}')" "$apt_vendor_sha" \
+  "retained unattended-upgrades vendor baseline"
+find /etc/apt/apt.conf.d -maxdepth 1 -name '20auto-upgrades.security-update-notify*' -print -quit | \
+  grep -q . && fail "APT baseline metadata survived purge"
 
 echo "### Human-style fresh Telegram + Feishu install validates both receiving platforms"
 reset_api_log

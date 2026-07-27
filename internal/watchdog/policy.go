@@ -1,6 +1,10 @@
 package watchdog
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/xxvcc/security-update-notify/internal/dnfconfig"
+)
 
 // CheckAPTPolicy validates the effective apt-config output and the metadata-refresh timer. The existing
 // CheckHealth function separately validates apt-daily-upgrade.timer and its service result.
@@ -50,39 +54,34 @@ func aptBoolEnabled(dump, key string) bool {
 	return false
 }
 
-// CheckDNFPolicy validates the two settings that make dnf-automatic install security updates.
+// CheckDNFPolicy validates the settings that make dnf-automatic install only security updates without rebooting.
 func CheckDNFPolicy(content string) []Issue {
-	values := parseINI(content)
+	values, err := dnfconfig.ParseStrict([]byte(content))
+	if err != nil {
+		return []Issue{{
+			"dnf-automatic-config-invalid",
+			"dnf-automatic 配置语法无效或存在重复项",
+			"dnf-automatic configuration has invalid or duplicate INI data",
+		}}
+	}
 	var issues []Issue
 	if values["commands.upgrade_type"] != "security" {
 		issues = append(issues, Issue{"dnf-upgrade-type-drift", "dnf-automatic 未配置为只安装安全更新", "dnf-automatic is not configured for security-only updates"})
 	}
-	if values["commands.apply_updates"] != "yes" {
+	if !dnfBoolEnabled(values["commands.apply_updates"]) {
 		issues = append(issues, Issue{"dnf-apply-updates-disabled", "dnf-automatic 未启用自动应用更新", "dnf-automatic is not configured to apply updates"})
+	}
+	if values["commands.reboot"] != "never" {
+		issues = append(issues, Issue{"dnf-auto-reboot-enabled", "dnf-automatic 未明确禁止自动重启", "dnf-automatic is not configured to avoid automatic reboots"})
 	}
 	return issues
 }
 
-func parseINI(content string) map[string]string {
-	values := map[string]string{}
-	section := ""
-	for _, raw := range strings.Split(content, "\n") {
-		line := strings.TrimSpace(raw)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
-			continue
-		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section = strings.ToLower(strings.TrimSpace(line[1 : len(line)-1]))
-			continue
-		}
-		if i := strings.IndexByte(line, '='); i >= 0 {
-			key := strings.ToLower(strings.TrimSpace(line[:i]))
-			value := strings.ToLower(strings.TrimSpace(line[i+1:]))
-			if j := strings.IndexAny(value, "#;"); j >= 0 {
-				value = strings.TrimSpace(value[:j])
-			}
-			values[section+"."+key] = value
-		}
+func dnfBoolEnabled(value string) bool {
+	switch value {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
 	}
-	return values
 }

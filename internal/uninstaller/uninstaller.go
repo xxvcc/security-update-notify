@@ -3,9 +3,9 @@
 package uninstaller
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,25 +13,33 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/xxvcc/security-update-notify/internal/aptconfig"
+	"github.com/xxvcc/security-update-notify/internal/dependencyproof"
+	"github.com/xxvcc/security-update-notify/internal/dnfconfig"
 	runlock "github.com/xxvcc/security-update-notify/internal/lock"
 	"github.com/xxvcc/security-update-notify/internal/sysexec"
 )
 
 const (
-	timerUnit          = "security-update-notify.timer"
-	serviceUnit        = "security-update-notify.service"
-	aptPeriodicLogical = "/etc/apt/apt.conf.d/20auto-upgrades"
-	aptStableLogical   = aptPeriodicLogical + ".security-update-notify.bak"
-	aptAbsentLogical   = aptPeriodicLogical + ".security-update-notify.absent.bak"
-	aptLegacyAbsent    = aptPeriodicLogical + ".security-update-notify.absent"
-	aptAbsentContents  = "security-update-notify: original file absent\n"
-	dnfAutomaticName   = "automatic.conf"
-	dnfStableName      = dnfAutomaticName + ".security-update-notify.bak"
-	installLockLogical = "/run/security-update-notify.install.lock"
-	runtimeLockLogical = "/run/security-update-notify.lock"
-	systemctlTimeout   = 30 * time.Second
-	atRemoveDir        = 0x200
-	oPath              = 0x200000
+	timerUnit              = "security-update-notify.timer"
+	serviceUnit            = "security-update-notify.service"
+	aptPeriodicLogical     = "/etc/apt/apt.conf.d/20auto-upgrades"
+	aptStableLogical       = aptPeriodicLogical + ".security-update-notify.bak"
+	aptAbsentLogical       = aptPeriodicLogical + ".security-update-notify.absent.bak"
+	aptLegacyAbsent        = aptPeriodicLogical + ".security-update-notify.absent"
+	aptDependencyProof     = aptPeriodicLogical + ".security-update-notify.dependency-default.bak"
+	aptAbsentContents      = "security-update-notify: original file absent\n"
+	dnfAutomaticName       = "automatic.conf"
+	dnfStableName          = dnfAutomaticName + ".security-update-notify.bak"
+	dnfAbsentName          = dnfAutomaticName + ".security-update-notify.absent.bak"
+	dnfDependencyProofName = dnfAutomaticName + ".security-update-notify.dependency-default.bak"
+	dnf4AbsentContents     = "security-update-notify: original file absent; engine=dnf4\n"
+	dnf5AbsentContents     = "security-update-notify: original file absent; engine=dnf5\n"
+	installLockLogical     = "/run/security-update-notify.install.lock"
+	runtimeLockLogical     = "/run/security-update-notify.lock"
+	systemctlTimeout       = 30 * time.Second
+	atRemoveDir            = 0x200
+	oPath                  = 0x200000
 )
 
 var ErrLockBusy = errors.New("lock is busy")
@@ -279,127 +287,404 @@ func purge(root string, report *Report) []error {
 }
 
 func restoreAPT(root string) (string, error) {
-	fixed, err := safePath(root, aptStableLogical, true)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("validate apt fixed backup: %w", err)
-	}
-	if fixed == "" {
-		fixed = rooted(root, aptStableLogical)
-	}
-	marker, err := safePath(root, aptAbsentLogical, true)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("validate apt absence marker: %w", err)
-	}
-	if marker == "" {
-		marker = rooted(root, aptAbsentLogical)
-	}
-	legacyMarker, err := safePath(root, aptLegacyAbsent, true)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("validate legacy apt absence marker: %w", err)
-	}
-	if legacyMarker == "" {
-		legacyMarker = rooted(root, aptLegacyAbsent)
-	}
-	destination, err := safePath(root, aptPeriodicLogical, false)
+	return restoreAPTWithRemove(root, nil)
+}
+
+func restoreAPTWithRemove(root string, beforeRemove func(string) error) (string, error) {
+	directory, err := openRestoreDirectory(root, filepath.Dir(aptPeriodicLogical))
 	if err != nil {
-		return "", fmt.Errorf("validate apt destination: %w", err)
+		return "", fmt.Errorf("open apt configuration directory: %w", err)
 	}
-	if _, err := safePath(root, "/etc/apt/apt.conf.d", true); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("validate apt directory: %w", err)
+	if directory == nil {
+		return "", nil
 	}
-	timestamps, err := aptTimestampBackups(filepath.Dir(fixed))
+	defer directory.close()
+	names, err := directory.names()
 	if err != nil {
-		return "", fmt.Errorf("list apt timestamp backups: %w", err)
+		return "", fmt.Errorf("list apt backups: %w", err)
+	}
+	if artifact := unfinishedRestoreArtifact(names); artifact != "" {
+		return "", fmt.Errorf("unfinished apt restore transaction requires manual recovery: %s", directory.host(artifact))
+	}
+	destination := filepath.Base(aptPeriodicLogical)
+	fixed := filepath.Base(aptStableLogical)
+	marker := filepath.Base(aptAbsentLogical)
+	legacyMarker := filepath.Base(aptLegacyAbsent)
+	proof := filepath.Base(aptDependencyProof)
+	timestamps := append(
+		restoreTimestampNames(names, fixed+".", ""),
+		restoreTimestampNames(names, destination+".security-update-notify.", ".bak")...,
+	)
+	timestampSnapshots, err := directory.readSnapshots(timestamps, restoreConfigLimit)
+	if err != nil {
+		return "", fmt.Errorf("inspect apt timestamp backups: %w", err)
 	}
 
-	var source string
-	if exists, err := regularFileExists(fixed); err != nil {
+	fixedSnapshot, err := directory.readRegular(fixed, restoreConfigLimit)
+	if err != nil {
 		return "", fmt.Errorf("inspect apt fixed backup: %w", err)
-	} else if exists {
-		source = fixed
 	}
-
-	markerExists, err := validAbsenceMarker(marker)
+	markerSnapshot, err := readAPTMarkerSnapshot(directory, marker)
 	if err != nil {
 		return "", fmt.Errorf("inspect apt absence marker: %w", err)
 	}
-	legacyMarkerExists, err := validAbsenceMarker(legacyMarker)
+	legacyMarkerSnapshot, err := readAPTMarkerSnapshot(directory, legacyMarker)
 	if err != nil {
 		return "", fmt.Errorf("inspect legacy apt absence marker: %w", err)
 	}
+	proofSnapshot, err := directory.readRegular(proof, 256)
+	if err != nil {
+		return "", fmt.Errorf("inspect apt dependency proof: %w", err)
+	}
 
-	if source != "" {
-		if err := restoreFile(source, destination); err != nil {
-			return "", fmt.Errorf("restore apt configuration from %s: %w", logicalPath(root, source), err)
+	source := ""
+	if fixedSnapshot.exists {
+		source = fixed
+	}
+	markerExists := markerSnapshot.exists || legacyMarkerSnapshot.exists
+	preserveDependencyDefault := false
+	var configSnapshot regularSnapshot
+	if source != "" || markerExists {
+		configSnapshot, err = directory.readRegular(destination, restoreConfigLimit)
+		if err != nil {
+			return "", fmt.Errorf("inspect apt configuration: %w", err)
 		}
-	} else if markerExists || legacyMarkerExists {
-		if err := removeFile(destination); err != nil {
+	}
+	if source == "" && markerExists {
+		managedHistory := aptBackupsContainOnlyManagedPolicyAt(timestampSnapshots, timestamps)
+		if proofSnapshot.exists {
+			if !configSnapshot.exists {
+				return "", errors.New("inspect apt dependency proof: 20auto-upgrades is missing")
+			}
+			if !bytes.Equal(proofSnapshot.data, dependencyproof.Contents("apt", configSnapshot.data)) {
+				return "", errors.New("inspect apt dependency proof: proof does not match 20auto-upgrades")
+			}
+			preserveDependencyDefault = true
+		} else if !managedHistory || (configSnapshot.exists && !bytes.Equal(configSnapshot.data, []byte(aptconfig.Periodic))) {
+			return "", errors.New("inspect apt dependency proof: cannot prove that 20auto-upgrades is a SUN-managed file or retained dependency default")
+		}
+	}
+
+	var committedConfig *regularSnapshot
+	if source != "" {
+		if err := callRestoreRemoveHook(beforeRemove, directory.host(destination)); err != nil {
+			return "", fmt.Errorf("restore apt configuration from %s: %w", logicalPath(root, directory.host(source)), err)
+		}
+		restored, err := directory.restoreFile(source, destination, fixedSnapshot, configSnapshot)
+		if err != nil {
+			return "", fmt.Errorf("restore apt configuration from %s: %w", logicalPath(root, directory.host(source)), err)
+		}
+		committedConfig = &restored
+	} else if markerExists && preserveDependencyDefault {
+		committedConfig = &configSnapshot
+	} else if markerExists && configSnapshot.exists {
+		if err := callRestoreRemoveHook(beforeRemove, directory.host(destination)); err != nil {
+			return "", fmt.Errorf("restore absent apt configuration: %w", err)
+		}
+		if err := directory.removeValidated(destination, configSnapshot); err != nil {
 			return "", fmt.Errorf("restore absent apt configuration: %w", err)
 		}
 	}
-	metadata := append([]string{fixed, marker, legacyMarker}, timestamps...)
-	if err := removeFiles(metadata...); err != nil {
-		return source, fmt.Errorf("clean apt backups: %w", err)
+
+	if markerExists {
+		for _, candidate := range []struct {
+			name     string
+			snapshot regularSnapshot
+		}{{marker, markerSnapshot}, {legacyMarker, legacyMarkerSnapshot}} {
+			if candidate.snapshot.exists {
+				if err := callRestoreRemoveHook(beforeRemove, directory.host(candidate.name)); err != nil {
+					return sourcePath(directory, source), fmt.Errorf("commit apt baseline restoration: %w", err)
+				}
+			}
+		}
+		if committedConfig != nil {
+			if err := directory.revalidate(destination, *committedConfig, restoreConfigLimit); err != nil {
+				return sourcePath(directory, source), fmt.Errorf("commit apt baseline restoration: %w",
+					directory.recordConflict("apt configuration changed before marker commit", err))
+			}
+		}
+		if proofSnapshot.exists {
+			if err := directory.revalidate(proof, proofSnapshot, 256); err != nil {
+				return sourcePath(directory, source), fmt.Errorf("commit apt baseline restoration: %w",
+					directory.recordConflict("apt dependency proof changed before marker commit", err))
+			}
+		}
+		if markerSnapshot.exists {
+			if err := directory.removeValidated(marker, markerSnapshot); err != nil {
+				return sourcePath(directory, source), fmt.Errorf("commit apt baseline restoration: %w", err)
+			}
+		}
+		if legacyMarkerSnapshot.exists {
+			if err := directory.removeValidated(legacyMarker, legacyMarkerSnapshot); err != nil {
+				return sourcePath(directory, source), fmt.Errorf("commit apt baseline restoration: %w", err)
+			}
+		}
+		if err := directory.sync(); err != nil {
+			return sourcePath(directory, source), fmt.Errorf("commit apt baseline restoration: %w",
+				directory.recordConflict("sync apt marker commit", err))
+		}
 	}
-	return source, nil
+	if committedConfig != nil {
+		if err := directory.revalidate(destination, *committedConfig, restoreConfigLimit); err != nil {
+			return sourcePath(directory, source), fmt.Errorf("validate restored apt configuration before cleanup: %w",
+				directory.recordConflict("apt configuration changed before cleanup", err))
+		}
+	}
+	metadata := append(append([]string(nil), timestamps...), fixed)
+	cleanupSnapshots := make(map[string]regularSnapshot, len(timestampSnapshots)+2)
+	for name, snapshot := range timestampSnapshots {
+		cleanupSnapshots[name] = snapshot
+	}
+	cleanupSnapshots[fixed] = fixedSnapshot
+	cleanupSnapshots[proof] = proofSnapshot
+	if err := removeRestoreSnapshots(directory, beforeRemove, cleanupSnapshots, metadata...); err != nil {
+		return sourcePath(directory, source), fmt.Errorf("clean apt backups: %w", err)
+	}
+	if err := removeRestoreSnapshots(directory, beforeRemove, cleanupSnapshots, proof); err != nil {
+		return sourcePath(directory, source), fmt.Errorf("clean apt dependency proof: %w", err)
+	}
+	if err := directory.sync(); err != nil {
+		return sourcePath(directory, source), fmt.Errorf("sync apt backup cleanup: %w",
+			directory.recordConflict("sync apt backup cleanup", err))
+	}
+	return sourcePath(directory, source), nil
+}
+
+func readAPTMarkerSnapshot(directory *restoreDirectory, name string) (regularSnapshot, error) {
+	snapshot, err := directory.readRegular(name, 256)
+	if err != nil || !snapshot.exists {
+		return snapshot, err
+	}
+	if string(snapshot.data) != aptAbsentContents {
+		return regularSnapshot{}, errors.New("absence marker has invalid contents")
+	}
+	return snapshot, nil
+}
+
+func aptBackupsContainOnlyManagedPolicyAt(snapshots map[string]regularSnapshot, names []string) bool {
+	for _, candidate := range names {
+		snapshot := snapshots[candidate]
+		if !bytes.Equal(snapshot.data, []byte(aptconfig.Periodic)) {
+			return false
+		}
+	}
+	return true
+}
+
+func sourcePath(directory *restoreDirectory, name string) string {
+	if name == "" {
+		return ""
+	}
+	return directory.host(name)
+}
+
+func callRestoreRemoveHook(hook func(string) error, path string) error {
+	if hook == nil {
+		return nil
+	}
+	return hook(path)
+}
+
+func removeRestoreSnapshots(directory *restoreDirectory, hook func(string) error, snapshots map[string]regularSnapshot, names ...string) error {
+	for _, name := range names {
+		snapshot := snapshots[name]
+		if !snapshot.exists {
+			continue
+		}
+		if err := callRestoreRemoveHook(hook, directory.host(name)); err != nil {
+			return err
+		}
+		if err := directory.removeValidated(name, snapshot); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func restoreDNF(root string) (string, bool, error) {
-	dnfDir, err := safePath(root, "/etc/dnf", true)
-	if errors.Is(err, os.ErrNotExist) {
-		dnfDir = rooted(root, "/etc/dnf")
-	} else if err != nil {
-		return "", false, fmt.Errorf("validate dnf directory: %w", err)
+	return restoreDNFWithRemove(root, nil)
+}
+
+func restoreDNFWithRemove(root string, beforeRemove func(string) error) (string, bool, error) {
+	directory, err := openRestoreDirectory(root, "/etc/dnf")
+	if err != nil {
+		return "", false, fmt.Errorf("open dnf configuration directory: %w", err)
 	}
-	destination := filepath.Join(dnfDir, dnfAutomaticName)
-	fixed, err := safePath(root, "/etc/dnf/"+dnfStableName, true)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", false, fmt.Errorf("validate dnf fixed backup: %w", err)
+	if directory == nil {
+		return "", false, nil
 	}
-	if fixed == "" {
-		fixed = filepath.Join(dnfDir, dnfStableName)
-	}
-	projectBackups, err := timestampBackups(dnfDir, dnfStableName+".", "")
+	defer directory.close()
+	names, err := directory.names()
 	if err != nil {
 		return "", false, fmt.Errorf("list dnf backups: %w", err)
 	}
-
-	var source string
-	if exists, err := regularFileExists(fixed); err != nil {
-		return "", false, fmt.Errorf("inspect dnf fixed backup: %w", err)
-	} else if exists {
-		source = fixed
+	if artifact := unfinishedRestoreArtifact(names); artifact != "" {
+		return "", false, fmt.Errorf("unfinished dnf restore transaction requires manual recovery: %s", directory.host(artifact))
 	}
-	if source == "" {
-		source, err = oldestRegular(projectBackups)
-		if err != nil {
-			return "", false, fmt.Errorf("select dnf backup: %w", err)
+	destination := dnfAutomaticName
+	fixed := dnfStableName
+	marker := dnfAbsentName
+	proof := dnfDependencyProofName
+	projectBackups := restoreTimestampNames(names, fixed+".", "")
+	projectSnapshots, err := directory.readSnapshots(projectBackups, restoreConfigLimit)
+	if err != nil {
+		return "", false, fmt.Errorf("inspect dnf timestamp backups: %w", err)
+	}
+
+	fixedSnapshot, err := directory.readRegular(fixed, restoreConfigLimit)
+	if err != nil {
+		return "", false, fmt.Errorf("inspect dnf fixed backup: %w", err)
+	}
+	markerEngine, markerSnapshot, err := readDNFMarkerSnapshot(directory, marker)
+	if err != nil {
+		return "", false, fmt.Errorf("inspect dnf absence marker: %w", err)
+	}
+	proofSnapshot, err := directory.readRegular(proof, 256)
+	if err != nil {
+		return "", false, fmt.Errorf("inspect dnf dependency proof: %w", err)
+	}
+
+	source := ""
+	var sourceSnapshot regularSnapshot
+	if fixedSnapshot.exists {
+		source = fixed
+		sourceSnapshot = fixedSnapshot
+	}
+	markerExists := markerSnapshot.exists
+	if source == "" && !markerExists {
+		source = oldestSnapshotName(projectBackups, projectSnapshots)
+		if source != "" {
+			sourceSnapshot = projectSnapshots[source]
 		}
 	}
 	legacy := false
-	if source == "" {
-		legacyBackups, listErr := filesWithPrefix(dnfDir, "automatic.conf.bak.")
-		if listErr != nil {
-			return "", false, fmt.Errorf("list legacy dnf backups: %w", listErr)
-		}
-		source, err = newestRegular(legacyBackups)
+	if source == "" && !markerExists {
+		legacyBackups := restoreNamesWithPrefix(names, "automatic.conf.bak.")
+		legacySnapshots, err := directory.readSnapshots(legacyBackups, restoreConfigLimit)
 		if err != nil {
-			return "", false, fmt.Errorf("select legacy dnf backup: %w", err)
+			return "", false, fmt.Errorf("inspect legacy dnf backups: %w", err)
 		}
+		source = newestSnapshotName(legacyBackups, legacySnapshots)
+		sourceSnapshot = legacySnapshots[source]
 		legacy = source != ""
 	}
 
-	if source != "" {
-		if err := restoreFile(source, destination); err != nil {
-			return "", legacy, fmt.Errorf("restore dnf configuration from %s: %w", logicalPath(root, source), err)
+	preserveDependencyDefault := false
+	var configSnapshot regularSnapshot
+	if source != "" || markerExists {
+		configSnapshot, err = directory.readRegular(destination, restoreConfigLimit)
+		if err != nil {
+			return "", false, fmt.Errorf("inspect dnf configuration: %w", err)
 		}
 	}
+	// A fixed backup is the authoritative pre-SUN baseline. Dependency proof is
+	// only a recovery path for an originally absent configuration when no fixed
+	// baseline was durably promoted before an interrupted transaction.
+	if markerExists && source == "" {
+		if proofSnapshot.exists {
+			if markerEngine != "dnf4" {
+				return "", false, errors.New("inspect dnf dependency proof: DNF5 absence marker conflicts with DNF4 dependency proof")
+			}
+			if !configSnapshot.exists {
+				return "", false, errors.New("inspect dnf dependency proof: automatic.conf is missing")
+			}
+			if !bytes.Equal(proofSnapshot.data, dnfconfig.DependencyDefaultProof(configSnapshot.data)) {
+				return "", false, errors.New("inspect dnf dependency proof: proof does not match automatic.conf")
+			}
+			preserveDependencyDefault = true
+		} else if markerEngine == "dnf4" && configSnapshot.exists {
+			return "", false, errors.New("inspect dnf dependency proof: cannot prove that automatic.conf is a retained DNF4 dependency default")
+		}
+	}
+
+	var committedConfig *regularSnapshot
+	if preserveDependencyDefault {
+		source = ""
+		legacy = false
+		committedConfig = &configSnapshot
+	} else if source != "" {
+		if err := callRestoreRemoveHook(beforeRemove, directory.host(destination)); err != nil {
+			return "", legacy, fmt.Errorf("restore dnf configuration from %s: %w", logicalPath(root, directory.host(source)), err)
+		}
+		restored, err := directory.restoreFile(source, destination, sourceSnapshot, configSnapshot)
+		if err != nil {
+			return "", legacy, fmt.Errorf("restore dnf configuration from %s: %w", logicalPath(root, directory.host(source)), err)
+		}
+		committedConfig = &restored
+	} else if markerExists && configSnapshot.exists {
+		if err := callRestoreRemoveHook(beforeRemove, directory.host(destination)); err != nil {
+			return "", false, fmt.Errorf("restore absent dnf configuration: %w", err)
+		}
+		if err := directory.removeValidated(destination, configSnapshot); err != nil {
+			return "", false, fmt.Errorf("restore absent dnf configuration: %w", err)
+		}
+	}
+
 	// Legacy backups may belong to another administrator. Preserve them, as the
 	// shell uninstaller does, and remove only project-owned backups.
-	if err := removeFiles(append([]string{fixed}, projectBackups...)...); err != nil {
-		return source, legacy, fmt.Errorf("clean dnf backups: %w", err)
+	if markerExists {
+		if err := callRestoreRemoveHook(beforeRemove, directory.host(marker)); err != nil {
+			return sourcePath(directory, source), legacy, fmt.Errorf("commit dnf baseline restoration: %w", err)
+		}
+		if committedConfig != nil {
+			if err := directory.revalidate(destination, *committedConfig, restoreConfigLimit); err != nil {
+				return sourcePath(directory, source), legacy, fmt.Errorf("commit dnf baseline restoration: %w",
+					directory.recordConflict("dnf configuration changed before marker commit", err))
+			}
+		}
+		if proofSnapshot.exists {
+			if err := directory.revalidate(proof, proofSnapshot, 256); err != nil {
+				return sourcePath(directory, source), legacy, fmt.Errorf("commit dnf baseline restoration: %w",
+					directory.recordConflict("dnf dependency proof changed before marker commit", err))
+			}
+		}
+		if err := directory.removeValidated(marker, markerSnapshot); err != nil {
+			return sourcePath(directory, source), legacy, fmt.Errorf("commit dnf baseline restoration: %w", err)
+		}
+		if err := directory.sync(); err != nil {
+			return sourcePath(directory, source), legacy, fmt.Errorf("commit dnf baseline restoration: %w",
+				directory.recordConflict("sync dnf marker commit", err))
+		}
 	}
-	return source, legacy, nil
+	if committedConfig != nil {
+		if err := directory.revalidate(destination, *committedConfig, restoreConfigLimit); err != nil {
+			return sourcePath(directory, source), legacy, fmt.Errorf("validate restored dnf configuration before cleanup: %w",
+				directory.recordConflict("dnf configuration changed before cleanup", err))
+		}
+	}
+	metadata := append(append([]string(nil), projectBackups...), fixed)
+	cleanupSnapshots := make(map[string]regularSnapshot, len(projectSnapshots)+2)
+	for name, snapshot := range projectSnapshots {
+		cleanupSnapshots[name] = snapshot
+	}
+	cleanupSnapshots[fixed] = fixedSnapshot
+	cleanupSnapshots[proof] = proofSnapshot
+	if err := removeRestoreSnapshots(directory, beforeRemove, cleanupSnapshots, metadata...); err != nil {
+		return sourcePath(directory, source), legacy, fmt.Errorf("clean dnf backups: %w", err)
+	}
+	if err := removeRestoreSnapshots(directory, beforeRemove, cleanupSnapshots, proof); err != nil {
+		return sourcePath(directory, source), legacy, fmt.Errorf("clean dnf dependency proof: %w", err)
+	}
+	if err := directory.sync(); err != nil {
+		return sourcePath(directory, source), legacy, fmt.Errorf("sync dnf backup cleanup: %w",
+			directory.recordConflict("sync dnf backup cleanup", err))
+	}
+	return sourcePath(directory, source), legacy, nil
+}
+
+func readDNFMarkerSnapshot(directory *restoreDirectory, name string) (string, regularSnapshot, error) {
+	snapshot, err := directory.readRegular(name, 256)
+	if err != nil || !snapshot.exists {
+		return "", snapshot, err
+	}
+	switch string(snapshot.data) {
+	case dnf4AbsentContents:
+		return "dnf4", snapshot, nil
+	case dnf5AbsentContents:
+		return "dnf5", snapshot, nil
+	default:
+		return "", regularSnapshot{}, errors.New("absence marker has invalid contents")
+	}
 }
 
 func normalizeRoot(root string) (string, error) {
@@ -475,11 +760,46 @@ func ensureSafeParent(root, logical string) error {
 }
 
 func removeLogicalFile(root, logical string) error {
-	path, err := safePath(root, logical, false)
+	parent, name, err := openLogicalParent(root, logical)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
-	return removeFile(path)
+	defer parent.Close()
+	fd, err := syscall.Openat(
+		int(parent.Fd()), name,
+		oPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK,
+		0,
+	)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	leaf := os.NewFile(uintptr(fd), logical)
+	if leaf == nil {
+		_ = syscall.Close(fd)
+		return errors.New("could not create uninstall file handle")
+	}
+	info, statErr := leaf.Stat()
+	closeErr := leaf.Close()
+	if statErr != nil {
+		return statErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if info.IsDir() {
+		return fmt.Errorf("refusing to remove directory as a file: %s", logical)
+	}
+	err = syscall.Unlinkat(int(parent.Fd()), name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 // removeLogicalTree resolves the parent beneath an opened RootDir descriptor
@@ -510,15 +830,24 @@ func openLogicalParent(root, logical string) (*os.File, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
+	walked := ""
 	for _, component := range strings.Split(strings.TrimPrefix(filepath.Dir(clean), string(filepath.Separator)), string(filepath.Separator)) {
 		if component == "" || component == "." {
 			continue
 		}
+		walked += string(filepath.Separator) + component
 		nextFD, openErr := syscall.Openat(
 			int(current.Fd()), component,
 			oPath|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC,
 			0,
 		)
+		if openErr != nil && walked == "/usr/local/sbin" && validLocalSbinAliasAt(current, component) {
+			nextFD, openErr = syscall.Openat(
+				int(current.Fd()), "bin",
+				oPath|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC,
+				0,
+			)
+		}
 		if openErr != nil {
 			_ = current.Close()
 			if errors.Is(openErr, syscall.ELOOP) || errors.Is(openErr, syscall.ENOTDIR) {
@@ -536,6 +865,19 @@ func openLogicalParent(root, logical string) (*os.File, string, error) {
 		current = next
 	}
 	return current, filepath.Base(clean), nil
+}
+
+func validLocalSbinAliasAt(parent *os.File, component string) bool {
+	componentPointer, err := syscall.BytePtrFromString(component)
+	if err != nil {
+		return false
+	}
+	var target [4]byte
+	result, _, errno := syscall.Syscall6(
+		syscall.SYS_READLINKAT,
+		parent.Fd(), uintptr(unsafe.Pointer(componentPointer)), uintptr(unsafe.Pointer(&target[0])), uintptr(len(target)), 0, 0,
+	)
+	return errno == 0 && int(result) == len("bin") && string(target[:result]) == "bin"
 }
 
 func openRootHandle(root string) (*os.File, error) {
@@ -662,221 +1004,6 @@ func logicalPath(root, path string) string {
 	return string(filepath.Separator) + filepath.ToSlash(rel)
 }
 
-func regularFileExists(path string) (bool, error) {
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if !info.Mode().IsRegular() {
-		return false, fmt.Errorf("backup is not a regular file: %s", path)
-	}
-	return true, nil
-}
-
-func validAbsenceMarker(path string) (bool, error) {
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > 256 {
-		return false, fmt.Errorf("absence marker is not a small regular file: %s", path)
-	}
-	opened, err := os.Open(path)
-	if err != nil {
-		return false, err
-	}
-	defer opened.Close()
-	openedInfo, err := opened.Stat()
-	if err != nil {
-		return false, err
-	}
-	if !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
-		return false, errors.New("absence marker changed while opening")
-	}
-	data, err := io.ReadAll(io.LimitReader(opened, 257))
-	if err != nil {
-		return false, err
-	}
-	if string(data) != aptAbsentContents {
-		return false, errors.New("absence marker has invalid contents")
-	}
-	return true, nil
-}
-
-func oldestRegular(paths []string) (string, error) {
-	oldest := ""
-	for _, path := range paths {
-		info, err := os.Lstat(path)
-		if err != nil {
-			return "", err
-		}
-		if !info.Mode().IsRegular() {
-			return "", fmt.Errorf("backup is not a regular file: %s", path)
-		}
-		if oldest == "" || path < oldest {
-			oldest = path
-		}
-	}
-	return oldest, nil
-}
-
-func newestRegular(paths []string) (string, error) {
-	type candidate struct {
-		path  string
-		mtime time.Time
-	}
-	var newest candidate
-	found := false
-	for _, path := range paths {
-		info, err := os.Lstat(path)
-		if err != nil {
-			return "", err
-		}
-		if !info.Mode().IsRegular() {
-			return "", fmt.Errorf("backup is not a regular file: %s", path)
-		}
-		current := candidate{path: path, mtime: info.ModTime()}
-		if !found || current.mtime.After(newest.mtime) || current.mtime.Equal(newest.mtime) && current.path > newest.path {
-			newest = current
-			found = true
-		}
-	}
-	if !found {
-		return "", nil
-	}
-	return newest.path, nil
-}
-
-func restoreFile(source, destination string) (retErr error) {
-	sourceInfo, err := os.Lstat(source)
-	if err != nil {
-		return err
-	}
-	if !sourceInfo.Mode().IsRegular() {
-		return fmt.Errorf("backup is not a regular file")
-	}
-	in, err := os.Open(source)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	openedInfo, err := in.Stat()
-	if err != nil {
-		return err
-	}
-	if !openedInfo.Mode().IsRegular() || !os.SameFile(sourceInfo, openedInfo) {
-		return fmt.Errorf("backup changed while opening")
-	}
-
-	tmp, err := os.CreateTemp(filepath.Dir(destination), ".security-update-notify-restore-*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	defer func() {
-		if retErr != nil {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-
-	if _, err := io.Copy(tmp, in); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if stat, ok := sourceInfo.Sys().(*syscall.Stat_t); ok {
-		if err := tmp.Chown(int(stat.Uid), int(stat.Gid)); err != nil {
-			_ = tmp.Close()
-			return err
-		}
-	}
-	// chown can clear set-ID bits, so apply the source mode afterwards.
-	if err := tmp.Chmod(sourceInfo.Mode()); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := copyXattrs(source, tmpPath); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Chtimes(tmpPath, sourceInfo.ModTime(), sourceInfo.ModTime()); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, destination); err != nil {
-		return err
-	}
-	return syncDir(filepath.Dir(destination))
-}
-
-func copyXattrs(source, target string) error {
-	size, err := syscall.Listxattr(source, nil)
-	if errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EOPNOTSUPP) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("list backup xattrs: %w", err)
-	}
-	if size == 0 {
-		return nil
-	}
-	if size > 1<<20 {
-		return fmt.Errorf("backup xattr name list exceeds 1 MiB")
-	}
-	names := make([]byte, size)
-	n, err := syscall.Listxattr(source, names)
-	if err != nil {
-		return fmt.Errorf("read backup xattr names: %w", err)
-	}
-	for _, nameBytes := range strings.Split(string(names[:n]), "\x00") {
-		if nameBytes == "" {
-			continue
-		}
-		valueSize, err := syscall.Getxattr(source, nameBytes, nil)
-		if errors.Is(err, syscall.ENODATA) {
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("read backup xattr %s: %w", nameBytes, err)
-		}
-		if valueSize > 1<<20 {
-			return fmt.Errorf("backup xattr %s exceeds 1 MiB", nameBytes)
-		}
-		value := make([]byte, valueSize)
-		if valueSize > 0 {
-			n, err = syscall.Getxattr(source, nameBytes, value)
-			if err != nil {
-				return fmt.Errorf("read backup xattr %s: %w", nameBytes, err)
-			}
-			value = value[:n]
-		}
-		if err := syscall.Setxattr(target, nameBytes, value, 0); err != nil {
-			return fmt.Errorf("restore backup xattr %s: %w", nameBytes, err)
-		}
-	}
-	return nil
-}
-
-func syncDir(path string) error {
-	dir, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	return dir.Sync()
-}
-
 func removeFile(path string) error {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -916,58 +1043,14 @@ func filesWithPrefix(dir, prefix string) ([]string, error) {
 	return paths, nil
 }
 
-func aptTimestampBackups(dir string) ([]string, error) {
-	legacy, err := timestampBackups(dir, filepath.Base(aptStableLogical)+".", "")
-	if err != nil {
-		return nil, err
-	}
-	current, err := timestampBackups(
-		dir,
-		filepath.Base(aptPeriodicLogical)+".security-update-notify.",
-		".bak",
-	)
-	if err != nil {
-		return nil, err
-	}
-	return append(legacy, current...), nil
-}
-
-func timestampBackups(dir, prefix, suffix string) ([]string, error) {
-	entries, err := os.ReadDir(dir)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	paths := make([]string, 0)
-	for _, entry := range entries {
-		name := entry.Name()
-		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
-			continue
-		}
-		stamp := strings.TrimSuffix(strings.TrimPrefix(name, prefix), suffix)
-		if len(stamp) != len("20060102150405") {
-			continue
-		}
-		valid := true
-		for _, character := range stamp {
-			if character < '0' || character > '9' {
-				valid = false
-				break
-			}
-		}
-		if valid {
-			paths = append(paths, filepath.Join(dir, name))
-		}
-	}
-	return paths, nil
-}
-
 func removeFiles(paths ...string) error {
+	return removeFilesWith(removeFile, paths...)
+}
+
+func removeFilesWith(remove func(string) error, paths ...string) error {
 	var errs []error
 	for _, path := range paths {
-		if err := removeFile(path); err != nil {
+		if err := remove(path); err != nil {
 			errs = append(errs, err)
 		}
 	}

@@ -5,9 +5,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/xxvcc/security-update-notify/internal/osrel"
 )
 
 func TestExecRunnerClassifiesCommandOutcomesAndBoundsOutput(t *testing.T) {
@@ -224,7 +227,7 @@ func TestPrepareRejectsUnsupportedHostsAndUnsafeInputs(t *testing.T) {
 			installer, _, _, _ := setupInstaller(t, test.release)
 			options := telegramOptions()
 			test.mutate(&options)
-			_, err := installer.prepare(options)
+			_, err := installer.prepare(context.Background(), options)
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("prepare error=%v want substring %q", err, test.want)
 			}
@@ -234,7 +237,7 @@ func TestPrepareRejectsUnsupportedHostsAndUnsafeInputs(t *testing.T) {
 	installer, _, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=11\nPRETTY_NAME=Debian 11\n")
 	options := telegramOptions()
 	options.AllowBestEffort = true
-	plan, err := installer.prepare(options)
+	plan, err := installer.prepare(context.Background(), options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,6 +247,187 @@ func TestPrepareRejectsUnsupportedHostsAndUnsafeInputs(t *testing.T) {
 	if displayOS(plan.osRelease) != "Debian 11" || displayOS(plan.osRelease) == "" {
 		t.Fatal("displayOS did not prefer PRETTY_NAME")
 	}
+}
+
+func TestPrepareAllowsInferredDerivativeOnlyWithBestEffortOptIn(t *testing.T) {
+	release := "ID=custom-el\nVERSION_ID=10\nID_LIKE='rhel fedora'\nPRETTY_NAME='Custom EL 10'\n"
+	installer, _, runner, _ := setupInstaller(t, release)
+	options := telegramOptions()
+	if _, err := installer.prepare(context.Background(), options); err == nil || !strings.Contains(err.Error(), "unsupported distribution") {
+		t.Fatalf("inferred derivative without opt-in error=%v", err)
+	}
+	if len(runner.commands) != 0 {
+		t.Fatalf("inferred derivative probed without opt-in: %v", runner.commands)
+	}
+	options.AllowBestEffort = true
+	plan, err := installer.prepare(context.Background(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.backend != "dnf" || plan.profile.Engine != osrel.EngineDNF4 || plan.supportTier != osrel.BestEffort {
+		t.Fatalf("inferred plan=%+v profile=%+v", plan, plan.profile)
+	}
+	if !containsAllCommands(runner.commands, "dnf --version", "yum --version") {
+		t.Fatalf("DNF generation probes = %v", runner.commands)
+	}
+	probeCount := len(runner.commands)
+	options.SkipPostInstallCheck = true
+	if _, err := installer.prepare(context.Background(), options); err == nil || !strings.Contains(err.Error(), "require the post-install verification gate") {
+		t.Fatalf("inferred derivative skipped post-install gate: %v", err)
+	}
+	if len(runner.commands) != probeCount {
+		t.Fatalf("skip-post-install rejection ran another probe: %v", runner.commands[probeCount:])
+	}
+	options.SkipPostInstallCheck = false
+
+	known, _, _, _ := setupInstaller(t, "ID=fedora\nVERSION_ID=42\n")
+	if _, err := known.prepare(context.Background(), options); err == nil || !strings.Contains(err.Error(), "unsupported distribution") {
+		t.Fatalf("known unverified release was accepted: %v", err)
+	}
+}
+
+func TestPrepareProbesUnknownDNFDerivativeBeforeSelectingProfile(t *testing.T) {
+	t.Run("DNF5 after ambiguous dnf", func(t *testing.T) {
+		installer, _, runner, _ := setupInstaller(t, "ID=custom-fedora\nVERSION_ID=43\nID_LIKE=fedora\n")
+		runner.missingCommands["dnf5"] = false
+		runner.missingCommands["yum"] = true
+		runner.failedCommands["dnf --version"] = CommandResult{Stdout: []byte("unrecognized version output\n")}
+		options := telegramOptions()
+		options.AllowBestEffort = true
+		plan, err := installer.prepare(context.Background(), options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if plan.profile.Engine != osrel.EngineDNF5 || !containsInstallerString(plan.profile.Packages, "dnf5-plugin-automatic") {
+			t.Fatalf("DNF5 inferred profile = %+v", plan.profile)
+		}
+		if !reflect.DeepEqual(runner.commands, []string{"dnf --version", "dnf5 --version"}) {
+			t.Fatalf("probe commands = %v", runner.commands)
+		}
+	})
+
+	t.Run("nonzero dnf then successful dnf5", func(t *testing.T) {
+		installer, _, runner, _ := setupInstaller(t, "ID=custom-fedora\nVERSION_ID=43\nID_LIKE=fedora\n")
+		runner.missingCommands["dnf5"] = false
+		runner.missingCommands["yum"] = true
+		runner.failedCommands["dnf --version"] = CommandResult{Code: 1, Stderr: []byte("broken\n")}
+		options := telegramOptions()
+		options.AllowBestEffort = true
+		plan, err := installer.prepare(context.Background(), options)
+		if err != nil || plan.profile.Engine != osrel.EngineDNF5 {
+			t.Fatalf("plan=%+v err=%v", plan, err)
+		}
+	})
+
+	for _, test := range []struct {
+		name  string
+		setup func(*fakeRunner)
+		want  string
+	}{
+		{
+			name: "ambiguous output",
+			setup: func(runner *fakeRunner) {
+				runner.missingCommands["yum"] = true
+				runner.failedCommands["dnf --version"] = CommandResult{Stdout: []byte("unknown\n")}
+			},
+			want: "unambiguous successful version",
+		},
+		{
+			name: "nonzero output",
+			setup: func(runner *fakeRunner) {
+				runner.missingCommands["yum"] = true
+				runner.failedCommands["dnf --version"] = CommandResult{Code: 1, Stderr: []byte("failed\n")}
+			},
+			want: "unambiguous successful version",
+		},
+		{
+			name: "only microdnf",
+			setup: func(runner *fakeRunner) {
+				runner.missingCommands["dnf"] = true
+				runner.missingCommands["yum"] = true
+				runner.missingCommands["microdnf"] = false
+			},
+			want: "no dnf, dnf5, or yum command",
+		},
+		{
+			name: "conflicting generations",
+			setup: func(runner *fakeRunner) {
+				runner.missingCommands["dnf5"] = false
+				runner.missingCommands["yum"] = true
+			},
+			want: "conflicting generations",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			installer, _, runner, _ := setupInstaller(t, "ID=custom-el\nVERSION_ID=10\nID_LIKE='rhel fedora'\n")
+			test.setup(runner)
+			options := telegramOptions()
+			options.AllowBestEffort = true
+			if _, err := installer.prepare(context.Background(), options); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("prepare error=%v want %q", err, test.want)
+			}
+		})
+	}
+
+	t.Run("known profile is not probed", func(t *testing.T) {
+		installer, _, runner, _ := setupInstaller(t, "ID=fedora\nVERSION_ID=43\n")
+		if _, err := installer.prepare(context.Background(), telegramOptions()); err != nil {
+			t.Fatal(err)
+		}
+		for _, command := range runner.commands {
+			if strings.HasSuffix(command, " --version") {
+				t.Fatalf("known Fedora profile was probed: %v", runner.commands)
+			}
+		}
+	})
+}
+
+func TestUnknownDNFProbeFailurePrecedesInstallerWrites(t *testing.T) {
+	installer, root, runner, _ := setupInstaller(t, "ID=custom-el\nVERSION_ID=10\nID_LIKE='rhel fedora'\n")
+	runner.missingCommands["dnf"] = true
+	runner.missingCommands["yum"] = true
+	options := telegramOptions()
+	options.AllowBestEffort = true
+
+	_, err := installer.Install(context.Background(), options)
+	if err == nil || !strings.Contains(err.Error(), "no dnf, dnf5, or yum command") {
+		t.Fatalf("Install error=%v", err)
+	}
+	for _, path := range []string{BackupRoot, BinaryPath, ConfigPath, "/etc/dnf/automatic.conf"} {
+		if existsNoErr(root, path) {
+			t.Fatalf("probe failure created %s", path)
+		}
+	}
+	for _, command := range runner.commands {
+		if strings.HasPrefix(command, "rpm ") || strings.Contains(command, " install ") {
+			t.Fatalf("probe failure reached package transaction: %v", runner.commands)
+		}
+	}
+}
+
+func containsAllCommands(commands []string, wanted ...string) bool {
+	for _, want := range wanted {
+		found := false
+		for _, command := range commands {
+			if command == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func containsInstallerString(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func TestLoadFeishuSecretCredentialStateMachine(t *testing.T) {

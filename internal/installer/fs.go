@@ -26,7 +26,9 @@ const (
 // real host; a temporary Root gives integration tests a private filesystem.
 // Every operation walks from an open root directory descriptor with
 // O_NOFOLLOW, so a concurrent symlink replacement cannot redirect it outside
-// the selected root.
+// the selected root. The one accepted ancestor alias is Fedora's package-owned
+// /usr/local/sbin -> bin layout; the walker validates that exact link text and
+// opens /usr/local/bin directly from the already-open /usr/local descriptor.
 type RootFS struct {
 	Root string
 	root *os.File
@@ -142,12 +144,23 @@ func (f *RootFS) openDir(logicalPath string, create bool, perm fs.FileMode) (*os
 	if clean == "/" {
 		return current, nil
 	}
+	walked := ""
 	for _, component := range strings.Split(strings.TrimPrefix(clean, "/"), "/") {
+		walked += "/" + component
 		nextFD, openErr := syscall.Openat(
 			int(current.Fd()), component,
 			syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC,
 			0,
 		)
+		if openErr != nil && walked == "/usr/local/sbin" && validLocalSbinAliasAt(current, component) {
+			// Never follow the link itself. Opening its fixed sibling target from
+			// the held parent descriptor keeps replacement races contained.
+			nextFD, openErr = syscall.Openat(
+				int(current.Fd()), "bin",
+				syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC,
+				0,
+			)
+		}
 		if errors.Is(openErr, fs.ErrNotExist) && create {
 			if mkdirErr := syscall.Mkdirat(int(current.Fd()), component, uint32(perm.Perm())); mkdirErr != nil && !errors.Is(mkdirErr, fs.ErrExist) {
 				_ = current.Close()
@@ -176,6 +189,12 @@ func (f *RootFS) openDir(logicalPath string, create bool, perm fs.FileMode) (*os
 		current = next
 	}
 	return current, nil
+}
+
+func validLocalSbinAliasAt(parent *os.File, component string) bool {
+	var target [4]byte
+	n, err := readlinkat(int(parent.Fd()), component, target[:])
+	return err == nil && n == len("bin") && string(target[:n]) == "bin"
 }
 
 func (f *RootFS) openParent(logicalPath string) (*os.File, string, error) {

@@ -75,7 +75,7 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 		}
 	}()
 
-	plan, err := i.prepare(options)
+	plan, err := i.prepare(ctx, options)
 	if err != nil {
 		return Result{}, err
 	}
@@ -91,19 +91,24 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 			zeroBytes(snapshot.data)
 		}
 	}()
-	timer := i.snapshotTimer()
+	timer, err := i.snapshotTimer(ctx)
+	if err != nil {
+		return Result{}, err
+	}
+	var automaticUnits []unitSnapshot
 	previousVersion := i.currentInstalledVersion(ctx)
 	b, err := i.createBackup()
 	if err != nil {
 		return Result{}, err
 	}
 	aptConfigOriginallyAbsent := plan.backend == "apt" && !b.snapshots[aptPeriodicPath].exists
+	dnfConfigOriginallyAbsent := plan.backend == "dnf" && !b.snapshots[dnfAutomaticPath].exists
 	transactionActive := true
 	defer func() {
 		if returnErr == nil || !transactionActive {
 			return
 		}
-		if rollbackErr := i.restoreBackup(b, private, timer, options.LockWait); rollbackErr != nil {
+		if rollbackErr := i.restoreBackup(b, private, timer, automaticUnits, options.LockWait); rollbackErr != nil {
 			returnErr = &ExitError{
 				Code: 1,
 				Op:   "installation failed and rollback was incomplete",
@@ -125,16 +130,84 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 			return Result{}, err
 		}
 	}
-	if !options.SkipDependencies {
-		if err := i.installDependencies(ctx, plan, options.ConfirmDependencies); err != nil {
+	if dnfConfigOriginallyAbsent {
+		if err := i.recordDNFAbsentBaseline(plan); err != nil {
 			return Result{}, err
 		}
 	}
+	packageInstallAttempted := false
+	var dependencyErr error
+	if !options.SkipDependencies {
+		packageInstallAttempted, dependencyErr = i.installDependencies(ctx, plan, options.ConfirmDependencies)
+	}
+	var dependencyProofErr error
+	if packageInstallAttempted {
+		switch {
+		case aptConfigOriginallyAbsent:
+			dependencyProofErr = i.recordAPTDependencyProof()
+		case dnfConfigOriginallyAbsent:
+			dependencyProofErr = i.recordDNF4DependencyProof(plan)
+		}
+	}
 	// Package installation is not rolled back. Capture its defaults together
-	// with the absence marker so a late failure and retry retain the original
+	// with baseline metadata so a late failure and retry retain the original
 	// host baseline. Recording the marker before package-manager writes also
 	// preserves that baseline across an abrupt process or host failure.
-	if err := i.captureDependencyDefaults(b); err != nil {
+	if packageInstallAttempted {
+		if err := i.captureDependencyDefaults(b); err != nil {
+			if dependencyErr != nil {
+				if dependencyProofErr != nil {
+					return Result{}, failure("capture partial dependency installation", fmt.Errorf(
+						"dependency installation error: %v; proof error: %v; capture error: %w",
+						dependencyErr, dependencyProofErr, err,
+					))
+				}
+				return Result{}, failure("capture partial dependency installation", fmt.Errorf(
+					"dependency installation error: %v; capture error: %w", dependencyErr, err,
+				))
+			}
+			return Result{}, err
+		}
+	}
+	if dependencyErr != nil {
+		if dependencyProofErr != nil {
+			return Result{}, failure("preserve partial dependency installation", fmt.Errorf(
+				"dependency installation error: %v; proof error: %w", dependencyErr, dependencyProofErr,
+			))
+		}
+		return Result{}, dependencyErr
+	}
+	if dependencyProofErr != nil {
+		// A successful retained package transaction is sufficient in-process
+		// provenance to promote its validated default. Do that before reporting
+		// the proof failure so purge cannot leave an enabled distribution timer
+		// without its vendor configuration.
+		var baselineErr error
+		if plan.backend == "apt" {
+			baselineErr = i.persistAPTDependencyBaseline(b, aptConfigOriginallyAbsent, packageInstallAttempted)
+		} else {
+			baselineErr = i.persistDNF4DependencyBaseline(plan, b, dnfConfigOriginallyAbsent)
+		}
+		if baselineErr != nil {
+			return Result{}, failure("preserve dependency installation", fmt.Errorf(
+				"proof error: %v; baseline error: %w", dependencyProofErr, baselineErr,
+			))
+		}
+		return Result{}, failure("preserve dependency installation", dependencyProofErr)
+	}
+	if plan.backend == "apt" {
+		if err := i.persistAPTDependencyBaseline(b, aptConfigOriginallyAbsent, packageInstallAttempted); err != nil {
+			return Result{}, err
+		}
+	}
+	if err := i.persistDNF4DependencyBaseline(plan, b, dnfConfigOriginallyAbsent); err != nil {
+		return Result{}, err
+	}
+	if err := i.verifyBackendCommands(ctx, plan); err != nil {
+		return Result{}, err
+	}
+	automaticUnits, err = i.snapshotAutomaticUnits(ctx, plan)
+	if err != nil {
 		return Result{}, err
 	}
 	credentialSecret := bytes.Clone(options.FeishuSecret)
@@ -181,11 +254,14 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 		}
 	}
 
-	storage, err := i.installFiles(ctx, plan, options, credentialSecret)
+	storage, err := i.installFiles(ctx, plan, options, credentialSecret, b)
 	if err != nil {
 		return Result{}, err
 	}
-	postInstallTest, postInstallDoctor, err := i.activateAndVerify(ctx, plan, options, previousVersion)
+	if err := i.verifyBackendPolicyFile(plan); err != nil {
+		return Result{}, err
+	}
+	postInstallTest, postInstallDoctor, err := i.activateAndVerify(ctx, plan, options, previousVersion, automaticUnits)
 	if err != nil {
 		return Result{}, err
 	}
@@ -197,15 +273,35 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 	}, nil
 }
 
-func (i *Installer) activateAndVerify(ctx context.Context, plan installPlan, options Options, previousVersion string) (*CommandResult, *CommandResult, error) {
+func (i *Installer) activateAndVerify(ctx context.Context, plan installPlan, options Options, previousVersion string, automaticUnits []unitSnapshot) (*CommandResult, *CommandResult, error) {
 	if err := i.requiredCommandContext(ctx, "reload systemd", Command{Name: "systemctl", Args: []string{"daemon-reload"}, Timeout: 30 * time.Second}); err != nil {
 		return nil, nil, err
 	}
+	automaticTimer := plan.profile.AutomaticTimer
+	if automaticTimer == "" {
+		return nil, nil, failure("enable automatic-update timer", errors.New("distribution profile does not define a timer"))
+	}
+	if err := i.disableAutomaticTimerVariants(ctx, plan, automaticUnits); err != nil {
+		return nil, nil, err
+	}
 	if plan.backend == "apt" {
-		_ = i.runner.Run(ctx, Command{Name: "systemctl", Args: []string{"enable", "--now", "apt-daily.timer", "apt-daily-upgrade.timer"}, Timeout: 30 * time.Second})
+		if err := i.requiredCommandContext(ctx, "enable automatic-update timers", Command{Name: "systemctl", Args: []string{"enable", "--now", "apt-daily.timer", automaticTimer}, Timeout: 30 * time.Second}); err != nil {
+			return nil, nil, err
+		}
 		_ = i.runner.Run(ctx, Command{Name: "systemctl", Args: []string{"enable", "--now", "unattended-upgrades.service"}, Timeout: 30 * time.Second})
 	} else {
-		_ = i.runner.Run(ctx, Command{Name: "systemctl", Args: []string{"enable", "--now", "dnf-automatic.timer"}, Timeout: 30 * time.Second})
+		if err := i.requiredCommandContext(ctx, "enable automatic-update timer", Command{Name: "systemctl", Args: []string{"enable", "--now", automaticTimer}, Timeout: 30 * time.Second}); err != nil {
+			return nil, nil, err
+		}
+	}
+	enablement := i.runner.Run(ctx, Command{Name: "systemctl", Args: []string{"is-enabled", automaticTimer}, Timeout: 30 * time.Second})
+	if enablement.Err != nil || enablement.Code != 0 {
+		return nil, nil, failure("verify automatic-update timer", commandResultError(enablement))
+	}
+	state := strings.TrimSpace(string(enablement.Stdout))
+	if state != "enabled" && state != "enabled-runtime" {
+		return nil, nil, failure("verify automatic-update timer", fmt.Errorf(
+			"%s has enablement state %q; want enabled or enabled-runtime", automaticTimer, state))
 	}
 	if !options.SkipPostInstallCheck {
 		if err := i.requiredCommandContext(ctx, "verify installed runtime", Command{Name: BinaryPath, Args: []string{"--version"}, Timeout: 30 * time.Second}); err != nil {
@@ -239,6 +335,9 @@ func (i *Installer) activateAndVerify(ctx context.Context, plan installPlan, opt
 			Name: BinaryPath, Args: []string{"--doctor", "--skip-notify", "--lang", plan.values["NOTIFY_LANG"]}, Timeout: 2 * time.Minute,
 		})
 		postInstallDoctor = &result
+		if plan.profile.Inferred && (result.Err != nil || result.Code != 0) {
+			return postInstallTest, postInstallDoctor, failure("verify inferred derivative with doctor", commandResultError(result))
+		}
 	}
 	if err := i.requiredCommandContext(ctx, "list project timer", Command{
 		Name: "systemctl", Args: []string{"list-timers", "security-update-notify.timer", "--no-pager"}, Timeout: 30 * time.Second,

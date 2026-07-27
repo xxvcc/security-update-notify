@@ -10,12 +10,63 @@ import (
 	"time"
 
 	"github.com/xxvcc/security-update-notify/internal/config"
+	"github.com/xxvcc/security-update-notify/internal/osrel"
 )
+
+func TestUbuntu2004ESMSupportEndRequiresEnabledInfraService(t *testing.T) {
+	status := func(services string) string {
+		return `{"_schema_version":"v1","data":{"attributes":{"enabled_services":` + services + `},"type":"EnabledServices"},"errors":[],"result":"success"}`
+	}
+	for _, test := range []struct {
+		name   string
+		output string
+		code   int
+		want   string
+	}{
+		{name: "esm infra enabled", output: status(`[{"name":"esm-apps"},{"name":"esm-infra"}]`), want: ubuntu2004ESMSupportEnd},
+		{name: "unattached", output: status(`[]`), want: "2025-05-31"},
+		{name: "only esm apps", output: status(`[{"name":"esm-apps"}]`), want: "2025-05-31"},
+		{name: "command failure", output: status(`[{"name":"esm-infra"}]`), code: 1, want: "2025-05-31"},
+		{name: "schema drift", output: `{"_schema_version":"v2","data":{"attributes":{"enabled_services":[{"name":"esm-infra"}]},"type":"EnabledServices"},"errors":[],"result":"success"}`, want: "2025-05-31"},
+		{name: "missing errors", output: `{"_schema_version":"v1","data":{"attributes":{"enabled_services":[{"name":"esm-infra"}]},"type":"EnabledServices"},"result":"success"}`, want: "2025-05-31"},
+		{name: "null services", output: `{"_schema_version":"v1","data":{"attributes":{"enabled_services":null},"type":"EnabledServices"},"errors":[],"result":"success"}`, want: "2025-05-31"},
+		{name: "malformed", output: `{`, want: "2025-05-31"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeTestCommand(t, dir, "pro", fmt.Sprintf("printf '%%s\\n' '%s'\nexit %d\n", test.output, test.code))
+			t.Setenv("PATH", dir)
+			got := effectiveSupportEnd(osrel.OSRelease{ID: "ubuntu", VersionID: "20.04", PrettyName: "Ubuntu 20.04 LTS"})
+			if got != test.want {
+				t.Fatalf("effectiveSupportEnd()=%q want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestEffectiveSupportEndPreservesOSReleaseOverride(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	o := osrel.OSRelease{ID: "custom", VersionID: "1", SupportEnd: "2032-06-30"}
+	if got := effectiveSupportEnd(o); got != o.SupportEnd {
+		t.Fatalf("effectiveSupportEnd()=%q want %q", got, o.SupportEnd)
+	}
+}
+
+func TestUbuntu2004IgnoresGenericSupportEndWithoutESM(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	o := osrel.OSRelease{
+		ID: "ubuntu", VersionID: "20.04", PrettyName: "Ubuntu 20.04 LTS", SupportEnd: ubuntu2004ESMSupportEnd,
+	}
+	if got := effectiveSupportEnd(o); got != "2025-05-31" {
+		t.Fatalf("effectiveSupportEnd()=%q want standard-maintenance end", got)
+	}
+}
 
 func TestCollectTestModeOrchestratesPackageCollection(t *testing.T) {
 	t.Run("dnf truncates reboot package details", func(t *testing.T) {
 		dir := t.TempDir()
 		var output strings.Builder
+		output.WriteString("if [ \"$1\" = \"--version\" ]; then printf '%s\\n' '4.14.0'; exit 0; fi\n")
 		for i := 0; i < 45; i++ {
 			fmt.Fprintf(&output, "printf 'RHSA-2026:%04d Important/Sec. package%02d.x86_64\\n'\n", i, i)
 		}
@@ -77,7 +128,7 @@ func TestCollectHealthUsesSystemdCommandResults(t *testing.T) {
 	writeTestCommand(t, dir, "systemctl", `
 printf '%s\n' "$*" >> "$SUN_SYSTEMCTL_CALL_LOG"
 case "$1:$4" in
-  is-enabled:*) exit 0 ;;
+  is-enabled:*) printf '%s\n' enabled ;;
   show:ExecMainExitTimestamp) printf '%s\n' 'fixture timestamp' ;;
   show:LastTriggerUSec) printf '%s\n' 'fixture timestamp' ;;
   show:Result) printf '%s\n' 'success' ;;
@@ -183,9 +234,13 @@ printf '%s\n' \
   'NEEDRESTART-KSTA: 3' \
   'NEEDRESTART-SVC: ssh.service'
 `)
+	writeTestCommand(t, dir, "dnf", `
+[ "$1" = "--version" ] || exit 2
+printf '%s\n' '4.14.0'
+`)
 	writeTestCommand(t, dir, "needs-restarting", `
 case "$1" in
-  -r) printf '%s\n' 'Reboot is required to apply updates.' >&2; exit 1 ;;
+  -r) printf '%s\n' 'Reboot is required to fully utilize these updates.'; exit 1 ;;
   --help) printf '%s\n' 'usage: needs-restarting [-r] [-s]' ;;
   -s) printf '%s\n' 'sshd.service' 'crond.service' ;;
   *) exit 2 ;;
@@ -224,8 +279,8 @@ printf '%s\n' '6.12-test'
 	if dnf.RestartSignal != "crond.service\nsshd.service" {
 		t.Fatalf("DNF restart signal = %q", dnf.RestartSignal)
 	}
-	if !strings.Contains(dnf.RestartSummary, "Reboot is required to apply updates.") {
-		t.Fatalf("DNF stderr was not preserved in merged -r output: %q", dnf.RestartSummary)
+	if !strings.Contains(dnf.RestartSummary, "Reboot is required to fully utilize these updates.") {
+		t.Fatalf("DNF stdout was not preserved in restart summary: %q", dnf.RestartSummary)
 	}
 
 	if got := parseSystemdTimeWithTimeout("ignored fixture", time.Second); got != 1700000000 {
@@ -245,6 +300,7 @@ func TestBoundedCommandCollectionTimesOut(t *testing.T) {
 	for _, name := range []string{"needrestart", "needs-restarting", "date", "hostname", "uname"} {
 		writeTestCommand(t, dir, name, "\nexec /bin/sleep 1\n")
 	}
+	writeTestCommand(t, dir, "dnf", "printf '%s\\n' '4.14.0'\n")
 	t.Setenv("PATH", dir)
 	cfg := loadEmptyConfig(t)
 	const timeout = 25 * time.Millisecond

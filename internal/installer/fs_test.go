@@ -49,6 +49,43 @@ func TestRootFSRejectsSymlinkedAncestor(t *testing.T) {
 	}
 }
 
+func TestRootFSAcceptsOnlyStandardLocalSbinAlias(t *testing.T) {
+	rootDir := t.TempDir()
+	filesystem, err := NewRootFS(rootDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := filesystem.MkdirAll("/usr/local/bin", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := filesystem.Symlink("bin", "/usr/local/sbin"); err != nil {
+		t.Fatal(err)
+	}
+	const binary = "/usr/local/sbin/security-update-notify"
+	if err := filesystem.WriteFileAtomic(binary, []byte("runtime"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(rootDir, "usr/local/bin/security-update-notify")); err != nil || string(got) != "runtime" {
+		t.Fatalf("standard alias target data=%q err=%v", got, err)
+	}
+	if err := filesystem.Remove(binary); err != nil {
+		t.Fatal(err)
+	}
+	if target, err := filesystem.Readlink("/usr/local/sbin"); err != nil || target != "bin" {
+		t.Fatalf("standard alias changed: target=%q err=%v", target, err)
+	}
+
+	if err := filesystem.Remove("/usr/local/sbin"); err != nil {
+		t.Fatal(err)
+	}
+	if err := filesystem.Symlink("../escape", "/usr/local/sbin"); err != nil {
+		t.Fatal(err)
+	}
+	if err := filesystem.WriteFileAtomic(binary, []byte("escaped"), 0o755); err == nil || !strings.Contains(err.Error(), "symlinked path component") {
+		t.Fatalf("nonstandard /usr/local/sbin alias accepted: %v", err)
+	}
+}
+
 func TestRootFSDoesNotFollowLeafSymlink(t *testing.T) {
 	rootDir := t.TempDir()
 	outside := filepath.Join(t.TempDir(), "outside")

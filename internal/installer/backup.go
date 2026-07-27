@@ -1,6 +1,7 @@
 package installer
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -19,19 +20,23 @@ var managedPaths = []string{
 	PersistentTimerLink,
 	RuntimeTimerLink,
 	LogrotatePath,
-	aptAbsentMarkerPath,
-	aptLegacyAbsentPath,
 	aptPeriodicPath,
 	aptStableBackupPath,
+	aptAbsentMarkerPath,
+	aptLegacyAbsentPath,
+	aptDependencyProofPath,
 	"/etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify",
 	"/etc/needrestart/conf.d/99-security-update-notify-report-only.conf",
 	"/etc/dnf/automatic.conf",
 	"/etc/dnf/automatic.conf.security-update-notify.bak",
+	"/etc/dnf/automatic.conf.security-update-notify.absent.bak",
+	"/etc/dnf/automatic.conf.security-update-notify.dependency-default.bak",
 }
 
 type nodeSnapshot struct {
-	exists     bool
-	backupPath string
+	exists          bool
+	backupPath      string
+	preserveCurrent bool
 }
 
 type backup struct {
@@ -150,11 +155,20 @@ func (i *Installer) captureDependencyDefaults(b *backup) error {
 		if !exists {
 			continue
 		}
-		snapshot.exists = true
-		snapshot.backupPath = path.Join(b.dir, strings.TrimPrefix(source, "/"))
-		if err := i.copyNode(source, snapshot.backupPath); err != nil {
+		backupPath := path.Join(b.dir, strings.TrimPrefix(source, "/"))
+		// The package transaction is retained. If capturing a package-owned default
+		// fails, rollback must not delete the only configuration that package wrote.
+		// SUN metadata such as markers and proofs must still roll back normally.
+		if source == aptPeriodicPath || source == dnfAutomaticPath {
+			snapshot.preserveCurrent = true
+			b.snapshots[source] = snapshot
+		}
+		if err := i.copyNode(source, backupPath); err != nil {
 			return failure("capture dependency-created default", err)
 		}
+		snapshot.exists = true
+		snapshot.backupPath = backupPath
+		snapshot.preserveCurrent = false
 		b.snapshots[source] = snapshot
 		b.manifest = append(b.manifest, strings.TrimPrefix(source, "/"))
 		changed = true
@@ -163,6 +177,32 @@ func (i *Installer) captureDependencyDefaults(b *backup) error {
 		return i.writeManifest(b)
 	}
 	return nil
+}
+
+// keepPathAbsentOnRollback adopts a durable post-dependency absence as the new
+// transaction baseline. This is used only for metadata whose replacement
+// baseline has already been captured and whose owning package is not rolled
+// back with the SUN transaction.
+func (i *Installer) keepPathAbsentOnRollback(b *backup, source string) error {
+	snapshot, tracked := b.snapshots[source]
+	if !tracked {
+		return failure("update transaction baseline", fmt.Errorf("path is not tracked: %s", source))
+	}
+	if snapshot.backupPath != "" {
+		if err := i.fs.Remove(snapshot.backupPath); err != nil {
+			return failure("remove superseded transaction snapshot", err)
+		}
+	}
+	b.snapshots[source] = nodeSnapshot{}
+	logical := strings.TrimPrefix(source, "/")
+	manifest := b.manifest[:0]
+	for _, entry := range b.manifest {
+		if entry != logical {
+			manifest = append(manifest, entry)
+		}
+	}
+	b.manifest = manifest
+	return i.writeManifest(b)
 }
 
 func (i *Installer) writeManifest(b *backup) error {
@@ -238,15 +278,21 @@ func (i *Installer) copyNode(source, destination string) error {
 	return i.fs.CopyRegularFileAtomic(source, destination, 256<<20)
 }
 
-func (i *Installer) restoreBackup(b *backup, private map[string]privateSnapshot, timer timerSnapshot, lockWait time.Duration) error {
+func (i *Installer) restoreBackup(b *backup, private map[string]privateSnapshot, timer timerSnapshot, automaticUnits []unitSnapshot, lockWait time.Duration) error {
 	if !i.runner.LookPath("systemctl") {
 		return failure("rollback", errors.New("systemctl disappeared during the installation transaction"))
 	}
 	if err := i.quiesceForRollback(lockWait, timer); err != nil {
 		return err
 	}
+	if err := i.quiesceAutomaticUnits(automaticUnits); err != nil {
+		return err
+	}
 	for _, destination := range b.paths {
 		snapshot := b.snapshots[destination]
+		if snapshot.preserveCurrent {
+			continue
+		}
 		if err := i.fs.Remove(destination); err != nil {
 			return failure("remove changed path during rollback", err)
 		}
@@ -279,20 +325,20 @@ func (i *Installer) restoreBackup(b *backup, private map[string]privateSnapshot,
 	if err := i.requiredCommand("reload systemd after rollback", Command{Name: "systemctl", Args: []string{"daemon-reload"}, Timeout: 30 * time.Second}); err != nil {
 		return err
 	}
-	if timer.active {
-		if err := i.requiredCommand("restart timer after rollback", Command{Name: "systemctl", Args: []string{"start", "security-update-notify.timer"}, Timeout: 30 * time.Second}); err != nil {
-			return err
-		}
+	if err := i.restoreAutomaticUnits(automaticUnits); err != nil {
+		return err
 	}
-	if timer.enablement != "unknown" {
-		result := i.run(Command{Name: "systemctl", Args: []string{"is-enabled", "security-update-notify.timer"}, Timeout: 30 * time.Second})
-		if got := strings.TrimSpace(string(result.Stdout)); got != timer.enablement {
-			return failure("verify timer enablement after rollback", fmt.Errorf("got %q, want %q", got, timer.enablement))
-		}
+	if err := i.restoreProjectTimer(timer); err != nil {
+		return err
 	}
-	active := i.run(Command{Name: "systemctl", Args: []string{"is-active", "--quiet", "security-update-notify.timer"}, Timeout: 30 * time.Second}).Code == 0
-	if active != timer.active {
-		return failure("verify timer activity after rollback", fmt.Errorf("got active=%t, want %t", active, timer.active))
+	after, err := i.snapshotTimer(context.Background())
+	if err != nil {
+		return failure("verify project timer after rollback", err)
+	}
+	if after != timer {
+		return failure("verify project timer after rollback", fmt.Errorf(
+			"got enablement=%q active=%t, want enablement=%q active=%t",
+			after.enablement, after.active, timer.enablement, timer.active))
 	}
 	return nil
 }

@@ -4,8 +4,8 @@
   <a href="https://github.com/xxvcc/security-update-notify/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/xxvcc/security-update-notify?style=flat-square&label=release&color=2EA043"></a>
   <img alt="Linux" src="https://img.shields.io/badge/Linux-systemd-1793D1?style=flat-square&logo=linux&logoColor=white">
   <img alt="Debian" src="https://img.shields.io/badge/Debian-12%20%7C%2013-A81D33?style=flat-square&logo=debian&logoColor=white">
-  <img alt="Ubuntu" src="https://img.shields.io/badge/Ubuntu-22.04%20%7C%2024.04-E95420?style=flat-square&logo=ubuntu&logoColor=white">
-  <img alt="RHEL compatible" src="https://img.shields.io/badge/RHEL%20compatible-8%20%7C%209-EE0000?style=flat-square&logo=redhat&logoColor=white">
+  <img alt="Ubuntu" src="https://img.shields.io/badge/Ubuntu-22.04%20%7C%2024.04%20%7C%2026.04-E95420?style=flat-square&logo=ubuntu&logoColor=white">
+  <img alt="RHEL compatible" src="https://img.shields.io/badge/RHEL%20compatible-8%20%7C%209%20%7C%2010-EE0000?style=flat-square&logo=redhat&logoColor=white">
   <img alt="License" src="https://img.shields.io/badge/License-MIT-green?style=flat-square">
 </p>
 
@@ -111,18 +111,28 @@ SUN **不会**：
 | 系统家族 | 版本 | 后端 |
 | --- | --- | --- |
 | Debian | 12, 13 | `apt` |
-| Ubuntu | 22.04, 24.04 | `apt` |
-| RHEL / Rocky / AlmaLinux | 8, 9 | `dnf` |
-| Fedora | 当前版本 | `dnf` |
+| Ubuntu | 22.04, 24.04, 26.04 | `apt` |
+| RHEL-compatible（Rocky / AlmaLinux 实测） | 8, 9, 10 | `dnf`（DNF4） |
+| Fedora | 43, 44 | `dnf`（DNF5） |
 
 ### 尽力支持
 
 以下系统需要显式加 `--allow-best-effort`：
 
 - Debian 11
-- Ubuntu 20.04
-- CentOS Stream 8 / 9
+- Ubuntu 20.04（仅限已启用 Ubuntu Pro/ESM 安全源）
+- CentOS Stream 9 / 10
+- Oracle Linux 8 / 9 / 10
+- CloudLinux 8 / 9 / 10
 - Amazon Linux 2023
+
+Amazon Linux 2023 默认锁定在一个发行快照，`dnf-automatic` 不会替管理员自动前移 `releasever`；旧快照可能看不到新快照中已经发布的安全公告。SUN 只能检查当前已启用快照，管理员仍须用 `dnf check-release-update` 跟踪并按 Amazon 的升级流程前移发行版本，因此该系统不能获得与正式支持发行版相同的补丁完整性承诺。
+
+尽力支持表示 SUN 的代码路径兼容，不表示 SUN 能证明所有外部订阅或安全公告源仍然有效；管理员必须先确认系统确有持续更新的安全源。Ubuntu 20.04 的标准安全维护已经结束；SUN 只有在本机 Ubuntu Pro 客户端的结构化状态确认 `esm-infra` 已启用时，才按 ESM 的 2030-04-30 近似终止日计算支持期，否则继续告警该版本已结束安全支持。CentOS Stream 8 已停止维护，因此不再列入兼容矩阵。
+
+无凭据 CI 会对 Debian 11、Ubuntu 20.04（不包含 ESM entitlement）、CentOS Stream 9/10、Oracle Linux 8/9/10 和 Amazon Linux 2023 执行容器生命周期 smoke；这验证安装、真实依赖包事务、升级、回滚与 purge 代码路径，不证明订阅、安全源完整性或真实 systemd D-Bus。CloudLinux 目前只有 profile、依赖和失败关闭测试，因为没有可公开、无授权拉取且适合重复 CI 的官方镜像。
+
+未列出的 `ID_LIKE` 衍生版不会自动视为正式支持。只有显式传入 `--allow-best-effort`、能够从 ancestry 明确确认 apt，或在任何包安装、备份和配置写入前根据本机 `dnf`/`dnf5`/`yum` 版本输出明确探测出 DNF4/DNF5，并且依赖包、命令、配置、timer 和不可跳过的安装后 `doctor` 门禁全部通过时，安装器才会接受；模糊、冲突或失败的 DNF 探测会直接拒绝，同时声明 Debian/Ubuntu 与 RHEL/Fedora/CentOS 两类冲突 ancestry 的系统也会直接拒绝。
 
 ### 暂不支持
 
@@ -130,7 +140,7 @@ SUN **不会**：
 - Arch Linux
 - SUSE / openSUSE
 - 没有完整 systemd 的容器或极简系统
-- 已停止安全更新的 EOL 系统
+- 已 EOL 且没有有效厂商或延长安全源的系统
 
 ## 快速开始
 
@@ -504,7 +514,7 @@ SUN 会配置或使用：
 - `apt-listchanges`
 - apt periodic timers
 
-安装器会启用 unattended-upgrades 的安全更新周期任务。每次覆盖 `/etc/apt/apt.conf.d/20auto-upgrades` 前都会保存一份带时间戳的 SUN 专用备份；如果安装前已有该文件，首次安装还会固定保存原始基线；如果原本不存在，则在包管理器写入前记录一个受校验、可回滚的“原始缺失”标记。APT 目录内的标记和时间戳备份都以 `.bak` 结尾，避免 apt 对非配置文件输出扩展名提示；升级会迁移旧命名。`--purge-config` 会恢复固定基线，或按标记把该文件恢复为不存在，然后删除 SUN 的基线、标记和时间戳备份。
+安装器会启用 unattended-upgrades 的安全更新周期任务。每次覆盖 `/etc/apt/apt.conf.d/20auto-upgrades` 前都会保存一份带时间戳的 SUN 专用备份；如果安装前已有该文件，首次安装还会固定保存原始基线；如果原本不存在，则在包管理器写入前记录一个受校验、可回滚的“原始缺失”标记。如果 SUN 本次安装的 `unattended-upgrades` 依赖包创建了发行版默认文件，SUN 会用内容绑定的 SHA-256 proof 确认来源，再把该文件提升为固定基线并移除缺失标记；因此 purge 保留依赖包和发行版 timer 时，也会恢复一份可用的 vendor 配置。部分依赖事务只在 proof 精确匹配当前文件时允许重试或 purge 保留它；proof 缺失、损坏或不匹配时会失败关闭并保留现场。若依赖包没有创建文件，原始缺失标记仍然有效，purge 会恢复为不存在。APT 目录内的标记、proof 和时间戳备份都以 `.bak` 结尾，避免 apt 对非配置文件输出扩展名提示；升级会迁移旧命名。`--purge-config` 最后会删除 SUN 的基线、标记、proof 及时间戳备份。
 
 检测方式：
 
@@ -514,23 +524,37 @@ SUN 会配置或使用：
 
 ### RHEL 兼容发行版 / Fedora (`dnf`)
 
-SUN 会配置或使用：
+`BACKEND` 对 DNF4 和 DNF5 都保持为稳定值 `dnf`，SUN 在内部识别实际代际。
+
+DNF4（RHEL-compatible 8–10；生命周期在 Rocky/AlmaLinux 实测，以及尽力支持的 EL 衍生版）会配置或使用：
 
 - `dnf-automatic`
-- `yum-utils` 或 `dnf-utils`
+- `yum-utils`（Amazon Linux 2023 使用实际包名 `dnf-utils`）
 - `ca-certificates`
+- EL10 极简系统还会显式安装 `dnf`，因为初始镜像可能只有 `microdnf`
 
-检测方式：
+DNF4 检测方式：
 
 - `needs-restarting -r`（判断是否需要整机重启）
 - `needs-restarting -s`（列出需要重启的 systemd 服务；不再用裸 `needs-restarting` 的整表进程，避免误报）
-- `dnf updateinfo list security updates`
+- `dnf -q updateinfo list security`
 
-如果 `/etc/dnf/automatic.conf` 存在，SUN 会在第一次管理时固定保存原始基线，每次覆盖前另存时间戳备份，再将其配置为只安装安全更新。升级旧安装时会从最早的 SUN 时间戳备份迁移原始基线；普通卸载和随后重装不会改写它。`--purge-config` 恢复这份固定原始基线，并删除 SUN 的固定及时间戳备份。
+DNF5（Fedora 43/44）会使用 `dnf5-plugin-automatic`、`dnf5-plugins` 和 `ca-certificates`，并启用原生 `dnf5-automatic.timer`。该软件包还会安装独立的兼容名称 `dnf-automatic.timer`；若其原本已启用，SUN 会将它禁用，避免同一任务重复执行，安装失败则精确恢复原状态。运行时健康检查仍兼容两种 unit 名。DNF5 检测使用：
+
+- `dnf -q advisory list --security --updates --json`
+- `dnf -q check-upgrade --security`（正确处理有更新时的退出码 `100`）
+- `dnf needs-restarting` 和 `dnf needs-restarting -s`
+
+DNF5 的公告 JSON 会与实际可执行事务做交集，避免把仅有公告、但不适用于当前事务的包误报为可安装更新。SUN 另行清除普通 exclude 取得完整公告集合，并用单次查询选项 `--setopt=disable_excludes=*` 计算忽略 versionlock/exclude 的事务候选；两组差集用于发现被锁定、排除或事务约束阻塞的安全包。该查询不会改写 `/etc/dnf/versionlock.toml` 或持久 DNF 配置。
+
+两代 DNF 都使用 `/etc/dnf/automatic.conf`。如果该文件存在，SUN 会在第一次管理时固定保存原始基线，每次覆盖前另存时间戳备份；如果原本缺失，缺失 marker 会明确记录 DNF4 或 DNF5 代际。DNF4 的 `dnf-automatic` 依赖包若在本次安装中创建了发行版默认配置，SUN 会把该依赖安装后的 vendor 文件固化为基线并移除“原始缺失”标记；因此 `--purge-config` 会恢复可用的 vendor 配置，而不会让保留且仍启用的发行版 timer 指向缺失文件。依赖事务若在创建 vendor 配置后失败，SUN 会留下与文件内容绑定的 SHA-256 证明；此时立即 purge 只在证明精确匹配当前文件时保留该配置并清理 SUN 元数据，证明损坏或不匹配则拒绝猜测并保留现场。升级带旧缺失标记的 DNF4 安装时，SUN 可从受校验的最早 SUN 时间戳备份迁移原始 vendor 配置，绝不会把当前受管配置误作基线。直接执行 purge 不会仅凭时间戳历史推断来源：DNF4 marker 与当前文件并存且没有固定基线或匹配当前内容的 proof 时，即使仍有时间戳备份也会失败关闭并保留现场。安装器只有在无法从受校验的最早时间戳或匹配 proof 建立可信基线时才会同样停止。如果 `dnf-automatic` 已显示为安装状态，但配置文件缺失且没有可信历史基线，安装器也会在启用 timer 前停止；需先 purge 本次未完成的 SUN 元数据，再重装该包或恢复可信 vendor 配置。DNF5 的配置路径由软件包声明为可缺失并有内置 vendor fallback；如果该文件原本不存在，SUN 保留受校验的缺失标记，purge 时恢复为不存在。普通卸载和随后重装不会改写固定基线；purge 最后会删除 SUN 的基线、标记及时间戳备份。
+
+DNF4 软件包可能同时 preset `dnf-automatic.timer`、`dnf-automatic-notifyonly.timer`、`dnf-automatic-download.timer` 和 `dnf-automatic-install.timer`。SUN 安装成功后只保留主 `dnf-automatic.timer` 启用，并禁用其余三个互斥变体，避免同一套配置被多组 automatic job 并行执行；安装事务失败时会精确恢复四个 timer 的原状态。成功卸载不会猜测或重建安装前的变体组合，而是维持卸载当时所有发行版 timer 的状态。
 
 ```ini
 upgrade_type = security
 apply_updates = yes
+reboot = never
 ```
 
 ## 日常操作
@@ -584,7 +608,9 @@ sudo security-update-notify uninstall
 sudo security-update-notify uninstall --purge-config
 ```
 
-作为依赖安装的软件包会保留，不会自动卸载。`--purge-config` 会删除 SUN 的配置、Telegram/飞书凭据、状态、升级备份（其中可能含 bot token 副本）以及轮转日志，并在备份存在时恢复 apt/dnf 自动更新配置。
+作为依赖安装的软件包会保留，不会自动卸载。`--purge-config` 会删除 SUN 的配置、Telegram/飞书凭据、状态、升级备份（其中可能含 bot token 副本）以及轮转日志，并在备份存在时恢复 apt/dnf 自动更新配置。卸载器不会改变发行版自身 automatic timer 的当前状态；它不会因为移除监控工具而主动关闭安全更新，也不会覆盖管理员之后对该 timer 的调整。
+
+卸载器会对正常返回的并发变化失败关闭：它使用目录句柄、无覆盖 rename 和内容/元数据复验，并保留 `.security-update-notify-restore.*`、`.security-update-notify-purge.*` 或 `.security-update-notify-conflict.*` 现场，避免覆盖或删除管理员同时创建的文件。但 `--purge-config` 不承诺跨 SIGKILL、内核崩溃或掉电中间点的事务原子性；执行时不要强制终止。若 purge 异常中断，请先检查这些保留文件和当前 apt/dnf 配置，不要在未确认现场前反复重试。
 
 ## Release 签名
 
@@ -627,7 +653,7 @@ go run ./cmd/sun-release package
 cd dist && sha256sum -c security-update-notify-*.tar.gz.sha256
 ```
 
-`build/compat-test.sh` 和 `build/rollback-test.sh` 会修改系统路径，只能按上面的命令在一次性 Docker 容器中运行，禁止直接在宿主机执行。正式发布还必须完成 CI 的五架构实跑、恶意归档、签名和公开资产复验门禁。
+`build/compat-test.sh`、`build/rollback-test.sh`、`build/interactive-test.sh`、`build/rocky-bootstrap-test.sh` 和 `build/rpm-best-effort-test.sh` 会修改系统路径，只能在一次性 Docker 容器中运行，禁止直接在宿主机执行。正式发布还必须完成 CI 的五架构实跑、恶意归档、签名和公开资产复验门禁。
 
 生成文件：
 

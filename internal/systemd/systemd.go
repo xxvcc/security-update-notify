@@ -18,13 +18,20 @@ const systemctlCommandTimeout = 15 * time.Second
 // Available 报告本机是否有 systemctl。
 func Available() bool { return sysexec.Look("systemctl") }
 
-// IsEnabled 复刻 `systemctl is-enabled <unit>`（退出 0 视为已启用）。
+// IsEnabled reports whether systemctl considers unit persistently or runtime enabled.
+// Other successful states such as static, alias, and indirect do not guarantee that
+// the unit is scheduled across boots.
 func IsEnabled(unit string) bool {
 	return isEnabledWithTimeout(unit, systemctlCommandTimeout)
 }
 
 func isEnabledWithTimeout(unit string, timeout time.Duration) bool {
-	return sysexec.RunTimeout(timeout, "systemctl", "is-enabled", unit).Code == 0
+	result := sysexec.RunTimeout(timeout, "systemctl", "is-enabled", unit)
+	if result.Code != 0 {
+		return false
+	}
+	state := strings.TrimSpace(result.Stdout)
+	return state == "enabled" || state == "enabled-runtime"
 }
 
 // ShowValue 复刻 `systemctl show <unit> -p <prop> --value`，去掉尾部换行；失败返回空。

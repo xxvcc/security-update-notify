@@ -45,8 +45,19 @@ func TestDoctorDNFHappyPathWithSkippedNotificationProbe(t *testing.T) {
 	}
 	dir := t.TempDir()
 	writeTestCommand(t, dir, "uname", "printf '%s\\n' '6.12-doctor'\n")
-	writeTestCommand(t, dir, "systemctl", "exit 0\n")
-	writeTestCommand(t, dir, "dnf", "exit 0\n")
+	writeTestCommand(t, dir, "systemctl", `
+if [ "$1" = "is-enabled" ]; then
+  printf '%s\n' enabled
+fi
+exit 0
+`)
+	writeTestCommand(t, dir, "dnf", `
+if [ "$*" = "--version" ]; then
+  printf '%s\n' '4.14.0'
+fi
+exit 0
+`)
+	writeTestCommand(t, dir, "dnf-automatic", "exit 0\n")
 	writeTestCommand(t, dir, "needs-restarting", `
 case "$1" in
   -r) printf '%s\n' 'Reboot should not be necessary.' ;;
@@ -55,6 +66,11 @@ case "$1" in
 esac
 `)
 	t.Setenv("PATH", dir)
+	dnfConfig := filepath.Join(t.TempDir(), "automatic.conf")
+	if err := os.WriteFile(dnfConfig, []byte("[commands]\nupgrade_type = security\napply_updates = yes\nreboot = never\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SECURITY_UPDATE_NOTIFY_DNF_AUTOMATIC_CONF", dnfConfig)
 	envPath := filepath.Join(t.TempDir(), "doctor.env")
 	body := "BACKEND=dnf\nHOST_LABEL=doctor-host\nINCLUDE_PUBLIC_IP=0\nNOTIFY_CHANNELS=telegram\nCHECK_UPDATE_HEALTH=0\nCHECK_EOL=0\nCHECK_SELF_UPDATE=0\n"
 	if err := os.WriteFile(envPath, []byte(body), 0o600); err != nil {
@@ -67,6 +83,73 @@ esac
 
 	if got := Doctor(cfg, DoctorOpts{Version: "2.7.3", Lang: i18n.EN, EnvPath: envPath, SkipNotify: true}); got != 0 {
 		t.Fatalf("Doctor()=%d want 0", got)
+	}
+
+	if err := os.WriteFile(dnfConfig, []byte("[commands]\nupgrade_type = default\napply_updates = no\nreboot = when-needed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, got := captureDoctorOutput(t, func() int {
+		return Doctor(cfg, DoctorOpts{Version: "2.7.3", Lang: i18n.EN, EnvPath: envPath, SkipNotify: true})
+	})
+	if got != 1 {
+		t.Fatalf("Doctor() with policy drift=%d want 1", got)
+	}
+	for _, want := range []string{
+		"FAIL dnf-automatic is not configured for security-only updates",
+		"FAIL dnf-automatic is not configured to apply updates",
+		"FAIL dnf-automatic is not configured to avoid automatic reboots",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("Doctor output missing %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestDoctorReportsUnknownDNFGenerationWithoutFallbackCommands(t *testing.T) {
+	dir := t.TempDir()
+	callLog := filepath.Join(t.TempDir(), "dnf.calls")
+	writeTestCommand(t, dir, "uname", "printf '%s\\n' '6.12-doctor'\n")
+	writeTestCommand(t, dir, "systemctl", "exit 0\n")
+	writeTestCommand(t, dir, "dnf", `
+printf '%s\n' "dnf:$*" >> "$SUN_DNF_CALL_LOG"
+if [ "$*" = "--version" ]; then
+  printf '%s\n' 'dnf version future'
+  exit 0
+fi
+exit 99
+`)
+	writeTestCommand(t, dir, "needs-restarting", `printf '%s\n' "needs-restarting:$*" >> "$SUN_DNF_CALL_LOG"`)
+	writeTestCommand(t, dir, "dnf-automatic", `printf '%s\n' "dnf-automatic:$*" >> "$SUN_DNF_CALL_LOG"`)
+	t.Setenv("PATH", dir)
+	t.Setenv("SUN_DNF_CALL_LOG", callLog)
+	t.Setenv("SECURITY_UPDATE_NOTIFY_DNF_AUTOMATIC_CONF", filepath.Join(t.TempDir(), "missing.conf"))
+	envPath := filepath.Join(t.TempDir(), "doctor.env")
+	body := "BACKEND=dnf\nHOST_LABEL=doctor-host\nINCLUDE_PUBLIC_IP=0\nNOTIFY_CHANNELS=unsupported\nCHECK_UPDATE_HEALTH=0\nCHECK_EOL=0\nCHECK_SELF_UPDATE=0\n"
+	if err := os.WriteFile(envPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output, got := captureDoctorOutput(t, func() int {
+		return Doctor(cfg, DoctorOpts{Version: "2.7.3", Lang: i18n.EN, EnvPath: envPath})
+	})
+	if got != 1 || !strings.Contains(output, "FAIL could not reliably identify DNF generation (dnf --version)") {
+		t.Fatalf("Doctor()=%d output:\n%s", got, output)
+	}
+	calls, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Fields(string(calls)) {
+		if line != "dnf:--version" {
+			t.Fatalf("fallback command executed; calls=%q", calls)
+		}
+	}
+	if strings.Count(string(calls), "dnf:--version\n") < 2 {
+		t.Fatalf("expected doctor and watchdog probes; calls=%q", calls)
 	}
 }
 

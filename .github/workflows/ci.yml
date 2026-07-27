@@ -108,25 +108,29 @@ jobs:
             build/bootstrap-test.sh \
             build/build.sh \
             build/compat-test.sh \
+            build/dnf5-versionlock-test.sh \
             build/interactive-test.sh \
             build/live-canary.sh \
             build/reproducibility-check.sh \
             build/rocky-bootstrap-test.sh \
+            build/rpm-best-effort-test.sh \
             build/rollback-test.sh \
             build/runtime-lock-test.sh
 
       - name: ShellCheck the retained Shell gates
         run: |
-          shellcheck -s bash -S warning \
+          shellcheck -s bash -S info \
             sun.sh \
             build/archive-safety-test.sh \
             build/bootstrap-test.sh \
             build/build.sh \
             build/compat-test.sh \
+            build/dnf5-versionlock-test.sh \
             build/interactive-test.sh \
             build/live-canary.sh \
             build/reproducibility-check.sh \
             build/rocky-bootstrap-test.sh \
+            build/rpm-best-effort-test.sh \
             build/rollback-test.sh \
             build/runtime-lock-test.sh
 
@@ -151,27 +155,6 @@ jobs:
             exit 1
           fi
           grep -Fq 'refusing to run outside a GitHub-hosted runner' canary-guard.err
-
-      - name: Build current installer for Rocky minimal lifecycle gate
-        run: |
-          set -euo pipefail
-          version="$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' VERSION)"
-          [[ -n "$version" && "$(wc -l <VERSION)" -eq 1 ]]
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-            go build -trimpath -ldflags "-s -w -X main.Version=$version" \
-            -o "$RUNNER_TEMP/security-update-notify-rocky" ./cmd/security-update-notify
-
-      - name: Rocky minimal bootstrap and Go installer lifecycle gate
-        run: |
-          set -euo pipefail
-          for image in rockylinux:8-minimal rockylinux:9-minimal; do
-            docker run --rm \
-              -e SUN_CONTAINER_TEST=1 \
-              -e SUN_INSTALL_BINARY=/sun-bin \
-              -v "$PWD:/src:ro" \
-              -v "$RUNNER_TEMP/security-update-notify-rocky:/sun-bin:ro" \
-              "$image" bash /src/build/rocky-bootstrap-test.sh
-          done
 
       - name: Stable mirror publication invariants
         run: |
@@ -320,6 +303,142 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  rpm-lifecycle:
+    if: ${{ github.event_name != 'release' }}
+    needs: package
+    name: RPM lifecycle (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        image:
+          - 'rockylinux/rockylinux:8-minimal'
+          - 'rockylinux/rockylinux:9-minimal'
+          - 'rockylinux/rockylinux:10-minimal'
+          - 'almalinux:8-minimal'
+          - 'almalinux:9-minimal'
+          - 'almalinux:10-minimal'
+          - 'fedora:43'
+          - 'fedora:44'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download CI release set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: security-update-notify-dist
+          path: dist
+
+      - name: Select the packaged amd64 installer
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' VERSION)"
+          [[ -n "$version" && "$(wc -l <VERSION)" -eq 1 ]]
+          package_root="$RUNNER_TEMP/security-update-notify-rpm-package"
+          mkdir -p "$package_root"
+          tar -xzf "dist/security-update-notify-$version.tar.gz" -C "$package_root"
+          runtime="$package_root/security-update-notify-$version/files/security-update-notify-linux-amd64"
+          [[ -x "$runtime" ]]
+          printf 'SUN_INSTALL_BINARY=%s\n' "$runtime" >>"$GITHUB_ENV"
+
+      - name: Bootstrap, install, rollback, upgrade, and purge
+        run: |
+          docker run --rm \
+            -e SUN_CONTAINER_TEST=1 \
+            -e SUN_INSTALL_BINARY=/sun-bin \
+            -v "$PWD:/src:ro" \
+            -v "$SUN_INSTALL_BINARY:/sun-bin:ro" \
+            "${{ matrix.image }}" bash /src/build/rocky-bootstrap-test.sh
+
+  best-effort-apt-lifecycle:
+    if: ${{ github.event_name != 'release' }}
+    needs: package
+    name: Best-effort APT lifecycle (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - 'debian:11'
+          - 'ubuntu:20.04'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download CI release set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: security-update-notify-dist
+          path: dist
+
+      - name: Upgrade a schema-3 installation
+        run: |
+          docker run --rm \
+            -e SUN_CONTAINER_TEST=1 \
+            -e SUN_ALLOW_BEST_EFFORT=1 \
+            -v "$PWD:/src:ro" \
+            "${{ matrix.image }}" bash /src/build/compat-test.sh
+
+      - name: Fresh install, failed-upgrade rollback, and uninstall lifecycle
+        run: |
+          docker run --rm \
+            -e SUN_CONTAINER_TEST=1 \
+            -e SUN_ALLOW_BEST_EFFORT=1 \
+            -v "$PWD:/src:ro" \
+            "${{ matrix.image }}" bash /src/build/rollback-test.sh
+
+  best-effort-rpm-lifecycle:
+    if: ${{ github.event_name != 'release' }}
+    needs: package
+    name: Best-effort RPM lifecycle (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        image:
+          - 'quay.io/centos/centos:stream9'
+          - 'quay.io/centos/centos:stream10'
+          - 'oraclelinux:8-slim'
+          - 'oraclelinux:9-slim'
+          - 'oraclelinux:10-slim'
+          - 'amazonlinux:2023'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download CI release set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: security-update-notify-dist
+          path: dist
+
+      - name: Select the packaged amd64 installer
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' VERSION)"
+          [[ -n "$version" && "$(wc -l <VERSION)" -eq 1 ]]
+          package_root="$RUNNER_TEMP/security-update-notify-best-effort-rpm-package"
+          mkdir -p "$package_root"
+          tar -xzf "dist/security-update-notify-$version.tar.gz" -C "$package_root"
+          runtime="$package_root/security-update-notify-$version/files/security-update-notify-linux-amd64"
+          [[ -x "$runtime" ]]
+          printf 'SUN_INSTALL_BINARY=%s\n' "$runtime" >>"$GITHUB_ENV"
+
+      - name: Install, upgrade, and purge with real RPM dependencies
+        run: |
+          docker run --rm \
+            -e SUN_CONTAINER_TEST=1 \
+            -e SUN_INSTALL_BINARY=/sun-bin \
+            -v "$PWD:/src:ro" \
+            -v "$SUN_INSTALL_BINARY:/sun-bin:ro" \
+            "${{ matrix.image }}" bash /src/build/rpm-best-effort-test.sh
+
   lifecycle:
     if: ${{ github.event_name != 'release' }}
     needs: package
@@ -333,6 +452,7 @@ jobs:
           - debian:13
           - ubuntu:22.04
           - ubuntu:24.04
+          - ubuntu:26.04
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -357,9 +477,18 @@ jobs:
     needs: package
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      GOTOOLCHAIN: local
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up pinned Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.5'
+          check-latest: false
+          cache: false
 
       - name: Download CI release set
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -371,6 +500,26 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-user-static
+
+      - name: Run restore filesystem syscalls on all five architectures
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          tests='^(TestPurgeRestorePreservesFileMetadataAndXattrs|TestPurgeRestoresFixedAPTBackupWhenDestinationIsMissing|TestPurgeAPTDoesNotDeleteFixedBackupReplacedDuringCleanup|TestPurgeDNFDoesNotDeleteConfigRecreatedAfterValidatedTargetDisappears|TestRestoreFileRetainsConcurrentDestinationChangedAfterExchange)$'
+          for arch in amd64 arm64 386 ppc64le s390x; do
+            binary="$work/uninstaller-$arch.test"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+              go test -c -o "$binary" ./internal/uninstaller
+            case "$arch" in
+              amd64|386) command=("$binary") ;;
+              arm64) command=(qemu-aarch64-static "$binary") ;;
+              ppc64le) command=(qemu-ppc64le-static "$binary") ;;
+              s390x) command=(qemu-s390x-static "$binary") ;;
+              *) echo "unknown architecture: $arch" >&2; exit 2 ;;
+            esac
+            "${command[@]}" -test.run "$tests" -test.count=1
+          done
 
       - name: Run all five packaged architectures
         run: |

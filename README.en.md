@@ -4,8 +4,8 @@
   <a href="https://github.com/xxvcc/security-update-notify/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/xxvcc/security-update-notify?style=flat-square&label=release&color=2EA043"></a>
   <img alt="Linux" src="https://img.shields.io/badge/Linux-systemd-1793D1?style=flat-square&logo=linux&logoColor=white">
   <img alt="Debian" src="https://img.shields.io/badge/Debian-12%20%7C%2013-A81D33?style=flat-square&logo=debian&logoColor=white">
-  <img alt="Ubuntu" src="https://img.shields.io/badge/Ubuntu-22.04%20%7C%2024.04-E95420?style=flat-square&logo=ubuntu&logoColor=white">
-  <img alt="RHEL compatible" src="https://img.shields.io/badge/RHEL%20compatible-8%20%7C%209-EE0000?style=flat-square&logo=redhat&logoColor=white">
+  <img alt="Ubuntu" src="https://img.shields.io/badge/Ubuntu-22.04%20%7C%2024.04%20%7C%2026.04-E95420?style=flat-square&logo=ubuntu&logoColor=white">
+  <img alt="RHEL compatible" src="https://img.shields.io/badge/RHEL%20compatible-8%20%7C%209%20%7C%2010-EE0000?style=flat-square&logo=redhat&logoColor=white">
   <img alt="License" src="https://img.shields.io/badge/License-MIT-green?style=flat-square">
 </p>
 
@@ -113,18 +113,28 @@ SUN does **not**:
 | Family | Versions | Backend |
 | --- | --- | --- |
 | Debian | 12, 13 | `apt` |
-| Ubuntu | 22.04, 24.04 | `apt` |
-| RHEL / Rocky / AlmaLinux | 8, 9 | `dnf` |
-| Fedora | current releases | `dnf` |
+| Ubuntu | 22.04, 24.04, 26.04 | `apt` |
+| RHEL-compatible (tested on Rocky / AlmaLinux) | 8, 9, 10 | `dnf` (DNF4) |
+| Fedora | 43, 44 | `dnf` (DNF5) |
 
 ### Best-effort support
 
 These require `--allow-best-effort`:
 
 - Debian 11
-- Ubuntu 20.04
-- CentOS Stream 8 / 9
+- Ubuntu 20.04 (only with Ubuntu Pro/ESM security sources enabled)
+- CentOS Stream 9 / 10
+- Oracle Linux 8 / 9 / 10
+- CloudLinux 8 / 9 / 10
 - Amazon Linux 2023
+
+Amazon Linux 2023 is pinned to a release snapshot by default, and `dnf-automatic` does not advance `releasever` on the administrator's behalf. An older snapshot can therefore miss security advisories already published in a newer snapshot. SUN can inspect only the currently enabled snapshot; administrators must still track `dnf check-release-update` and advance releases through Amazon's documented upgrade process, so this platform cannot receive the same patch-completeness guarantee as an officially supported distribution.
+
+Best-effort support means SUN's code paths are compatible; it does not mean SUN can prove that every external entitlement or security-advisory source remains active. Administrators must first confirm that the host has a continuously maintained security source. Ubuntu 20.04 standard security maintenance has ended; SUN uses the approximate ESM end date of 2030-04-30 only when the local Ubuntu Pro client's structured status confirms that `esm-infra` is enabled, and otherwise continues to report that the release has ended security support. CentOS Stream 8 has reached end of maintenance and is no longer listed in the compatibility matrix.
+
+Credential-free CI runs container lifecycle smoke tests on Debian 11, Ubuntu 20.04 (without an ESM entitlement), CentOS Stream 9/10, Oracle Linux 8/9/10, and Amazon Linux 2023. This covers installation, real dependency transactions, upgrade, rollback, and purge code paths; it does not prove entitlement, security-source completeness, or real systemd D-Bus behavior. CloudLinux currently has profile, dependency, and fail-closed tests only because no official image is publicly pullable without authorization and suitable for repeatable CI.
+
+Unlisted `ID_LIKE` derivatives are never promoted to official support. The installer accepts one only with an explicit `--allow-best-effort`; an apt backend established unambiguously from its ancestry, or a DNF4/DNF5 generation established from the installed `dnf`/`dnf5`/`yum` version output before any package installation, backup, or configuration write; and successful gates for every dependency, command, configuration file, timer, and a mandatory post-install `doctor` run that cannot be skipped. Ambiguous, conflicting, or failed DNF probes are rejected, as is a derivative claiming both Debian/Ubuntu and RHEL/Fedora/CentOS ancestry.
 
 ### Not supported
 
@@ -132,7 +142,7 @@ These require `--allow-best-effort`:
 - Arch Linux
 - SUSE / openSUSE
 - containers or minimal systems without full systemd
-- end-of-life systems without security updates
+- EOL systems without an active vendor or extended-security source
 
 ## Quick start
 
@@ -506,7 +516,7 @@ SUN configures or uses:
 - `apt-listchanges`
 - apt periodic timers
 
-The installer enables unattended-upgrades security update timers. Before each overwrite of `/etc/apt/apt.conf.d/20auto-upgrades`, it saves a timestamped SUN-specific backup. If the file existed before SUN, the first install also preserves a fixed original baseline; if it was absent, SUN records a validated, rollback-protected absence marker before package-manager writes. Metadata stored in the APT configuration directory ends in `.bak`, so apt silently ignores it instead of printing invalid-extension notices; upgrades migrate the older names. `--purge-config` restores the fixed baseline or removes the file to restore original absence, then deletes SUN's baseline, marker, and timestamped backups.
+The installer enables unattended-upgrades security update timers. Before each overwrite of `/etc/apt/apt.conf.d/20auto-upgrades`, it saves a timestamped SUN-specific backup. If the file existed before SUN, the first install also preserves a fixed original baseline; if it was absent, SUN records a validated, rollback-protected absence marker before package-manager writes. When the `unattended-upgrades` dependency installed by this SUN transaction creates the distribution default, SUN binds its exact contents to a SHA-256 proof, promotes that file to the fixed baseline, and removes the absence marker. Purge can therefore retain the package and distribution timer while restoring a usable vendor configuration. A partial dependency transaction may be retried or purged only when the proof exactly matches the current file; a missing, damaged, or mismatched proof fails closed and preserves the evidence. If the package did not create the file, the original-absence marker remains authoritative and purge restores the file to absence. Markers, proofs, and timestamped backups in the APT configuration directory end in `.bak`, so apt silently ignores them instead of printing invalid-extension notices; upgrades migrate the older names. `--purge-config` finally removes SUN's baseline, marker, proof, and timestamped backups.
 
 It checks:
 
@@ -516,23 +526,37 @@ It checks:
 
 ### RHEL-compatible / Fedora (`dnf`)
 
-SUN configures or uses:
+`BACKEND` remains the stable value `dnf` for both DNF4 and DNF5; SUN detects the installed generation internally.
+
+DNF4 (RHEL-compatible 8–10, lifecycle-tested on Rocky/AlmaLinux, and best-effort EL derivatives) configures or uses:
 
 - `dnf-automatic`
-- `yum-utils` or `dnf-utils`
+- `yum-utils` (Amazon Linux 2023 uses the actual package name `dnf-utils`)
 - `ca-certificates`
+- an explicit `dnf` package on EL10 minimal systems, whose base image may provide only `microdnf`
 
-It checks:
+DNF4 checks:
 
 - `needs-restarting -r` (whether a full reboot is required)
 - `needs-restarting -s` (systemd services that need a restart; no longer the raw `needs-restarting` process list, which caused false alerts)
-- `dnf updateinfo list security updates`
+- `dnf -q updateinfo list security`
 
-If `/etc/dnf/automatic.conf` exists, SUN preserves one fixed original baseline when it first takes ownership, saves an additional timestamped copy before each overwrite, then configures security-only automatic updates. An upgrade from an older installation migrates the earliest SUN timestamped backup into that baseline; a normal uninstall followed by reinstall does not replace it. `--purge-config` restores the fixed original baseline and removes SUN's fixed and timestamped backups.
+DNF5 (Fedora 43/44) uses `dnf5-plugin-automatic`, `dnf5-plugins`, and `ca-certificates`, and enables the native `dnf5-automatic.timer`. The package also ships the separate compatibility name `dnf-automatic.timer`; SUN disables that timer if it was enabled so the identical job cannot run twice, and restores its exact state if installation fails. Runtime health checks still recognize either unit name. DNF5 checks use:
+
+- `dnf -q advisory list --security --updates --json`
+- `dnf -q check-upgrade --security` (including its update-present exit code `100`)
+- `dnf needs-restarting` and `dnf needs-restarting -s`
+
+SUN intersects DNF5 advisory JSON with the actual transaction candidate set so advisory-only packages are not reported as installable updates. It separately clears ordinary excludes for the complete advisory set and uses the per-query option `--setopt=disable_excludes=*` to calculate transaction candidates without versionlock or exclude filtering. The differences identify security packages blocked by locks, excludes, or transaction constraints. This query does not modify `/etc/dnf/versionlock.toml` or persistent DNF configuration.
+
+Both generations use `/etc/dnf/automatic.conf`. If it exists, SUN preserves one fixed original baseline when it first takes ownership and saves an additional timestamped copy before each overwrite; if it was absent, the absence marker explicitly records the DNF4 or DNF5 generation. When the retained DNF4 `dnf-automatic` dependency creates its distribution default during this installation, SUN adopts that post-dependency vendor file as the fixed baseline and removes the original-absence marker. `--purge-config` therefore restores a usable vendor configuration instead of leaving the retained, enabled distribution timer pointed at a missing file. If the dependency transaction fails after creating that vendor configuration, SUN leaves a SHA-256 proof bound to the file contents. An immediate purge then preserves the configuration and removes SUN metadata only when that proof exactly matches the current file; a damaged or mismatched proof fails closed and preserves the evidence. When upgrading an older DNF4 installation that still has an absence marker, SUN can migrate the validated earliest SUN timestamped backup and never mistakes the current managed configuration for the vendor baseline. A direct purge does not infer provenance from timestamp history alone: when a DNF4 marker and current file coexist without a fixed baseline or proof matching the current contents, it fails closed and preserves the evidence even if timestamped backups remain. The installer likewise stops only when it cannot establish a trusted baseline from the validated earliest timestamp or a matching proof. If `dnf-automatic` is already reported as installed but its configuration is missing and no trusted historical baseline exists, the installer also stops before enabling the timer; purge the incomplete SUN metadata, then reinstall the package or restore a trusted vendor configuration before retrying. DNF5 declares the path as optional and has a packaged vendor fallback, so a file that was originally absent keeps its validated absence marker and purge restores it to absence. A normal uninstall followed by reinstall does not replace a fixed baseline; purge finally removes SUN's baseline, marker, and timestamped backups.
+
+DNF4 packages may preset `dnf-automatic.timer`, `dnf-automatic-notifyonly.timer`, `dnf-automatic-download.timer`, and `dnf-automatic-install.timer` together. After a successful SUN installation, only the primary `dnf-automatic.timer` remains enabled; the three mutually exclusive variants are disabled so multiple automatic jobs cannot run the same configuration in parallel. A failed installation restores the exact prior state of all four timers. A later successful uninstall does not guess or reconstruct the pre-install variant combination; it leaves every distribution timer in its state at uninstall time.
 
 ```ini
 upgrade_type = security
 apply_updates = yes
+reboot = never
 ```
 
 ## Operations
@@ -586,7 +610,9 @@ Remove config and state too:
 sudo security-update-notify uninstall --purge-config
 ```
 
-Packages installed as dependencies are left in place. `--purge-config` removes SUN config, Telegram/Feishu credentials, state, upgrade backups (which may contain bot-token copies) and rotated logs, and restores apt/dnf automatic-update config when a SUN-created backup exists.
+Packages installed as dependencies are left in place. `--purge-config` removes SUN config, Telegram/Feishu credentials, state, upgrade backups (which may contain bot-token copies) and rotated logs, and restores apt/dnf automatic-update config when a SUN-created backup exists. The uninstaller leaves the distribution's own automatic timer in its current state: removing the monitoring tool does not actively disable security updates or override later administrator changes to that timer.
+
+The uninstaller fails closed on concurrent changes that return normally: it uses directory handles, no-overwrite renames, and content/metadata revalidation, and retains `.security-update-notify-restore.*`, `.security-update-notify-purge.*`, or `.security-update-notify-conflict.*` evidence instead of overwriting or deleting an administrator-created concurrent file. `--purge-config` does not, however, promise transactional atomicity across SIGKILL, a kernel crash, or power loss; do not forcibly terminate it. If purge is interrupted, inspect those retained files and the current apt/dnf configuration before retrying.
 
 ## Release signatures
 
@@ -629,7 +655,7 @@ go run ./cmd/sun-release package
 cd dist && sha256sum -c security-update-notify-*.tar.gz.sha256
 ```
 
-`build/compat-test.sh` and `build/rollback-test.sh` modify system paths and must only be run with the disposable Docker commands above, never directly on the host. An official release must also pass CI's five-architecture execution, hostile-archive, signature, and public-asset verification gates.
+`build/compat-test.sh`, `build/rollback-test.sh`, `build/interactive-test.sh`, `build/rocky-bootstrap-test.sh`, and `build/rpm-best-effort-test.sh` modify system paths and must only run in disposable Docker containers, never directly on the host. An official release must also pass CI's five-architecture execution, hostile-archive, signature, and public-asset verification gates.
 
 Generated files:
 

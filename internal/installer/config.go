@@ -3,12 +3,15 @@ package installer
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"regexp"
 	"strings"
+	"time"
 
+	"github.com/xxvcc/security-update-notify/internal/backend"
 	"github.com/xxvcc/security-update-notify/internal/config"
 	"github.com/xxvcc/security-update-notify/internal/osrel"
 )
@@ -67,11 +70,12 @@ type installPlan struct {
 	osRelease      osrel.OSRelease
 	backend        string
 	supportTier    string
+	profile        osrel.Profile
 	existingConfig bool
 	upgrade        bool
 }
 
-func (i *Installer) prepare(options Options) (installPlan, error) {
+func (i *Installer) prepare(ctx context.Context, options Options) (installPlan, error) {
 	payload := options.Payload.withEmbeddedDefaults()
 	if len(payload.Runtime) == 0 {
 		return installPlan{}, invalid("runtime payload is required")
@@ -137,12 +141,21 @@ func (i *Installer) prepare(options Options) (installPlan, error) {
 	if err != nil {
 		return installPlan{}, err
 	}
-	detected, tier := osrel.SupportTier(osRelease)
+	profile := osrel.ProfileFor(osRelease)
+	detected, tier := profile.Backend, profile.Tier
 	if tier == osrel.Unsupported {
-		return installPlan{}, failure("detect distribution", fmt.Errorf("unsupported distribution ID=%s VERSION_ID=%s", osRelease.ID, osRelease.VersionID))
+		if options.AllowBestEffort && profile.Inferred {
+			tier = osrel.BestEffort
+			profile.Tier = tier
+		} else {
+			return installPlan{}, failure("detect distribution", fmt.Errorf("unsupported distribution ID=%s VERSION_ID=%s", osRelease.ID, osRelease.VersionID))
+		}
 	}
 	if tier == osrel.BestEffort && !options.AllowBestEffort {
 		return installPlan{}, failure("detect distribution", fmt.Errorf("%s is best-effort; explicit opt-in is required", displayOS(osRelease)))
+	}
+	if profile.Inferred && options.SkipPostInstallCheck {
+		return installPlan{}, invalid("unlisted ID_LIKE derivatives require the post-install verification gate")
 	}
 	backend := values["BACKEND"]
 	if backend == "auto" {
@@ -150,6 +163,16 @@ func (i *Installer) prepare(options Options) (installPlan, error) {
 	}
 	if backend != "apt" && backend != "dnf" {
 		return installPlan{}, invalid("invalid or unsupported backend: %s", backend)
+	}
+	if backend != detected {
+		return installPlan{}, invalid("backend %s does not match supported host backend %s", backend, detected)
+	}
+	if profile.Engine == osrel.EngineUnknown {
+		profile, err = i.probeInferredDNFProfile(ctx, osRelease)
+		if err != nil {
+			return installPlan{}, err
+		}
+		profile.Tier = tier
 	}
 	values["BACKEND"] = backend
 
@@ -163,8 +186,51 @@ func (i *Installer) prepare(options Options) (installPlan, error) {
 	}
 	return installPlan{
 		values: values, checkTime: checkTime, osRelease: osRelease,
-		backend: backend, supportTier: tier, existingConfig: exists, upgrade: upgrade,
+		backend: backend, supportTier: tier, profile: profile, existingConfig: exists, upgrade: upgrade,
 	}, nil
+}
+
+func (i *Installer) probeInferredDNFProfile(ctx context.Context, release osrel.OSRelease) (osrel.Profile, error) {
+	probeContext, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	detectedEngine := ""
+	foundCandidate := false
+	for _, candidate := range []string{"dnf", "dnf5", "yum"} {
+		if !i.runner.LookPath(candidate) {
+			continue
+		}
+		foundCandidate = true
+		result := i.runner.Run(probeContext, Command{
+			Name: candidate, Args: []string{"--version"}, Timeout: 30 * time.Second,
+		})
+		if result.Err != nil || result.Code != 0 {
+			continue
+		}
+		generation, known := backend.ProbeDNFGeneration(candidate, string(result.Stdout)+"\n"+string(result.Stderr))
+		if !known {
+			continue
+		}
+		engine := osrel.EngineDNF4
+		if generation == backend.DNF5 {
+			engine = osrel.EngineDNF5
+		}
+		if detectedEngine != "" && detectedEngine != engine {
+			return osrel.Profile{}, failure("detect DNF generation", errors.New("installed DNF commands report conflicting generations"))
+		}
+		detectedEngine = engine
+	}
+	if detectedEngine == "" {
+		detail := "no dnf, dnf5, or yum command was found"
+		if foundCandidate {
+			detail = "dnf, dnf5, and yum did not report an unambiguous successful version"
+		}
+		return osrel.Profile{}, failure("detect DNF generation", errors.New(detail))
+	}
+	profile, ok := osrel.ProfileForDetectedEngine(release, detectedEngine)
+	if !ok {
+		return osrel.Profile{}, failure("detect DNF generation", errors.New("detected engine cannot complete this distribution profile"))
+	}
+	return profile, nil
 }
 
 func normalizeAndValidateConfig(values map[string]string, allowMissingFeishuRecipient bool) error {
@@ -453,47 +519,25 @@ func (i *Installer) readExistingCheckTime() (string, error) {
 }
 
 func (i *Installer) readOSRelease() (osrel.OSRelease, error) {
-	data, _, err := i.fs.ReadFileFollow("/etc/os-release", 4<<20)
+	path := "/etc/os-release"
+	_, statErr := i.fs.Lstat(path)
+	if errors.Is(statErr, fs.ErrNotExist) {
+		path = "/usr/lib/os-release"
+	} else if statErr != nil {
+		return osrel.OSRelease{}, failure("read "+path, statErr)
+	}
+	data, _, err := i.fs.ReadFileFollow(path, 4<<20)
 	if err != nil {
-		return osrel.OSRelease{}, failure("read /etc/os-release", err)
+		return osrel.OSRelease{}, failure("read "+path, err)
 	}
 	if len(data) > 4<<20 {
-		return osrel.OSRelease{}, failure("read /etc/os-release", errors.New("file exceeds 4 MiB"))
+		return osrel.OSRelease{}, failure("read "+path, errors.New("file exceeds 4 MiB"))
 	}
-	var result osrel.OSRelease
-	scanner := bufio.NewScanner(bytes.NewReader(data))
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
-		key, value, ok := strings.Cut(strings.TrimSuffix(scanner.Text(), "\r"), "=")
-		if !ok {
-			continue
-		}
-		value = parseOSReleaseValue(value)
-		switch key {
-		case "ID":
-			result.ID = value
-		case "VERSION_ID":
-			result.VersionID = value
-		case "PRETTY_NAME":
-			result.PrettyName = value
-		case "ID_LIKE":
-			result.IDLike = value
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return osrel.OSRelease{}, failure("parse /etc/os-release", err)
+	result, err := osrel.Parse(bytes.NewReader(data))
+	if err != nil {
+		return osrel.OSRelease{}, failure("parse "+path, err)
 	}
 	return result, nil
-}
-
-func parseOSReleaseValue(value string) string {
-	if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
-		value = value[1 : len(value)-1]
-	}
-	if len(value) >= 2 && value[0] == '\'' && value[len(value)-1] == '\'' {
-		value = value[1 : len(value)-1]
-	}
-	return value
 }
 
 func displayOS(release osrel.OSRelease) string {

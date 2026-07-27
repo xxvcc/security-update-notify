@@ -118,7 +118,10 @@ for runtime in "${RUNTIMES[@]}"; do
     echo "$name wake-before-timeout exit $LAST_RC, expected doctor result 0 or 1" >&2
     exit 1
   }
-  ! grep -Fq 'Timed out waiting for the security-update-notify lock' "$TMP/$name-wake.out"
+  if grep -Fq 'Timed out waiting for the security-update-notify lock' "$TMP/$name-wake.out"; then
+    echo "$name reported a timeout after waking before the deadline" >&2
+    exit 1
+  fi
 done
 
 echo "Go production entrypoint lock parsing, precedence, error, timeout, and wake semantics passed"

@@ -268,6 +268,15 @@ func EolDateFor(id, ver, pretty string) string {
 			return "2027-06-01"
 		case "24.04":
 			return "2029-05-31"
+		case "26.04":
+			return "2031-05-31"
+		}
+	case "fedora":
+		switch ver {
+		case "43":
+			return "2026-12-02"
+		case "44":
+			return "2027-05-19"
 		}
 	case "rhel", "rocky", "ol", "cloudlinux":
 		switch major {
@@ -294,6 +303,8 @@ func EolDateFor(id, ver, pretty string) string {
 				return "2024-05-31"
 			case "9":
 				return "2027-05-31"
+			case "10":
+				return "2030-05-31"
 			}
 		} else {
 			switch major {
@@ -315,13 +326,18 @@ func EolDateFor(id, ver, pretty string) string {
 // CheckEOL 复刻 check_eol：已过 EOL 触发告警（sig=past）；90 天内临近仅信息（sig=soon）。
 // now 为当前 epoch；EOL 日期按本地时区 00:00 解释（对应 Bash `date -d "$eol" +%s`）。
 func CheckEOL(id, ver, pretty string, now int64) EOL {
+	return CheckEOLDate(EolDateFor(id, ver, pretty), now)
+}
+
+// CheckEOLDate evaluates a validated distribution support-end date. Callers may pass a strict SUPPORT_END
+// value from os-release; malformed dates produce an empty result rather than relying on permissive parsing.
+func CheckEOLDate(eol string, now int64) EOL {
 	var e EOL
-	eol := EolDateFor(id, ver, pretty)
 	if eol == "" {
 		return e
 	}
 	t, err := time.ParseInLocation("2006-01-02", eol, time.Local)
-	if err != nil {
+	if err != nil || t.Format("2006-01-02") != eol {
 		return e
 	}
 	eolEpoch := t.Unix()
