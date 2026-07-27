@@ -402,8 +402,10 @@ func TestInspectRepositoryFindsTrackedAndUntrackedReleaseChanges(t *testing.T) {
 	gitRun(t, root, "init", "-q")
 	gitRun(t, root, "config", "user.name", "SUN test")
 	gitRun(t, root, "config", "user.email", "sun@example.invalid")
-	if err := os.MkdirAll(filepath.Join(root, "internal"), 0o755); err != nil {
-		t.Fatal(err)
+	for _, dir := range []string{"docs", "internal"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("one\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -420,11 +422,14 @@ func TestInspectRepositoryFindsTrackedAndUntrackedReleaseChanges(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "internal", "new.go"), []byte("package internal\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(root, "docs", "new.md"), []byte("new documentation\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	dirty, err := inspectRepository(context.Background(), root, "3.0.0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !dirty.Dirty || !reflect.DeepEqual(dirty.DirtyFiles, []string{"README.md", "internal/new.go"}) {
+	if !dirty.Dirty || !reflect.DeepEqual(dirty.DirtyFiles, []string{"README.md", "docs/new.md", "internal/new.go"}) {
 		t.Fatalf("dirty files=%v", dirty.DirtyFiles)
 	}
 }

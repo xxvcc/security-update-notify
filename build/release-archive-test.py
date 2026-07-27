@@ -79,6 +79,17 @@ def main() -> None:
         "README.en.md": 0o644,
         "VERSION": 0o644,
         "sun.sh": 0o755,
+        "docs/development.en.md": 0o644,
+        "docs/development.md": 0o644,
+        "docs/go-port.md": 0o644,
+        "docs/installation.en.md": 0o644,
+        "docs/installation.md": 0o644,
+        "docs/operations.en.md": 0o644,
+        "docs/operations.md": 0o644,
+        "docs/releasing.en.md": 0o644,
+        "docs/releasing.md": 0o644,
+        "docs/security.en.md": 0o644,
+        "docs/security.md": 0o644,
         "files/needrestart-report-only.conf": 0o644,
         "files/release-signing.pub.asc": 0o644,
         "files/security-update-notify.logrotate": 0o644,
@@ -99,7 +110,7 @@ def main() -> None:
     file_modes.update(compatibility_modes)
     for arch in elf_arches:
         file_modes[f"files/security-update-notify-linux-{arch}"] = 0o755
-    directory_modes = {"": 0o755, "files": 0o755}
+    directory_modes = {"": 0o755, "docs": 0o755, "files": 0o755}
     # tarfile normalizes a directory header's trailing slash while preserving
     # internal path spelling, so compare its canonical member names directly.
     expected = {
