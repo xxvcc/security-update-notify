@@ -253,6 +253,7 @@ GPG 私钥，签名后立即复验。未打 tag 的本地开发包可显式 `--s
 
 CI/发布门禁包括：
 
+- CI 先对变更分类：只有 `.env.example`、CHANGELOG、README 或 `docs/` 变化时运行文档结构、版本绑定和高保障安装示例快速门禁；其他源码、构建脚本、workflow 或发布输入变化仍运行完整门禁。稳定的 `ci-gate` 聚合任务检查所选层级，GitHub 分支保护不直接绑定易变化的矩阵任务名。
 - gofmt、vet、固定版本 `staticcheck`/`govulncheck`、race、至少 75% 的 atomic 总覆盖率和定向安全测试；
 - `sun.sh` 及保留构建测试脚本的 Bash 语法、ShellCheck、TTY 输入和精确依赖解析；
 - 两次独立构建逐字节一致；

@@ -2,6 +2,8 @@
 
 ## 3.1.1
 
+- 将受保护分支 CI 分为文档快速门禁与完整实现门禁，并通过稳定的 `ci-gate` 聚合结果：纯 `.env.example`、CHANGELOG、README 和 `docs/` 改动不再重复运行全部 Linux 生命周期矩阵，源码、构建脚本、workflow 与发布输入仍执行完整门禁；兼容容器若在预期的晚期失败注入前退出，现在会输出被隐藏的真实安装诊断。
+  Splits protected-branch CI into a documentation fast path and the full implementation gate, with a stable `ci-gate` result: changes limited to `.env.example`, CHANGELOG, README, and `docs/` no longer rerun the entire Linux lifecycle matrix, while source, build-script, workflow, and release-input changes retain the full gates. Compatibility containers now print the previously hidden installer diagnostics when they exit before the expected late-failure injection.
 - 同步 3.1.x 文档与当前实现：补齐分级 Linux/DNF5 与并发恢复不变量，明确未列 `ID_LIKE` 衍生版的强制 doctor 回滚门禁、Ubuntu 20.04 `esm-infra` 自动识别及不应整体关闭 EOL 检查，并使本地构建命令与 CI 的 ShellCheck info、静态分析和 75% atomic coverage 门槛一致。
   Synchronizes the 3.1.x documentation with the implementation: tiered Linux/DNF5 and concurrent-restore invariants, the mandatory rollback-producing doctor gate for unlisted `ID_LIKE` derivatives, automatic Ubuntu 20.04 `esm-infra` recognition without disabling all EOL checks, and local build commands aligned with CI's ShellCheck info severity, static analysis, and 75% atomic-coverage gate.
 - 修正公网发布 canary 对 APT purge 基线的判断：安装前 `20auto-upgrades` 不存在时，若保留的 `unattended-upgrades` 依赖创建了受信任的 vendor 默认配置，canary 现在要求 purge 精确恢复该稳定备份；只有缺失标记时仍要求文件被删除，其他备份、标记或 proof 组合失败关闭。

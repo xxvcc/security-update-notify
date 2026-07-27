@@ -16,8 +16,78 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'release' }}
 
 jobs:
-  quality:
+  changes:
     if: ${{ github.event_name != 'release' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      full_ci: ${{ steps.classify.outputs.full_ci }}
+    steps:
+      - name: Checkout complete history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Classify documentation-only changes
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          full_ci=true
+          if [[ "$EVENT_NAME" == pull_request || "$EVENT_NAME" == push ]] &&
+             [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] &&
+             [[ ! "$BASE_SHA" =~ ^0+$ ]] &&
+             git cat-file -e "$BASE_SHA^{commit}" && git cat-file -e "$HEAD_SHA^{commit}"; then
+            full_ci=false
+            while IFS= read -r -d '' path; do
+              case "$path" in
+                .env.example|CHANGELOG.md|README.md|README.en.md|docs/*) ;;
+                *) full_ci=true; break ;;
+              esac
+            done < <(git diff --name-only --no-renames -z "$BASE_SHA" "$HEAD_SHA")
+          fi
+          echo "full_ci=$full_ci" | tee -a "$GITHUB_OUTPUT"
+
+  docs:
+    if: ${{ github.event_name != 'release' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up pinned Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.5'
+          check-latest: false
+          cache: false
+
+      - name: Repository whitespace check
+        run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD --
+
+      - name: Markdown fence structure
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do
+            count="$(awk '/^```/ { count++ } END { print count + 0 }' "$file")"
+            if (( count % 2 != 0 )); then
+              echo "::error file=$file::unbalanced fenced code blocks"
+              exit 1
+            fi
+          done < <(git ls-files -z '*.md')
+
+      - name: Documentation and version binding tests
+        run: go test ./internal/releasepkg ./internal/config -count=1
+
+  quality:
+    if: ${{ github.event_name != 'release' && needs.changes.outputs.full_ci == 'true' }}
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -86,7 +156,8 @@ jobs:
           retention-days: 7
 
   bootstrap:
-    if: ${{ github.event_name != 'release' }}
+    if: ${{ github.event_name != 'release' && needs.changes.outputs.full_ci == 'true' }}
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -224,8 +295,8 @@ jobs:
           PY
 
   package:
-    if: ${{ github.event_name != 'release' }}
-    needs: [quality, bootstrap]
+    if: ${{ github.event_name != 'release' && needs.changes.outputs.full_ci == 'true' }}
+    needs: [changes, quality, bootstrap]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -304,8 +375,8 @@ jobs:
           retention-days: 7
 
   rpm-lifecycle:
-    if: ${{ github.event_name != 'release' }}
-    needs: package
+    if: ${{ github.event_name != 'release' && needs.changes.outputs.full_ci == 'true' }}
+    needs: [changes, package]
     name: RPM lifecycle (${{ matrix.image }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -354,8 +425,8 @@ jobs:
             "${{ matrix.image }}" bash /src/build/rocky-bootstrap-test.sh
 
   best-effort-apt-lifecycle:
-    if: ${{ github.event_name != 'release' }}
-    needs: package
+    if: ${{ github.event_name != 'release' && needs.changes.outputs.full_ci == 'true' }}
+    needs: [changes, package]
     name: Best-effort APT lifecycle (${{ matrix.image }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -392,8 +463,8 @@ jobs:
             "${{ matrix.image }}" bash /src/build/rollback-test.sh
 
   best-effort-rpm-lifecycle:
-    if: ${{ github.event_name != 'release' }}
-    needs: package
+    if: ${{ github.event_name != 'release' && needs.changes.outputs.full_ci == 'true' }}
+    needs: [changes, package]
     name: Best-effort RPM lifecycle (${{ matrix.image }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -440,8 +511,8 @@ jobs:
             "${{ matrix.image }}" bash /src/build/rpm-best-effort-test.sh
 
   lifecycle:
-    if: ${{ github.event_name != 'release' }}
-    needs: package
+    if: ${{ github.event_name != 'release' && needs.changes.outputs.full_ci == 'true' }}
+    needs: [changes, package]
     runs-on: ubuntu-latest
     timeout-minutes: 35
     strategy:
@@ -473,8 +544,8 @@ jobs:
         run: docker run --rm -e SUN_CONTAINER_TEST=1 -v "$PWD:/src:ro" "${{ matrix.image }}" bash /src/build/interactive-test.sh
 
   multiarch:
-    if: ${{ github.event_name != 'release' }}
-    needs: package
+    if: ${{ github.event_name != 'release' && needs.changes.outputs.full_ci == 'true' }}
+    needs: [changes, package]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -571,6 +642,58 @@ jobs:
           for arch in amd64 arm64 386 ppc64le s390x; do
             run_arch "$arch"
           done
+
+  ci-gate:
+    name: ci-gate
+    if: ${{ always() && github.event_name != 'release' }}
+    needs:
+      - changes
+      - docs
+      - quality
+      - bootstrap
+      - package
+      - rpm-lifecycle
+      - best-effort-apt-lifecycle
+      - best-effort-rpm-lifecycle
+      - lifecycle
+      - multiarch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the selected CI tier
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          failures = []
+          for name in ("changes", "docs"):
+              if needs[name]["result"] != "success":
+                  failures.append(f"{name}={needs[name]['result']}")
+
+          full_ci = needs["changes"].get("outputs", {}).get("full_ci") == "true"
+          full_jobs = (
+              "quality",
+              "bootstrap",
+              "package",
+              "rpm-lifecycle",
+              "best-effort-apt-lifecycle",
+              "best-effort-rpm-lifecycle",
+              "lifecycle",
+              "multiarch",
+          )
+          expected = "success" if full_ci else "skipped"
+          for name in full_jobs:
+              if needs[name]["result"] != expected:
+                  failures.append(f"{name}={needs[name]['result']} (expected {expected})")
+
+          if failures:
+              raise SystemExit("CI gate rejected: " + ", ".join(failures))
+          print("full CI tier passed" if full_ci else "documentation CI tier passed")
+          PY
 
   verify-signed-release:
     if: ${{ github.event_name == 'release' }}
