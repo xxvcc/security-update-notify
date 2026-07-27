@@ -124,6 +124,14 @@ func TestLiveCanaryIsolatesRunnerHealthAndSkipsFakeNotificationCredentialProbe(t
 		`grep -qxF "$expected" /etc/security-update-notify/telegram.env`,
 		`apt_check_before_rc="$(capture_bounded_rc "$work/apt-check.before" apt-get check -qq)"`,
 		`dpkg_audit_before_rc="$(capture_bounded_rc "$work/dpkg-audit.before" dpkg --audit)"`,
+		`apt_policy_backup="${apt_policy}.security-update-notify.bak"`,
+		`apt_policy_absent_marker="${apt_policy}.security-update-notify.absent.bak"`,
+		`apt_policy_legacy_absent_marker="${apt_policy}.security-update-notify.absent"`,
+		`apt_policy_dependency_proof="${apt_policy}.security-update-notify.dependency-default.bak"`,
+		`assert_restored_apt_policy()`,
+		`die "runner is not clean: SUN APT policy metadata already exists"`,
+		`die "installed SUN APT baseline state is ambiguous"`,
+		`die "SUN APT policy metadata remained after purge"`,
 	} {
 		if !bytes.Contains(script, []byte(item)) {
 			t.Fatalf("live canary runner-isolation invariant missing: %s", item)
@@ -146,6 +154,10 @@ func TestLiveCanaryIsolatesRunnerHealthAndSkipsFakeNotificationCredentialProbe(t
 		`systemctl is-active --quiet security-update-notify.timer || die`,
 		"systemd-analyze verify \\\n  /etc/systemd/system/security-update-notify.service \\\n  /etc/systemd/system/security-update-notify.timer\n/usr/local/sbin/security-update-notify doctor --skip-notify --lang en\n",
 		`assert_package_state_not_regressed after-install`,
+		`case "$apt_policy_was_present:$apt_policy_backup_exists:$apt_policy_absent_marker_exists:$apt_policy_legacy_absent_marker_exists:$apt_policy_dependency_proof_exists" in`,
+		`apt_policy_purge_expectation=original`,
+		`apt_policy_purge_expectation=dependency-default`,
+		`apt_policy_purge_expectation=absent`,
 		`dry_run_output="$(/usr/local/sbin/security-update-notify run`,
 		`grep -q $'^HASH\t' <<<"$dry_run_output" || die`,
 		"/usr/local/sbin/security-update-notify uninstall --purge-config --lang en\n[[ ! -e /usr/local/sbin/security-update-notify ]] || die",
@@ -154,9 +166,11 @@ func TestLiveCanaryIsolatesRunnerHealthAndSkipsFakeNotificationCredentialProbe(t
 		`[[ ! -e /etc/systemd/system/security-update-notify.service ]] || die`,
 		`[[ ! -e /etc/systemd/system/security-update-notify.timer ]] || die`,
 		`assert_package_state_not_regressed after-purge`,
-		`cmp "$work/apt-policy.before" "$apt_policy" || die`,
-		`die "APT policy metadata was not restored"`,
+		`case "$apt_policy_purge_expectation" in`,
+		`assert_restored_apt_policy "$work/apt-policy.before" "original APT policy"`,
+		`assert_restored_apt_policy "$work/apt-policy.dependency-default" "retained dependency APT policy"`,
 		`die "originally absent APT policy was not removed"`,
+		`die "SUN APT policy metadata remained after purge"`,
 	}
 	previous := -1
 	for _, item := range requiredInOrder {

@@ -50,12 +50,30 @@ done
 [[ ! -e /etc/security-update-notify ]] || die "runner is not clean: SUN config already exists"
 
 apt_policy=/etc/apt/apt.conf.d/20auto-upgrades
+apt_policy_backup="${apt_policy}.security-update-notify.bak"
+apt_policy_absent_marker="${apt_policy}.security-update-notify.absent.bak"
+apt_policy_legacy_absent_marker="${apt_policy}.security-update-notify.absent"
+apt_policy_dependency_proof="${apt_policy}.security-update-notify.dependency-default.bak"
 apt_policy_was_present=0
+apt_policy_purge_expectation=""
+if compgen -G "${apt_policy}.security-update-notify*" >/dev/null; then
+  die "runner is not clean: SUN APT policy metadata already exists"
+fi
 if [[ -e "$apt_policy" || -L "$apt_policy" ]]; then
   [[ -f "$apt_policy" && ! -L "$apt_policy" ]] || die "unexpected APT policy node"
   apt_policy_was_present=1
   cp --preserve=all "$apt_policy" "$work/apt-policy.before"
 fi
+
+assert_restored_apt_policy() {
+  local expected="$1"
+  local description="$2"
+  [[ -f "$apt_policy" && ! -L "$apt_policy" ]] ||
+    die "$description was not restored as a regular APT policy file"
+  cmp "$expected" "$apt_policy" || die "$description content was not restored"
+  [[ "$(stat -c %u:%g:%a "$expected")" == "$(stat -c %u:%g:%a "$apt_policy")" ]] ||
+    die "$description metadata was not restored"
+}
 
 capture_bounded_rc() {
   local output="$1"
@@ -309,6 +327,58 @@ systemd-analyze verify \
   /etc/systemd/system/security-update-notify.timer
 /usr/local/sbin/security-update-notify doctor --skip-notify --lang en
 assert_package_state_not_regressed after-install
+
+[[ -f "$apt_policy" && ! -L "$apt_policy" ]] || die "installed APT policy is not a regular file"
+apt_policy_backup_exists=0
+apt_policy_absent_marker_exists=0
+apt_policy_legacy_absent_marker_exists=0
+apt_policy_dependency_proof_exists=0
+if [[ -e "$apt_policy_backup" || -L "$apt_policy_backup" ]]; then
+  [[ -f "$apt_policy_backup" && ! -L "$apt_policy_backup" ]] ||
+    die "SUN APT baseline backup is not a regular file"
+  apt_policy_backup_exists=1
+fi
+if [[ -e "$apt_policy_absent_marker" || -L "$apt_policy_absent_marker" ]]; then
+  [[ -f "$apt_policy_absent_marker" && ! -L "$apt_policy_absent_marker" ]] ||
+    die "SUN APT absence marker is not a regular file"
+  apt_policy_absent_marker_exists=1
+fi
+if [[ -e "$apt_policy_legacy_absent_marker" || -L "$apt_policy_legacy_absent_marker" ]]; then
+  [[ -f "$apt_policy_legacy_absent_marker" && ! -L "$apt_policy_legacy_absent_marker" ]] ||
+    die "legacy SUN APT absence marker is not a regular file"
+  apt_policy_legacy_absent_marker_exists=1
+fi
+if [[ -e "$apt_policy_dependency_proof" || -L "$apt_policy_dependency_proof" ]]; then
+  [[ -f "$apt_policy_dependency_proof" && ! -L "$apt_policy_dependency_proof" ]] ||
+    die "SUN APT dependency proof is not a regular file"
+  apt_policy_dependency_proof_exists=1
+fi
+
+case "$apt_policy_was_present:$apt_policy_backup_exists:$apt_policy_absent_marker_exists:$apt_policy_legacy_absent_marker_exists:$apt_policy_dependency_proof_exists" in
+  1:1:0:0:0)
+    cmp "$work/apt-policy.before" "$apt_policy_backup" ||
+      die "SUN stable APT backup differs from the original policy"
+    [[ "$(stat -c %u:%g:%a "$work/apt-policy.before")" == "$(stat -c %u:%g:%a "$apt_policy_backup")" ]] ||
+      die "SUN stable APT backup metadata differs from the original policy"
+    apt_policy_purge_expectation=original
+    ;;
+  0:1:0:0:0)
+    cp --preserve=all "$apt_policy_backup" "$work/apt-policy.dependency-default"
+    apt_policy_purge_expectation=dependency-default
+    ;;
+  0:0:1:0:0)
+    printf '%s\n' 'security-update-notify: original file absent' >"$work/apt-policy.absent-marker.expected"
+    cmp "$work/apt-policy.absent-marker.expected" "$apt_policy_absent_marker" ||
+      die "SUN APT absence marker has unexpected contents"
+    [[ "$(stat -c %u:%g:%a "$apt_policy_absent_marker")" == "0:0:600" ]] ||
+      die "SUN APT absence marker has unexpected metadata"
+    apt_policy_purge_expectation=absent
+    ;;
+  *)
+    die "installed SUN APT baseline state is ambiguous"
+    ;;
+esac
+
 dry_run_output="$(/usr/local/sbin/security-update-notify run \
   --test-reboot --no-dedupe --dry-run --wait-lock 0 --lang en)"
 grep -q $'^HASH\t' <<<"$dry_run_output" || die "dry-run did not produce a stable hash"
@@ -320,12 +390,23 @@ grep -q $'^HASH\t' <<<"$dry_run_output" || die "dry-run did not produce a stable
 [[ ! -e /etc/systemd/system/security-update-notify.service ]] || die "service remained after purge"
 [[ ! -e /etc/systemd/system/security-update-notify.timer ]] || die "timer remained after purge"
 assert_package_state_not_regressed after-purge
-if [[ "$apt_policy_was_present" -eq 1 ]]; then
-  cmp "$work/apt-policy.before" "$apt_policy" || die "APT policy content was not restored"
-  [[ "$(stat -c %U:%G:%a "$work/apt-policy.before")" == "$(stat -c %U:%G:%a "$apt_policy")" ]] ||
-    die "APT policy metadata was not restored"
-else
-  [[ ! -e "$apt_policy" && ! -L "$apt_policy" ]] || die "originally absent APT policy was not removed"
+case "$apt_policy_purge_expectation" in
+  original)
+    assert_restored_apt_policy "$work/apt-policy.before" "original APT policy"
+    ;;
+  dependency-default)
+    assert_restored_apt_policy "$work/apt-policy.dependency-default" "retained dependency APT policy"
+    ;;
+  absent)
+    [[ ! -e "$apt_policy" && ! -L "$apt_policy" ]] ||
+      die "originally absent APT policy was not removed"
+    ;;
+  *)
+    die "APT policy purge expectation was not established"
+    ;;
+esac
+if compgen -G "${apt_policy}.security-update-notify*" >/dev/null; then
+  die "SUN APT policy metadata remained after purge"
 fi
 
 echo "Live public-release canary passed for $tag on ${PRETTY_NAME}"
