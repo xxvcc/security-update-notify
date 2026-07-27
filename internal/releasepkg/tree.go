@@ -27,6 +27,17 @@ var releaseFiles = [...]releaseFile{
 	{Source: "README.en.md", Target: "README.en.md", Mode: 0o644},
 	{Source: "VERSION", Target: "VERSION", Mode: 0o644},
 	{Source: "sun.sh", Target: "sun.sh", Mode: 0o755},
+	{Source: "docs/development.en.md", Target: "docs/development.en.md", Mode: 0o644},
+	{Source: "docs/development.md", Target: "docs/development.md", Mode: 0o644},
+	{Source: "docs/go-port.md", Target: "docs/go-port.md", Mode: 0o644},
+	{Source: "docs/installation.en.md", Target: "docs/installation.en.md", Mode: 0o644},
+	{Source: "docs/installation.md", Target: "docs/installation.md", Mode: 0o644},
+	{Source: "docs/operations.en.md", Target: "docs/operations.en.md", Mode: 0o644},
+	{Source: "docs/operations.md", Target: "docs/operations.md", Mode: 0o644},
+	{Source: "docs/releasing.en.md", Target: "docs/releasing.en.md", Mode: 0o644},
+	{Source: "docs/releasing.md", Target: "docs/releasing.md", Mode: 0o644},
+	{Source: "docs/security.en.md", Target: "docs/security.en.md", Mode: 0o644},
+	{Source: "docs/security.md", Target: "docs/security.md", Mode: 0o644},
 	{Source: "files/needrestart-report-only.conf", Target: "files/needrestart-report-only.conf", Mode: 0o644},
 	{Source: "files/release-signing.pub.asc", Target: "files/release-signing.pub.asc", Mode: 0o644},
 	{Source: "files/security-update-notify.logrotate", Target: "files/security-update-notify.logrotate", Mode: 0o644},
@@ -68,14 +79,18 @@ func validateRegularSource(path string) error {
 }
 
 func preparePackageTree(root, pkgDir, version string) error {
-	if err := os.MkdirAll(filepath.Join(pkgDir, "files"), 0o755); err != nil {
-		return fmt.Errorf("create package tree: %w", err)
+	for _, dir := range []string{"docs", "files"} {
+		if err := os.MkdirAll(filepath.Join(pkgDir, dir), 0o755); err != nil {
+			return fmt.Errorf("create package tree: %w", err)
+		}
 	}
 	if err := os.Chmod(pkgDir, 0o755); err != nil {
 		return fmt.Errorf("normalize package directory mode: %w", err)
 	}
-	if err := os.Chmod(filepath.Join(pkgDir, "files"), 0o755); err != nil {
-		return fmt.Errorf("normalize files directory mode: %w", err)
+	for _, dir := range []string{"docs", "files"} {
+		if err := os.Chmod(filepath.Join(pkgDir, dir), 0o755); err != nil {
+			return fmt.Errorf("normalize %s directory mode: %w", dir, err)
+		}
 	}
 	for _, spec := range releaseFiles {
 		if err := copyRegularFile(
@@ -138,6 +153,7 @@ func copyRegularFile(source, target string, mode fs.FileMode) error {
 func expectedPackagePaths() map[string]fs.FileMode {
 	want := map[string]fs.FileMode{
 		".":                    fs.ModeDir | 0o755,
+		"docs":                 fs.ModeDir | 0o755,
 		"files":                fs.ModeDir | 0o755,
 		"install.sh":           0o755,
 		"files/" + productName: 0o644,

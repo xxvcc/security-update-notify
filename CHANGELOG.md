@@ -2,6 +2,8 @@
 
 ## 3.1.1
 
+- 精简中英文 README，使其只承担项目介绍、快速安装、支持矩阵、常用操作、核心配置和安全保证；高保障安装、自动化部署、运维恢复、安全模型、开发和发布细节拆分到双语专题文档。签名发布归档同步纳入完整 `docs/` 文档集，保证归档内 README 的相对链接可用，高保障安装命令仍由真实 GPG 正负向测试直接验证。
+  Streamlines both READMEs around the project overview, quick install, compatibility matrix, common operations, core configuration, and security guarantees. High-assurance installation, automation, operations/recovery, the security model, development, and release details move into focused bilingual guides. The signed release archive now includes the complete `docs/` set so README-relative links work after extraction, while real-GPG positive and negative tests continue to execute the documented high-assurance install command directly.
 - 将受保护分支 CI 分为文档快速门禁与完整实现门禁，并通过稳定的 `ci-gate` 聚合结果：纯 `.env.example`、CHANGELOG、README 和 `docs/` 改动不再重复运行全部 Linux 生命周期矩阵，源码、构建脚本、workflow 与发布输入仍执行完整门禁；兼容容器若在预期的晚期失败注入前退出，现在会输出被隐藏的真实安装诊断。
   Splits protected-branch CI into a documentation fast path and the full implementation gate, with a stable `ci-gate` result: changes limited to `.env.example`, CHANGELOG, README, and `docs/` no longer rerun the entire Linux lifecycle matrix, while source, build-script, workflow, and release-input changes retain the full gates. Compatibility containers now print the previously hidden installer diagnostics when they exit before the expected late-failure injection.
 - 同步 3.1.x 文档与当前实现：补齐分级 Linux/DNF5 与并发恢复不变量，明确未列 `ID_LIKE` 衍生版的强制 doctor 回滚门禁、Ubuntu 20.04 `esm-infra` 自动识别及不应整体关闭 EOL 检查，并使本地构建命令与 CI 的 ShellCheck info、静态分析和 75% atomic coverage 门槛一致。

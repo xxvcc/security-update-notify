@@ -14,6 +14,7 @@ import (
 
 var releaseSourcePaths = []string{
 	".env.example", "CHANGELOG.md", "LICENSE", "README.md", "README.en.md", "VERSION", "sun.sh",
+	"docs",
 	"files/needrestart-report-only.conf", "files/release-signing.pub.asc",
 	"files/security-update-notify.logrotate", "files/security-update-notify.service",
 	".github/workflows/ci.yml", ".github/workflows/mirror-release.yml",

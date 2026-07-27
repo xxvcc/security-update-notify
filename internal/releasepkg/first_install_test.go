@@ -213,7 +213,7 @@ func TestDocumentedHighAssuranceBlocksAreShellSyntaxValid(t *testing.T) {
 		t.Skip("bash unavailable")
 	}
 	root := repositoryRoot(t)
-	for _, name := range []string{"README.md", "README.en.md"} {
+	for _, name := range []string{"docs/installation.md", "docs/installation.en.md"} {
 		t.Run(name, func(t *testing.T) {
 			b, err := os.ReadFile(filepath.Join(root, name))
 			if err != nil {
@@ -272,7 +272,7 @@ func TestDocumentedHighAssuranceBlocksExecuteOnlyAfterRealGPGVerification(t *tes
 		t.Fatal(err)
 	}
 	blocks := make(map[string][]byte, 2)
-	for _, name := range []string{"README.md", "README.en.md"} {
+	for _, name := range []string{"docs/installation.md", "docs/installation.en.md"} {
 		b, err := os.ReadFile(filepath.Join(root, name))
 		if err != nil {
 			t.Fatal(err)
@@ -321,7 +321,7 @@ func TestDocumentedHighAssuranceBlocksExecuteOnlyAfterRealGPGVerification(t *tes
 			)
 			marker := filepath.Join(t.TempDir(), "must-not-execute")
 			output, err := runDocumentedHighAssuranceBlock(
-				blocks["README.md"], version, goodFingerprint, assetsDir, fakeBin, marker,
+				blocks["docs/installation.md"], version, goodFingerprint, assetsDir, fakeBin, marker,
 			)
 			if err == nil {
 				t.Fatalf("invalid bootstrap trust set was accepted: %s", output)
