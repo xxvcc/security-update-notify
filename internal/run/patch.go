@@ -455,6 +455,10 @@ func aptListsPath() string {
 	return envOr("SECURITY_UPDATE_NOTIFY_APT_LISTS_DIR", "/var/lib/apt/lists")
 }
 
+func aptPeriodicConfigPath() string {
+	return envOr("SECURITY_UPDATE_NOTIFY_APT_PERIODIC_CONF", "/etc/apt/apt.conf.d/20auto-upgrades")
+}
+
 func dnfAutomaticConfigPath() string {
 	return envOr("SECURITY_UPDATE_NOTIFY_DNF_AUTOMATIC_CONF", "/etc/dnf/automatic.conf")
 }

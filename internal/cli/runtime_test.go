@@ -78,6 +78,11 @@ CHECK_SELF_UPDATE=0
 	t.Setenv("SECURITY_UPDATE_NOTIFY_STATE_DIR", t.TempDir())
 	t.Setenv("SECURITY_UPDATE_NOTIFY_LOCK_FILE", filepath.Join(t.TempDir(), "runtime.lock"))
 	t.Setenv("SECURITY_UPDATE_NOTIFY_LOG_FILE", filepath.Join(t.TempDir(), "runtime.log"))
+	aptPeriodic := filepath.Join(t.TempDir(), "20auto-upgrades")
+	if err := os.WriteFile(aptPeriodic, []byte("APT::Periodic::Unattended-Upgrade \"1\";\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SECURITY_UPDATE_NOTIFY_APT_PERIODIC_CONF", aptPeriodic)
 	t.Setenv("PATH", runtimeCommandPath(t))
 
 	stdout, stderr, rc := captureCLIOutput(t, func() int {

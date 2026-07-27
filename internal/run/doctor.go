@@ -82,7 +82,7 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 			say(out, lang, "失败：unattended-upgrade 命令不可用", "FAIL unattended-upgrade command unavailable")
 			backendReady = false
 		}
-		if !fileReadable("/etc/apt/apt.conf.d/20auto-upgrades") {
+		if !fileReadable(aptPeriodicConfigPath()) {
 			say(out, lang, "失败：APT 自动更新配置不可读", "FAIL APT automatic-update configuration not readable")
 			backendReady = false
 		}
