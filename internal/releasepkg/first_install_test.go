@@ -122,7 +122,8 @@ func TestLiveCanaryIsolatesRunnerHealthAndSkipsFakeNotificationCredentialProbe(t
 		`CHECK_SELF_UPDATE=0`,
 		`matches="$(grep -c "^${key}=" /etc/security-update-notify/telegram.env || :)"`,
 		`grep -qxF "$expected" /etc/security-update-notify/telegram.env`,
-		`apt_check_before_rc="$(capture_bounded_rc "$work/apt-check.before" apt-get check -qq)"`,
+		`apt_check=(apt-get -o DPkg::Lock::Timeout=45 check -qq)`,
+		`apt_check_before_rc="$(capture_bounded_rc "$work/apt-check.before" "${apt_check[@]}")"`,
 		`dpkg_audit_before_rc="$(capture_bounded_rc "$work/dpkg-audit.before" dpkg --audit)"`,
 		`apt_policy_backup="${apt_policy}.security-update-notify.bak"`,
 		`apt_policy_absent_marker="${apt_policy}.security-update-notify.absent.bak"`,
@@ -147,7 +148,7 @@ func TestLiveCanaryIsolatesRunnerHealthAndSkipsFakeNotificationCredentialProbe(t
 		t.Fatal("live canary must be invoked as a dependency of a completed mirror job")
 	}
 	requiredInOrder := []string{
-		`apt_check_before_rc="$(capture_bounded_rc "$work/apt-check.before" apt-get check -qq)"`,
+		`apt_check_before_rc="$(capture_bounded_rc "$work/apt-check.before" "${apt_check[@]}")"`,
 		`bash "$work/stable-sun.sh"`,
 		`grep -qxF "$expected" /etc/security-update-notify/telegram.env ||`,
 		`systemctl is-enabled --quiet security-update-notify.timer || die`,

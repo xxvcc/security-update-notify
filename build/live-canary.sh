@@ -86,7 +86,8 @@ capture_bounded_rc() {
   printf '%s\n' "$rc"
 }
 
-apt_check_before_rc="$(capture_bounded_rc "$work/apt-check.before" apt-get check -qq)"
+apt_check=(apt-get -o DPkg::Lock::Timeout=45 check -qq)
+apt_check_before_rc="$(capture_bounded_rc "$work/apt-check.before" "${apt_check[@]}")"
 dpkg_audit_before_rc="$(capture_bounded_rc "$work/dpkg-audit.before" dpkg --audit)"
 dpkg_audit_before_clean=0
 if [[ "$dpkg_audit_before_rc" -eq 0 && ! -s "$work/dpkg-audit.before" ]]; then
@@ -107,7 +108,7 @@ assert_package_state_not_regressed() {
   local apt_output="$work/apt-check.$phase"
   local dpkg_output="$work/dpkg-audit.$phase"
   local apt_rc dpkg_rc
-  apt_rc="$(capture_bounded_rc "$apt_output" apt-get check -qq)"
+  apt_rc="$(capture_bounded_rc "$apt_output" "${apt_check[@]}")"
   dpkg_rc="$(capture_bounded_rc "$dpkg_output" dpkg --audit)"
   if [[ "$apt_check_before_rc" -eq 0 && "$apt_rc" -ne 0 ]]; then
     head -c 4096 "$apt_output" >&2
