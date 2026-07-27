@@ -187,6 +187,10 @@ set +e
 failure_rc=$?
 set -e
 ok "[[ '$failure_rc' -eq 1 ]]" "late compatibility failure returned 1"
+if ! grep -Fq 'forced compatibility list-timers failure' /tmp/sun-compat-failure.out; then
+  echo "  diagnostic: compatibility upgrade failed before the injected late failure" >&2
+  sed -n '1,240p' /tmp/sun-compat-failure.out >&2
+fi
 ok "grep -Fq 'forced compatibility list-timers failure' /tmp/sun-compat-failure.out" \
   "late compatibility failure retained its cause"
 ok "! grep -Fq 'rollback was incomplete' /tmp/sun-compat-failure.out" \
