@@ -77,18 +77,19 @@ assert_restored_apt_policy() {
 
 capture_bounded_rc() {
   local output="$1"
-  shift
+  local limit="$2"
+  shift 2
   local rc
   set +e
-  timeout --signal=TERM --kill-after=5s 60s "$@" 2>&1 | head -c 65536 >"$output"
+  timeout --signal=TERM --kill-after=5s "$limit" "$@" 2>&1 | head -c 65536 >"$output"
   rc="${PIPESTATUS[0]}"
   set -e
   printf '%s\n' "$rc"
 }
 
-apt_check=(apt-get -o DPkg::Lock::Timeout=45 check -qq)
-apt_check_before_rc="$(capture_bounded_rc "$work/apt-check.before" "${apt_check[@]}")"
-dpkg_audit_before_rc="$(capture_bounded_rc "$work/dpkg-audit.before" dpkg --audit)"
+apt_check=(apt-get -o DPkg::Lock::Timeout=300 check -qq)
+apt_check_before_rc="$(capture_bounded_rc "$work/apt-check.before" 330s "${apt_check[@]}")"
+dpkg_audit_before_rc="$(capture_bounded_rc "$work/dpkg-audit.before" 60s dpkg --audit)"
 dpkg_audit_before_clean=0
 if [[ "$dpkg_audit_before_rc" -eq 0 && ! -s "$work/dpkg-audit.before" ]]; then
   dpkg_audit_before_clean=1
@@ -108,8 +109,8 @@ assert_package_state_not_regressed() {
   local apt_output="$work/apt-check.$phase"
   local dpkg_output="$work/dpkg-audit.$phase"
   local apt_rc dpkg_rc
-  apt_rc="$(capture_bounded_rc "$apt_output" "${apt_check[@]}")"
-  dpkg_rc="$(capture_bounded_rc "$dpkg_output" dpkg --audit)"
+  apt_rc="$(capture_bounded_rc "$apt_output" 330s "${apt_check[@]}")"
+  dpkg_rc="$(capture_bounded_rc "$dpkg_output" 60s dpkg --audit)"
   if [[ "$apt_check_before_rc" -eq 0 && "$apt_rc" -ne 0 ]]; then
     head -c 4096 "$apt_output" >&2
     die "SUN changed a clean apt-get check baseline into a failure during $phase"
