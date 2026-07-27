@@ -180,7 +180,7 @@ SUN_PIN='C678256ACBFC6491BF5076655F3AE24999921FFC'
 SUN_NOTATION='release-version@xxv.cc'
 [[ "$SUN_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z]+)?$ \
    && "${#SUN_VERSION}" -le 64 ]] || {
-  echo 'Set SUN_VERSION to an explicit version, for example 3.0.2.' >&2
+  echo 'Replace X.Y.Z in SUN_VERSION with an explicit version confirmed through a trusted release announcement.' >&2
   exit 2
 }
 
@@ -478,7 +478,7 @@ In addition to reboot/service-restart and distro-EOL detection, SUN runs seven p
 | `RESTART_ALERT_DAYS` | `7` | Days before a persistent full-reboot or service-restart requirement is escalated; set `0` to disable age escalation. SUN never restarts the host or services automatically. |
 | `CHECK_SELF_UPDATE` | `1` | Periodically check for a SUN release; notify only, never auto-upgrade. |
 | `SELF_UPDATE_CHECK_DAYS` | `7` | SUN release-check interval. Successful results are cached; `security-update-notify doctor` forces a read-only refresh. |
-| `CHECK_EOL` | `1` | Distro end-of-life (EOL) warning: a past-EOL release triggers an alert, an approaching one (within 90 days) is informational. Set `0` if you have extended support such as Ubuntu ESM. |
+| `CHECK_EOL` | `1` | Distro end-of-life (EOL) warning: a past-EOL release triggers an alert, an approaching one (within 90 days) is informational. Ubuntu 20.04 automatically checks the local `esm-infra` state. Consider `0` only for an external extended-support arrangement that SUN cannot recognize, accepting that it disables every EOL check. |
 
 The pending count remains informational until it reaches `PENDING_ALERT_DAYS`. DNF's high-severity subtotal includes both `critical` and `important`. Run `security-update-notify doctor` anytime to inspect all seven checks, pending counts, and the SUN release result; diagnostics never mutate age or release-cache state. Simulated `security-update-notify test` modes and `security-update-notify run --dry-run` neither write this state nor make the periodic release request.
 
@@ -494,8 +494,11 @@ The pending count remains informational until it reaches `PENDING_ALERT_DAYS`. D
 /etc/security-update-notify/credentials/feishu-app-secret              # older-systemd fallback
 /etc/logrotate.d/security-update-notify
 /var/lib/security-update-notify/
+/var/backups/security-update-notify/
 /var/log/security-update-notify.log
 ```
+
+Depending on the backend, the installer also manages apt's `/etc/apt/apt.conf.d/20auto-upgrades`, `/etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify`, and `/etc/needrestart/conf.d/99-security-update-notify-report-only.conf`, or DNF's `/etc/dnf/automatic.conf`. Original baselines, absence markers, proofs, and timestamped backups live beside the managed policy; the backend sections below define their exact restoration rules.
 
 Notification options, the Telegram Bot Token, Feishu App ID, and recipient `open_id` are stored in:
 
@@ -641,11 +644,17 @@ From the source checkout:
 
 ```bash
 bash -n sun.sh build/*.sh
-shellcheck -s bash -S warning sun.sh build/*.sh
-unformatted="$(rg --files cmd internal -g '*.go' -0 | xargs -0 gofmt -l)"
+shellcheck -s bash -S info sun.sh build/*.sh
+unformatted="$(find cmd internal -type f -name '*.go' -print0 | sort -z | xargs -0 gofmt -l)"
 test -z "$unformatted"
+git diff --check
+git diff --check "$(git hash-object -t tree /dev/null)" HEAD --
 go vet ./...
-go test -race -cover ./...
+go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+go test -race -covermode=atomic -coverprofile=coverage.out ./...
+total="$(go tool cover -func=coverage.out | awk '/^total:/ {sub(/%$/, "", $3); print $3}')"
+awk -v total="$total" 'BEGIN { exit !(total + 0 >= 75.0) }'
 build/archive-safety-test.sh
 build/runtime-lock-test.sh
 build/reproducibility-check.sh linux amd64

@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to mirror, for example v3.0.2
+        description: Release tag to mirror, for example vX.Y.Z
         required: true
         type: string
 
