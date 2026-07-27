@@ -4,6 +4,8 @@
 
 - 修正公网发布 canary 对 APT purge 基线的判断：安装前 `20auto-upgrades` 不存在时，若保留的 `unattended-upgrades` 依赖创建了受信任的 vendor 默认配置，canary 现在要求 purge 精确恢复该稳定备份；只有缺失标记时仍要求文件被删除，其他备份、标记或 proof 组合失败关闭。
   Fixes the public-release canary's APT purge baseline: when `20auto-upgrades` was initially absent but the retained `unattended-upgrades` dependency created a trusted vendor default, the canary now requires purge to restore that stable backup exactly. An absence marker still requires removal, while every other backup, marker, or proof combination fails closed.
+- 公网 canary 的只读 `apt-get check` 现在会在现有总超时内最多等待 45 秒 dpkg 锁，避免将托管 runner 上刚启动的 `unattended-upgr` 短暂竞争误报为包状态损坏；实际依赖错误、锁超时和 dpkg audit 异常仍失败关闭。
+  The public canary's read-only `apt-get check` now waits up to 45 seconds for the dpkg lock within its existing overall timeout, avoiding a false package-state regression when `unattended-upgr` has just started on a hosted runner. Real dependency failures, lock timeouts, and dpkg audit findings still fail closed.
 
 ## 3.1.0
 
