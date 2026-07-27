@@ -1,5 +1,10 @@
 # 变更记录
 
+## 3.1.1
+
+- 修正公网发布 canary 对 APT purge 基线的判断：安装前 `20auto-upgrades` 不存在时，若保留的 `unattended-upgrades` 依赖创建了受信任的 vendor 默认配置，canary 现在要求 purge 精确恢复该稳定备份；只有缺失标记时仍要求文件被删除，其他备份、标记或 proof 组合失败关闭。
+  Fixes the public-release canary's APT purge baseline: when `20auto-upgrades` was initially absent but the retained `unattended-upgrades` dependency created a trusted vendor default, the canary now requires purge to restore that stable backup exactly. An absence marker still requires removal, while every other backup, marker, or proof combination fails closed.
+
 ## 3.1.0
 
 - 扩大并分级 Linux 支持矩阵：正式支持 Debian 12/13、Ubuntu 22.04/24.04/26.04、RHEL-compatible 8/9/10（Rocky/AlmaLinux 实测）及 Fedora 43/44；Debian 11、Ubuntu 20.04、CentOS Stream 9/10、Oracle Linux 8/9/10、CloudLinux 8/9/10 和 Amazon Linux 2023 进入显式 opt-in 的尽力支持。未知 `ID_LIKE` 衍生版只会在任何安装副作用前明确探测出 apt 或 DNF4/DNF5 且完整安装后 doctor 通过时接受，模糊或冲突 ancestry 失败关闭。
