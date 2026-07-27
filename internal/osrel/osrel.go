@@ -8,8 +8,13 @@ package osrel
 
 import (
 	"bufio"
+	"errors"
+	"io"
+	"io/fs"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // OSRelease 保存运行时/安装器关心的 os-release 字段。
@@ -18,18 +23,38 @@ type OSRelease struct {
 	VersionID  string
 	PrettyName string
 	IDLike     string
+	SupportEnd string
 }
 
-// Read 解析 os-release 文件（缺失返回零值）。只取 ID/VERSION_ID/PRETTY_NAME/ID_LIKE，剥离一层引号，
-// 保留 2.x 的兼容解析语义（不做变量展开）。
+// Read 解析 os-release 文件（缺失返回零值）。只取运行时需要的字段，剥离一层引号，保留 2.x
+// 的兼容解析语义（不做变量展开）。SUPPORT_END 保留原值；SupportEndDate 负责严格日期校验。
 func Read(path string) OSRelease {
-	var o OSRelease
 	f, err := os.Open(path)
 	if err != nil {
-		return o
+		return OSRelease{}
 	}
 	defer f.Close()
-	sc := bufio.NewScanner(f)
+	o, _ := Parse(f)
+	return o
+}
+
+// ReadFirst reads the canonical os-release path and falls back only when that
+// path does not exist. Permission, I/O, and parse failures are not hidden by a
+// second file with different contents.
+func ReadFirst(primary, fallback string) OSRelease {
+	if _, err := os.Lstat(primary); errors.Is(err, fs.ErrNotExist) {
+		return Read(fallback)
+	} else if err != nil {
+		return OSRelease{}
+	}
+	return Read(primary)
+}
+
+// Parse parses os-release data from r and reports scanner errors. Read keeps its historical zero-value/
+// best-effort behavior, while callers that already control file IO can use Parse without duplicating the parser.
+func Parse(r io.Reader) (OSRelease, error) {
+	var o OSRelease
+	sc := bufio.NewScanner(r)
 	// 放宽默认 64KB 行上限，避免超长行导致后续行被静默跳过（与 Bash `read -r` 的无界读法一致）。
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for sc.Scan() {
@@ -48,9 +73,24 @@ func Read(path string) OSRelease {
 			o.PrettyName = val
 		case "ID_LIKE":
 			o.IDLike = val
+		case "SUPPORT_END":
+			o.SupportEnd = val
 		}
 	}
-	return o
+	return o, sc.Err()
+}
+
+// SupportEndDate 返回 os-release 中格式严格且真实存在的 YYYY-MM-DD 日期；无值或非法值返回空串。
+// 它不在解析阶段丢弃原字段，便于诊断损坏的发行版元数据，同时避免调用方误用宽松日期。
+func SupportEndDate(o OSRelease) string {
+	if o.SupportEnd == "" {
+		return ""
+	}
+	parsed, err := time.Parse(time.DateOnly, o.SupportEnd)
+	if err != nil || parsed.Format(time.DateOnly) != o.SupportEnd {
+		return ""
+	}
+	return o.SupportEnd
 }
 
 // unquote 顺序剥离（先双引号再单引号），保留 2.x 配置与 os-release 解析语义：值
@@ -65,21 +105,25 @@ func unquote(v string) string {
 	return v
 }
 
-// AutoBackend 保留 BACKEND=auto 的既有判定：debian/ubuntu→apt；rhel/rocky/almalinux/fedora/centos/
-// amzn→dnf；否则用 ID_LIKE 兜底（*debian*/*ubuntu*→apt，*rhel*/*fedora*/*centos*→dnf），仍无则 unknown。
+// AutoBackend 保留 BACKEND=auto 的既有判定：Debian 系→apt；Fedora/EL 系→dnf；否则用
+// ID_LIKE 兜底，仍无则 unknown。Backend 名称保持 apt/dnf，DNF 代际由 Profile.Engine 区分。
 func AutoBackend(o OSRelease) string {
 	switch o.ID {
 	case "debian", "ubuntu":
 		return "apt"
-	case "rhel", "rocky", "almalinux", "fedora", "centos", "amzn":
+	case "rhel", "rocky", "almalinux", "fedora", "centos", "amzn", "ol", "cloudlinux":
 		return "dnf"
 	}
 	if o.IDLike != "" {
-		padded := " " + o.IDLike + " "
-		if strings.Contains(padded, " debian ") || strings.Contains(padded, " ubuntu ") {
+		aptLike := hasIDLike(o.IDLike, "debian", "ubuntu")
+		dnfLike := hasIDLike(o.IDLike, "rhel", "fedora", "centos")
+		if aptLike && dnfLike {
+			return "unknown"
+		}
+		if aptLike {
 			return "apt"
 		}
-		if strings.Contains(padded, " rhel ") || strings.Contains(padded, " fedora ") || strings.Contains(padded, " centos ") {
+		if dnfLike {
 			return "dnf"
 		}
 	}
@@ -93,16 +137,132 @@ const (
 	Unsupported = "unsupported"
 )
 
-// SupportTier 复刻 lib.sh lib_detect_backend：返回安装器视角的 backend 与支持级别。
-func SupportTier(o OSRelease) (backend, tier string) {
-	backend, tier = "unknown", Unsupported
-	major := o.VersionID
-	if i := strings.IndexByte(major, '.'); i >= 0 {
-		major = major[:i]
+// Engine 区分共享同一稳定 BACKEND 值的具体实现。
+const (
+	EngineUnknown = "unknown"
+	EngineAPT     = "apt"
+	EngineDNF4    = "dnf4"
+	EngineDNF5    = "dnf5"
+)
+
+// CommandProbe 描述不经 shell 执行的命令探测。Args 是固定前缀；例如 PackageProbe 会在其后追加包名。
+type CommandProbe struct {
+	Name string
+	Args []string
+}
+
+// Profile 汇总发行版相关且会随包管理器代际变化的元数据。Backend 是稳定的用户配置值；Engine
+// 是内部实现。返回值的 slice 均由本次调用独占，调用方可以安全修改。
+type Profile struct {
+	Backend  string
+	Engine   string
+	Tier     string
+	Inferred bool // true only when backend/engine came from an unknown distribution's ID_LIKE
+	Packages []string
+
+	PackageProbe     CommandProbe
+	PackageManagers  []string
+	RequiredCommands []string
+
+	AutomaticConfig        string
+	AutomaticTimer         string
+	AutomaticTimerVariants []string
+	AutomaticService       string
+	AutomaticProbe         CommandProbe
+
+	RestartHintProbe     CommandProbe
+	RestartServicesProbe CommandProbe
+}
+
+// ProfileFor 返回安装和运行探测共用的发行版 profile。未知发行版仍可从 ID_LIKE 得到稳定 backend，
+// 但不会因此获得支持等级；只有足以可靠判断实现代际时才填充 engine 元数据。
+func ProfileFor(o OSRelease) Profile {
+	return profileForEngine(o, engineFor(o))
+}
+
+// ProfileForDetectedEngine completes an inferred DNF profile after a caller
+// has positively identified the installed command generation. It cannot
+// override a listed distribution or an already-known engine.
+func ProfileForDetectedEngine(o OSRelease, engine string) (Profile, bool) {
+	p := ProfileFor(o)
+	if !p.Inferred || p.Backend != "dnf" || p.Engine != EngineUnknown ||
+		(engine != EngineDNF4 && engine != EngineDNF5) {
+		return p, false
 	}
+	return profileForEngine(o, engine), true
+}
+
+func profileForEngine(o OSRelease, engine string) Profile {
+	p := Profile{
+		Backend: AutoBackend(o),
+		Engine:  engine,
+		Tier:    supportTierFor(o),
+	}
+	p.Inferred = !knownDistributionID(o.ID) && p.Backend != "unknown"
+
+	switch p.Engine {
+	case EngineAPT:
+		p.Packages = []string{"unattended-upgrades", "needrestart", "apt-listchanges", "ca-certificates"}
+		p.PackageProbe = CommandProbe{Name: "dpkg", Args: []string{"-s"}}
+		p.PackageManagers = []string{"apt-get"}
+		p.RequiredCommands = []string{"apt-get", "dpkg", "needrestart"}
+		p.AutomaticConfig = "/etc/apt/apt.conf.d/20auto-upgrades"
+		p.AutomaticTimer = "apt-daily-upgrade.timer"
+		p.AutomaticService = "apt-daily-upgrade.service"
+		p.AutomaticProbe = CommandProbe{Name: "unattended-upgrade", Args: []string{"--help"}}
+		p.RestartServicesProbe = CommandProbe{Name: "needrestart", Args: []string{"-b"}}
+	case EngineDNF4:
+		p.Packages = []string{"dnf-automatic", "ca-certificates"}
+		if o.ID == "fedora" || o.ID == "amzn" || p.Inferred && !hasIDLike(o.IDLike, "rhel", "centos") {
+			p.Packages = append(p.Packages, "dnf-utils")
+		} else {
+			p.Packages = append(p.Packages, "yum-utils")
+		}
+		if major, ok := versionMajor(o.VersionID); ok && major == "10" && (isELFamilyID(o.ID) || p.Inferred) {
+			// EL10 minimal images provide microdnf but not the dnf command used at runtime.
+			p.Packages = append([]string{"dnf"}, p.Packages...)
+		}
+		p.PackageProbe = CommandProbe{Name: "rpm", Args: []string{"-q"}}
+		p.PackageManagers = []string{"dnf", "microdnf", "yum"}
+		p.RequiredCommands = []string{"dnf", "rpm", "needs-restarting"}
+		p.AutomaticConfig = "/etc/dnf/automatic.conf"
+		p.AutomaticTimer = "dnf-automatic.timer"
+		p.AutomaticTimerVariants = []string{
+			"dnf-automatic-notifyonly.timer",
+			"dnf-automatic-download.timer",
+			"dnf-automatic-install.timer",
+		}
+		p.AutomaticService = "dnf-automatic.service"
+		p.AutomaticProbe = CommandProbe{Name: "dnf-automatic", Args: []string{"--help"}}
+		p.RestartHintProbe = CommandProbe{Name: "needs-restarting", Args: []string{"-r"}}
+		p.RestartServicesProbe = CommandProbe{Name: "needs-restarting", Args: []string{"-s"}}
+	case EngineDNF5:
+		p.Packages = []string{"dnf5-plugin-automatic", "ca-certificates", "dnf5-plugins"}
+		p.PackageProbe = CommandProbe{Name: "rpm", Args: []string{"-q"}}
+		p.PackageManagers = []string{"dnf", "dnf5", "microdnf"}
+		p.RequiredCommands = []string{"dnf", "rpm"}
+		p.AutomaticConfig = "/etc/dnf/automatic.conf"
+		p.AutomaticTimer = "dnf5-automatic.timer"
+		p.AutomaticTimerVariants = []string{"dnf-automatic.timer"}
+		p.AutomaticService = "dnf5-automatic.service"
+		p.AutomaticProbe = CommandProbe{Name: "dnf", Args: []string{"automatic", "--help"}}
+		p.RestartHintProbe = CommandProbe{Name: "dnf", Args: []string{"needs-restarting"}}
+		p.RestartServicesProbe = CommandProbe{Name: "dnf", Args: []string{"needs-restarting", "-s"}}
+	}
+	return p
+}
+
+// SupportTier 返回安装器视角的稳定 backend 与支持级别。保留既有 API，具体元数据由 ProfileFor 提供。
+func SupportTier(o OSRelease) (backend, tier string) {
+	p := ProfileFor(o)
+	return p.Backend, p.Tier
+}
+
+func supportTierFor(o OSRelease) string {
+	tier := Unsupported
+	major, validMajor := versionMajor(o.VersionID)
 	switch o.ID {
 	case "debian":
-		backend = "apt"
 		switch o.VersionID {
 		case "12", "13":
 			tier = Supported
@@ -110,41 +270,132 @@ func SupportTier(o OSRelease) (backend, tier string) {
 			tier = BestEffort
 		}
 	case "ubuntu":
-		backend = "apt"
 		switch o.VersionID {
-		case "22.04", "24.04":
+		case "22.04", "24.04", "26.04":
 			tier = Supported
 		case "20.04":
 			tier = BestEffort
 		}
 	case "rhel", "rocky", "almalinux":
-		backend = "dnf"
-		switch major {
-		case "8", "9":
-			tier = Supported
+		if validMajor {
+			switch major {
+			case "8", "9", "10":
+				tier = Supported
+			}
 		}
 	case "fedora":
-		backend, tier = "dnf", Supported
+		switch o.VersionID {
+		case "43", "44":
+			tier = Supported
+		}
 	case "centos":
-		backend = "dnf"
-		switch major {
-		case "8", "9":
-			tier = BestEffort
+		if validMajor {
+			switch major {
+			case "9", "10":
+				tier = BestEffort
+			}
+		}
+	case "ol", "cloudlinux":
+		if validMajor {
+			switch major {
+			case "8", "9", "10":
+				tier = BestEffort
+			}
 		}
 	case "amzn":
-		backend = "dnf"
 		if o.VersionID == "2023" {
 			tier = BestEffort
 		}
 	}
-	if backend == "unknown" && o.IDLike != "" {
-		padded := " " + o.IDLike + " "
-		switch {
-		case strings.Contains(padded, " debian ") || strings.Contains(padded, " ubuntu "):
-			backend = "apt"
-		case strings.Contains(padded, " rhel ") || strings.Contains(padded, " fedora ") || strings.Contains(padded, " centos "):
-			backend = "dnf"
+	return tier
+}
+
+func engineFor(o OSRelease) string {
+	switch o.ID {
+	case "debian", "ubuntu":
+		return EngineAPT
+	case "fedora":
+		major, ok := numericMajor(o.VersionID)
+		if !ok {
+			return EngineUnknown
+		}
+		if major >= 41 {
+			return EngineDNF5
+		}
+		return EngineDNF4
+	case "rhel", "rocky", "almalinux", "centos", "amzn", "ol", "cloudlinux":
+		return EngineDNF4
+	}
+
+	aptLike := hasIDLike(o.IDLike, "debian", "ubuntu")
+	elLike := hasIDLike(o.IDLike, "rhel", "centos")
+	fedoraLike := hasIDLike(o.IDLike, "fedora")
+	if aptLike && (elLike || fedoraLike) {
+		return EngineUnknown
+	}
+	if aptLike {
+		return EngineAPT
+	}
+	return EngineUnknown
+}
+
+func isELFamilyID(id string) bool {
+	switch id {
+	case "rhel", "rocky", "almalinux", "centos", "ol", "cloudlinux":
+		return true
+	default:
+		return false
+	}
+}
+
+func knownDistributionID(id string) bool {
+	switch id {
+	case "debian", "ubuntu", "rhel", "rocky", "almalinux", "fedora", "centos", "amzn", "ol", "cloudlinux":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasIDLike(idLike string, ids ...string) bool {
+	if idLike == "" {
+		return false
+	}
+	padded := " " + idLike + " "
+	for _, id := range ids {
+		if strings.Contains(padded, " "+id+" ") {
+			return true
 		}
 	}
-	return backend, tier
+	return false
+}
+
+func versionMajor(version string) (string, bool) {
+	parts := strings.Split(version, ".")
+	if len(parts) == 0 || parts[0] == "" {
+		return "", false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return "", false
+		}
+		for i := 0; i < len(part); i++ {
+			if part[i] < '0' || part[i] > '9' {
+				return "", false
+			}
+		}
+	}
+	return parts[0], true
+}
+
+func numericMajor(version string) (int, bool) {
+	major, ok := versionMajor(version)
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.Atoi(major)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }

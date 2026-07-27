@@ -16,6 +16,7 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/httpx"
 	"github.com/xxvcc/security-update-notify/internal/statefile"
 	"github.com/xxvcc/security-update-notify/internal/sysexec"
+	"github.com/xxvcc/security-update-notify/internal/systemd"
 	"github.com/xxvcc/security-update-notify/internal/version"
 	"github.com/xxvcc/security-update-notify/internal/watchdog"
 )
@@ -38,6 +39,9 @@ func collectPatchWatchdog(cfg *config.Config, be string, restart backend.Restart
 		opts.LatestRelease = dist.LatestRelease
 	}
 	pending, blocked, issues := collectPackageFacts(cfg, be, opts.Now)
+	if restart.ProbeIssue != "" {
+		issues = append(issues, restartProbeIssue(restart.ProbeIssue))
+	}
 	store := statefile.Store{Dir: stateDirPath()}
 	now := opts.Now.Unix()
 
@@ -99,7 +103,7 @@ func collectAPTPackageFacts(healthEnabled bool, now time.Time, stale int) (watch
 	if aptConfig.Code != 0 {
 		issues = append(issues, watchdog.Issue{Code: "apt-config-unreadable", ZH: "无法读取 APT 有效配置", EN: "Could not read the effective APT configuration"})
 	} else {
-		aptDailyEnabled := sysexec.RunTimeout(patchCommandTimeout, "systemctl", "is-enabled", "apt-daily.timer").Code == 0
+		aptDailyEnabled := systemd.IsEnabled("apt-daily.timer")
 		issues = append(issues, watchdog.CheckAPTPolicy(aptConfig.Stdout, aptDailyEnabled)...)
 	}
 	dpkgAudit := sysexec.RunTimeout(patchCommandTimeout, "dpkg", "--audit")
@@ -115,22 +119,34 @@ func collectAPTPackageFacts(healthEnabled bool, now time.Time, stale int) (watch
 }
 
 func collectDNFPackageFacts(healthEnabled bool) (watchdog.Pending, []string, []watchdog.Issue) {
-	regular := sysexec.RunTimeout(patchCommandTimeout, "dnf", "-q", "updateinfo", "list", "security")
+	runtime := detectDNFRuntime(patchCommandTimeout)
+	if !runtime.GenerationKnown {
+		if !healthEnabled {
+			return watchdog.Pending{}, nil, nil
+		}
+		return watchdog.Pending{}, nil, []watchdog.Issue{{
+			Code: "dnf-generation-probe-failed",
+			ZH:   "无法可靠识别已安装的 DNF 代际，已跳过安全更新查询",
+			EN:   "Could not reliably identify the installed DNF generation; security-update queries were skipped",
+		}}
+	}
+	if runtime.isDNF5() {
+		return collectDNF5PackageFacts(healthEnabled, runtime)
+	}
+	regular := sysexec.RunTimeout(patchCommandTimeout, runtime.Command, runtime.advisoryArgs(false)...)
 	pending := watchdog.CollectPending("dnf", regular.Stdout)
 	var blocked []string
 	var issues []watchdog.Issue
 	if !healthEnabled {
 		return pending, nil, nil
 	}
-	if regular.Code != 0 {
-		code, zh, en := "dnf-repository-failed", "DNF 无法读取安全更新元数据", "DNF could not read security-update metadata"
-		if repositorySignatureError(regular.Stderr) {
-			code, zh, en = "dnf-repository-signature", "DNF 软件源元数据签名或 TLS 校验失败", "DNF repository metadata signature or TLS verification failed"
-		}
-		issues = append(issues, watchdog.Issue{Code: code, ZH: zh, EN: en})
+	if issue, failed := dnfRepositoryIssue(regular, regular.Code == 0); failed {
+		issues = append(issues, issue)
 	}
-	unrestricted := sysexec.RunTimeout(patchCommandTimeout, "dnf", "-q", "--disableplugin=versionlock", "--disableexcludes=all", "updateinfo", "list", "security")
-	if unrestricted.Code == 0 {
+	unrestricted := sysexec.RunTimeout(patchCommandTimeout, runtime.Command, runtime.advisoryArgs(true)...)
+	if issue, failed := dnfRepositoryIssue(unrestricted, unrestricted.Code == 0); failed {
+		issues = append(issues, issue, dnfBlockedQueryIssue())
+	} else {
 		blocked = watchdog.BlockedDNF(pending, watchdog.CollectPending("dnf", unrestricted.Stdout))
 	}
 	content, err := os.ReadFile(dnfAutomaticConfigPath())
@@ -139,7 +155,92 @@ func collectDNFPackageFacts(healthEnabled bool) (watchdog.Pending, []string, []w
 	} else {
 		issues = append(issues, watchdog.CheckDNFPolicy(string(content))...)
 	}
-	dnfCheck := sysexec.RunTimeout(patchCommandTimeout, "dnf", "-q", "check")
+	dnfCheck := sysexec.RunTimeout(patchCommandTimeout, runtime.Command, "-q", "check")
+	if dnfCheck.Code != 0 {
+		issues = append(issues, watchdog.Issue{Code: "dnf-check", ZH: "DNF 软件包一致性检查失败，请运行 dnf check", EN: "DNF package consistency check failed; run dnf check"})
+	}
+	return pending, blocked, issues
+}
+
+func collectDNF5PackageFacts(healthEnabled bool, runtime dnfRuntime) (watchdog.Pending, []string, []watchdog.Issue) {
+	regular := sysexec.RunTimeout(patchCommandTimeout, runtime.Command, runtime.advisoryArgs(false)...)
+	transaction := sysexec.RunTimeout(patchCommandTimeout, runtime.Command, runtime.checkUpgradeArgs(false)...)
+	transactionStatusOK := transaction.Code == 0 || transaction.Code == 100
+	transactionUpgrades, transactionParseErr := backend.ParseDNF5CheckUpgrades(transaction.Stdout)
+	transactionUsable := transactionParseErr == nil && ((transaction.Code == 0 && len(transactionUpgrades) == 0) ||
+		(transaction.Code == 100 && len(transactionUpgrades) > 0))
+
+	normalized := ""
+	var parseErr error
+	if regular.Code == 0 {
+		if transactionUsable {
+			normalized, parseErr = backend.NormalizeDNF5Pending(regular.Stdout, transaction.Stdout)
+			if parseErr != nil {
+				// A valid advisory response is stronger evidence than a failed
+				// advisory/transaction join. Conservatively over-report the
+				// advisories instead of turning parser drift into a false green.
+				normalized, _ = backend.NormalizeDNF5Advisories(regular.Stdout)
+			}
+		} else {
+			normalized, parseErr = backend.NormalizeDNF5Advisories(regular.Stdout)
+		}
+	}
+	pending := watchdog.CollectPending("dnf", normalized)
+	if !healthEnabled {
+		return pending, nil, nil
+	}
+
+	var blocked []string
+	var issues []watchdog.Issue
+	if issue, failed := dnfRepositoryIssue(regular, regular.Code == 0); failed {
+		issues = append(issues, issue)
+	} else if parseErr != nil {
+		issues = append(issues, watchdog.Issue{Code: "dnf-advisory-output-invalid", ZH: "DNF5 返回了无法解析的安全公告数据", EN: "DNF5 returned unparseable security-advisory data"})
+	}
+	if issue, failed := dnfRepositoryIssue(transaction, transactionStatusOK); failed {
+		issues = append(issues, issue)
+	}
+	if !transactionStatusOK {
+		issues = append(issues, watchdog.Issue{Code: "dnf-security-transaction-failed", ZH: "DNF5 无法计算实际可安装的安全更新", EN: "DNF5 could not calculate transaction-eligible security updates"})
+	} else if !transactionUsable {
+		issues = append(issues, watchdog.Issue{Code: "dnf-security-transaction-invalid", ZH: "DNF5 安全更新事务输出无法解析", EN: "DNF5 security-update transaction output could not be parsed"})
+	}
+
+	if transactionUsable {
+		unrestricted := sysexec.RunTimeout(patchCommandTimeout, runtime.Command, runtime.advisoryArgs(true)...)
+		unrestrictedTransaction := sysexec.RunTimeout(patchCommandTimeout, runtime.Command, runtime.checkUpgradeArgs(true)...)
+		unrestrictedTransactionStatusOK := unrestrictedTransaction.Code == 0 || unrestrictedTransaction.Code == 100
+		unrestrictedUpgrades, unrestrictedParseErr := backend.ParseDNF5CheckUpgrades(unrestrictedTransaction.Stdout)
+		unrestrictedTransactionUsable := unrestrictedParseErr == nil &&
+			((unrestrictedTransaction.Code == 0 && len(unrestrictedUpgrades) == 0) ||
+				(unrestrictedTransaction.Code == 100 && len(unrestrictedUpgrades) > 0))
+		unrestrictedFailed := false
+		if issue, failed := dnfRepositoryIssue(unrestricted, unrestricted.Code == 0); failed {
+			issues = append(issues, issue, dnfBlockedQueryIssue())
+			unrestrictedFailed = true
+		}
+		if issue, failed := dnfRepositoryIssue(unrestrictedTransaction, unrestrictedTransactionStatusOK); failed {
+			issues = append(issues, issue, dnfBlockedQueryIssue())
+			unrestrictedFailed = true
+		} else if !unrestrictedTransactionUsable {
+			issues = append(issues, dnfBlockedQueryIssue())
+			unrestrictedFailed = true
+		}
+		if !unrestrictedFailed {
+			var err error
+			blocked, err = backend.BlockedDNF5(unrestricted.Stdout, transaction.Stdout, unrestrictedTransaction.Stdout)
+			if err != nil {
+				issues = append(issues, watchdog.Issue{Code: "dnf-advisory-output-invalid", ZH: "DNF5 返回了无法解析的安全公告数据", EN: "DNF5 returned unparseable security-advisory data"})
+			}
+		}
+	}
+	content, err := os.ReadFile(dnfAutomaticConfigPath())
+	if err != nil {
+		issues = append(issues, watchdog.Issue{Code: "dnf-automatic-config", ZH: "无法读取 /etc/dnf/automatic.conf", EN: "Could not read /etc/dnf/automatic.conf"})
+	} else {
+		issues = append(issues, watchdog.CheckDNFPolicy(string(content))...)
+	}
+	dnfCheck := sysexec.RunTimeout(patchCommandTimeout, runtime.Command, "-q", "check")
 	if dnfCheck.Code != 0 {
 		issues = append(issues, watchdog.Issue{Code: "dnf-check", ZH: "DNF 软件包一致性检查失败，请运行 dnf check", EN: "DNF package consistency check failed; run dnf check"})
 	}
@@ -271,6 +372,63 @@ func repositorySignatureError(text string) bool {
 		}
 	}
 	return false
+}
+
+func repositoryOperationalError(text string) bool {
+	lower := strings.ToLower(text)
+	for _, marker := range []string{
+		"failed to download metadata", "errors during downloading metadata", "cannot download repomd",
+		"ignoring repositories", "skipping repository", "all mirrors were tried", "curl error",
+		"cannot prepare internal mirrorlist", "failed to synchronize cache", "repomd.xml",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func dnfRepositoryIssue(result sysexec.Result, statusOK bool) (watchdog.Issue, bool) {
+	if repositorySignatureError(result.Stderr) {
+		return watchdog.Issue{
+			Code: "dnf-repository-signature",
+			ZH:   "DNF 软件源元数据签名或 TLS 校验失败",
+			EN:   "DNF repository metadata signature or TLS verification failed",
+		}, true
+	}
+	if !statusOK || repositoryOperationalError(result.Stderr) {
+		return watchdog.Issue{
+			Code: "dnf-repository-failed",
+			ZH:   "DNF 无法可靠读取安全更新元数据",
+			EN:   "DNF could not reliably read security-update metadata",
+		}, true
+	}
+	return watchdog.Issue{}, false
+}
+
+func dnfBlockedQueryIssue() watchdog.Issue {
+	return watchdog.Issue{
+		Code: "dnf-blocked-query-failed",
+		ZH:   "DNF 无法检查被 versionlock 或 exclude 阻塞的安全更新",
+		EN:   "DNF could not check security updates blocked by versionlock or excludes",
+	}
+}
+
+func restartProbeIssue(code string) watchdog.Issue {
+	switch code {
+	case "dnf-restart-probe-failed":
+		return watchdog.Issue{
+			Code: code,
+			ZH:   "DNF 无法可靠检查需要重启的系统或服务",
+			EN:   "DNF could not reliably check whether the system or services need restarting",
+		}
+	default:
+		return watchdog.Issue{
+			Code: "restart-probe-failed",
+			ZH:   "无法可靠检查更新后的重启需求",
+			EN:   "Could not reliably check restart requirements after updates",
+		}
+	}
 }
 
 func nonNegativeConfig(cfg *config.Config, key string, dflt int) int {

@@ -1,6 +1,7 @@
 package run
 
 import (
+	"encoding/json"
 	"io"
 	"math"
 	"math/bits"
@@ -23,9 +24,11 @@ import (
 
 const (
 	osReleasePath              = "/etc/os-release"
+	osReleaseFallbackPath      = "/usr/lib/os-release"
 	maxRebootPkgsBytes         = 1 << 20
 	restartProbeCommandTimeout = 30 * time.Second
 	identityCommandTimeout     = 5 * time.Second
+	ubuntu2004ESMSupportEnd    = "2030-04-30"
 )
 
 // Flags 是影响采集/决策的运行时标志。
@@ -46,7 +49,7 @@ const (
 
 // Collect 从系统与配置采集 run 路径的全部输入。纯逻辑在 Assemble；此处集中所有 IO/exec。
 func Collect(cfg *config.Config, f Flags) Input {
-	o := osrel.Read(osReleasePath)
+	o := osrel.ReadFirst(osReleasePath, osReleaseFallbackPath)
 
 	be := cfg.Get("BACKEND")
 	if be == "" || be == "auto" {
@@ -100,9 +103,69 @@ func collectWatchdog(cfg *config.Config, be string, o osrel.OSRelease, restart b
 	patch, p := collectPatchWatchdog(cfg, be, restart, currentVersion, patchCollectOptions{PersistState: persistPatchState, ForceSelfUpdate: forceSelfUpdate, SkipSelfUpdate: skipSelfUpdate})
 	var e watchdog.EOL
 	if truthyLooseDefault(cfg.Get("CHECK_EOL"), true) {
-		e = watchdog.CheckEOL(o.ID, o.VersionID, o.PrettyName, time.Now().Unix())
+		if supportEnd := effectiveSupportEnd(o); supportEnd != "" {
+			e = watchdog.CheckEOLDate(supportEnd, time.Now().Unix())
+		}
 	}
 	return h, p, patch, e
+}
+
+func effectiveSupportEnd(o osrel.OSRelease) string {
+	if o.ID == "ubuntu" && o.VersionID == "20.04" {
+		if ubuntuESMInfraEnabled(identityCommandTimeout) {
+			return ubuntu2004ESMSupportEnd
+		}
+		// Ubuntu 20.04 is past standard maintenance. Do not let generic
+		// os-release metadata extend it without local entitlement evidence.
+		return watchdog.EolDateFor(o.ID, o.VersionID, o.PrettyName)
+	}
+	if supportEnd := osrel.SupportEndDate(o); supportEnd != "" {
+		return supportEnd
+	}
+	return watchdog.EolDateFor(o.ID, o.VersionID, o.PrettyName)
+}
+
+func ubuntuESMInfraEnabled(timeout time.Duration) bool {
+	command := ""
+	for _, candidate := range []string{"pro", "ua"} {
+		if sysexec.Look(candidate) {
+			command = candidate
+			break
+		}
+	}
+	if command == "" {
+		return false
+	}
+	result := sysexec.RunTimeout(timeout, command, "api", "u.pro.status.enabled_services.v1")
+	return result.Err == nil && result.Code == 0 && parseUbuntuESMInfraStatus(result.Stdout)
+}
+
+func parseUbuntuESMInfraStatus(output string) bool {
+	var response struct {
+		SchemaVersion string             `json:"_schema_version"`
+		Result        string             `json:"result"`
+		Errors        *[]json.RawMessage `json:"errors"`
+		Data          struct {
+			Type       string `json:"type"`
+			Attributes struct {
+				EnabledServices *[]struct {
+					Name string `json:"name"`
+				} `json:"enabled_services"`
+			} `json:"attributes"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(output), &response); err != nil ||
+		response.SchemaVersion != "v1" || response.Result != "success" ||
+		response.Data.Type != "EnabledServices" || response.Errors == nil || len(*response.Errors) != 0 ||
+		response.Data.Attributes.EnabledServices == nil {
+		return false
+	}
+	for _, service := range *response.Data.Attributes.EnabledServices {
+		if service.Name == "esm-infra" {
+			return true
+		}
+	}
+	return false
 }
 
 // resolvePublicIP 复刻 INCLUDE_PUBLIC_IP + PUBLIC_IP + 运行时自动获取 的解析。
@@ -160,21 +223,51 @@ func collectDNF() backend.RestartState {
 }
 
 func collectDNFWithTimeout(timeout time.Duration) backend.RestartState {
+	runtime := detectDNFRuntime(timeout)
+	if !runtime.GenerationKnown {
+		return backend.RestartState{
+			RestartSummary: "无法识别 DNF 代际；已跳过 needs-restarting 检查 / DNF generation probe failed; skipped needs-restarting checks",
+			ProbeIssue:     "dnf-restart-probe-failed",
+		}
+	}
+	if runtime.isDNF5() {
+		return collectDNF5WithRuntime(timeout, runtime)
+	}
 	hasNR := sysexec.Look("needs-restarting")
 	var nrR, nrS string
 	var rcR int
 	hasS := false
+	probeIssue := ""
+	rebootValid := false
 	if hasNR {
-		r := sysexec.RunTimeout(timeout, "needs-restarting", "-r") // Bash 用 2>&1
-		nrR = r.Stdout + r.Stderr
+		r := sysexec.RunTimeout(timeout, "needs-restarting", "-r")
+		nrR = r.Stdout
 		rcR = r.Code
-		help := sysexec.RunTimeout(timeout, "needs-restarting", "--help")
-		hasS = strings.Contains(help.Stdout+help.Stderr, "-s")
-		if hasS {
-			nrS = sysexec.RunTimeout(timeout, "needs-restarting", "-s").Stdout
+		_, rebootValid = backend.DNFRebootDecision(nrR, rcR)
+		rebootValid = rebootValid && r.Err == nil && strings.TrimSpace(r.Stderr) == ""
+		if !rebootValid {
+			probeIssue = "dnf-restart-probe-failed"
 		}
+		help := sysexec.RunTimeout(timeout, "needs-restarting", "--help")
+		if help.Code != 0 {
+			probeIssue = "dnf-restart-probe-failed"
+		} else {
+			hasS = strings.Contains(help.Stdout+help.Stderr, "-s")
+		}
+		if hasS {
+			services := sysexec.RunTimeout(timeout, "needs-restarting", "-s")
+			var valid bool
+			nrS, valid = backend.NormalizeDNFServiceList(services.Stdout)
+			if services.Err != nil || services.Code != 0 || strings.TrimSpace(services.Stderr) != "" || !valid {
+				probeIssue = "dnf-restart-probe-failed"
+				nrS = ""
+			}
+		}
+	} else {
+		probeIssue = "dnf-restart-probe-failed"
 	}
-	return backend.ParseDNF(backend.DNFInput{
+	state := backend.ParseDNF(backend.DNFInput{
+		Generation:         runtime.Generation,
 		HasNeedsRestarting: hasNR,
 		NeedsRestartingR:   nrR,
 		NeedsRestartingRC:  rcR,
@@ -182,23 +275,87 @@ func collectDNFWithTimeout(timeout time.Duration) backend.RestartState {
 		NeedsRestartingS:   nrS,
 		UpdateInfo:         "",
 	})
+	if !rebootValid {
+		state.RebootRequired = false
+	}
+	state.ProbeIssue = probeIssue
+	return state
+}
+
+func collectDNF5WithRuntime(timeout time.Duration, runtime dnfRuntime) backend.RestartState {
+	help := sysexec.RunTimeout(timeout, runtime.Command, "needs-restarting", "--help")
+	hasNR := help.Code == 0
+	var nrR, nrS string
+	var rcR int
+	hasS := false
+	probeIssue := ""
+	rebootValid := false
+	if hasNR {
+		r := sysexec.RunTimeout(timeout, runtime.Command, "-q", "needs-restarting")
+		nrR = r.Stdout
+		rcR = r.Code
+		_, rebootValid = backend.DNFRebootDecision(nrR, rcR)
+		rebootValid = rebootValid && r.Err == nil && strings.TrimSpace(r.Stderr) == ""
+		if !rebootValid {
+			probeIssue = "dnf-restart-probe-failed"
+		}
+		hasS = strings.Contains(help.Stdout+help.Stderr, "-s") || strings.Contains(help.Stdout+help.Stderr, "--services")
+		if hasS {
+			services := sysexec.RunTimeout(timeout, runtime.Command, "-q", "needs-restarting", "-s")
+			var valid bool
+			nrS, valid = backend.NormalizeDNFServiceList(services.Stdout)
+			wantCode := 0
+			if nrS != "" {
+				wantCode = 1
+			}
+			if services.Err != nil || services.Code != wantCode || strings.TrimSpace(services.Stderr) != "" || !valid {
+				probeIssue = "dnf-restart-probe-failed"
+				nrS = ""
+			}
+		} else {
+			probeIssue = "dnf-restart-probe-failed"
+		}
+	} else {
+		probeIssue = "dnf-restart-probe-failed"
+	}
+	state := backend.ParseDNF(backend.DNFInput{
+		Generation:         runtime.Generation,
+		HasNeedsRestarting: hasNR,
+		NeedsRestartingR:   nrR,
+		NeedsRestartingRC:  rcR,
+		HasS:               hasS,
+		NeedsRestartingS:   nrS,
+	})
+	if !rebootValid {
+		state.RebootRequired = false
+	}
+	state.ProbeIssue = probeIssue
+	return state
 }
 
 func collectHealth(be string, stale int) watchdog.Health {
 	var timer, svc string
+	timerEnabled := false
+	var dnfUnit dnfAutomaticUnit
 	switch be {
 	case "apt":
 		timer, svc = "apt-daily-upgrade.timer", "apt-daily-upgrade.service"
+		timerEnabled = systemd.IsEnabled(timer)
 	case "dnf":
-		timer, svc = "dnf-automatic.timer", "dnf-automatic.service"
+		runtime := detectDNFRuntime(restartProbeCommandTimeout)
+		if !runtime.GenerationKnown {
+			return watchdog.Health{}
+		}
+		dnfUnit = selectDNFAutomaticUnit(runtime.Generation, systemd.IsEnabled)
+		timer, svc, timerEnabled = dnfUnit.Timer, dnfUnit.Service, dnfUnit.Enabled
 	default:
 		return watchdog.Health{}
 	}
 	lastTs := systemd.ShowValue(svc, "ExecMainExitTimestamp")
 	timerTrig := systemd.ShowValue(timer, "LastTriggerUSec")
-	return watchdog.CheckHealth(watchdog.HealthInput{
+	health := watchdog.CheckHealth(watchdog.HealthInput{
 		Backend:           be,
-		TimerEnabled:      systemd.IsEnabled(timer),
+		TimerEnabled:      timerEnabled,
 		SvcResult:         systemd.ShowValue(svc, "Result"),
 		HaveSvcExit:       lastTs != "",
 		SvcExitEpoch:      parseSystemdTime(lastTs),
@@ -208,6 +365,11 @@ func collectHealth(be string, stale int) watchdog.Health {
 		StaleDays:         stale,
 		Disks:             collectDisks(),
 	})
+	if be == "dnf" {
+		health.TxtZH = rewriteDNFHealthUnitNames(health.TxtZH, dnfUnit)
+		health.TxtEN = rewriteDNFHealthUnitNames(health.TxtEN, dnfUnit)
+	}
+	return health
 }
 
 func collectDisks() []watchdog.DiskAvail {

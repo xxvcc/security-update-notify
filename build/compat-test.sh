@@ -31,30 +31,72 @@ cat >/usr/local/bin/systemctl <<'EOF'
 set -euo pipefail
 state=/tmp/mock-systemd
 link=/etc/systemd/system/timers.target.wants/security-update-notify.timer
+enabled_dir="$state/enabled"
+active_dir="$state/active-units"
 case "${1:-}" in
   is-enabled)
-    if [[ -L "$link" ]]; then echo enabled; exit 0; fi
+    unit="${!#}"
+    if [[ "$unit" == security-update-notify.timer && -L "$link" ]]; then
+      echo enabled
+      exit 0
+    fi
+    if [[ -e "$enabled_dir/$unit" ]]; then
+      echo enabled
+      exit 0
+    fi
     echo disabled
     exit 1
     ;;
   is-active)
-    [[ -e "$state/active" ]]
+    unit="${!#}"
+    if [[ "$unit" == security-update-notify.timer && -e "$state/active" ]] || \
+       [[ "$unit" != security-update-notify.timer && -e "$active_dir/$unit" ]]; then
+      echo active
+      exit 0
+    fi
+    echo inactive
+    exit 3
     ;;
   disable)
-    rm -f "$link" /run/systemd/system/timers.target.wants/security-update-notify.timer \
-      "$state/active"
+    for unit in "${@:2}"; do
+      [[ "$unit" == -* ]] && continue
+      rm -f "$enabled_dir/$unit"
+      [[ " $* " == *" --now "* ]] && rm -f "$active_dir/$unit"
+      if [[ "$unit" == security-update-notify.timer ]]; then
+        rm -f "$link" /run/systemd/system/timers.target.wants/security-update-notify.timer
+        [[ " $* " == *" --now "* ]] && rm -f "$state/active"
+      fi
+    done
     ;;
   enable)
-    if [[ " $* " == *" security-update-notify.timer "* ]]; then
-      mkdir -p "$(dirname "$link")"
-      ln -sfn ../security-update-notify.timer "$link"
-      [[ " $* " == *" --now "* ]] && touch "$state/active"
-    fi
+    mkdir -p "$enabled_dir" "$active_dir"
+    for unit in "${@:2}"; do
+      [[ "$unit" == -* ]] && continue
+      touch "$enabled_dir/$unit"
+      [[ " $* " == *" --now "* ]] && touch "$active_dir/$unit"
+      if [[ "$unit" == security-update-notify.timer ]]; then
+        mkdir -p "$(dirname "$link")"
+        ln -sfn ../security-update-notify.timer "$link"
+        [[ " $* " == *" --now "* ]] && touch "$state/active"
+      fi
+    done
     ;;
   start)
-    [[ "${2:-}" == security-update-notify.timer ]] && touch "$state/active"
+    unit="${!#}"
+    mkdir -p "$active_dir"
+    touch "$active_dir/$unit"
+    if [[ "$unit" == security-update-notify.timer ]]; then
+      touch "$state/active"
+    fi
     ;;
-  stop|daemon-reload)
+  stop)
+    unit="${!#}"
+    rm -f "$active_dir/$unit"
+    if [[ "$unit" == security-update-notify.timer ]]; then
+      rm -f "$state/active"
+    fi
+    ;;
+  daemon-reload)
     ;;
   list-timers)
     if [[ "${FAIL_LIST_TIMERS:-0}" == 1 ]]; then
@@ -70,6 +112,8 @@ case "${1:-}" in
 esac
 EOF
 chmod 0755 /usr/local/bin/systemctl
+ok "! systemctl is-enabled --quiet apt-daily-upgrade.timer >/dev/null" \
+  "APT automatic timer starts disabled"
 printf '#!/usr/bin/env bash\nexit 0\n' >/usr/local/bin/systemd-analyze
 chmod 0755 /usr/local/bin/systemd-analyze
 
@@ -92,6 +136,10 @@ runtime="$package_dir/files/security-update-notify-linux-amd64"
   echo "2.x compatibility version marker is not bound to $version" >&2
   exit 1
 }
+best_effort_args=()
+if [[ "${SUN_ALLOW_BEST_EFFORT:-0}" == 1 ]]; then
+  best_effort_args=(--allow-best-effort)
+fi
 
 cat >/etc/security-update-notify/telegram.env <<'EOF'
 CONFIG_VERSION='3'
@@ -118,8 +166,10 @@ printf '[Unit]\nDescription=legacy\n' >/etc/systemd/system/security-update-notif
 printf '[Timer]\nOnCalendar=*-*-* 08:30:00\n' >/etc/systemd/system/security-update-notify.timer
 printf 'security-update-notify: original file absent\n' \
   >/etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.absent
-printf 'legacy APT backup\n' \
-  >/etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak.20260725010203
+cat >/etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak.20260725010203 <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
 printf '%s\n' '67937ecd9dc8b78bb7bbb248d4ef6ef6ec0ac64ad65de2141dc171faec1803cd' \
   >/var/lib/security-update-notify/last-alert.sha256
 mkdir -p /etc/systemd/system/timers.target.wants
@@ -132,7 +182,7 @@ set +e
 (
   cd "$package_dir"
   FAIL_LIST_TIMERS=1 ./install.sh --skip-notify-test --non-interactive -y \
-    --skip-post-install-check --lang en
+    --skip-post-install-check --lang en "${best_effort_args[@]}"
 ) >/tmp/sun-compat-failure.out 2>&1
 failure_rc=$?
 set -e
@@ -145,12 +195,15 @@ ok "grep -Fxq 'legacy-runtime' /usr/local/sbin/security-update-notify" \
   "legacy runtime restored"
 ok "grep -qF \"CONFIG_VERSION='3'\" /etc/security-update-notify/telegram.env" \
   "schema 3 configuration restored"
-ok "test -f /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.absent && \
-    test -f /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak.20260725010203" \
-  "legacy APT metadata restored"
+ok "test ! -e /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.absent && \
+    test -f /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak.20260725010203 && \
+    cmp -s /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak.20260725010203 \
+      /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak" \
+  "legacy APT vendor baseline promoted durably"
 ok "test ! -e /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.absent.bak && \
+    test ! -e /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.dependency-default.bak && \
     test ! -e /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.20260725010203.bak" \
-  "migrated APT metadata rolled back"
+  "transient migrated APT metadata rolled back"
 ok "test -L /etc/systemd/system/timers.target.wants/security-update-notify.timer && \
     test -e /tmp/mock-systemd/active" \
   "legacy timer state restored"
@@ -158,7 +211,8 @@ ok "test -L /etc/systemd/system/timers.target.wants/security-update-notify.timer
 echo "### Upgrade representative 2.x state through the generated 3.x compatibility bridge"
 (
   cd "$package_dir"
-  ./install.sh --skip-notify-test --non-interactive -y --skip-post-install-check --lang en
+  ./install.sh --skip-notify-test --non-interactive -y --skip-post-install-check --lang en \
+    "${best_effort_args[@]}"
 )
 
 ok "[[ \"$(/usr/local/sbin/security-update-notify --version)\" == 'security-update-notify $version' ]]" \
@@ -183,12 +237,16 @@ ok "test -s /var/backups/security-update-notify/latest" "transaction backup crea
 ok "test -L /etc/systemd/system/timers.target.wants/security-update-notify.timer && \
     test -e /tmp/mock-systemd/active" \
   "project timer enabled and active"
+ok "test -e /tmp/mock-systemd/enabled/apt-daily-upgrade.timer" \
+  "APT automatic timer enablement tracked"
 ok "test ! -e /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.absent && \
     test ! -e /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak.20260725010203" \
   "legacy APT metadata names migrated"
-ok "test -f /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.absent.bak && \
+ok "test ! -e /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.absent.bak && \
+    test ! -e /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.dependency-default.bak && \
+    test -f /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak && \
     test -f /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.20260725010203.bak" \
-  "migrated APT metadata retained"
+  "migrated APT vendor baseline retained without transient proof"
 apt-config dump >/tmp/sun-compat-apt-config.out 2>&1
 ok "! grep -Fq \"Ignoring file '20auto-upgrades.security-update-notify\" /tmp/sun-compat-apt-config.out" \
   "migrated APT metadata is silently ignored"

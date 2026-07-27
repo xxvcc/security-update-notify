@@ -75,8 +75,12 @@ func TestEolDateFor(t *testing.T) {
 		{"rhel", "9", "Red Hat Enterprise Linux 9", "2032-05-31"},
 		{"debian", "12", "Debian GNU/Linux 12", "2028-06-30"},
 		{"ubuntu", "24.04", "Ubuntu 24.04", "2029-05-31"},
+		{"ubuntu", "26.04", "Ubuntu 26.04", "2031-05-31"},
 		{"ol", "9", "Oracle Linux 9", "2032-05-31"},
-		{"fedora", "40", "Fedora 40", ""}, // 表中不列 Fedora
+		{"fedora", "43", "Fedora 43", "2026-12-02"},
+		{"fedora", "44", "Fedora 44", "2027-05-19"},
+		{"centos", "10", "CentOS Stream 10", "2030-05-31"},
+		{"fedora", "40", "Fedora 40", ""},
 	}
 	for _, c := range cases {
 		if got := EolDateFor(c.id, c.ver, c.pretty); got != c.want {
@@ -103,6 +107,13 @@ func TestCheckEOL(t *testing.T) {
 	none := CheckEOL("fedora", "40", "Fedora 40", eol)
 	if none.Sig != "" {
 		t.Errorf("not in table: Sig=%q", none.Sig)
+	}
+	fromSupportEnd := CheckEOLDate("2026-08-31", eol-30*86400)
+	if fromSupportEnd.Attention || fromSupportEnd.Sig != "soon" {
+		t.Errorf("SUPPORT_END: Attention=%v Sig=%q", fromSupportEnd.Attention, fromSupportEnd.Sig)
+	}
+	if invalid := CheckEOLDate("2026-8-31", eol); invalid != (EOL{}) {
+		t.Errorf("invalid SUPPORT_END=%+v", invalid)
 	}
 }
 
@@ -167,11 +178,27 @@ Unattended-Upgrade::Automatic-Reboot "false";`
 			t.Errorf("APT automatic-reboot value %q issues=%v", value, issues)
 		}
 	}
-	dnf := "[commands]\nupgrade_type = security\napply_updates = yes\n"
+	dnf := "[commands]\nupgrade_type = security\napply_updates = yes\nreboot = never\n"
 	if issues := CheckDNFPolicy(dnf); len(issues) != 0 {
 		t.Fatalf("healthy dnf policy issues=%v", issues)
 	}
-	if issues := CheckDNFPolicy("[commands]\nupgrade_type = default\napply_updates = no\n"); len(issues) != 2 {
+	for _, value := range []string{"1", "true", "yes", "on"} {
+		equivalent := "[commands]\nupgrade_type = security\napply_updates = " + value + "\nreboot = never\n"
+		if issues := CheckDNFPolicy(equivalent); len(issues) != 0 {
+			t.Errorf("DNF true value %q issues=%v", value, issues)
+		}
+	}
+	if issues := CheckDNFPolicy("[commands]\nupgrade_type = default\napply_updates = no\nreboot = when-needed\n"); len(issues) != 3 {
 		t.Fatalf("drifted dnf policy issues=%v", issues)
+	}
+	for _, malformed := range []string{
+		"[commands\nupgrade_type = security\napply_updates = yes\nreboot = never\n",
+		"[commands]\nupgrade_type = security\napply_updates = yes\nreboot = never\n[COMMANDS]\napply_updates = yes\n",
+		"[commands]\nupgrade_type = default\nupgrade_type = security\napply_updates = yes\nreboot = never\n",
+	} {
+		issues := CheckDNFPolicy(malformed)
+		if len(issues) != 1 || issues[0].Code != "dnf-automatic-config-invalid" {
+			t.Errorf("malformed DNF policy issues=%v", issues)
+		}
 	}
 }

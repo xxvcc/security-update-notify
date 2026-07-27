@@ -13,6 +13,9 @@ func TestSystemctlQueriesHonorExitStatus(t *testing.T) {
 	stub := `#!/bin/sh
 case "$1:$2:$3" in
   is-enabled:enabled.service:) printf 'enabled\n'; exit 0 ;;
+  is-enabled:runtime.service:) printf 'enabled-runtime\n'; exit 0 ;;
+  is-enabled:static.service:) printf 'static\n'; exit 0 ;;
+  is-enabled:alias.service:) printf 'alias\n'; exit 0 ;;
   is-enabled:disabled.service:) printf 'disabled\n'; exit 1 ;;
   is-enabled:broken.service:) printf 'enabled\n'; exit 3 ;;
   show:healthy.service:-p) printf 'active\n\n'; exit 0 ;;
@@ -28,11 +31,13 @@ esac
 	if !Available() {
 		t.Fatal("Available()=false with systemctl on PATH")
 	}
-	if !IsEnabled("enabled.service") {
-		t.Error("IsEnabled() rejected exit status 0")
+	if !IsEnabled("enabled.service") || !IsEnabled("runtime.service") {
+		t.Error("IsEnabled() rejected an enabled state")
 	}
-	if IsEnabled("disabled.service") || IsEnabled("broken.service") {
-		t.Error("IsEnabled() accepted a non-zero exit status")
+	for _, unit := range []string{"static.service", "alias.service", "disabled.service", "broken.service"} {
+		if IsEnabled(unit) {
+			t.Errorf("IsEnabled(%q)=true for a state that does not guarantee enablement", unit)
+		}
 	}
 	if got := ShowValue("healthy.service", "ActiveState"); got != "active" {
 		t.Fatalf("ShowValue()=%q, want active", got)

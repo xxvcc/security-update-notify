@@ -14,6 +14,7 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/osrel"
 	"github.com/xxvcc/security-update-notify/internal/sysexec"
 	"github.com/xxvcc/security-update-notify/internal/systemd"
+	"github.com/xxvcc/security-update-notify/internal/watchdog"
 )
 
 const doctorCommandTimeout = 30 * time.Second
@@ -77,29 +78,96 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 		backendReady = doctorAPTDependencies(out, lang, sysexec.Look, func(name string, args ...string) sysexec.Result {
 			return sysexec.RunTimeout(doctorCommandTimeout, name, args...)
 		})
+		if probe := sysexec.RunTimeout(doctorCommandTimeout, "unattended-upgrade", "--help"); probe.Code != 0 {
+			say(out, lang, "失败：unattended-upgrade 命令不可用", "FAIL unattended-upgrade command unavailable")
+			backendReady = false
+		}
+		if !fileReadable("/etc/apt/apt.conf.d/20auto-upgrades") {
+			say(out, lang, "失败：APT 自动更新配置不可读", "FAIL APT automatic-update configuration not readable")
+			backendReady = false
+		}
+		if systemd.IsEnabled("apt-daily-upgrade.timer") {
+			say(out, lang, "正常：apt-daily-upgrade.timer 已启用", "OK apt-daily-upgrade.timer enabled")
+		} else {
+			say(out, lang, "失败：apt-daily-upgrade.timer 未启用", "FAIL apt-daily-upgrade.timer not enabled")
+			backendReady = false
+		}
 		ok = ok && backendReady
 	case "dnf":
-		switch {
-		case sysexec.Look("dnf"):
-			say(out, lang, "正常：命令存在 dnf", "OK command dnf")
-		case sysexec.Look("yum"):
-			say(out, lang, "正常：命令存在 yum", "OK command yum")
-		default:
+		runtime := detectDNFRuntime(doctorCommandTimeout)
+		generationProbeFailed := runtime.Available && !runtime.GenerationKnown
+		if runtime.Available {
+			label := runtime.Command
+			if runtime.isDNF5() {
+				label += " (DNF5)"
+			}
+			say(out, lang, "正常：命令存在 "+label, "OK command "+label)
+			if generationProbeFailed {
+				say(out, lang,
+					"失败：无法可靠识别 DNF 代际（"+runtime.Command+" --version）",
+					"FAIL could not reliably identify DNF generation ("+runtime.Command+" --version)")
+				ok = false
+				backendReady = false
+			}
+		} else {
 			say(out, lang, "失败：缺少 dnf/yum", "FAIL missing dnf/yum")
 			ok = false
 			backendReady = false
 		}
-		if sysexec.Look("needs-restarting") {
-			say(out, lang, "正常：命令存在 needs-restarting", "OK command needs-restarting")
+		if !generationProbeFailed {
+			if runtime.isDNF5() {
+				probe := sysexec.RunTimeout(doctorCommandTimeout, runtime.Command, "needs-restarting", "--help")
+				if probe.Code == 0 {
+					say(out, lang, "正常：命令存在 dnf needs-restarting", "OK command dnf needs-restarting")
+				} else {
+					say(out, lang, "失败：缺少 dnf needs-restarting 子命令", "FAIL missing dnf needs-restarting command")
+					ok = false
+					backendReady = false
+				}
+			} else if sysexec.Look("needs-restarting") {
+				say(out, lang, "正常：命令存在 needs-restarting", "OK command needs-restarting")
+			} else {
+				say(out, lang, "失败：缺少 needs-restarting", "FAIL missing needs-restarting")
+				ok = false
+				backendReady = false
+			}
+			var automaticProbe sysexec.Result
+			if runtime.isDNF5() {
+				automaticProbe = sysexec.RunTimeout(doctorCommandTimeout, runtime.Command, "automatic", "--help")
+			} else if sysexec.Look("dnf-automatic") {
+				automaticProbe = sysexec.RunTimeout(doctorCommandTimeout, "dnf-automatic", "--help")
+			} else {
+				automaticProbe.Code = -1
+			}
+			if automaticProbe.Code == 0 {
+				say(out, lang, "正常：DNF automatic 命令可用", "OK DNF automatic command available")
+			} else {
+				say(out, lang, "失败：DNF automatic 命令不可用", "FAIL DNF automatic command unavailable")
+				ok = false
+				backendReady = false
+			}
+		}
+		if content, err := os.ReadFile(dnfAutomaticConfigPath()); err == nil {
+			say(out, lang, "正常：DNF automatic 配置可读", "OK DNF automatic configuration readable")
+			for _, issue := range watchdog.CheckDNFPolicy(string(content)) {
+				say(out, lang, "失败："+issue.ZH, "FAIL "+issue.EN)
+				ok = false
+				backendReady = false
+			}
 		} else {
-			say(out, lang, "失败：缺少 needs-restarting", "FAIL missing needs-restarting")
+			say(out, lang, "失败：DNF automatic 配置不可读", "FAIL DNF automatic configuration not readable")
 			ok = false
 			backendReady = false
 		}
-		if systemd.IsEnabled("dnf-automatic.timer") {
-			say(out, lang, "正常：dnf-automatic.timer 已启用", "OK dnf-automatic.timer enabled")
-		} else {
-			say(out, lang, "警告：dnf-automatic.timer 未启用", "WARN dnf-automatic.timer not enabled")
+		if !generationProbeFailed {
+			unit := selectDNFAutomaticUnit(runtime.Generation, systemd.IsEnabled)
+			if unit.Enabled {
+				say(out, lang, "正常："+unit.Timer+" 已启用", "OK "+unit.Timer+" enabled")
+			} else {
+				say(out, lang, "失败："+unit.Timer+" 未启用", "FAIL "+unit.Timer+" not enabled")
+				ok = false
+				backendReady = false
+			}
 		}
 	default:
 		say(out, lang, "失败：不支持的后端 "+be, "FAIL unsupported backend "+be)

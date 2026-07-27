@@ -20,6 +20,7 @@ type RestartState struct {
 	RestartAttention bool
 	RestartSummary   string // 通知正文用；apt=真换行原文，dnf=含字面 \n
 	RestartSignal    string // 去重 hash 用；apt=KCUR/KEXP/KSTA+SVC 成帧后 TrimRight，dnf=SVC 列表
+	ProbeIssue       string // non-empty when command execution failed and an empty result is not trustworthy
 }
 
 // splitLines 按 \n 切分（不产生末尾空串），模拟对命令输出逐行处理。

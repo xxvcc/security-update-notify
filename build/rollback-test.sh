@@ -32,29 +32,72 @@ cat >/usr/local/bin/systemctl <<'EOF'
 set -euo pipefail
 state=/tmp/mock-systemd
 link=/etc/systemd/system/timers.target.wants/security-update-notify.timer
+enabled_dir="$state/enabled"
+active_dir="$state/active-units"
 case "${1:-}" in
   is-enabled)
-    if [[ -L "$link" ]]; then echo enabled; exit 0; fi
+    unit="${!#}"
+    if [[ "$unit" == security-update-notify.timer && -L "$link" ]]; then
+      echo enabled
+      exit 0
+    fi
+    if [[ -e "$enabled_dir/$unit" ]]; then
+      echo enabled
+      exit 0
+    fi
     echo disabled
     exit 1
     ;;
   is-active)
-    [[ -e "$state/active" ]]
+    unit="${!#}"
+    if [[ "$unit" == security-update-notify.timer && -e "$state/active" ]] || \
+       [[ "$unit" != security-update-notify.timer && -e "$active_dir/$unit" ]]; then
+      echo active
+      exit 0
+    fi
+    echo inactive
+    exit 3
     ;;
   disable)
-    rm -f "$link" /run/systemd/system/timers.target.wants/security-update-notify.timer "$state/active"
+    for unit in "${@:2}"; do
+      [[ "$unit" == -* ]] && continue
+      rm -f "$enabled_dir/$unit"
+      [[ " $* " == *" --now "* ]] && rm -f "$active_dir/$unit"
+      if [[ "$unit" == security-update-notify.timer ]]; then
+        rm -f "$link" /run/systemd/system/timers.target.wants/security-update-notify.timer
+        [[ " $* " == *" --now "* ]] && rm -f "$state/active"
+      fi
+    done
     ;;
   enable)
-    if [[ " $* " == *" security-update-notify.timer "* ]]; then
-      mkdir -p "$(dirname "$link")"
-      ln -sfn ../security-update-notify.timer "$link"
-      [[ " $* " == *" --now "* ]] && touch "$state/active"
-    fi
+    mkdir -p "$enabled_dir" "$active_dir"
+    for unit in "${@:2}"; do
+      [[ "$unit" == -* ]] && continue
+      touch "$enabled_dir/$unit"
+      [[ " $* " == *" --now "* ]] && touch "$active_dir/$unit"
+      if [[ "$unit" == security-update-notify.timer ]]; then
+        mkdir -p "$(dirname "$link")"
+        ln -sfn ../security-update-notify.timer "$link"
+        [[ " $* " == *" --now "* ]] && touch "$state/active"
+      fi
+    done
     ;;
   start)
-    [[ "${2:-}" == security-update-notify.timer ]] && touch "$state/active"
+    unit="${!#}"
+    mkdir -p "$active_dir"
+    touch "$active_dir/$unit"
+    if [[ "$unit" == security-update-notify.timer ]]; then
+      touch "$state/active"
+    fi
     ;;
-  stop|daemon-reload)
+  stop)
+    unit="${!#}"
+    rm -f "$active_dir/$unit"
+    if [[ "$unit" == security-update-notify.timer ]]; then
+      rm -f "$state/active"
+    fi
+    ;;
+  daemon-reload)
     ;;
   list-timers)
     if [[ "${FAIL_LIST_TIMERS:-0}" == 1 ]]; then
@@ -70,6 +113,8 @@ case "${1:-}" in
 esac
 EOF
 chmod 0755 /usr/local/bin/systemctl
+ok "! systemctl is-enabled --quiet apt-daily-upgrade.timer >/dev/null" \
+  "APT automatic timer starts disabled"
 printf '#!/usr/bin/env bash\nexit 0\n' >/usr/local/bin/systemd-analyze
 chmod 0755 /usr/local/bin/systemd-analyze
 
@@ -99,6 +144,11 @@ install_args=(
   --skip-post-install-check
   --lang en
 )
+best_effort_args=()
+if [[ "${SUN_ALLOW_BEST_EFFORT:-0}" == 1 ]]; then
+  best_effort_args=(--allow-best-effort)
+  install_args+=("${best_effort_args[@]}")
+fi
 
 cat >/etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 APT::Periodic::Update-Package-Lists "0";
@@ -127,6 +177,8 @@ ok "grep -qF \"CONFIG_VERSION='4'\" /etc/security-update-notify/telegram.env" \
 ok "[[ -L /etc/systemd/system/timers.target.wants/security-update-notify.timer ]]" \
   "timer enabled"
 ok "[[ -e /tmp/mock-systemd/active ]]" "timer active"
+ok "[[ -e /tmp/mock-systemd/enabled/apt-daily-upgrade.timer ]]" \
+  "APT automatic timer enablement tracked"
 ok "[[ -f /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak ]]" \
   "stable APT baseline backup created"
 apt-config dump >/tmp/sun-apt-config.out 2>&1
@@ -143,6 +195,7 @@ echo "### Late upgrade failure rolls back files and timer state"
 set +e
 FAIL_LIST_TIMERS=1 "$runtime" install --host-label should-not-survive \
   --skip-notify-test --non-interactive -y --skip-post-install-check --lang en \
+  "${best_effort_args[@]}" \
   >/tmp/late-upgrade.out 2>&1
 upgrade_rc=$?
 set -e
@@ -169,7 +222,8 @@ ok "[[ ! -e /usr/local/sbin/security-update-notify ]]" "runtime removed"
 ok "[[ -f /etc/security-update-notify/telegram.env ]]" "configuration retained"
 
 echo "### Reinstall from retained configuration"
-"$runtime" install --skip-notify-test --non-interactive -y --skip-post-install-check --lang en
+"$runtime" install --skip-notify-test --non-interactive -y --skip-post-install-check --lang en \
+  "${best_effort_args[@]}"
 ok "[[ \"$(/usr/local/sbin/security-update-notify --version)\" == 'security-update-notify $version' ]]" \
   "runtime reinstalled"
 

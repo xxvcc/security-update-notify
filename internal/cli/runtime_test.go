@@ -185,7 +185,7 @@ func runtimeCommandPath(t *testing.T) string {
 	dir := t.TempDir()
 	writeCLICommand(t, dir, "systemctl", `
 case "$1" in
-  is-enabled) exit 0 ;;
+  is-enabled) printf '%s\n' enabled ;;
   show)
     case "$4" in
       Result) printf '%s\n' success ;;
@@ -201,6 +201,7 @@ printf '%s\n' "Package: $2" "Status: install ok installed"
 `)
 	writeCLICommand(t, dir, "apt-get", "exit 0\n")
 	writeCLICommand(t, dir, "needrestart", "exit 0\n")
+	writeCLICommand(t, dir, "unattended-upgrade", "exit 0\n")
 	writeCLICommand(t, dir, "hostname", `
 if [ "${1:-}" = "-f" ]; then printf '%s\n' fixture.example.test; else printf '%s\n' fixture; fi
 `)
