@@ -234,24 +234,21 @@ jobs:
       - name: Stable mirror publication invariants
         run: |
           python3 -I - <<'PY'
-          import subprocess
-          import tempfile
           from pathlib import Path
 
           workflow = Path('.github/workflows/mirror-release.yml').read_text(encoding='utf-8')
           workflow_sha_ref = 'ref: $' + '{{ github.workflow_sha }}'
           release_sha_ref = 'ref: $' + '{{ github.event.workflow_run.head_sha || inputs.tag }}'
           upstream_sha_env = 'EXPECTED_HEAD_SHA: $' + '{{ github.event.workflow_run.head_sha }}'
-          tag_concurrency = 'group: signed-release-mirror-$' + \
-              '{{ github.event.workflow_run.head_branch || inputs.tag }}'
+          stable_concurrency = 'group: signed-release-mirror-stable'
           concurrency_groups = [
               line.strip()
               for line in workflow.splitlines()
               if line.startswith('      group:')
           ]
-          if concurrency_groups != [tag_concurrency]:
+          if concurrency_groups != [stable_concurrency]:
               raise SystemExit(
-                  'mirror workflow must isolate concurrency by release tag: '
+                  'mirror workflow must globally serialize stable publication: '
                   f'{concurrency_groups}'
               )
           required = [
@@ -282,16 +279,11 @@ jobs:
               'raise ValueError("download exceeds byte limit")',
               'gpg --no-options --batch --status-fd=1',
               'cmp "deploy/$TAG/$asset" "public-check/$asset"',
-              '- name: Publish stable files under one remote lock',
-              'flock --wait 180 --exclusive 9',
-              'deadline=$((SECONDS + 720))',
-              'read_reply LOCKED 200',
-              'if [[ "$BOOTSTRAP_PRESENT" == "1" ]]; then',
-              '[[ -f "$stage/sun.sh" && ! -L "$stage/sun.sh" ]] || exit 64',
-              'rollback_stable() {',
-              'sun_backup="$stage/.previous-sun.sh"',
-              'latest_backup="$stage/.previous-latest.json"',
-              'committed=1',
+              '- name: Confirm GitHub Latest before stable update',
+              '- name: Publish stable bootstrap through forced-command rrsync',
+              '- name: Publish latest manifest last through forced-command rrsync',
+              '"deploy/$TAG/sun.sh" "$MIRROR_USER@$MIRROR_HOST:sun.sh"',
+              'latest.json "$MIRROR_USER@$MIRROR_HOST:latest.json"',
               'needs: verify-and-sync',
               'uses: ./.github/workflows/live-canary.yml',
           ]
@@ -313,7 +305,9 @@ jobs:
               '- name: Configure pinned SSH identity',
               '- name: Upload immutable signed release files',
               '- name: Verify release files through the public mirror',
-              '- name: Publish stable files under one remote lock',
+              '- name: Confirm GitHub Latest before stable update',
+              '- name: Publish stable bootstrap through forced-command rrsync',
+              '- name: Publish latest manifest last through forced-command rrsync',
           ]
           positions = [workflow.index(item) for item in ordered]
           if positions != sorted(positions):
@@ -333,102 +327,35 @@ jobs:
               raise SystemExit('the bounded HTTPS helper and all four call sites must remain intact')
 
           stable = workflow.split(
-              '- name: Publish stable files under one remote lock', 1
+              '- name: Confirm GitHub Latest before stable update', 1
           )[1].split('- name: Remove SSH identity', 1)[0]
-          remote_script, controller = stable.split('\n          REMOTE_SCRIPT\n', 1)
-          latest_handler = remote_script.split(
-              '              PUBLISH_LATEST)', 1
-          )[1].split('              RELEASE)', 1)[0]
-          latest_handler_order = [
-              'install -m 0644 -- "$stage/latest.json" "$latest_tmp"',
-              'mv -f -- "$latest_tmp" latest.json',
-              "printf '%s\\n' LATEST_PUBLISHED",
-          ]
-          latest_handler_positions = [latest_handler.index(item) for item in latest_handler_order]
-          if latest_handler_positions != sorted(latest_handler_positions):
-              raise SystemExit('latest.json must be the final stable artifact write')
-          controller_order = [
-              'read_reply LOCKED 200',
+          stable_order = [
               'latest_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"',
-              "printf '%s\\n' PUBLISH_SUN",
-              'read_reply SUN_PUBLISHED 60',
+              '- name: Publish stable bootstrap through forced-command rrsync',
+              '"deploy/$TAG/sun.sh" "$MIRROR_USER@$MIRROR_HOST:sun.sh"',
               '"$MIRROR_BASE_URL/sun.sh?run=$GITHUB_RUN_ID&attempt=$GITHUB_RUN_ATTEMPT"',
-              "printf '%s\\n' PUBLISH_LATEST",
-              'read_reply LATEST_PUBLISHED 60',
+              'cmp "deploy/$TAG/sun.sh" public-sun.sh',
+              '- name: Publish latest manifest last through forced-command rrsync',
+              'latest.json "$MIRROR_USER@$MIRROR_HOST:latest.json"',
               '"$MIRROR_BASE_URL/latest.json?run=$GITHUB_RUN_ID&attempt=$GITHUB_RUN_ATTEMPT"',
-              '\n          finish_remote_lock\n',
+              'cmp latest.json public-latest.json',
           ]
-          controller_positions = [controller.index(item) for item in controller_order]
-          if controller_positions != sorted(controller_positions):
-              raise SystemExit('stable files must be published and read back inside one ordered lock')
-          snapshot_order = [
-              'install -m 0600 -- sun.sh "$sun_backup"',
-              'install -m 0600 -- latest.json "$latest_backup"',
-              'install -m 0644 -- "$stage/sun.sh" "$sun_tmp"',
-              'mv -f -- "$sun_tmp" sun.sh',
+          stable_positions = [stable.index(item) for item in stable_order]
+          if stable_positions != sorted(stable_positions):
+              raise SystemExit('stable files must use ordered rrsync writes and public read-back')
+          if stable.count('rsync --archive --checksum --delay-updates --chmod=F644') != 2:
+              raise SystemExit('stable publication must contain exactly two delayed rrsync writes')
+          forbidden_remote_execution = [
+              'mirror-lock.sh', 'REMOTE_SCRIPT', 'coproc ', 'flock ',
+              'ssh_command=', 'bash --noprofile', 'PUBLISH_SUN', 'PUBLISH_LATEST',
           ]
-          publish_sun_handler = remote_script.split(
-              '              PUBLISH_SUN)', 1
-          )[1].split('              PUBLISH_LATEST)', 1)[0]
-          snapshot_positions = [publish_sun_handler.index(item) for item in snapshot_order]
-          if snapshot_positions != sorted(snapshot_positions):
-              raise SystemExit('stable files must be snapshotted before publishing sun.sh')
-          cleanup_handler = remote_script.split('          cleanup() {', 1)[1].split(
-              '          }\n          trap cleanup EXIT', 1
-          )[0]
-          for item in ['rollback_stable', 'committed', 'preserve_stage']:
-              if item not in cleanup_handler:
-                  raise SystemExit(f'remote cleanup must retain transactional rollback: {item}')
-
-          remote_body = remote_script.split(
-              'cat > "$local_stage/mirror-lock.sh" <<\'REMOTE_SCRIPT\'\n', 1
-          )[1]
-
-          def protocol_case(name, actions, expected_sun, expected_latest, expected_rc):
-              with tempfile.TemporaryDirectory(prefix=f'sun-mirror-{name}-') as temporary:
-                  root = Path(temporary)
-                  stage_name = '.security-update-notify-stage-123-1-v3.1.1'
-                  stage = root / stage_name
-                  stage.mkdir()
-                  (stage / 'sun.sh').write_text('new sun\n', encoding='ascii')
-                  (stage / 'latest.json').write_text('new latest\n', encoding='ascii')
-                  (stage / 'mirror-lock.sh').write_text('fixture\n', encoding='ascii')
-                  if expected_sun is not None:
-                      (root / 'sun.sh').write_text('old sun\n', encoding='ascii')
-                  if expected_latest is not None:
-                      (root / 'latest.json').write_text('old latest\n', encoding='ascii')
-                  script = root / 'remote-lock.sh'
-                  script.write_text(remote_body, encoding='utf-8')
-                  completed = subprocess.run(
-                      ['bash', '--noprofile', '--norc', str(script), stage_name],
-                      cwd=root, input=actions, text=True, capture_output=True,
-                      timeout=10, check=False,
+          for item in forbidden_remote_execution:
+              if item in stable:
+                  raise SystemExit(
+                      f'forced-command rrsync publication must not execute remote commands: {item}'
                   )
-                  if completed.returncode != expected_rc:
-                      raise SystemExit(
-                          f'{name}: remote protocol returned {completed.returncode}, '
-                          f'want {expected_rc}: {completed.stderr}'
-                      )
-                  actual_sun = (root / 'sun.sh').read_text(encoding='ascii').strip() \
-                      if (root / 'sun.sh').exists() else None
-                  actual_latest = (root / 'latest.json').read_text(encoding='ascii').strip() \
-                      if (root / 'latest.json').exists() else None
-                  if (actual_sun, actual_latest) != (expected_sun, expected_latest):
-                      raise SystemExit(
-                          f'{name}: stable rollback produced '
-                          f'{(actual_sun, actual_latest)}, want '
-                          f'{(expected_sun, expected_latest)}'
-                      )
-                  if stage.exists():
-                      raise SystemExit(f'{name}: completed protocol retained its stage')
-
-          protocol_case('abort', 'PUBLISH_SUN\nABORT\n', 'old sun', 'old latest', 0)
-          protocol_case(
-              'commit', 'PUBLISH_SUN\nPUBLISH_LATEST\nRELEASE\n',
-              'new sun', 'new latest', 0,
-          )
-          protocol_case('eof', 'PUBLISH_SUN\n', 'old sun', 'old latest', 124)
-          protocol_case('initial', 'PUBLISH_SUN\nABORT\n', None, None, 0)
+          if 'RSYNC_RSH=ssh ' not in workflow:
+              raise SystemExit('pinned SSH transport must remain confined to RSYNC_RSH')
 
           canary = Path('.github/workflows/live-canary.yml').read_text(encoding='utf-8')
           if 'workflow_call:' not in canary or 'workflow_run:' in canary or '\nconcurrency:' in canary:

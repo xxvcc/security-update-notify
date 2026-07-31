@@ -52,12 +52,16 @@ func TestMirrorWorkflowBindsVersionedBootstrapTrustSet(t *testing.T) {
 		`cmp files/release-signing.pub.asc "deploy/$TAG/release-signing.pub.asc"`,
 		`assets+=("$BOOTSTRAP_SIGNATURE_ASSET" release-signing.pub.asc)`,
 		`--verify "public-check/$BOOTSTRAP_SIGNATURE_ASSET" public-check/sun.sh`,
-		`- name: Publish stable files under one remote lock`,
+		`- name: Confirm GitHub Latest before stable update`,
 		`latest_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"`,
-		`printf '%s\n' PUBLISH_SUN`,
+		`- name: Publish stable bootstrap through forced-command rrsync`,
+		`"deploy/$TAG/sun.sh" "$MIRROR_USER@$MIRROR_HOST:sun.sh"`,
 		`"$MIRROR_BASE_URL/sun.sh?run=$GITHUB_RUN_ID&attempt=$GITHUB_RUN_ATTEMPT"`,
-		`printf '%s\n' PUBLISH_LATEST`,
+		`cmp "deploy/$TAG/sun.sh" public-sun.sh`,
+		`- name: Publish latest manifest last through forced-command rrsync`,
+		`latest.json "$MIRROR_USER@$MIRROR_HOST:latest.json"`,
 		`"$MIRROR_BASE_URL/latest.json?run=$GITHUB_RUN_ID&attempt=$GITHUB_RUN_ATTEMPT"`,
+		`cmp latest.json public-latest.json`,
 	}
 	previous := -1
 	for _, item := range requiredInOrder {
@@ -70,13 +74,14 @@ func TestMirrorWorkflowBindsVersionedBootstrapTrustSet(t *testing.T) {
 		}
 		previous = position
 	}
-	stableStart := strings.Index(workflow, `- name: Publish stable files under one remote lock`)
+	stableStart := strings.Index(workflow, `- name: Confirm GitHub Latest before stable update`)
 	stableEnd := strings.Index(workflow[stableStart:], `- name: Remove SSH identity`)
 	stableStep := workflow[stableStart : stableStart+stableEnd]
 	for _, item := range []string{
-		`if [[ "$BOOTSTRAP_PRESENT" == "1" ]]; then`,
-		`install -m 0600 "deploy/$TAG/sun.sh" "$local_stage/"`,
-		`[[ -f "$stage/sun.sh" && ! -L "$stage/sun.sh" ]] || exit 64`,
+		`[[ "$BOOTSTRAP_PRESENT" == "1" ]]`,
+		`[[ -z "$BOOTSTRAP_SIGNATURE_ASSET" || "$HIGH_ASSURANCE_BOOTSTRAP" == "1" ]]`,
+		`"deploy/$TAG/sun.sh" "$MIRROR_USER@$MIRROR_HOST:sun.sh"`,
+		`latest.json "$MIRROR_USER@$MIRROR_HOST:latest.json"`,
 	} {
 		if !strings.Contains(stableStep, item) {
 			t.Fatalf("stable publication legacy-bootstrap guard missing: %s", item)
@@ -84,6 +89,11 @@ func TestMirrorWorkflowBindsVersionedBootstrapTrustSet(t *testing.T) {
 	}
 	if strings.Contains(stableStep, `release-signing.pub.asc`) {
 		t.Fatal("stable publication must not pretend to atomically publish the versioned trust set")
+	}
+	for _, item := range []string{`mirror-lock.sh`, `REMOTE_SCRIPT`, `coproc `, `flock `} {
+		if strings.Contains(stableStep, item) {
+			t.Fatalf("forced-command rrsync publication must not execute remote code: %s", item)
+		}
 	}
 }
 

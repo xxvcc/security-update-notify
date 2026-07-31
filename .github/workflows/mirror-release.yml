@@ -602,7 +602,9 @@ jobs:
     timeout-minutes: 25
     environment: release-mirror
     concurrency:
-      group: signed-release-mirror-${{ github.event.workflow_run.head_branch || inputs.tag }}
+      # The forced-command key can only invoke rrsync, so Actions provides the
+      # single writer boundary for the two stable files.
+      group: signed-release-mirror-stable
       cancel-in-progress: false
     env:
       TAG: ${{ github.event.workflow_run.head_branch || inputs.tag }}
@@ -1187,197 +1189,11 @@ jobs:
             }
           fi
 
-      - name: Publish stable files under one remote lock
+      - name: Confirm GitHub Latest before stable update
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ \
-             && "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z]+)?$ \
-             && "${#TAG}" -le 65 ]] || {
-            echo "::error::invalid workflow run or release identity"
-            exit 2
-          }
-          remote_stage=".security-update-notify-stage-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${TAG}"
-          local_stage="$RUNNER_TEMP/security-update-notify-stable-stage"
-          ssh_command=(
-            ssh -i "$HOME/.ssh/mirror_key" -p "$MIRROR_PORT"
-            -o BatchMode=yes -o ConnectTimeout=20 -o IdentitiesOnly=yes
-            -o StrictHostKeyChecking=yes
-            -o "UserKnownHostsFile=$HOME/.ssh/known_hosts"
-            -o ServerAliveInterval=15 -o ServerAliveCountMax=3
-          )
-          lock_pid=""
-          lock_read_fd=""
-          lock_write_fd=""
-          cleanup_remote_publish() {
-            local status=$?
-            local remove_stage=1
-            trap - EXIT HUP INT TERM
-            set +e
-            if [[ -n "$lock_write_fd" ]]; then
-              printf '%s\n' ABORT >&"$lock_write_fd"
-            fi
-            if [[ -n "$lock_pid" ]]; then
-              if ! wait "$lock_pid"; then
-                remove_stage=0
-              fi
-            fi
-            if [[ "$remove_stage" -eq 1 ]]; then
-              /usr/bin/timeout --signal=TERM --kill-after=5s 60s \
-                "${ssh_command[@]}" "$MIRROR_USER@$MIRROR_HOST" \
-                "rm -rf -- '$remote_stage'"
-            else
-              echo "::error::remote rollback failed; preserved $remote_stage for recovery"
-            fi
-            exit "$status"
-          }
-          trap cleanup_remote_publish EXIT
-          trap 'exit 130' HUP INT TERM
-          install -d -m 0700 "$local_stage"
-          install -m 0600 latest.json "$local_stage/"
-          if [[ "$BOOTSTRAP_PRESENT" == "1" ]]; then
-            install -m 0600 "deploy/$TAG/sun.sh" "$local_stage/"
-          fi
-          cat > "$local_stage/mirror-lock.sh" <<'REMOTE_SCRIPT'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          stage="${1:-}"
-          [[ "$stage" =~ ^\.security-update-notify-stage-[0-9]+-[0-9]+-v[0-9A-Za-z._-]+$ ]] || exit 64
-          suffix="${stage#.security-update-notify-stage-}"
-          sun_tmp=".sun.sh.${suffix}.tmp"
-          latest_tmp=".latest.json.${suffix}.tmp"
-          sun_backup="$stage/.previous-sun.sh"
-          latest_backup="$stage/.previous-latest.json"
-          sun_existed=0
-          latest_existed=0
-          state=starting
-          committed=0
-          preserve_stage=0
-          rollback_stable() {
-            local failed=0
-            if [[ "$sun_existed" -eq 1 ]]; then
-              install -m 0644 -- "$sun_backup" "$sun_tmp" &&
-                mv -f -- "$sun_tmp" sun.sh || failed=1
-            else
-              rm -f -- sun.sh || failed=1
-            fi
-            if [[ "$latest_existed" -eq 1 ]]; then
-              install -m 0644 -- "$latest_backup" "$latest_tmp" &&
-                mv -f -- "$latest_tmp" latest.json || failed=1
-            else
-              rm -f -- latest.json || failed=1
-            fi
-            if [[ "$failed" -eq 0 ]]; then
-              state=rolled-back
-              return 0
-            fi
-            preserve_stage=1
-            return 1
-          }
-          # Invoked indirectly by the EXIT trap.
-          # shellcheck disable=SC2317
-          cleanup() {
-            local status=$?
-            trap - EXIT HUP INT TERM
-            set +e
-            if [[ "$committed" -ne 1 && ( "$state" == sun || "$state" == latest ) ]]; then
-              if ! rollback_stable; then
-                status=70
-              fi
-            fi
-            rm -f -- "$sun_tmp" "$latest_tmp"
-            if [[ "$preserve_stage" -eq 0 ]]; then
-              rm -rf -- "$stage"
-            fi
-            exit "$status"
-          }
-          trap cleanup EXIT
-          trap 'exit 130' HUP INT TERM
-          [[ -d "$stage" && ! -L "$stage" ]] || exit 64
-          for file in latest.json mirror-lock.sh; do
-            [[ -f "$stage/$file" && ! -L "$stage/$file" ]] || exit 64
-          done
-          [[ ! -L .security-update-notify-release.lock ]] || exit 64
-          umask 077
-          exec 9>>.security-update-notify-release.lock
-          flock --wait 180 --exclusive 9
-          printf '%s\n' LOCKED
-          state=locked
-          deadline=$((SECONDS + 720))
-          while (( SECONDS < deadline )); do
-            remaining=$((deadline - SECONDS))
-            IFS= read -r -t "$remaining" action || exit 124
-            case "$action" in
-              PUBLISH_SUN)
-                [[ "$state" == locked ]] || exit 65
-                [[ -f "$stage/sun.sh" && ! -L "$stage/sun.sh" ]] || exit 64
-                [[ ! -e "$sun_backup" && ! -L "$sun_backup" \
-                   && ! -e "$latest_backup" && ! -L "$latest_backup" ]] || exit 64
-                if [[ -e sun.sh || -L sun.sh ]]; then
-                  [[ -f sun.sh && ! -L sun.sh ]] || exit 64
-                  install -m 0600 -- sun.sh "$sun_backup"
-                  sun_existed=1
-                fi
-                if [[ -e latest.json || -L latest.json ]]; then
-                  [[ -f latest.json && ! -L latest.json ]] || exit 64
-                  install -m 0600 -- latest.json "$latest_backup"
-                  latest_existed=1
-                fi
-                state=sun
-                install -m 0644 -- "$stage/sun.sh" "$sun_tmp"
-                mv -f -- "$sun_tmp" sun.sh
-                printf '%s\n' SUN_PUBLISHED
-                ;;
-              PUBLISH_LATEST)
-                [[ "$state" == sun ]] || exit 65
-                state=latest
-                install -m 0644 -- "$stage/latest.json" "$latest_tmp"
-                mv -f -- "$latest_tmp" latest.json
-                printf '%s\n' LATEST_PUBLISHED
-                ;;
-              RELEASE)
-                [[ "$state" == locked || "$state" == latest ]] || exit 65
-                committed=1
-                exit 0
-                ;;
-              ABORT) exit 0 ;;
-              *) exit 65 ;;
-            esac
-          done
-          exit 124
-          REMOTE_SCRIPT
-          chmod 0700 "$local_stage/mirror-lock.sh"
-          rsync --archive --checksum --delay-updates --chmod=D700,F600 \
-            "$local_stage/" "$MIRROR_USER@$MIRROR_HOST:$remote_stage/"
-          coproc REMOTE_LOCK {
-            /usr/bin/timeout --signal=TERM --kill-after=5s 960s \
-              "${ssh_command[@]}" "$MIRROR_USER@$MIRROR_HOST" \
-              "bash --noprofile --norc '$remote_stage/mirror-lock.sh' '$remote_stage'"
-          }
-          lock_pid="$REMOTE_LOCK_PID"
-          lock_read_fd="${REMOTE_LOCK[0]}"
-          lock_write_fd="${REMOTE_LOCK[1]}"
-          read_reply() {
-            local expected="$1" timeout_seconds="$2" actual
-            if ! IFS= read -r -t "$timeout_seconds" -u "$lock_read_fd" actual; then
-              echo "::error::remote mirror lock closed before $expected"
-              return 1
-            fi
-            [[ "$actual" == "$expected" ]] || {
-              echo "::error::unexpected remote mirror lock response: $actual"
-              return 1
-            }
-          }
-          finish_remote_lock() {
-            printf '%s\n' RELEASE >&"$lock_write_fd"
-            wait "$lock_pid"
-            lock_pid=""
-            lock_read_fd=""
-            lock_write_fd=""
-          }
-          read_reply LOCKED 200
-
           latest_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
           update_latest=0
           stable_bootstrap_updated=0
@@ -1390,26 +1206,33 @@ jobs:
               echo "::error::current Latest release has no verified high-assurance bootstrap set"
               exit 1
             }
-            printf '%s\n' PUBLISH_SUN >&"$lock_write_fd"
-            read_reply SUN_PUBLISHED 60
-            "$RUNNER_TEMP/download-limited" 1048576 public-sun.sh \
-              "$MIRROR_BASE_URL/sun.sh?run=$GITHUB_RUN_ID&attempt=$GITHUB_RUN_ATTEMPT"
-            cmp "deploy/$TAG/sun.sh" public-sun.sh
-
-            printf '%s\n' PUBLISH_LATEST >&"$lock_write_fd"
-            read_reply LATEST_PUBLISHED 60
-            "$RUNNER_TEMP/download-limited" 1048576 public-latest.json \
-              "$MIRROR_BASE_URL/latest.json?run=$GITHUB_RUN_ID&attempt=$GITHUB_RUN_ATTEMPT"
-            cmp latest.json public-latest.json
             update_latest=1
             stable_bootstrap_updated=1
           else
             echo "Mirrored $TAG without changing stable files (GitHub Latest is $latest_tag)."
           fi
-          finish_remote_lock
-          trap - EXIT HUP INT TERM
           printf 'UPDATE_LATEST=%s\nSTABLE_BOOTSTRAP_UPDATED=%s\n' \
             "$update_latest" "$stable_bootstrap_updated" >> "$GITHUB_ENV"
+
+      - name: Publish stable bootstrap through forced-command rrsync
+        if: env.STABLE_BOOTSTRAP_UPDATED == '1'
+        run: |
+          set -euo pipefail
+          rsync --archive --checksum --delay-updates --chmod=F644 \
+            "deploy/$TAG/sun.sh" "$MIRROR_USER@$MIRROR_HOST:sun.sh"
+          "$RUNNER_TEMP/download-limited" 1048576 public-sun.sh \
+            "$MIRROR_BASE_URL/sun.sh?run=$GITHUB_RUN_ID&attempt=$GITHUB_RUN_ATTEMPT"
+          cmp "deploy/$TAG/sun.sh" public-sun.sh
+
+      - name: Publish latest manifest last through forced-command rrsync
+        if: env.UPDATE_LATEST == '1'
+        run: |
+          set -euo pipefail
+          rsync --archive --checksum --delay-updates --chmod=F644 \
+            latest.json "$MIRROR_USER@$MIRROR_HOST:latest.json"
+          "$RUNNER_TEMP/download-limited" 1048576 public-latest.json \
+            "$MIRROR_BASE_URL/latest.json?run=$GITHUB_RUN_ID&attempt=$GITHUB_RUN_ATTEMPT"
+          cmp latest.json public-latest.json
 
       - name: Remove SSH identity
         if: always()
