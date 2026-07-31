@@ -1,6 +1,6 @@
 # 变更记录
 
-## Unreleased
+## 3.1.3
 
 - 修复 v3.1.2 发布后发现的镜像部署兼容性问题：生产 SSH 身份由 forced-command `rrsync` 限制，不能执行该版本新工作流尝试启动的远端 Bash 锁协议。部署恢复为仅使用 `rrsync` 的单文件延迟替换，由仓库级全局 concurrency 串行写入；稳定 `sun.sh` 公网回读成功后才最后更新 `latest.json`。文档不再承诺两个稳定文件构成远端事务，并明确后半段失败时须从 `main` 幂等重跑。
   Fixes a mirror-deployment compatibility issue discovered after v3.1.2: the production SSH identity is constrained by forced-command `rrsync` and cannot start the remote Bash lock protocol attempted by that release's new workflow. Deployment now uses only single-file delayed `rrsync` replacements serialized by repository-wide concurrency, updating `latest.json` last only after the stable `sun.sh` passes public read-back. The documentation no longer claims that the two stable files form a remote transaction and requires an idempotent rerun from `main` after a second-phase failure.
