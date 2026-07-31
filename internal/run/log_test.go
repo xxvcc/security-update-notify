@@ -122,13 +122,51 @@ func TestLogEventRejectsUnsafeParentDirectory(t *testing.T) {
 	if err := os.Mkdir(wideDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(wideDir, 0o777); err != nil {
+	if err := os.Chmod(wideDir, 0o770); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("SECURITY_UPDATE_NOTIFY_LOG_FILE", filepath.Join(wideDir, "sun.log"))
 	logEvent("must not be written")
 	if _, err := os.Lstat(filepath.Join(wideDir, "sun.log")); !os.IsNotExist(err) {
-		t.Fatalf("log was created in a group/world-writable parent: %v", err)
+		t.Fatalf("custom log was created in a group-writable parent: %v", err)
+	}
+}
+
+func TestSharedLogPathIsLimitedToExactDefault(t *testing.T) {
+	if !isSharedLogPath(defaultLogFile) {
+		t.Fatal("default log path did not select the shared-directory policy")
+	}
+	for _, custom := range []string{
+		"/var/log/custom.log",
+		"/var/log/../var/log/security-update-notify.log",
+		filepath.Join(t.TempDir(), "security-update-notify.log"),
+	} {
+		if isSharedLogPath(custom) {
+			t.Fatalf("custom log %q selected the shared-directory policy", custom)
+		}
+	}
+}
+
+func TestLogEventWritesInsideTrustedGroupWritableDirectory(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "security-update-notify.log")
+	logEventAtPath("shared parent append", path, os.Geteuid(), true)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(string(data), " shared parent append\n") {
+		t.Fatalf("unexpected shared-parent log data: %q", data)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o640 {
+		t.Fatalf("shared-parent log mode = %04o, want 0640", info.Mode().Perm())
 	}
 }
 

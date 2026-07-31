@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -541,6 +542,9 @@ func telegramOptions() Options {
 
 func TestFreshAPTInstall(t *testing.T) {
 	installer, root, runner, locker := setupInstaller(t, "ID=debian\nVERSION_ID=13\nPRETTY_NAME=Debian 13\n")
+	if err := root.Chmod("/var/log", 0o775); err != nil {
+		t.Fatal(err)
+	}
 	options := telegramOptions()
 	result, err := installer.Install(context.Background(), options)
 	if err != nil {
@@ -560,6 +564,16 @@ func TestFreshAPTInstall(t *testing.T) {
 	}
 	assertMode(t, root, ConfigPath, 0o600)
 	assertMode(t, root, BinaryPath, 0o755)
+	assertMode(t, root, "/var/log", 0o775)
+	assertMode(t, root, LogPath, 0o640)
+	logInfo, err := root.Lstat(LogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logStat, ok := logInfo.Sys().(*syscall.Stat_t)
+	if !ok || logStat == nil || logStat.Uid != uint32(os.Geteuid()) || logStat.Nlink != 1 {
+		t.Fatalf("installed log metadata = %#v, want owner %d and one link", logStat, os.Geteuid())
+	}
 	if got := readFile(t, root, "/etc/apt/apt.conf.d/20auto-upgrades"); got != aptPeriodicConfig {
 		t.Errorf("apt periodic config drifted:\n%s", got)
 	}
@@ -648,9 +662,10 @@ func TestPrivilegedDirectoriesRejectUnsafePermissionsBeforeChmod(t *testing.T) {
 		name      string
 		directory string
 		managed   bool
+		sharedLog bool
 	}{
 		{name: "managed service drop-in", directory: "/etc/systemd/system/security-update-notify.service.d", managed: true},
-		{name: "shared install parent", directory: "/var/log"},
+		{name: "shared install parent", directory: "/var/log", sharedLog: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if err := root.MkdirAll(test.directory, 0o755); err != nil {
@@ -665,10 +680,13 @@ func TestPrivilegedDirectoriesRejectUnsafePermissionsBeforeChmod(t *testing.T) {
 			var err error
 			if test.managed {
 				err = installer.ensureManagedDir(test.directory, 0o755)
+			} else if test.sharedLog {
+				err = installer.ensureSharedLogDir()
 			} else {
 				err = installer.ensureDir(test.directory, 0o755)
 			}
-			if err == nil || !strings.Contains(err.Error(), "must not be writable by group or other users") {
+			if err == nil || !strings.Contains(err.Error(), "must not be writable by other users") &&
+				!strings.Contains(err.Error(), "must not be writable by group or other users") {
 				t.Fatalf("unsafe directory error = %v", err)
 			}
 			info, statErr := root.Lstat(test.directory)
@@ -677,6 +695,74 @@ func TestPrivilegedDirectoriesRejectUnsafePermissionsBeforeChmod(t *testing.T) {
 			}
 			if info.Mode().Perm() != 0o777 || readFile(t, root, planted) != "untrusted" {
 				t.Fatal("unsafe directory was modified before trust validation")
+			}
+		})
+	}
+}
+
+func TestSharedLogDirectoryAllowsOnlyGroupWrite(t *testing.T) {
+	installer, root, _, _ := setupInstaller(t, "ID=ubuntu\nVERSION_ID=24.04\n")
+	if err := root.Chmod("/var/log", 0o775); err != nil {
+		t.Fatal(err)
+	}
+	write(t, root, "/var/log/existing.log", "existing", 0o640)
+	if err := installer.ensureSharedLogDir(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := root.Lstat("/var/log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o775 {
+		t.Fatalf("shared log directory mode changed to %04o", info.Mode().Perm())
+	}
+	if readFile(t, root, "/var/log/existing.log") != "existing" {
+		t.Fatal("shared log directory contents changed during validation")
+	}
+	installer.rootOwnerUID = uint32(os.Geteuid() + 1)
+	if err := installer.ensureSharedLogDir(); err == nil || !strings.Contains(err.Error(), "must be owned by root") {
+		t.Fatalf("wrong-owner shared log directory error = %v", err)
+	}
+	installer.rootOwnerUID = uint32(os.Geteuid())
+	if err := installer.ensureDir("/etc/systemd/system", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Chmod("/etc/systemd/system", 0o775); err != nil {
+		t.Fatal(err)
+	}
+	if err := installer.ensureDir("/etc/systemd/system", 0o755); err == nil {
+		t.Fatal("group-writable non-log privileged directory was accepted")
+	}
+}
+
+func TestSharedLogDirectoryRejectsSymlinkAndNonDirectory(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		plant func(*testing.T, *RootFS)
+	}{
+		{
+			name: "symlink",
+			plant: func(t *testing.T, root *RootFS) {
+				if err := root.Symlink("/tmp", "/var/log"); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "regular file",
+			plant: func(t *testing.T, root *RootFS) {
+				write(t, root, "/var/log", "not a directory", 0o644)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			installer, root, _, _ := setupInstaller(t, "ID=ubuntu\nVERSION_ID=24.04\n")
+			if err := os.Remove(filepath.Join(root.Root, "var/log")); err != nil {
+				t.Fatal(err)
+			}
+			test.plant(t, root)
+			if err := installer.ensureSharedLogDir(); err == nil {
+				t.Fatalf("shared log policy accepted %s", test.name)
 			}
 		})
 	}

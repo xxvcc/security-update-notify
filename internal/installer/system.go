@@ -75,6 +75,10 @@ var knownUnitEnablement = map[string]bool{
 }
 
 func (i *Installer) ensureDir(directory string, mode fs.FileMode) error {
+	return i.ensureDirWithForbiddenPerm(directory, mode, 0o022)
+}
+
+func (i *Installer) ensureDirWithForbiddenPerm(directory string, mode, forbiddenPerm fs.FileMode) error {
 	info, err := i.fs.Lstat(directory)
 	if errors.Is(err, fs.ErrNotExist) {
 		if err := i.fs.MkdirAll(directory, mode); err != nil {
@@ -97,7 +101,11 @@ func (i *Installer) ensureDir(directory string, mode fs.FileMode) error {
 	if !info.IsDir() {
 		return fmt.Errorf("%s must be a directory, not a symlink", directory)
 	}
-	return i.validateTrustedDirectory(directory, info)
+	return i.validateTrustedDirectoryWithForbiddenPerm(directory, info, forbiddenPerm)
+}
+
+func (i *Installer) ensureSharedLogDir() error {
+	return i.ensureDirWithForbiddenPerm("/var/log", 0o755, 0o002)
 }
 
 func (i *Installer) validateLocalSbinAlias(linkInfo fs.FileInfo) error {
@@ -170,6 +178,10 @@ func (i *Installer) validateManagedDir(directory string, info fs.FileInfo, expec
 }
 
 func (i *Installer) validateTrustedDirectory(directory string, info fs.FileInfo) error {
+	return i.validateTrustedDirectoryWithForbiddenPerm(directory, info, 0o022)
+}
+
+func (i *Installer) validateTrustedDirectoryWithForbiddenPerm(directory string, info fs.FileInfo, forbiddenPerm fs.FileMode) error {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return fmt.Errorf("cannot verify owner of privileged directory %s", directory)
@@ -177,7 +189,10 @@ func (i *Installer) validateTrustedDirectory(directory string, info fs.FileInfo)
 	if stat.Uid != i.rootOwnerUID {
 		return fmt.Errorf("privileged directory %s must be owned by root", directory)
 	}
-	if info.Mode().Perm()&0o022 != 0 {
+	if info.Mode().Perm()&forbiddenPerm != 0 {
+		if forbiddenPerm.Perm() == 0o002 {
+			return fmt.Errorf("privileged directory %s must not be writable by other users", directory)
+		}
 		return fmt.Errorf("privileged directory %s must not be writable by group or other users", directory)
 	}
 	return nil
@@ -1187,12 +1202,14 @@ func (i *Installer) installFiles(ctx context.Context, plan installPlan, options 
 	payload := options.Payload.withEmbeddedDefaults()
 	for directory, mode := range map[string]fs.FileMode{
 		"/usr/local/sbin":     0o755,
-		"/var/log":            0o755,
 		"/etc/systemd/system": 0o755,
 	} {
 		if err := i.ensureDir(directory, mode); err != nil {
 			return "", failure("create install directory", err)
 		}
+	}
+	if err := i.ensureSharedLogDir(); err != nil {
+		return "", failure("create install directory", err)
 	}
 	for directory, mode := range map[string]fs.FileMode{
 		"/etc/security-update-notify":     0o750,
