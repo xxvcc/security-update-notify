@@ -347,10 +347,11 @@ jobs:
               raise SystemExit('stable publication must contain exactly two delayed rrsync writes')
           forbidden_remote_execution = [
               'mirror-lock.sh', 'REMOTE_SCRIPT', 'coproc ', 'flock ',
-              'ssh_command=', 'bash --noprofile', 'PUBLISH_SUN', 'PUBLISH_LATEST',
+              'ssh_command=', '          ssh -i ', 'bash --noprofile',
+              'PUBLISH_SUN', 'PUBLISH_LATEST',
           ]
           for item in forbidden_remote_execution:
-              if item in stable:
+              if item in workflow:
                   raise SystemExit(
                       f'forced-command rrsync publication must not execute remote commands: {item}'
                   )

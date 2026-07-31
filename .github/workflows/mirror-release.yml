@@ -602,8 +602,8 @@ jobs:
     timeout-minutes: 25
     environment: release-mirror
     concurrency:
-      # The forced-command key can only invoke rrsync, so Actions provides the
-      # single writer boundary for the two stable files.
+      # The forced-command key can only invoke rrsync, so Actions serializes
+      # this workflow's writes to the two stable files.
       group: signed-release-mirror-stable
       cancel-in-progress: false
     env:
