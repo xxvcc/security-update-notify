@@ -415,6 +415,28 @@ func TestDNFRepositoryErrorsOnStdoutAreNotIgnored(t *testing.T) {
 	}
 }
 
+func TestDNFRepositoryPackageNamesAreNotDiagnostics(t *testing.T) {
+	for _, output := range []string{
+		"FEDORA-2026:1 Important/Sec. gnutls.x86_64",
+		"FEDORA-2026:2 Moderate/Sec. rustls.noarch",
+		"FEDORA-2026:3 Low/Sec. detached-signature.aarch64",
+	} {
+		if issue, failed := dnfRepositoryIssue(sysexec.Result{Stdout: output}, true); failed {
+			t.Fatalf("package output=%q issue=%+v", output, issue)
+		}
+	}
+	jsonOutput := `[{"name":"tls-signature-rollup","type":"security","severity":"Important","nevra":"gnutls-1-1.x86_64"}]`
+	if issue, failed := dnfStructuredRepositoryIssue(sysexec.Result{Stdout: jsonOutput}, true); failed {
+		t.Fatalf("valid DNF5 JSON issue=%+v", issue)
+	}
+	if issue, failed := dnfStructuredRepositoryIssue(sysexec.Result{
+		Stdout: jsonOutput,
+		Stderr: "GPG signature verification failed for repository metadata",
+	}, true); !failed || issue.Code != "dnf-repository-signature" {
+		t.Fatalf("DNF5 stderr issue=%+v failed=%v", issue, failed)
+	}
+}
+
 func TestAPTRepositoryStatusProbeFailureIsExplicit(t *testing.T) {
 	for _, test := range []struct {
 		name, body string
@@ -575,6 +597,56 @@ func TestCollectPatchWatchdogReportsRestartProbeFailure(t *testing.T) {
 	}, "3.0.2", patchCollectOptions{Now: time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)})
 	if !patch.RiskAttention || !strings.Contains(patch.Sig, "dnf-restart-probe-failed") {
 		t.Fatalf("patch=%+v", patch)
+	}
+}
+
+func TestCollectPatchWatchdogPreservesAgesAcrossUnknownObservations(t *testing.T) {
+	commandDir := t.TempDir()
+	stateDir := t.TempDir()
+	t.Setenv("PATH", commandDir)
+	t.Setenv("SECURITY_UPDATE_NOTIFY_STATE_DIR", stateDir)
+	cfg := patchTestConfig(t, "CHECK_UPDATE_HEALTH=0\nCHECK_SELF_UPDATE=0\nPENDING_ALERT_DAYS=3\nRESTART_ALERT_DAYS=3\n")
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	store := statefile.Store{Dir: stateDir}
+	for _, name := range []string{"pending-security.first_seen", "reboot-required.first_seen", "service-restart.first_seen"} {
+		if err := store.WriteInt(name, now.Add(-4*24*time.Hour).Unix()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writeTestCommand(t, commandDir, "apt-get", "exit 2\n")
+	patch, pending := collectPatchWatchdog(cfg, "apt", backend.RestartState{
+		ProbeIssue: "apt-restart-probe-failed",
+	}, "3.1.4", patchCollectOptions{PersistState: true, Now: now})
+	if pending.Count != 0 || strings.Contains(patch.Sig, "pending-stale") ||
+		strings.Contains(patch.Sig, "reboot-stale") || strings.Contains(patch.Sig, "service-restart-stale") {
+		t.Fatalf("unknown observations triggered stale alerts: pending=%+v patch=%+v", pending, patch)
+	}
+	for _, name := range []string{"pending-security.first_seen", "reboot-required.first_seen", "service-restart.first_seen"} {
+		if first, err := store.ReadInt(name); err != nil || first != now.Add(-4*24*time.Hour).Unix() {
+			t.Fatalf("unknown observation changed %s: first=%d err=%v", name, first, err)
+		}
+	}
+
+	writeTestCommand(t, commandDir, "apt-get", "printf '%s\\n' 'Inst openssl [1] (2 Debian-Security:12/stable-security [amd64])'\n")
+	patch, pending = collectPatchWatchdog(cfg, "apt", backend.RestartState{
+		RebootRequired:   true,
+		RestartAttention: true,
+	}, "3.1.4", patchCollectOptions{PersistState: true, Now: now})
+	if pending.Count != 1 || !strings.Contains(patch.Sig, "pending-stale") ||
+		!strings.Contains(patch.Sig, "reboot-stale") || !strings.Contains(patch.Sig, "service-restart-stale") {
+		t.Fatalf("confirmed active observations lost original ages: pending=%+v patch=%+v", pending, patch)
+	}
+
+	writeTestCommand(t, commandDir, "apt-get", "exit 0\n")
+	patch, pending = collectPatchWatchdog(cfg, "apt", backend.RestartState{}, "3.1.4", patchCollectOptions{PersistState: true, Now: now})
+	if pending.Count != 0 || patch.RiskAttention {
+		t.Fatalf("confirmed absence remained active: pending=%+v patch=%+v", pending, patch)
+	}
+	for _, name := range []string{"pending-security.first_seen", "reboot-required.first_seen", "service-restart.first_seen"} {
+		if _, err := os.Stat(filepath.Join(stateDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("confirmed absence did not remove %s: %v", name, err)
+		}
 	}
 }
 
@@ -865,7 +937,7 @@ func TestTrackedAgeReadOnlyDoesNotWriteOrRemove(t *testing.T) {
 	dir := t.TempDir()
 	store := statefile.Store{Dir: dir}
 	now := int64(1_722_000_000)
-	if age, err := trackedAgeDays(store, "pending-security.first_seen", true, now, false); err != nil || age != 0 {
+	if age, err := trackedAgeDays(store, "pending-security.first_seen", statefile.ObservationPresent, now, false); err != nil || age != 0 {
 		t.Fatalf("missing read-only state age=%d err=%v", age, err)
 	}
 	path := filepath.Join(dir, "pending-security.first_seen")
@@ -875,7 +947,7 @@ func TestTrackedAgeReadOnlyDoesNotWriteOrRemove(t *testing.T) {
 	if err := store.WriteInt("pending-security.first_seen", now-4*86400); err != nil {
 		t.Fatal(err)
 	}
-	if age, err := trackedAgeDays(store, "pending-security.first_seen", false, now, false); err != nil || age != 0 {
+	if age, err := trackedAgeDays(store, "pending-security.first_seen", statefile.ObservationAbsent, now, false); err != nil || age != 0 {
 		t.Fatalf("inactive read-only state age=%d err=%v", age, err)
 	}
 	if _, err := os.Stat(path); err != nil {

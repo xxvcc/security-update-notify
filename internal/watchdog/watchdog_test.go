@@ -153,7 +153,7 @@ func TestCollectPending(t *testing.T) {
 	if dnf.TxtZH != "待安装安全更新：2 个（其中高危/重要 2 个）" {
 		t.Errorf("dnf TxtZH=%q", dnf.TxtZH)
 	}
-	apt := CollectPending("apt", "Inst libc6 [1] (2 Debian:12/stable [amd64]) security\nInst bash [5] (5.1 Debian:12/stable [amd64])\n")
+	apt := CollectPending("apt", "Inst libc6 [1] (2 Debian-Security:12/stable-security [amd64])\nInst bash [5] (5.1 Debian:12/stable [amd64])\n")
 	if apt.Count != 1 {
 		t.Errorf("apt count=%d want 1", apt.Count)
 	}
@@ -166,9 +166,51 @@ func TestCollectPending(t *testing.T) {
 	}
 }
 
+func TestCollectAPTPendingUsesCandidateSourceNotPackageName(t *testing.T) {
+	out := strings.Join([]string{
+		"Inst openssl [3.0.2] (3.0.3 Debian:12/stable-security [amd64])",
+		"Inst linux-image-generic [1] (2 Ubuntu:24.04/noble-security [amd64])",
+		"Inst ubuntu-pro-client [1] (2 UbuntuESMInfra:20.04/focal-infra-security [amd64])",
+		"Inst esm-app [1] (2 UbuntuESMApps:20.04/focal-apps-security [amd64])",
+		"Inst debian-security-support [1] (2 Debian:12/stable [amd64])",
+		"Inst libmodsecurity3 [1] (2 Ubuntu:24.04/noble-updates [amd64])",
+		"Inst gnutls30 [1] (2 Ubuntu:24.04/noble-updates [amd64]) security",
+	}, "\n")
+	pending, complete := CollectAPTPending(out)
+	if !complete {
+		t.Fatal("valid apt simulation output was marked incomplete")
+	}
+	if pending.Count != 4 {
+		t.Fatalf("pending count=%d want 4: %+v", pending.Count, pending)
+	}
+	want := "esm-app,linux-image-generic,openssl,ubuntu-pro-client"
+	if got := strings.Join(pending.Packages, ","); got != want {
+		t.Fatalf("packages=%q want %q", got, want)
+	}
+}
+
+func TestCollectAPTPendingReportsMalformedInstallRecord(t *testing.T) {
+	for _, malformed := range []string{
+		"Inst openssl [1] malformed-security-text\n",
+		"Inst openssl [1] (2 [amd64])\n",
+	} {
+		pending, complete := CollectAPTPending(malformed)
+		if complete || pending.Count != 0 {
+			t.Fatalf("input=%q pending=%+v complete=%v", malformed, pending, complete)
+		}
+	}
+}
+
+func TestCollectAPTPendingRejectsLookalikeESMOrigin(t *testing.T) {
+	pending, complete := CollectAPTPending("Inst openssl [1] (2 UbuntuESMExample:24.04/noble-security [amd64])\n")
+	if !complete || pending.Count != 0 {
+		t.Fatalf("pending=%+v complete=%v", pending, complete)
+	}
+}
+
 func TestBlockedPackages(t *testing.T) {
-	normalAPT := CollectPending("apt", "Inst bash [1] (2 Debian-Security) security\n")
-	ignoreHold := CollectPending("apt", "Inst bash [1] (2 Debian-Security) security\nInst openssl [1] (2 Debian-Security) security\n")
+	normalAPT := CollectPending("apt", "Inst bash [1] (2 Debian-Security:12/stable-security [amd64])\n")
+	ignoreHold := CollectPending("apt", "Inst bash [1] (2 Debian-Security:12/stable-security [amd64])\nInst openssl [1] (2 Debian-Security:12/stable-security [amd64])\n")
 	if got := BlockedAPT(normalAPT, ignoreHold, "openssl\nnonsecurity\n"); len(got) != 1 || got[0] != "openssl" {
 		t.Fatalf("BlockedAPT=%v", got)
 	}

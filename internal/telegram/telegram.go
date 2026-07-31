@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -28,7 +29,11 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/textsafe"
 )
 
-const defaultBaseURL = "https://api.telegram.org"
+const (
+	defaultBaseURL    = "https://api.telegram.org"
+	maxRetryAfter     = 30 * time.Second
+	defaultRetryAfter = time.Second
+)
 
 // maxRespBytes 限制 Telegram 响应体的读取量，防止（被 MITM/重定向劫持的）超大响应体撑爆内存。
 // 正常 Telegram JSON 仅数百字节，1 MiB 绰绰有余。
@@ -50,7 +55,9 @@ func sanitizeErr(err error, secrets ...string) error {
 // tokenRe 复刻 `^\d+:[A-Za-z0-9_-]+$`。
 var tokenRe = regexp.MustCompile(`^[0-9]+:[A-Za-z0-9_-]+$`)
 
-func retryableStatus(status int) bool { return status == 429 || (status >= 500 && status < 600) }
+func retryableStatus(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || (status >= 500 && status < 600)
+}
 
 // Client 承载 HTTP 客户端与可注入的 BaseURL / Sleep（便于测试）。
 type Client struct {
@@ -124,7 +131,7 @@ func (c *Client) GetMe(ctx context.Context, token string) error {
 	endpoint := base + "/bot" + token + "/getMe"
 	var last error
 	for attempt := 0; attempt < 3; attempt++ {
-		retryable, transient, err := c.getMeAttempt(ctx, client, endpoint, token)
+		retryable, transient, delay, err := c.getMeAttempt(ctx, client, endpoint, token)
 		if err == nil {
 			return nil
 		}
@@ -136,7 +143,10 @@ func (c *Client) GetMe(ctx context.Context, token string) error {
 			return err
 		}
 		if attempt < 2 {
-			if err := c.sleep(ctx, time.Second); err != nil {
+			if delay <= 0 {
+				delay = defaultRetryAfter
+			}
+			if err := c.sleep(ctx, delay); err != nil {
 				return temporary(err)
 			}
 		}
@@ -144,35 +154,35 @@ func (c *Client) GetMe(ctx context.Context, token string) error {
 	return temporary(last)
 }
 
-func (c *Client) getMeAttempt(ctx context.Context, client *http.Client, endpoint, token string) (retryable, transient bool, returnErr error) {
+func (c *Client) getMeAttempt(ctx context.Context, client *http.Client, endpoint, token string) (retryable, transient bool, delay time.Duration, returnErr error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return false, false, err
+		return false, false, 0, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return true, true, sanitizeErr(err, token)
+		return true, true, 0, sanitizeErr(err, token)
 	}
 	defer resp.Body.Close()
 	body, err := readResponseBody(resp.Body)
 	if err != nil {
 		// getMe is read-only, so a mid-response transport failure is safe to retry.
-		return !errors.Is(err, errResponseTooLarge), true, err
+		return !errors.Is(err, errResponseTooLarge), true, 0, err
 	}
 	if retryableStatus(resp.StatusCode) {
-		return true, true, fmt.Errorf("getMe HTTP %d: %s", resp.StatusCode, truncErr(string(body), token))
+		return true, true, telegramRetryAfter(resp, body), fmt.Errorf("getMe HTTP %d: %s", resp.StatusCode, truncErr(string(body), token))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return false, false, fmt.Errorf("getMe HTTP %d: %s", resp.StatusCode, truncErr(string(body), token))
+		return false, false, 0, fmt.Errorf("getMe HTTP %d: %s", resp.StatusCode, truncErr(string(body), token))
 	}
 	ok, valid := decodeOK(body)
 	if !valid {
-		return false, true, fmt.Errorf("getMe returned an invalid response")
+		return false, true, 0, fmt.Errorf("getMe returned an invalid response")
 	}
 	if !ok {
-		return false, false, fmt.Errorf("getMe failed: %s", truncErr(strings.TrimSpace(string(body)), token))
+		return false, false, 0, fmt.Errorf("getMe failed: %s", truncErr(strings.TrimSpace(string(body)), token))
 	}
-	return false, false, nil
+	return false, false, 0, nil
 }
 
 // SendMessage 发送一条消息：按 rune 截断超长正文；仅对明确 HTTP 429 限流最多尝试
@@ -202,7 +212,7 @@ func (c *Client) SendMessage(ctx context.Context, token, chatID, text string) er
 	var lastErr string
 	lastTransient := false
 	for attempt := 0; attempt < 3; attempt++ {
-		retryable, transient, ok, msg := c.attempt(ctx, client, endpoint, form, token, chatID)
+		retryable, transient, ok, delay, msg := c.attempt(ctx, client, endpoint, form, token, chatID)
 		if ok {
 			return nil
 		}
@@ -212,7 +222,10 @@ func (c *Client) SendMessage(ctx context.Context, token, chatID, text string) er
 			break
 		}
 		if attempt < 2 {
-			if err := c.sleep(ctx, time.Second); err != nil {
+			if delay <= 0 {
+				delay = defaultRetryAfter
+			}
+			if err := c.sleep(ctx, delay); err != nil {
 				return temporary(err)
 			}
 		}
@@ -227,40 +240,71 @@ func (c *Client) SendMessage(ctx context.Context, token, chatID, text string) er
 	return err
 }
 
-// attempt 执行一次发送，返回 (是否可重试, 是否成功, 错误信息)。
-func (c *Client) attempt(ctx context.Context, client *http.Client, endpoint string, form url.Values, secrets ...string) (retryable, transient, ok bool, msg string) {
+// attempt 执行一次发送，返回是否可重试、是否为临时故障、是否成功、服务端退避时间和错误信息。
+func (c *Client) attempt(ctx context.Context, client *http.Client, endpoint string, form url.Values, secrets ...string) (retryable, transient, ok bool, delay time.Duration, msg string) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
-		return false, false, false, err.Error()
+		return false, false, false, 0, err.Error()
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := client.Do(req)
 	if err != nil {
-		return false, true, false, sanitizeErr(err, secrets...).Error()
+		return false, true, false, 0, sanitizeErr(err, secrets...).Error()
 	}
 	defer resp.Body.Close()
 	body, err := readResponseBody(resp.Body)
 	if err != nil {
-		return false, true, false, err.Error()
+		return false, true, false, 0, err.Error()
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return true, true, false, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncErr(string(body), secrets...))
+		return true, true, false, telegramRetryAfter(resp, body), fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncErr(string(body), secrets...))
 	}
-	if resp.StatusCode >= 500 && resp.StatusCode < 600 {
-		return false, true, false, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncErr(string(body), secrets...))
+	if resp.StatusCode == http.StatusRequestTimeout || (resp.StatusCode >= 500 && resp.StatusCode < 600) {
+		return false, true, false, 0, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncErr(string(body), secrets...))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return false, false, false, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncErr(string(body), secrets...))
+		return false, false, false, 0, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncErr(string(body), secrets...))
 	}
 	ok, valid := decodeOK(body)
 	if !valid {
-		return false, true, false, "Telegram returned an invalid response"
+		return false, true, false, 0, "Telegram returned an invalid response"
 	}
 	if ok {
-		return false, false, true, ""
+		return false, false, true, 0, ""
 	}
 	// ok=false 或其它非重试状态码：永久失败。
-	return false, false, false, truncErr(strings.TrimSpace(string(body)), secrets...)
+	return false, false, false, 0, truncErr(strings.TrimSpace(string(body)), secrets...)
+}
+
+func telegramRetryAfter(resp *http.Response, body []byte) time.Duration {
+	var decoded struct {
+		Parameters struct {
+			RetryAfter json.Number `json:"retry_after"`
+		} `json:"parameters"`
+	}
+	if json.Unmarshal(body, &decoded) == nil {
+		if seconds, err := strconv.ParseUint(string(decoded.Parameters.RetryAfter), 10, 64); err == nil && seconds > 0 {
+			return boundedRetryAfter(seconds)
+		}
+	}
+	raw := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if seconds, err := strconv.ParseUint(raw, 10, 64); err == nil && seconds > 0 {
+		return boundedRetryAfter(seconds)
+	}
+	if when, err := http.ParseTime(raw); err == nil {
+		delay := time.Until(when)
+		if delay > 0 {
+			return min(delay, maxRetryAfter)
+		}
+	}
+	return 0
+}
+
+func boundedRetryAfter(seconds uint64) time.Duration {
+	if seconds >= uint64(maxRetryAfter/time.Second) {
+		return maxRetryAfter
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func readResponseBody(r io.Reader) ([]byte, error) {

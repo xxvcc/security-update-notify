@@ -9,9 +9,12 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/xxvcc/security-update-notify/internal/backend"
 	"github.com/xxvcc/security-update-notify/internal/config"
 	"github.com/xxvcc/security-update-notify/internal/i18n"
+	"github.com/xxvcc/security-update-notify/internal/osrel"
 	"github.com/xxvcc/security-update-notify/internal/sysexec"
+	"github.com/xxvcc/security-update-notify/internal/watchdog"
 )
 
 func TestDoctorReportsControlledDNFFailures(t *testing.T) {
@@ -35,10 +38,23 @@ func TestDoctorReportsControlledDNFFailures(t *testing.T) {
 		"FAIL missing dnf/yum",
 		"FAIL missing needs-restarting",
 		"FAIL invalid notification channel configuration",
-		"FAIL automatic security-update mechanism issue",
+		"SKIP automatic security-update mechanism health check disabled",
+		"SKIP patch policy, package consistency, and repository health checks disabled",
+		"UNKNOWN pending security-update status could not be determined",
+		"SKIP release security-support check disabled",
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("Doctor output missing %q:\n%s", want, output)
+		}
+	}
+	for _, unexpected := range []string{
+		"OK automatic security-update mechanism healthy",
+		"OK patch policy, package, and repository checks passed",
+		"OK no pending security updates",
+		"OK release within security support",
+	} {
+		if strings.Contains(output, unexpected) {
+			t.Fatalf("Doctor output contains false success %q:\n%s", unexpected, output)
 		}
 	}
 }
@@ -83,14 +99,55 @@ esac
 		},
 	}
 
-	if got := Doctor(cfg, DoctorOpts{Version: "2.7.3", Lang: i18n.EN, EnvPath: envPath, SkipNotify: true, Systemd: systemdQuery}); got != 0 {
-		t.Fatalf("Doctor()=%d want 0", got)
+	output, got := captureDoctorOutput(t, func() int {
+		return Doctor(cfg, DoctorOpts{Version: "2.7.3", Lang: i18n.EN, EnvPath: envPath, SkipNotify: true, Systemd: systemdQuery})
+	})
+	if got != 0 {
+		t.Fatalf("Doctor()=%d want 0\n%s", got, output)
+	}
+	for _, want := range []string{
+		"SKIP automatic security-update mechanism health check disabled",
+		"SKIP patch policy, package consistency, and repository health checks disabled",
+		"SKIP pending security-update status was not confirmed",
+		"SKIP release security-support check disabled",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("Doctor output missing %q:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "OK automatic security-update mechanism healthy") || strings.Contains(output, "OK no pending security updates") {
+		t.Fatalf("Doctor output reported a skipped check as successful:\n%s", output)
+	}
+
+	checkedPath := filepath.Join(t.TempDir(), "doctor-checked.env")
+	checkedBody := strings.Replace(body, "CHECK_UPDATE_HEALTH=0", "CHECK_UPDATE_HEALTH=1", 1)
+	if err := os.WriteFile(checkedPath, []byte(checkedBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checkedCfg, err := config.Load(checkedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, got = captureDoctorOutput(t, func() int {
+		return Doctor(checkedCfg, DoctorOpts{Version: "2.7.3", Lang: i18n.EN, EnvPath: checkedPath, SkipNotify: true, Systemd: systemdQuery})
+	})
+	if got != 0 {
+		t.Fatalf("Doctor() with enabled healthy checks=%d want 0\n%s", got, output)
+	}
+	for _, want := range []string{
+		"OK automatic security-update mechanism healthy",
+		"OK patch policy, package, and repository checks passed",
+		"OK no pending security updates",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("Doctor output missing checked result %q:\n%s", want, output)
+		}
 	}
 
 	if err := os.WriteFile(dnfConfig, []byte("[commands]\nupgrade_type = default\napply_updates = no\nreboot = when-needed\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	output, got := captureDoctorOutput(t, func() int {
+	output, got = captureDoctorOutput(t, func() int {
 		return Doctor(cfg, DoctorOpts{Version: "2.7.3", Lang: i18n.EN, EnvPath: envPath, SkipNotify: true, Systemd: systemdQuery})
 	})
 	if got != 1 {
@@ -104,6 +161,36 @@ esac
 		if !strings.Contains(output, want) {
 			t.Fatalf("Doctor output missing %q:\n%s", want, output)
 		}
+	}
+}
+
+func TestDoctorWatchdogStatesDistinguishCheckedSkippedAndUnknown(t *testing.T) {
+	if got := doctorPendingState("apt", true, true, watchdog.Pending{}, watchdog.Patch{}); got != doctorCheckChecked {
+		t.Fatalf("successful empty query state=%v want checked", got)
+	}
+	if got := doctorPendingState("apt", true, false, watchdog.Pending{}, watchdog.Patch{}); got != doctorCheckSkipped {
+		t.Fatalf("unverified disabled query state=%v want skipped", got)
+	}
+	if got := doctorPendingState("apt", true, true, watchdog.Pending{}, watchdog.Patch{Sig: "apt-simulation-failed,"}); got != doctorCheckUnknown {
+		t.Fatalf("failed query state=%v want unknown", got)
+	}
+	if got := doctorPendingState("apt", true, true, watchdog.Pending{}, watchdog.Patch{Sig: "apt-simulation-output-invalid,"}); got != doctorCheckUnknown {
+		t.Fatalf("malformed query state=%v want unknown", got)
+	}
+	if got := doctorPendingState("dnf", true, true, watchdog.Pending{}, watchdog.Patch{Sig: "dnf-repository-failed,"}); got != doctorCheckUnknown {
+		t.Fatalf("failed DNF query state=%v want unknown", got)
+	}
+	if got := doctorPendingState("dnf", true, true, watchdog.Pending{Count: 1}, watchdog.Patch{Sig: "dnf-security-transaction-invalid,"}); got != doctorCheckUnknown {
+		t.Fatalf("conservative DNF result state=%v want unknown", got)
+	}
+	if got := doctorPendingState("apt", true, false, watchdog.Pending{Count: 1}, watchdog.Patch{}); got != doctorCheckChecked {
+		t.Fatalf("reported pending state=%v want checked", got)
+	}
+
+	cfg := patchTestConfig(t, "CHECK_UPDATE_HEALTH=0\nCHECK_EOL=1\nCHECK_SELF_UPDATE=0\n")
+	checks := collectDoctorWatchdog(cfg, "unsupported", osrel.OSRelease{ID: "future", VersionID: "1"}, backend.RestartState{}, "3.1.4", false, &recordingSystemdQuery{})
+	if checks.healthState != doctorCheckSkipped || checks.patchHealthState != doctorCheckSkipped || checks.pendingState != doctorCheckUnknown || checks.eolState != doctorCheckUnknown {
+		t.Fatalf("unexpected doctor states: health=%v patch=%v pending=%v eol=%v", checks.healthState, checks.patchHealthState, checks.pendingState, checks.eolState)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/xxvcc/security-update-notify/internal/config"
@@ -126,15 +127,33 @@ func deliverChannels(cfg *config.Config, channels []string, message delivery.Mes
 	configFailed := false
 	sendFailed := false
 	type pendingDelivery struct {
-		name   string
-		store  *dedup.Store
-		sender delivery.Sender
+		name              string
+		store             *dedup.Store
+		sender            delivery.Sender
+		targetFingerprint string
 	}
 	var pending []pendingDelivery
 	for _, name := range channels {
 		store := channelStore(name)
+		targetFingerprint, err := channelTargetFingerprint(cfg, name)
+		if err != nil {
+			configFailed = true
+			logEvent(fmt.Sprintf("%s failed backend=%s host=%s reason=config", name, backend, host))
+			fmt.Fprintf(os.Stderr, "%s configuration failed: %v\n", channelLabel(name), err)
+			continue
+		}
 		lastHash, lastSent := store.ReadLast()
-		if !dedup.ShouldSend(noDedupe, curHash, lastHash, lastSent, now, mode, dedupInterval(cfg)) {
+		targetStatus := store.ReadTargetStatus(targetFingerprint)
+		shouldSend := dedup.ShouldSend(noDedupe, curHash, lastHash, lastSent, now, mode, dedupInterval(cfg))
+		if targetStatus == dedup.TargetLegacy && !shouldSend {
+			if err := store.AdoptLegacyTarget(targetFingerprint); err != nil {
+				sendFailed = true
+				logEvent(fmt.Sprintf("%s state failed backend=%s host=%s reason=target-migration", name, backend, host))
+				fmt.Fprintf(os.Stderr, "%s delivery target state could not be migrated: %v\n", channelLabel(name), err)
+				continue
+			}
+		}
+		if targetStatus != dedup.TargetChanged && !shouldSend {
 			logEvent(fmt.Sprintf("dedup suppressed channel=%s backend=%s host=%s mode=%s hash=%s", name, backend, host, mode, curHash))
 			continue
 		}
@@ -145,7 +164,9 @@ func deliverChannels(cfg *config.Config, channels []string, message delivery.Mes
 			fmt.Fprintf(os.Stderr, "%s configuration failed: %v\n", channelLabel(name), err)
 			continue
 		}
-		pending = append(pending, pendingDelivery{name: name, store: store, sender: sender})
+		pending = append(pending, pendingDelivery{
+			name: name, store: store, sender: sender, targetFingerprint: targetFingerprint,
+		})
 	}
 	for _, item := range pending {
 		if err := item.sender.Send(context.Background(), message); err != nil {
@@ -154,7 +175,7 @@ func deliverChannels(cfg *config.Config, channels []string, message delivery.Mes
 			fmt.Fprintf(os.Stderr, "%s notification failed: %v\n", channelLabel(item.name), err)
 			continue
 		}
-		if err := item.store.Write(curHash, now); err != nil {
+		if err := item.store.WriteDelivery(curHash, now, item.targetFingerprint); err != nil {
 			sendFailed = true
 			logEvent(fmt.Sprintf("%s state failed backend=%s host=%s", item.name, backend, host))
 			fmt.Fprintf(os.Stderr, "%s notification was sent but delivery state could not be persisted: %v\n", channelLabel(item.name), err)
@@ -170,6 +191,39 @@ func deliverChannels(cfg *config.Config, channels []string, message delivery.Mes
 		return 1
 	}
 	return 0
+}
+
+func channelTargetFingerprint(cfg *config.Config, name string) (string, error) {
+	switch name {
+	case "telegram":
+		token := cfg.Get("TELEGRAM_BOT_TOKEN")
+		botID, secret, ok := strings.Cut(token, ":")
+		if !ok || botID == "" || secret == "" {
+			return "", fmt.Errorf("invalid TELEGRAM_BOT_TOKEN")
+		}
+		for _, char := range botID {
+			if char < '0' || char > '9' {
+				return "", fmt.Errorf("invalid TELEGRAM_BOT_TOKEN")
+			}
+		}
+		chatID := cfg.Get("TELEGRAM_CHAT_ID")
+		if chatID == "" {
+			return "", fmt.Errorf("missing TELEGRAM_CHAT_ID")
+		}
+		return dedup.TargetFingerprint("telegram", botID, chatID), nil
+	case "feishu":
+		appID := cfg.Get("FEISHU_APP_ID")
+		receiveID := cfg.Get("FEISHU_RECEIVE_ID")
+		if appID == "" || receiveID == "" {
+			return "", fmt.Errorf("missing FEISHU_APP_ID or FEISHU_RECEIVE_ID")
+		}
+		if !feishuOpenIDPattern.MatchString(receiveID) {
+			return "", fmt.Errorf("FEISHU_RECEIVE_ID must be an open_id")
+		}
+		return dedup.TargetFingerprint("feishu", appID, receiveID), nil
+	default:
+		return "", fmt.Errorf("unsupported notification channel: %s", name)
+	}
 }
 
 func channelStore(name string) *dedup.Store {

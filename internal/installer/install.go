@@ -270,6 +270,12 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 			return Result{}, preflightErr
 		}
 	}
+	if err := i.snapshotChangedDeliveryTargets(b, plan); err != nil {
+		return Result{}, err
+	}
+	if err := i.markChangedDeliveryTargets(plan); err != nil {
+		return Result{}, err
+	}
 
 	storage, err := i.installFiles(ctx, plan, options, credentialSecret, b)
 	if err != nil {
@@ -288,6 +294,53 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 		PreviousVersion: previousVersion, BackupDir: b.dir, CredentialStorage: storage,
 		PostInstallTest: postInstallTest, PostInstallDoctor: postInstallDoctor,
 	}, nil
+}
+
+func deliveryStatePaths(channel string) []string {
+	if channel == "telegram" {
+		return []string{
+			TelegramAlertHashPath, TelegramAlertTimePath,
+			TelegramTargetPath, TelegramTargetPendingPath,
+		}
+	}
+	return []string{
+		FeishuAlertHashPath, FeishuAlertTimePath,
+		FeishuTargetPath, FeishuTargetPendingPath,
+	}
+}
+
+func targetPendingPath(channel string) string {
+	if channel == "telegram" {
+		return TelegramTargetPendingPath
+	}
+	return FeishuTargetPendingPath
+}
+
+func (i *Installer) snapshotChangedDeliveryTargets(b *backup, plan installPlan) error {
+	for _, channel := range changedDeliveryTargetChannels(plan) {
+		for _, statePath := range deliveryStatePaths(channel) {
+			if err := i.snapshotAdditionalPath(b, statePath); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (i *Installer) markChangedDeliveryTargets(plan installPlan) error {
+	channels := changedDeliveryTargetChannels(plan)
+	if len(channels) == 0 {
+		return nil
+	}
+	if err := i.ensureManagedDir(StateDirPath, 0o750); err != nil {
+		return failure("prepare delivery target state", err)
+	}
+	for _, channel := range channels {
+		if err := i.fs.WriteFileAtomic(targetPendingPath(channel), []byte("pending\n"), 0o600); err != nil {
+			return failure("invalidate changed "+channel+" delivery target", err)
+		}
+	}
+	return nil
 }
 
 func (i *Installer) activateAndVerify(ctx context.Context, plan installPlan, options Options, previousVersion string, automaticUnits []unitSnapshot) (*CommandResult, *CommandResult, error) {

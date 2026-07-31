@@ -430,10 +430,121 @@ func TestChannelStoreUsesIndependentFiles(t *testing.T) {
 	dir := t.TempDir()
 	legacy := NewStore(dir)
 	feishu := NewChannelStore(dir, "feishu")
-	if legacy.HashFile == feishu.HashFile || legacy.TimeFile == feishu.TimeFile {
+	if legacy.HashFile == feishu.HashFile || legacy.TimeFile == feishu.TimeFile ||
+		legacy.TargetFile == feishu.TargetFile || legacy.TargetPendingFile == feishu.TargetPendingFile {
 		t.Fatal("channel store must not share legacy Telegram files")
 	}
 	if filepath.Base(feishu.HashFile) != "last-alert.feishu.sha256" || filepath.Base(feishu.TimeFile) != "last-alert.feishu.sent_at" {
 		t.Errorf("unexpected channel paths: %s %s", feishu.HashFile, feishu.TimeFile)
+	}
+}
+
+func TestTargetFingerprintUsesStableIdentityParts(t *testing.T) {
+	first := TargetFingerprint("telegram", "123456", "-100123")
+	second := TargetFingerprint("telegram", "123456", "-100123")
+	if first != second || !validFingerprint(first) {
+		t.Fatalf("unstable target fingerprint: %q %q", first, second)
+	}
+	for _, changed := range []string{
+		TargetFingerprint("telegram", "654321", "-100123"),
+		TargetFingerprint("telegram", "123456", "-100999"),
+		TargetFingerprint("feishu", "123456", "-100123"),
+	} {
+		if changed == first {
+			t.Fatal("distinct target identity produced the same fingerprint")
+		}
+	}
+}
+
+func TestTargetStatusPreservesLegacyStateAndDetectsChanges(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	current := TargetFingerprint("telegram", "123456", "-100123")
+	if got := store.ReadTargetStatus(current); got != TargetLegacy {
+		t.Fatalf("missing upgrade fingerprint status=%v want legacy", got)
+	}
+	if err := store.WriteDelivery("alert-hash", 100, current); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.ReadTargetStatus(current); got != TargetCurrent {
+		t.Fatalf("persisted target status=%v want current", got)
+	}
+	if got := store.ReadTargetStatus(TargetFingerprint("telegram", "123456", "-100999")); got != TargetChanged {
+		t.Fatalf("changed target status=%v want changed", got)
+	}
+	if _, err := os.Stat(store.TargetPendingFile); !os.IsNotExist(err) {
+		t.Fatalf("completed delivery left pending marker: %v", err)
+	}
+}
+
+func TestTargetPendingMarkerForcesDeliveryWithoutContainingIdentity(t *testing.T) {
+	store := NewChannelStore(t.TempDir(), "feishu")
+	current := TargetFingerprint("feishu", "cli_app", "ou_recipient")
+	if err := os.WriteFile(store.TargetPendingFile, []byte("pending\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.ReadTargetStatus(current); got != TargetChanged {
+		t.Fatalf("pending target status=%v want changed", got)
+	}
+	b, err := os.ReadFile(store.TargetPendingFile)
+	if err != nil || string(b) != "pending\n" {
+		t.Fatalf("pending marker=%q err=%v", b, err)
+	}
+}
+
+func TestAdoptLegacyTargetDoesNotChangeAlertState(t *testing.T) {
+	store := NewStore(t.TempDir())
+	if err := store.Write("old-hash", 100); err != nil {
+		t.Fatal(err)
+	}
+	current := TargetFingerprint("telegram", "123456", "-100123")
+	if err := store.AdoptLegacyTarget(current); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.ReadTargetStatus(current); got != TargetCurrent {
+		t.Fatalf("adopted status=%v want current", got)
+	}
+	if hash, sentAt := store.ReadLast(); hash != "old-hash" || sentAt != 100 {
+		t.Fatalf("adoption changed alert state=(%q,%d)", hash, sentAt)
+	}
+	if err := store.AdoptLegacyTarget(current); err != nil {
+		t.Fatalf("idempotent adoption failed: %v", err)
+	}
+	if err := os.WriteFile(store.TargetPendingFile, []byte("pending\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdoptLegacyTarget(current); err == nil {
+		t.Fatal("adoption ignored a pending target change")
+	}
+}
+
+func TestWriteDeliveryFailureLeavesPendingMarkerToBiasTowardResend(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	if err := store.Write("old-hash", 100); err != nil {
+		t.Fatal(err)
+	}
+	current := TargetFingerprint("telegram", "123456", "-100999")
+	wantErr := errors.New("timestamp sync failed")
+	syncs := 0
+	store.fileSync = func(file *os.File) error {
+		syncs++
+		if syncs == 3 {
+			return wantErr
+		}
+		return file.Sync()
+	}
+	if err := store.WriteDelivery("new-hash", 200, current); !errors.Is(err, wantErr) {
+		t.Fatalf("WriteDelivery error=%v want %v", err, wantErr)
+	}
+	if got := store.ReadTargetStatus(current); got != TargetChanged {
+		t.Fatalf("interrupted delivery status=%v want changed", got)
+	}
+	if _, err := os.Stat(store.TargetPendingFile); err != nil {
+		t.Fatalf("interrupted delivery lost pending marker: %v", err)
+	}
+	hash, sentAt := store.ReadLast()
+	if hash != "old-hash" || sentAt != 100 {
+		t.Fatalf("interrupted alert state=(%q,%d), want old state", hash, sentAt)
 	}
 }
