@@ -16,6 +16,8 @@
 
 双发时每个渠道有独立状态：Telegram 成功而飞书失败时，下一次只重试飞书，不会重复发送 Telegram。
 
+渠道状态还会绑定稳定接收目标：Telegram 使用 bot 数字身份与 Chat ID，飞书使用 App ID 与应用级 `open_id`，磁盘只保存不可逆指纹。通过 `configure notifications` 更换目标时，安装器会在新配置可见前、同一回滚事务中标记该渠道，使下一条真实告警不受旧目标的 `once`/间隔状态压制；发送失败不会推进目标，只有成功投递才提交新指纹。升级前已有的无指纹状态会在首次去重压制时静默绑定当前目标，不发送消息；之后运行时也能识别受保护配置文件中的手工目标变化。
+
 ## 安全更新看门狗
 
 除了原有内核、服务重启和发行版 EOL 检测，SUN 默认还会执行七类补丁维护检查：
@@ -38,7 +40,9 @@
 | `SELF_UPDATE_CHECK_DAYS` | `7` | SUN 版本检查间隔；成功结果会缓存，`security-update-notify doctor` 可强制只读刷新。 |
 | `CHECK_EOL` | `1` | 发行版安全支持终止（EOL）提醒：已过 EOL 触发提醒，临近（90 天内）仅作信息展示。Ubuntu 20.04 会自动核对本机 `esm-infra` 状态；只有使用 SUN 无法识别的外部延长支持时，才应考虑设 `0`，并接受这会关闭全部 EOL 检查。 |
 
-待安装数量在阈值以内仍是信息项；达到 `PENDING_ALERT_DAYS` 后才转为风险告警。DNF 的高危子计数同时包含 `critical` 和 `important`。可随时用 `security-update-notify doctor` 查看七项检测、当前待装数量和 SUN 版本结果；诊断不会写入时长或版本缓存状态。`security-update-notify test` 的模拟模式和 `security-update-notify run --dry-run` 不写这些状态，也不会发起周期版本请求。
+待安装数量在阈值以内仍是信息项；达到 `PENDING_ALERT_DAYS` 后才转为风险告警。DNF 的高危子计数同时包含 `critical` 和 `important`。补丁积压、整机重启和服务重启的持续时间使用三态观测：明确存在才累计，明确不存在才清除；命令失败、输出截断或解析不完整属于未知，本轮不计算陈旧告警，也不会丢失之前的 `first_seen`。
+
+可随时用 `security-update-notify doctor` 查看七项检测、当前待装数量和 SUN 版本结果；每项会明确显示 `OK`、`SKIP` 或 `UNKNOWN`，未知结果以非零状态退出，配置明确禁用的跳过项不会单独导致失败。诊断不会写入时长或版本缓存状态。`security-update-notify test` 的模拟模式和 `security-update-notify run --dry-run` 不写这些状态，也不会发起周期版本请求。
 
 ## 安装后写入的内容
 

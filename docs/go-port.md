@@ -192,27 +192,33 @@ distributions, but the same doctor is a mandatory rollback-producing support gat
 - needrestart 仅在 KCUR 与 KEXP 明确不同、KSTA 为 2/3 或出现任一 `NEEDRESTART-SVC:` 行时触发关注；
   KSTA=0、SESS 与 AUX 不触发。needs-restarting 先匹配明确“需要重启”文本，再匹配明确“不需要”文本，
   仅在都未匹配时把 rc=1 当作重启；其他非零退出不能误报重启。缺 `-s` 能力时只判断整机并给可见提示。
-- 去重文件继续原子写入，先提交时间戳再提交 hash；第二步失败时保留旧 hash，使下一次倾向重发而不是
-  静默压制真实告警。Telegram 与飞书有独立状态，双发部分失败只重试失败平台。
+- 11 字段告警 hash 不加入接收人。每个渠道另存稳定目标指纹和无身份 pending 标记：Telegram 绑定 bot
+  数字身份与 Chat ID，飞书绑定 App ID 与 `open_id`；只有成功发送才提交新指纹。去重文件继续原子写入，
+  时间戳先于 hash，目标变更或中断提交都倾向重发。Telegram 与飞书有独立状态，双发部分失败只重试失败平台。
+- 补丁积压、整机重启和服务重启的 `first_seen` 使用 `Present`、`Absent`、`Unknown` 三态；未知不读写年龄，
+  只有明确不存在才删除。APT 只按候选版本来源/pocket 识别 security/ESM；DNF5 有效 JSON 永远作为数据，
+  仓库签名/TLS 故障只从有上下文的诊断短语判断。
 - 普通 timer 运行才写补丁 first-seen 与版本缓存；doctor 强制只读刷新；测试模拟与 dry-run 不写这些
   状态，也不触发周期版本请求。周期版本检查只通知，绝不自动升级。
 - Telegram token 必须匹配 `^\d+:[A-Za-z0-9_-]+$`；正文超过 4096 rune 时截为前 4000 rune 加固定提示。
-  只读 `getMe` 对网络错误、HTTP 429 和 5xx 最多尝试三次；会产生副作用的 `sendMessage`
-  只在服务端明确以 HTTP 429 拒绝时重试。传输错误、5xx、响应中断或非法响应均返回临时失败，
+  只读 `getMe` 对网络错误、HTTP 408、429 和 5xx 最多尝试三次，429 遵循封顶的 `retry_after`；会产生副作用的 `sendMessage`
+  只在服务端明确以 HTTP 429 拒绝时重试。传输错误、HTTP 408、5xx、响应中断或非法响应均返回临时失败，
   但不立即重发，避免服务端已收件时重复告警；`ok=false` 与其他 4xx 立即永久失败。
 - 飞书固定向应用级 `open_id` 发送内嵌 Card JSON 2.0，不增加事件订阅或回调。App Secret 只从隐藏输入、
   systemd credential 或已验证的 root-only 普通文件进入内存；Directory v1 扫描只用于选人。更换 App ID
   时必须重新选择或显式提供接收人，不能跨应用复用 `open_id`。消息 POST 仅对明确 HTTP 429 或飞书业务
-  限流码重试；传输错误、5xx 和响应中断只返回临时失败，不在同一轮立即重发。
+  限流码重试；传输错误、HTTP 408、5xx 和响应中断只返回临时失败，不在同一轮立即重发。
 - DNF5 的 JSON 安全公告必须与实际可执行的 `check-upgrade` 候选取交集；忽略 versionlock/exclude 的查询只使用单次命令选项，不修改持久 DNF 配置。DNF4 安装成功后只保留主 `dnf-automatic.timer` 启用，并禁用三个互斥变体；安装回滚恢复四个 unit 的精确原状态。
 - 退出码保持 `0/1/2/75`：成功或无需动作 / 操作或发送失败 / 参数配置错误 / 显式锁等待超时。默认运行
   锁竞争仍安静返回成功，避免 timer 重叠产生噪声。
 
-Existing schema-4 config, state, notification text, and exit-code contracts remain compatible. Delivery
-retries are intentionally narrower for side-effecting sends: ambiguous transport and 5xx failures return
-temporary failure without an immediate resend, while explicit rate limits remain retryable. The tests treat
-the 11-field dedup frame, newline details, atomic commit order, and read-only diagnostic/test behavior as
-byte-level invariants.
+Existing schema-4 config, notification text, and exit-code contracts remain compatible. The 11-field alert
+hash remains byte-identical; a separate per-channel fingerprint binds successful state to the stable recipient,
+and suppressed legacy target-less state adopts the current target without a fleet-wide resend. Age tracking
+distinguishes present, absent, and unknown probe results so failures preserve prior observations. Delivery retries are intentionally narrower
+for side-effecting sends: ambiguous transport, HTTP 408, and 5xx failures return temporary failure without an
+immediate resend, while explicit rate limits remain retryable. The tests treat hash framing, newline details,
+atomic commit order, and read-only diagnostic/test behavior as byte-level invariants.
 
 ## 分发与信任链 / Distribution and trust chain
 
