@@ -11,15 +11,19 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/xxvcc/security-update-notify/internal/sysexec"
+	"github.com/xxvcc/security-update-notify/internal/textsafe"
 )
 
 const (
@@ -46,12 +50,21 @@ func GPGAvailable() bool {
 // → GPG verify. Every step surfaces as a returned error (instead of Bash's `|| exit 1` guards), so no
 // failure is silently swallowed.
 func VerifyRelease(tarball, sha256File, ascFile, pubKeyFile, wantFpr string) error {
+	if len(wantFpr) != 40 || !isHex(wantFpr) {
+		return fmt.Errorf("invalid pinned signing-key fingerprint")
+	}
+	inputs, err := openReleaseInputs(tarball, sha256File, ascFile, pubKeyFile)
+	if err != nil {
+		return err
+	}
+	defer inputs.close()
+
 	// 1) sha256：读期望值并与实算比对
-	want, err := readExpectedSHA(sha256File, filepath.Base(tarball))
+	want, err := readExpectedSHAFile(inputs.sha256, filepath.Base(tarball))
 	if err != nil {
 		return fmt.Errorf("read sha256 file: %w", err)
 	}
-	got, err := fileSHA256(tarball)
+	got, err := fileSHA256File(inputs.tarball)
 	if err != nil {
 		return fmt.Errorf("hash tarball: %w", err)
 	}
@@ -68,7 +81,10 @@ func VerifyRelease(tarball, sha256File, ascFile, pubKeyFile, wantFpr string) err
 	if err := os.Chmod(home, 0o700); err != nil {
 		return err
 	}
-	if err := runGPG(home, "--import", pubKeyFile); err != nil {
+	if err := rewindFile(inputs.publicKey); err != nil {
+		return fmt.Errorf("rewind public key: %w", err)
+	}
+	if err := runGPGFiles(home, []*os.File{inputs.publicKey}, "--import", "--", inheritedFilePath(0)); err != nil {
 		return fmt.Errorf("import public key: %w", err)
 	}
 	fpr, err := gpgFingerprint(home)
@@ -80,24 +96,64 @@ func VerifyRelease(tarball, sha256File, ascFile, pubKeyFile, wantFpr string) err
 	}
 
 	// 3) 验签
-	if err := runGPG(home, "--verify", ascFile, tarball); err != nil {
+	if err := rewindFile(inputs.signature); err != nil {
+		return fmt.Errorf("rewind signature: %w", err)
+	}
+	if err := rewindFile(inputs.tarball); err != nil {
+		return fmt.Errorf("rewind tarball: %w", err)
+	}
+	status, err := runGPGOutputFiles(home, []*os.File{inputs.signature, inputs.tarball},
+		"--no-tty", "--status-fd=1", "--verify", inheritedFilePath(0), inheritedFilePath(1))
+	if err != nil {
 		return fmt.Errorf("signature verification failed: %w", err)
+	}
+	if !gpgStatusHasPinnedSignature(status, wantFpr) {
+		return fmt.Errorf("signature verification did not return exactly one signature bound to the pinned primary fingerprint")
+	}
+	// Re-hash the same opened inode after GPG returns. This catches ordinary
+	// in-place mutation in addition to pathname replacement; GPG and SHA-256
+	// are never allowed to authenticate two different path resolutions.
+	after, err := fileSHA256File(inputs.tarball)
+	if err != nil {
+		return fmt.Errorf("rehash tarball after signature verification: %w", err)
+	}
+	if !strings.EqualFold(after, want) {
+		return fmt.Errorf("tarball changed during signature verification")
+	}
+	if err := inputs.validatePaths(); err != nil {
+		return err
 	}
 	return nil
 }
 
 // VerifySHA256 只做 sha256 校验（sha256-only 分支用；gpg 缺失且显式 opt-in 时）。
 func VerifySHA256(tarball, sha256File string) error {
-	want, err := readExpectedSHA(sha256File, filepath.Base(tarball))
+	tarFile, tarInfo, err := openRegularInput(tarball, maxArchiveBytes)
+	if err != nil {
+		return fmt.Errorf("open tarball: %w", err)
+	}
+	defer tarFile.Close()
+	shaFile, shaInfo, err := openRegularInput(sha256File, maxReleaseMetadataBytes)
+	if err != nil {
+		return fmt.Errorf("open sha256 file: %w", err)
+	}
+	defer shaFile.Close()
+	want, err := readExpectedSHAFile(shaFile, filepath.Base(tarball))
 	if err != nil {
 		return fmt.Errorf("read sha256 file: %w", err)
 	}
-	got, err := fileSHA256(tarball)
+	got, err := fileSHA256File(tarFile)
 	if err != nil {
 		return fmt.Errorf("hash tarball: %w", err)
 	}
 	if !strings.EqualFold(got, want) {
 		return fmt.Errorf("sha256 mismatch: got %s want %s", got, want)
+	}
+	if err := validateOpenedInput("tarball", tarball, tarFile, tarInfo); err != nil {
+		return err
+	}
+	if err := validateOpenedInput("sha256 file", sha256File, shaFile, shaInfo); err != nil {
+		return err
 	}
 	return nil
 }
@@ -120,15 +176,13 @@ func VerifyReleaseKey(tarball, sha256File, ascFile string, pubKey []byte, wantFp
 	return VerifyRelease(tarball, sha256File, ascFile, tmp.Name(), wantFpr)
 }
 
-func readExpectedSHA(path, archiveName string) (string, error) {
+func readExpectedSHAFile(f *os.File, archiveName string) (string, error) {
 	if archiveName == "" || archiveName == "." || archiveName == ".." || filepath.Base(archiveName) != archiveName {
 		return "", fmt.Errorf("invalid archive name %q", archiveName)
 	}
-	f, err := os.Open(path)
-	if err != nil {
+	if err := rewindFile(f); err != nil {
 		return "", err
 	}
-	defer f.Close()
 	b, err := io.ReadAll(io.LimitReader(f, maxReleaseMetadataBytes+1))
 	if err != nil {
 		return "", err
@@ -151,12 +205,10 @@ func readExpectedSHA(path, archiveName string) (string, error) {
 	return h, nil
 }
 
-func fileSHA256(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
+func fileSHA256File(f *os.File) (string, error) {
+	if err := rewindFile(f); err != nil {
 		return "", err
 	}
-	defer f.Close()
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
@@ -174,25 +226,27 @@ func isHex(s string) bool {
 	return len(s) > 0
 }
 
-func runGPG(home string, args ...string) error {
-	out, err := runGPGOutput(home, append([]string{"--no-tty"}, args...)...)
+func runGPGFiles(home string, files []*os.File, args ...string) error {
+	out, err := runGPGOutputFiles(home, files, append([]string{"--no-tty"}, args...)...)
 	if err != nil {
-		return fmt.Errorf("gpg failed: %v: %s", err, summarizeGPGOutput(out))
+		if message := summarizeGPGOutput(out); message != "" {
+			return fmt.Errorf("gpg failed: %w: %s", err, message)
+		}
+		return fmt.Errorf("gpg failed: %w", err)
 	}
 	return nil
 }
 
 func summarizeGPGOutput(out []byte) string {
-	if len(out) > maxGPGErrorBytes {
-		out = out[:maxGPGErrorBytes]
+	s := strings.TrimSpace(textsafe.SingleLine(string(out)))
+	if len(s) <= maxGPGErrorBytes {
+		return s
 	}
-	s := strings.Map(func(r rune) rune {
-		if r == '\n' || r == '\t' || r >= 0x20 && r != 0x7f {
-			return r
-		}
-		return ' '
-	}, string(out))
-	return strings.TrimSpace(s)
+	limit := maxGPGErrorBytes
+	for limit > 0 && !utf8.ValidString(s[:limit]) {
+		limit--
+	}
+	return strings.TrimSpace(s[:limit])
 }
 
 func gpgFingerprint(home string) (string, error) {
@@ -223,6 +277,36 @@ func gpgFingerprint(home string) (string, error) {
 	return fpr, nil
 }
 
+func gpgStatusHasPinnedSignature(status []byte, pinned string) bool {
+	goodCount, outcomeCount := 0, 0
+	validCount, pinnedCount := 0, 0
+	for _, line := range strings.Split(string(status), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "[GNUPG:]" {
+			continue
+		}
+		switch fields[1] {
+		case "GOODSIG":
+			outcomeCount++
+			goodCount++
+		case "EXPSIG", "EXPKEYSIG", "REVKEYSIG", "BADSIG", "ERRSIG":
+			// VALIDSIG only means the signature is cryptographically valid. GPG
+			// also emits it for expired and revoked signing keys, often with a
+			// zero exit status, so the corresponding outcome must be GOODSIG.
+			outcomeCount++
+		case "VALIDSIG":
+			if len(fields) < 3 {
+				continue
+			}
+			validCount++
+			if strings.EqualFold(fields[2], pinned) || strings.EqualFold(fields[len(fields)-1], pinned) {
+				pinnedCount++
+			}
+		}
+	}
+	return outcomeCount == 1 && goodCount == 1 && validCount == 1 && pinnedCount == 1
+}
+
 type boundedGPGOutput struct {
 	buf      bytes.Buffer
 	overflow bool
@@ -242,26 +326,142 @@ func (w *boundedGPGOutput) Write(p []byte) (int, error) {
 }
 
 func runGPGOutput(home string, args ...string) ([]byte, error) {
+	return runGPGOutputFiles(home, nil, args...)
+}
+
+func runGPGOutputFiles(home string, files []*os.File, args ...string) ([]byte, error) {
 	gpg, err := trustedGPGExecutable()
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), gpgCommandTimeout)
 	defer cancel()
-	baseArgs := []string{"--batch", "--homedir", home}
+	baseArgs := []string{"--no-options", "--batch", "--homedir", home}
 	cmd := sysexec.CommandContext(ctx, gpg, append(baseArgs, args...)...)
 	cmd.Env = []string{"HOME=" + home, "GNUPGHOME=" + home, "PATH=" + trustedSystemPath, "LC_ALL=C"}
-	out := &boundedGPGOutput{}
-	cmd.Stdout = out
-	cmd.Stderr = out
+	cmd.ExtraFiles = append([]*os.File(nil), files...)
+	stdout := &boundedGPGOutput{}
+	stderr := &boundedGPGOutput{}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	err = cmd.Run()
 	if ctx.Err() != nil {
-		return out.buf.Bytes(), fmt.Errorf("timed out")
+		return stdout.buf.Bytes(), fmt.Errorf("timed out")
 	}
-	if out.overflow {
-		return out.buf.Bytes()[:maxGPGOutputBytes], fmt.Errorf("output exceeds size limit")
+	if stdout.overflow || stderr.overflow {
+		return stdout.buf.Bytes()[:min(stdout.buf.Len(), maxGPGOutputBytes)], fmt.Errorf("output exceeds size limit")
 	}
-	return out.buf.Bytes(), err
+	if err != nil {
+		message := summarizeGPGOutput(stderr.buf.Bytes())
+		if message != "" {
+			return stdout.buf.Bytes(), fmt.Errorf("%w: %s", err, message)
+		}
+	}
+	return stdout.buf.Bytes(), err
+}
+
+type releaseInputs struct {
+	tarballPath, sha256Path, signaturePath, publicKeyPath string
+	tarball, sha256, signature, publicKey                 *os.File
+	tarballInfo, sha256Info, signatureInfo, publicKeyInfo os.FileInfo
+}
+
+func openReleaseInputs(tarball, sha256File, ascFile, pubKeyFile string) (releaseInputs, error) {
+	var inputs releaseInputs
+	inputs.tarballPath, inputs.sha256Path = tarball, sha256File
+	inputs.signaturePath, inputs.publicKeyPath = ascFile, pubKeyFile
+	var err error
+	if inputs.tarball, inputs.tarballInfo, err = openRegularInput(tarball, maxArchiveBytes); err != nil {
+		return releaseInputs{}, fmt.Errorf("open tarball: %w", err)
+	}
+	if inputs.sha256, inputs.sha256Info, err = openRegularInput(sha256File, maxReleaseMetadataBytes); err != nil {
+		inputs.close()
+		return releaseInputs{}, fmt.Errorf("open sha256 file: %w", err)
+	}
+	if inputs.signature, inputs.signatureInfo, err = openRegularInput(ascFile, maxReleaseMetadataBytes); err != nil {
+		inputs.close()
+		return releaseInputs{}, fmt.Errorf("open signature: %w", err)
+	}
+	if inputs.publicKey, inputs.publicKeyInfo, err = openRegularInput(pubKeyFile, maxReleaseMetadataBytes); err != nil {
+		inputs.close()
+		return releaseInputs{}, fmt.Errorf("open public key: %w", err)
+	}
+	return inputs, nil
+}
+
+func (inputs *releaseInputs) close() {
+	for _, file := range []*os.File{inputs.tarball, inputs.sha256, inputs.signature, inputs.publicKey} {
+		if file != nil {
+			_ = file.Close()
+		}
+	}
+}
+
+func (inputs releaseInputs) validatePaths() error {
+	checks := []struct {
+		label string
+		path  string
+		file  *os.File
+		info  os.FileInfo
+	}{
+		{"tarball", inputs.tarballPath, inputs.tarball, inputs.tarballInfo},
+		{"sha256 file", inputs.sha256Path, inputs.sha256, inputs.sha256Info},
+		{"signature", inputs.signaturePath, inputs.signature, inputs.signatureInfo},
+		{"public key", inputs.publicKeyPath, inputs.publicKey, inputs.publicKeyInfo},
+	}
+	for _, check := range checks {
+		if err := validateOpenedInput(check.label, check.path, check.file, check.info); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateOpenedInput(label, path string, file *os.File, initial os.FileInfo) error {
+	opened, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("reinspect opened %s: %w", label, err)
+	}
+	current, err := os.Lstat(path)
+	if err != nil || !current.Mode().IsRegular() || !os.SameFile(opened, current) ||
+		opened.Size() != initial.Size() || !opened.ModTime().Equal(initial.ModTime()) {
+		return fmt.Errorf("%s changed during release verification", label)
+	}
+	return nil
+}
+
+func openRegularInput(path string, maxSize int64) (*os.File, os.FileInfo, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = syscall.Close(fd)
+		return nil, nil, fmt.Errorf("create file handle")
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() < 0 || maxSize < 1 || info.Size() > maxSize {
+		_ = file.Close()
+		return nil, nil, fmt.Errorf("must be a regular file no larger than %d bytes", maxSize)
+	}
+	return file, info, nil
+}
+
+func rewindFile(file *os.File) error {
+	if file == nil {
+		return errors.New("missing opened file")
+	}
+	_, err := file.Seek(0, io.SeekStart)
+	return err
+}
+
+func inheritedFilePath(index int) string {
+	return fmt.Sprintf("/proc/self/fd/%d", 3+index)
 }
 
 func trustedGPGExecutable() (string, error) {

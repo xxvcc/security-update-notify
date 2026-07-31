@@ -2,16 +2,20 @@ package run
 
 import (
 	"errors"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/xxvcc/security-update-notify/internal/backend"
 	"github.com/xxvcc/security-update-notify/internal/config"
 	"github.com/xxvcc/security-update-notify/internal/statefile"
+	"github.com/xxvcc/security-update-notify/internal/sysexec"
 	"github.com/xxvcc/security-update-notify/internal/watchdog"
 )
 
@@ -41,7 +45,7 @@ esac
 	t.Setenv("SECURITY_UPDATE_NOTIFY_APT_LISTS_DIR", filepath.Join(t.TempDir(), "missing-lists"))
 
 	pending, blocked, issues := collectAPTPackageFacts(true, time.Now(), 7)
-	if pending.Count != 1 || len(blocked) != 1 || blocked[0] != "linux-image" {
+	if pending.Count != 0 || len(pending.Packages) != 0 || len(blocked) != 0 {
 		t.Fatalf("pending=%+v blocked=%v", pending, blocked)
 	}
 	for _, code := range []string{
@@ -51,6 +55,48 @@ esac
 		if !hasIssueCode(issues, code) {
 			t.Errorf("missing issue %q in %v", code, issues)
 		}
+	}
+}
+
+func TestCollectAPTPackageFactsReportsBlockedQueryFailure(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCommand(t, dir, "apt-get", `
+case "$*" in
+  "-s upgrade") ;;
+  "-s --ignore-hold upgrade") exit 2 ;;
+  "check -qq") ;;
+  *) exit 2 ;;
+esac
+`)
+	writeTestCommand(t, dir, "apt-mark", "printf '%s\\n' openssl\n")
+	writeTestCommand(t, dir, "apt-config", `printf '%s\n' 'APT::Periodic::Update-Package-Lists "1";' 'APT::Periodic::Unattended-Upgrade "1";' 'Unattended-Upgrade::Origins-Pattern:: "security";'`)
+	writeTestCommand(t, dir, "dpkg", "exit 0\n")
+	writeTestCommand(t, dir, "systemctl", "printf '%s\\n' success\n")
+	t.Setenv("PATH", dir)
+	lists := t.TempDir()
+	metadata := filepath.Join(lists, "security_InRelease")
+	if err := os.WriteFile(metadata, []byte("Valid-Until: "+time.Now().Add(24*time.Hour).Format(time.RFC1123Z)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SECURITY_UPDATE_NOTIFY_APT_LISTS_DIR", lists)
+
+	_, blocked, issues := collectAPTPackageFacts(true, time.Now(), 7)
+	if len(blocked) != 0 || !hasIssueCode(issues, "apt-blocked-query-failed") {
+		t.Fatalf("blocked=%v issues=%v", blocked, issues)
+	}
+}
+
+func TestCollectAPTPackageFactsDoesNotTrustFailedOutputWhenHealthDisabled(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCommand(t, dir, "apt-get", `
+printf '%s\n' 'Inst openssl [1] (2 Debian-Security:stable-security [amd64])'
+exit 2
+`)
+	t.Setenv("PATH", dir)
+
+	pending, blocked, issues := collectAPTPackageFacts(false, time.Now(), 7)
+	if pending.Count != 0 || len(pending.Packages) != 0 || len(blocked) != 0 || len(issues) != 0 {
+		t.Fatalf("failed APT output was trusted: pending=%+v blocked=%v issues=%v", pending, blocked, issues)
 	}
 }
 
@@ -77,7 +123,7 @@ esac
 	t.Setenv("SECURITY_UPDATE_NOTIFY_DNF_AUTOMATIC_CONF", filepath.Join(t.TempDir(), "missing.conf"))
 
 	pending, blocked, issues := collectDNFPackageFacts(true)
-	if pending.Count != 1 || len(blocked) != 1 || blocked[0] != "blocked.noarch" {
+	if pending.Count != 0 || len(pending.Packages) != 0 || len(blocked) != 0 {
 		t.Fatalf("pending=%+v blocked=%v", pending, blocked)
 	}
 	for _, code := range []string{"dnf-repository-signature", "dnf-automatic-config", "dnf-check"} {
@@ -209,6 +255,66 @@ esac
 	}
 }
 
+func TestCollectDNFPackageFactsDoesNotTrustFailedOutputWhenHealthDisabled(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCommand(t, dir, "dnf", `
+case "$*" in
+  "--version") printf '%s\n' '4.14.0' ;;
+  "-q updateinfo list security")
+    printf '%s\n' 'RHSA-2026:1 Important/Sec. openssl.x86_64'
+    exit 2
+    ;;
+  *) exit 2 ;;
+esac
+`)
+	t.Setenv("PATH", dir)
+
+	pending, blocked, issues := collectDNFPackageFacts(false)
+	if pending.Count != 0 || len(pending.Packages) != 0 || len(blocked) != 0 || len(issues) != 0 {
+		t.Fatalf("failed DNF output was trusted: pending=%+v blocked=%v issues=%v", pending, blocked, issues)
+	}
+}
+
+func TestCollectDNF5PackageFactsDoesNotTrustFailedOrTruncatedOutputWhenHealthDisabled(t *testing.T) {
+	for _, test := range []struct {
+		name, advisory string
+	}{
+		{
+			name: "failed",
+			advisory: `printf '%s\n' '[{"name":"FEDORA-2026-openssl","type":"security","severity":"Critical","nevra":"openssl-2-1.fc44.x86_64"}]'
+exit 2`,
+		},
+		{
+			name: "truncated",
+			advisory: `printf '%s\n' '[{"name":"FEDORA-2026-openssl","type":"security","severity":"Critical","nevra":"openssl-2-1.fc44.x86_64"}]'
+head -c 8388609 /dev/zero | tr '\000' ' '`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeTestCommand(t, dir, "dnf", `
+case "$*" in
+  "--version") printf '%s\n' 'dnf5 version 5.4.2.1' ;;
+  "-q advisory list --security --updates --json")
+    `+test.advisory+`
+    ;;
+  "-q check-upgrade --security")
+    printf '%s\n' 'openssl.x86_64 2-1.fc44 updates'
+    exit 100
+    ;;
+  *) exit 2 ;;
+esac
+`)
+			t.Setenv("PATH", dir)
+
+			pending, blocked, issues := collectDNFPackageFacts(false)
+			if pending.Count != 0 || len(pending.Packages) != 0 || len(blocked) != 0 || len(issues) != 0 {
+				t.Fatalf("%s DNF5 output was trusted: pending=%+v blocked=%v issues=%v", test.name, pending, blocked, issues)
+			}
+		})
+	}
+}
+
 func TestCollectDNF5PackageFactsReportsUnrestrictedQueryFailures(t *testing.T) {
 	for _, failingCommand := range []string{"advisory", "transaction"} {
 		t.Run(failingCommand, func(t *testing.T) {
@@ -291,6 +397,83 @@ esac
 	}
 }
 
+func TestDNFRepositoryErrorsOnStdoutAreNotIgnored(t *testing.T) {
+	for _, test := range []struct {
+		output, want string
+	}{
+		{output: "certificate verification failed", want: "dnf-repository-signature"},
+		{output: "Ignoring repositories: security", want: "dnf-repository-failed"},
+	} {
+		issue, failed := dnfRepositoryIssue(sysexec.Result{Stdout: test.output}, true)
+		if !failed || issue.Code != test.want {
+			t.Fatalf("output=%q issue=%+v failed=%v want=%q", test.output, issue, failed, test.want)
+		}
+	}
+	issue, failed := dnfRepositoryIssue(sysexec.Result{StdoutTruncated: true}, true)
+	if !failed || issue.Code != "dnf-repository-failed" {
+		t.Fatalf("truncated repository query issue=%+v failed=%v", issue, failed)
+	}
+}
+
+func TestAPTRepositoryStatusProbeFailureIsExplicit(t *testing.T) {
+	for _, test := range []struct {
+		name, body string
+	}{
+		{name: "failed command", body: "exit 2\n"},
+		{name: "empty status", body: "exit 0\n"},
+		{name: "stderr warning", body: "printf '%s\\n' success\nprintf '%s\\n' warning >&2\n"},
+		{name: "multiple values", body: "printf '%s\\n' success failed\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeTestCommand(t, dir, "systemctl", test.body)
+			t.Setenv("PATH", dir)
+			lists := t.TempDir()
+			metadata := filepath.Join(lists, "security_InRelease")
+			if err := os.WriteFile(metadata, []byte("Valid-Until: "+time.Now().Add(24*time.Hour).Format(time.RFC1123Z)+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("SECURITY_UPDATE_NOTIFY_APT_LISTS_DIR", lists)
+			if issues := checkAPTRepository(time.Now(), 7); !hasIssueCode(issues, "apt-daily-status-unreadable") {
+				t.Fatalf("issues=%v", issues)
+			}
+		})
+	}
+}
+
+func TestAPTRepositoryDoesNotTrustFailedJournalOutput(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCommand(t, dir, "systemctl", "printf '%s\\n' failed\n")
+	writeTestCommand(t, dir, "journalctl", "printf '%s\\n' 'NO_PUBKEY DEADBEEF'\nexit 2\n")
+	lists := t.TempDir()
+	metadata := filepath.Join(lists, "security_InRelease")
+	if err := os.WriteFile(metadata, []byte("Valid-Until: "+time.Now().Add(24*time.Hour).Format(time.RFC1123Z)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SECURITY_UPDATE_NOTIFY_APT_LISTS_DIR", lists)
+	issues := checkAPTRepository(time.Now(), 7)
+	if !hasIssueCode(issues, "apt-daily-failed") || hasIssueCode(issues, "apt-repository-signature") {
+		t.Fatalf("failed journal output affected repository classification: %v", issues)
+	}
+}
+
+func TestInspectAPTMetadataRejectsUnreadableSecurityEntries(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte("Valid-Until: "+time.Now().Add(24*time.Hour).Format(time.RFC1123Z)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "security_InRelease")); err != nil {
+		t.Fatal(err)
+	}
+	issues := inspectAPTMetadata(dir, time.Now(), 7)
+	for _, code := range []string{"apt-metadata-unreadable", "apt-security-metadata-missing"} {
+		if !hasIssueCode(issues, code) {
+			t.Fatalf("missing issue %q in %v", code, issues)
+		}
+	}
+}
+
 func TestCollectDNFPackageFactsFailsClosedOnUnknownGeneration(t *testing.T) {
 	for _, test := range []struct {
 		name          string
@@ -353,6 +536,35 @@ func TestCollectPatchWatchdogDeduplicatesStateFailures(t *testing.T) {
 	}
 	if strings.Count(patch.Sig, "patch-state-write") != 1 {
 		t.Fatalf("state failure was not deduplicated: %q", patch.Sig)
+	}
+}
+
+func TestCollectPatchWatchdogReportsInvalidAgeWithoutOverwritingIt(t *testing.T) {
+	cfg := patchTestConfig(t, "CHECK_UPDATE_HEALTH=0\nCHECK_SELF_UPDATE=0\n")
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	for _, value := range []string{"broken", "0", "-1"} {
+		t.Run(value, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "reboot-required.first_seen")
+			original := []byte(value + "\n")
+			if err := os.WriteFile(path, original, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("SECURITY_UPDATE_NOTIFY_STATE_DIR", dir)
+			patch, _ := collectPatchWatchdog(cfg, "unsupported", backend.RestartState{
+				RebootRequired: true,
+			}, "3.1.1", patchCollectOptions{PersistState: true, Now: now})
+			if !patch.RiskAttention || !strings.Contains(patch.Sig, "patch-state-write") {
+				t.Fatalf("invalid age was not surfaced: %+v", patch)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != string(original) {
+				t.Fatalf("invalid age was overwritten: got %q want %q", got, original)
+			}
+		})
 	}
 }
 
@@ -439,6 +651,25 @@ func TestInspectAPTMetadata(t *testing.T) {
 			t.Fatal("fresh non-security metadata masked stale security metadata")
 		}
 	})
+	t.Run("huge stale threshold does not overflow", func(t *testing.T) {
+		dir := write(t, "security_InRelease", now.Add(24*time.Hour).Format(time.RFC1123Z), now.Add(-365*24*time.Hour))
+		if hasIssueCode(inspectAPTMetadata(dir, now, math.MaxInt), "apt-metadata-stale") {
+			t.Fatal("an effectively unreachable stale threshold overflowed into an alert")
+		}
+	})
+	t.Run("oversized metadata is unreadable rather than partially parsed", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "security_InRelease")
+		prefix := "Valid-Until: " + now.Add(24*time.Hour).Format(time.RFC1123Z) + "\n"
+		body := prefix + strings.Repeat("x", maxAPTMetadataParseBytes-len(prefix)+1)
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		issues := inspectAPTMetadata(dir, now, 7)
+		if !hasIssueCode(issues, "apt-metadata-unreadable") {
+			t.Fatalf("oversized metadata issues=%v", issues)
+		}
+	})
 }
 
 func TestCollectSelfUpdateCacheForceAndSkip(t *testing.T) {
@@ -483,6 +714,153 @@ func TestCollectSelfUpdateCacheForceAndSkip(t *testing.T) {
 	}
 }
 
+func TestCollectSelfUpdateInvalidCacheForcesRefreshAndRemainsVisible(t *testing.T) {
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name  string
+		setup func(*testing.T, statefile.Store)
+	}{
+		{
+			name: "timestamp without version",
+			setup: func(t *testing.T, store statefile.Store) {
+				if err := store.WriteInt("self-update.checked_at", now.Unix()); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "version without timestamp",
+			setup: func(t *testing.T, store statefile.Store) {
+				if err := store.WriteString("self-update.latest", "3.1.1"); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "invalid version",
+			setup: func(t *testing.T, store statefile.Store) {
+				if err := store.WriteInt("self-update.checked_at", now.Unix()); err != nil {
+					t.Fatal(err)
+				}
+				if err := store.WriteString("self-update.latest", "not_a_version"); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "version with surrounding whitespace",
+			setup: func(t *testing.T, store statefile.Store) {
+				if err := store.WriteInt("self-update.checked_at", now.Unix()); err != nil {
+					t.Fatal(err)
+				}
+				if err := store.WriteString("self-update.latest", " 3.1.1 "); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "invalid timestamp",
+			setup: func(t *testing.T, store statefile.Store) {
+				if err := os.WriteFile(filepath.Join(store.Dir, "self-update.checked_at"), []byte("broken\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := store.WriteString("self-update.latest", "3.1.1"); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := statefile.Store{Dir: t.TempDir()}
+			test.setup(t, store)
+			cfg := patchTestConfig(t, "CHECK_SELF_UPDATE=1\nSELF_UPDATE_CHECK_DAYS=7\n")
+			calls := 0
+			latest, available, checkErr, stateErr := collectSelfUpdate(cfg, "3.1.1", store, patchCollectOptions{
+				PersistState: true,
+				Now:          now,
+				LatestRelease: func(*http.Client, string) (string, error) {
+					calls++
+					return "3.1.2", nil
+				},
+			})
+			if calls != 1 || latest != "3.1.2" || !available || checkErr != nil || stateErr == nil {
+				t.Fatalf("calls=%d latest=%q available=%v checkErr=%v stateErr=%v", calls, latest, available, checkErr, stateErr)
+			}
+			if repaired, err := store.ReadString("self-update.latest"); err != nil || repaired != "3.1.2" {
+				t.Fatalf("repaired latest=%q err=%v", repaired, err)
+			}
+			if repaired, err := store.ReadInt("self-update.checked_at"); err != nil || repaired != now.Unix() {
+				t.Fatalf("repaired timestamp=%d err=%v", repaired, err)
+			}
+		})
+	}
+}
+
+func TestCollectSelfUpdateRejectsInvalidFreshVersion(t *testing.T) {
+	for _, invalid := range []string{"not_a_version", " 3.1.2 "} {
+		t.Run(invalid, func(t *testing.T) {
+			cfg := patchTestConfig(t, "CHECK_SELF_UPDATE=1\n")
+			store := statefile.Store{Dir: t.TempDir()}
+			latest, available, checkErr, stateErr := collectSelfUpdate(cfg, "3.1.1", store, patchCollectOptions{
+				PersistState: true,
+				Now:          time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC),
+				LatestRelease: func(*http.Client, string) (string, error) {
+					return invalid, nil
+				},
+			})
+			if latest != "" || available || checkErr == nil || stateErr != nil {
+				t.Fatalf("latest=%q available=%v checkErr=%v stateErr=%v", latest, available, checkErr, stateErr)
+			}
+			if _, err := os.Stat(filepath.Join(store.Dir, "self-update.latest")); !os.IsNotExist(err) {
+				t.Fatalf("invalid fresh version was cached: %v", err)
+			}
+		})
+	}
+}
+
+func TestCollectSelfUpdateReportsInvalidCurrentVersion(t *testing.T) {
+	cfg := patchTestConfig(t, "CHECK_SELF_UPDATE=1\n")
+	store := statefile.Store{Dir: t.TempDir()}
+	calls := 0
+	latest, available, checkErr, stateErr := collectSelfUpdate(cfg, " 3.1.1 ", store, patchCollectOptions{
+		PersistState: true,
+		Now:          time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC),
+		LatestRelease: func(*http.Client, string) (string, error) {
+			calls++
+			return "3.1.2", nil
+		},
+	})
+	if latest != "" || available || checkErr == nil || stateErr != nil || calls != 0 {
+		t.Fatalf("latest=%q available=%v checkErr=%v stateErr=%v calls=%d", latest, available, checkErr, stateErr, calls)
+	}
+	if _, err := os.Stat(filepath.Join(store.Dir, "self-update.latest")); !os.IsNotExist(err) {
+		t.Fatalf("invalid local version caused cache mutation: %v", err)
+	}
+}
+
+func TestCollectSelfUpdateHugeIntervalDoesNotOverflow(t *testing.T) {
+	cfg := patchTestConfig(t, "CHECK_SELF_UPDATE=1\nSELF_UPDATE_CHECK_DAYS="+strconv.Itoa(math.MaxInt)+"\n")
+	store := statefile.Store{Dir: t.TempDir()}
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	if err := store.WriteInt("self-update.checked_at", now.Add(-30*24*time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteString("self-update.latest", "3.1.1"); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	latest, available, checkErr, stateErr := collectSelfUpdate(cfg, "3.1.1", store, patchCollectOptions{
+		Now: now,
+		LatestRelease: func(*http.Client, string) (string, error) {
+			calls++
+			return "9.9.9", nil
+		},
+	})
+	if calls != 0 || latest != "3.1.1" || available || checkErr != nil || stateErr != nil {
+		t.Fatalf("calls=%d latest=%q available=%v checkErr=%v stateErr=%v", calls, latest, available, checkErr, stateErr)
+	}
+}
+
 func TestTrackedAgeReadOnlyDoesNotWriteOrRemove(t *testing.T) {
 	dir := t.TempDir()
 	store := statefile.Store{Dir: dir}
@@ -502,6 +880,28 @@ func TestTrackedAgeReadOnlyDoesNotWriteOrRemove(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("read-only tracking removed state: %v", err)
+	}
+}
+
+func TestReadBoundedFileRejectsSymlinksAndFIFOs(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readBoundedFile(link, 1024); err == nil {
+		t.Fatal("readBoundedFile accepted a symlink")
+	}
+	fifo := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readBoundedFile(fifo, 1024); err == nil {
+		t.Fatal("readBoundedFile accepted a FIFO")
 	}
 }
 

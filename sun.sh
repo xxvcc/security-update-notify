@@ -1,5 +1,75 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
+
+# Bash imports BASH_ENV and exported functions before reading a non-privileged
+# script, so in-script cleanup alone is too late. The documented pipe entry and
+# this shebang both enable privileged mode (-p), which suppresses those startup
+# hooks. Keep this check before every overridable builtin or external helper.
+if [[ $- != *p* ]]; then
+  # A fatal expansion stops the shell before an imported function could replace
+  # `exit` or another builtin used to reject this invocation.
+  : "${BASH_VERSINFO[999]:?sun.sh requires Bash privileged mode; run it with /bin/bash -p}"
+fi
+
+# In -p mode Bash ignores exported function definitions but can retain their
+# raw BASH_FUNC_* environment entries. Re-exec with an empty environment so a
+# later Bash-script child cannot import them. For a pipe, the clean Bash reads
+# the unconsumed script body from stdin; for a file, it reopens this same file.
+if [[ ${SUN_BOOTSTRAP_CLEAN_PID:-} != "$BASHPID" ]]; then
+  sun_clean_env=(
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin
+    LC_ALL=C
+    "TERM=${TERM-}"
+    "TZ=${TZ-}"
+    "http_proxy=${http_proxy-}"
+    "https_proxy=${https_proxy-}"
+    "no_proxy=${no_proxy-}"
+    "all_proxy=${all_proxy-}"
+    "HTTP_PROXY=${HTTP_PROXY-}"
+    "HTTPS_PROXY=${HTTPS_PROXY-}"
+    "NO_PROXY=${NO_PROXY-}"
+    "ALL_PROXY=${ALL_PROXY-}"
+    "UI_LANG=${UI_LANG-}"
+    "SUN_LANG=${SUN_LANG-}"
+  )
+  if [[ -n ${BASH_SOURCE[0]:-} ]]; then
+    exec -c /usr/bin/env -i "${sun_clean_env[@]}" \
+      "SUN_BOOTSTRAP_CLEAN_PID=$BASHPID" \
+      /bin/bash -p "${BASH_SOURCE[0]}" "$@"
+  fi
+  exec -c /usr/bin/env -i "${sun_clean_env[@]}" \
+    /bin/bash -p -s -- "$@"
+fi
+
 set -euo pipefail
+
+# Privileged bootstrap helpers must not be selected from /usr/local or a
+# caller-controlled PATH. Every supported distribution installs them here.
+readonly SYSTEM_PATH=/usr/sbin:/usr/bin:/sbin:/bin
+PATH="$SYSTEM_PATH"
+export PATH
+
+# Capture the only supported caller-controlled UI setting, then remove
+# inherited command overrides and reduce the privileged process environment to
+# the same small compatibility allowlist used by the Go runtime. Proxy values
+# remain available for installations that require an outbound proxy.
+sun_requested_lang="${UI_LANG:-${SUN_LANG:-}}"
+sun_inherited_names=()
+mapfile -t sun_inherited_names < <(builtin compgen -A function)
+for sun_name in "${sun_inherited_names[@]}"; do
+  builtin unset -f "$sun_name" 2>/dev/null || true
+done
+builtin unalias -a 2>/dev/null || true
+mapfile -t sun_inherited_names < <(builtin compgen -e)
+for sun_name in "${sun_inherited_names[@]}"; do
+  case "$sun_name" in
+    TERM|TZ|http_proxy|https_proxy|no_proxy|all_proxy|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|ALL_PROXY|PATH) ;;
+    *) builtin unset "$sun_name" 2>/dev/null || true ;;
+  esac
+done
+builtin export -n BASHOPTS SHELLOPTS 2>/dev/null || true
+unset sun_inherited_names sun_name
+LC_ALL=C
+export LC_ALL PATH
 
 # security-update-notify 引导安装器。
 # Bootstrap installer for security-update-notify.
@@ -18,10 +88,13 @@ RELEASE_SIGNING_FINGERPRINT="C678256ACBFC6491BF5076655F3AE24999921FFC"
 BOOTSTRAP_SIGNATURE_ASSET="sun.sh.asc"
 # shellcheck disable=SC2034
 BOOTSTRAP_VERSION_NOTATION="release-version@xxv.cc"
-UI_LANG="${UI_LANG:-${SUN_LANG:-}}"
+UI_LANG="$sun_requested_lang"
+unset sun_requested_lang
 RUN_MODE="menu"
 INSTALL_ARGS=()
 CURL_RETRY_OPTIONS=()
+readonly MAX_METADATA_BYTES=1048576
+readonly MAX_ARCHIVE_BYTES=268435456
 
 # 双语输出助手：sun.sh 运行在“选择语言”之前，自身输出默认 zh；
 # 仅当显式指定 --lang/UI_LANG/SUN_LANG 时才把语言传给目标脚本（否则菜单会提示选择）。
@@ -36,8 +109,8 @@ usage() {
     cat <<'EOF'
 Usage:
   set -o pipefail
-  curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash
-  curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- install [install args]
+  curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo /bin/bash -p
+  curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo /bin/bash -p -s -- install [install args]
 
 Bootstrap options:
   --lang LANG             Language for output and the selected script: zh | en
@@ -60,8 +133,8 @@ EOF
     cat <<'EOF'
 用法:
   set -o pipefail
-  curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash
-  curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- install [安装参数]
+  curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo /bin/bash -p
+  curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo /bin/bash -p -s -- install [安装参数]
 
 引导选项:
   --lang LANG             输出与所选脚本的语言：zh | en
@@ -85,10 +158,10 @@ EOF
 
 require_arg() { [[ $# -ge 2 && -n "${2:-}" ]] || { say "缺少 $1 的值" "Missing value for $1" >&2; exit 2; }; }
 validate_version() { [[ ${#1} -le 128 && "$1" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]] || { say "无效版本: $1" "Invalid VERSION: $1" >&2; exit 2; }; }
-curl_https() { curl --proto '=https' --proto-redir '=https' "$@"; }
+curl_https() { curl --disable --proto '=https' --proto-redir '=https' "$@"; }
 configure_curl_retry_options() {
   local curl_help
-  curl_help="$(curl --help all 2>/dev/null || true)"
+  curl_help="$(curl --disable --help all 2>/dev/null || true)"
   if [[ "$curl_help" == *"--retry-all-errors"* ]]; then
     CURL_RETRY_OPTIONS=(--retry-all-errors)
   elif [[ "$curl_help" == *"--retry-connrefused"* ]]; then
@@ -96,8 +169,83 @@ configure_curl_retry_options() {
   fi
 }
 curl_retry() {
-  curl_https --connect-timeout 20 --retry 4 --retry-delay 1 --retry-max-time 180 \
+  curl_https --connect-timeout 20 --retry 4 --retry-delay 1 --retry-max-time 180 --max-time 180 \
     "${CURL_RETRY_OPTIONS[@]}" "$@"
+}
+download_limited() {
+  local limit="$1" output="$2" part="${2}.part"
+  shift 2
+  rm -f -- "$part"
+  if curl_retry --max-filesize "$limit" "$@" | python3 -I -c '
+import os
+import sys
+
+limit = int(sys.argv[1])
+path = sys.argv[2]
+if limit < 0:
+    raise SystemExit(1)
+try:
+    with open(path, "xb") as output:
+        remaining = limit
+        while True:
+            chunk = sys.stdin.buffer.read(min(65536, remaining + 1))
+            if not chunk:
+                break
+            if len(chunk) > remaining:
+                raise ValueError("download exceeds size limit")
+            output.write(chunk)
+            remaining -= len(chunk)
+except Exception:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    raise SystemExit(1)
+' "$limit" "$part"; then
+    if mv -f -- "$part" "$output"; then
+      return 0
+    fi
+  fi
+  rm -f -- "$part"
+  return 1
+}
+
+capture_limited() {
+  local limit="$1" output="$2" duration="$3" part="${2}.part"
+  shift 3
+  rm -f -- "$part"
+  if timeout --signal=TERM --kill-after=5s "$duration" "$@" 2>/dev/null | python3 -I -c '
+import os
+import sys
+
+limit = int(sys.argv[1])
+path = sys.argv[2]
+if limit < 0:
+    raise SystemExit(1)
+try:
+    with open(path, "xb") as output:
+        remaining = limit
+        while True:
+            chunk = sys.stdin.buffer.read(min(65536, remaining + 1))
+            if not chunk:
+                break
+            if len(chunk) > remaining:
+                raise ValueError("command output exceeds size limit")
+            output.write(chunk)
+            remaining -= len(chunk)
+except Exception:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    raise SystemExit(1)
+' "$limit" "$part"; then
+    if mv -f -- "$part" "$output"; then
+      return 0
+    fi
+  fi
+  rm -f -- "$part"
+  return 1
 }
 tar_clean_env() { env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT tar "$@"; }
 
@@ -118,7 +266,7 @@ resolve_bootstrap_packages() {
     case "$command" in
       curl) package=curl ;;
       tar) package=tar ;;
-      sha256sum|mktemp|env|uname|timeout) package=coreutils ;;
+      sha256sum|mktemp|env|uname|timeout|wc) package=coreutils ;;
       python3) package=python3 ;;
       gpg)
         case "$family" in
@@ -152,36 +300,71 @@ gpg_primary_fingerprints() {
 
 gpg_status_has_pinned_signature() {
   local pin="$1" line last
+  local good_count=0 outcome_count=0 valid_count=0 pinned_count=0
   local -a fields=()
   while IFS= read -r line; do
     read -r -a fields <<<"$line"
-    [[ "${#fields[@]}" -ge 3 ]] || continue
-    last="${fields[${#fields[@]}-1]}"
-    if [[ "${fields[0]}" == '[GNUPG:]' && "${fields[1]}" == VALIDSIG \
-       && ( "${fields[2]}" == "$pin" || "$last" == "$pin" ) ]]; then
-      return 0
-    fi
+    [[ "${#fields[@]}" -ge 2 && "${fields[0]}" == '[GNUPG:]' ]] || continue
+    case "${fields[1]}" in
+      GOODSIG)
+        ((outcome_count += 1))
+        ((good_count += 1))
+        ;;
+      EXPSIG|EXPKEYSIG|REVKEYSIG|BADSIG|ERRSIG)
+        # VALIDSIG only proves the signature bytes. GnuPG also emits it for an
+        # expired or revoked signing key and can still exit zero, so exactly
+        # one high-level outcome must exist and that outcome must be GOODSIG.
+        ((outcome_count += 1))
+        ;;
+      VALIDSIG)
+        [[ "${#fields[@]}" -ge 3 ]] || continue
+        last="${fields[${#fields[@]}-1]}"
+        ((valid_count += 1))
+        if [[ "${fields[2]}" == "$pin" || "$last" == "$pin" ]]; then
+          ((pinned_count += 1))
+        fi
+        ;;
+    esac
   done
-  return 1
+  [[ "$outcome_count" -eq 1 && "$good_count" -eq 1 \
+     && "$valid_count" -eq 1 && "$pinned_count" -eq 1 ]]
 }
 
 parse_mirror_latest() {
-  python3 -c '
+  python3 -I -c '
 import json, sys
 root = sys.argv[1].rstrip("/")
-data = json.load(sys.stdin)
+limit = int(sys.argv[2])
+raw = sys.stdin.buffer.read(limit + 1)
+if len(raw) > limit:
+    raise SystemExit("mirror latest manifest exceeds size limit")
+data = json.loads(raw)
 version = str(data.get("version", ""))
 tag = str(data.get("tag", ""))
 base_url = str(data.get("base_url", ""))
 if not version or tag != "v" + version or base_url != root + "/" + tag:
     raise SystemExit("invalid mirror latest manifest")
 print(version)
-' "$RELEASE_MIRROR_BASE"
+' "$RELEASE_MIRROR_BASE" "$MAX_METADATA_BYTES"
+}
+
+parse_github_latest() {
+  python3 -I -c '
+import json, sys
+limit = int(sys.argv[1])
+raw = sys.stdin.buffer.read(limit + 1)
+if len(raw) > limit:
+    raise SystemExit("GitHub latest response exceeds size limit")
+tag = json.loads(raw)["tag_name"]
+if not isinstance(tag, str):
+    raise SystemExit("invalid GitHub latest response")
+print(tag[1:] if tag.startswith("v") else tag)
+' "$MAX_METADATA_BYTES"
 }
 
 verify_checksum() {
   local file="$1" sha_file="$2" expected
-  expected="$(python3 - "$sha_file" "$file" <<'PY'
+  expected="$(python3 -I - "$sha_file" "$file" <<'PY'
 import os
 import re
 import sys
@@ -207,7 +390,7 @@ PY
 
 safe_extract_tar() {
   local archive="$1" topdir="$2"
-  python3 - "$archive" "$topdir" <<'PY' || {
+  python3 -I - "$archive" "$topdir" <<'PY' || {
 import sys
 import tarfile
 
@@ -250,7 +433,7 @@ PY
 gpg_release() {
   local home="$1"
   shift
-  timeout --signal=TERM --kill-after=5s 30s gpg --batch --no-tty --homedir "$home" "$@"
+  timeout --signal=TERM --kill-after=5s 30s gpg --no-options --batch --no-tty --homedir "$home" "$@"
 }
 
 release_signing_public_key() {
@@ -363,8 +546,8 @@ if [[ "$VERSION" == "latest" || -z "$BASE_URL" ]]; then
   }
 fi
 
-REQUIRED_COMMANDS=(curl tar sha256sum mktemp python3 env uname)
-[[ "$VERIFY_SIGNATURE" == "off" ]] || REQUIRED_COMMANDS+=(gpg timeout)
+REQUIRED_COMMANDS=(curl tar sha256sum mktemp python3 env uname timeout wc)
+[[ "$VERIFY_SIGNATURE" == "off" ]] || REQUIRED_COMMANDS+=(gpg)
 missing_commands=()
 for c in "${REQUIRED_COMMANDS[@]}"; do
   command -v "$c" >/dev/null 2>&1 || missing_commands+=("$c")
@@ -419,10 +602,10 @@ fi
 configure_curl_retry_options
 
 if [[ "$VERSION" == "latest" ]]; then
-  if ! VERSION="$(curl_retry --max-filesize 1048576 -fsSL "${RELEASE_MIRROR_BASE%/}/latest.json" 2>/dev/null | parse_mirror_latest 2>/dev/null)"; then
+  if ! VERSION="$(curl_retry --max-filesize "$MAX_METADATA_BYTES" -fsSL "${RELEASE_MIRROR_BASE%/}/latest.json" 2>/dev/null | parse_mirror_latest 2>/dev/null)"; then
     say "发布镜像版本索引不可用，正在回退 GitHub。" "Release mirror index unavailable; falling back to GitHub."
     api="https://api.github.com/repos/${REPO}/releases/latest"
-    VERSION="$(curl_retry --max-filesize 1048576 -fsSL "$api" | python3 -c 'import json,sys; t=json.load(sys.stdin)["tag_name"]; print(t[1:] if t.startswith("v") else t)')"
+    VERSION="$(curl_retry --max-filesize "$MAX_METADATA_BYTES" -fsSL "$api" | parse_github_latest)"
   fi
 fi
 validate_version "$VERSION"
@@ -448,9 +631,9 @@ download_release_set() {
     SHA_URL="${URL}.sha256"
     rm -f "$PKG" "$PKG.sha256" "$PKG.asc"
     say "正在下载: $URL" "Downloading: $URL"
-    if curl_retry --max-filesize 268435456 -fL -o "$PKG" "$URL" \
-        && curl_retry --max-filesize 1048576 -fL -o "$PKG.sha256" "$SHA_URL" \
-        && { [[ "$VERIFY_SIGNATURE" == "off" ]] || curl_retry --max-filesize 1048576 -fsL -o "$PKG.asc" "${URL}.asc"; }; then
+    if download_limited "$MAX_ARCHIVE_BYTES" "$PKG" -fL "$URL" \
+        && download_limited "$MAX_METADATA_BYTES" "$PKG.sha256" -fL "$SHA_URL" \
+        && { [[ "$VERIFY_SIGNATURE" == "off" ]] || download_limited "$MAX_METADATA_BYTES" "$PKG.asc" -fsL "${URL}.asc"; }; then
       SELECTED_BASE="$base"
       return 0
     fi
@@ -497,7 +680,8 @@ verify_signature_if_available() {
     exit 1
   }
   gpg_status_has_pinned_signature "$RELEASE_SIGNING_FINGERPRINT" <<<"$status" || {
-    say "签名未绑定固定指纹；拒绝继续" "Signature is not bound to the pinned primary key; refusing to continue" >&2
+    say "签名未唯一绑定固定指纹；拒绝继续" \
+        "Signature is not uniquely bound to the pinned primary key; refusing to continue" >&2
     exit 1
   }
   say "签名校验通过 (${RELEASE_SIGNING_FINGERPRINT})" "Signature verified (${RELEASE_SIGNING_FINGERPRINT})"
@@ -536,16 +720,25 @@ GO_RUNTIME="./files/security-update-notify-linux-$go_arch"
       "Release is missing an executable linux-$go_arch Go binary." >&2
   exit 1
 }
-runtime_version="$($GO_RUNTIME --version 2>/dev/null || true)"
-[[ "$runtime_version" == "security-update-notify $VERSION" ]] || {
+runtime_version_file="$TMP/runtime-version"
+expected_runtime_version="security-update-notify $VERSION"
+if ! capture_limited 4096 "$runtime_version_file" 15s "$GO_RUNTIME" --version; then
+  say "Go 二进制版本探针失败、超时或输出过大；拒绝继续。" \
+      "Go binary version probe failed, timed out, or produced too much output; refusing to continue." >&2
+  exit 1
+fi
+runtime_version=""
+IFS= read -r runtime_version < "$runtime_version_file" || true
+[[ "$runtime_version" == "$expected_runtime_version" \
+   && "$(wc -c < "$runtime_version_file")" -eq "$((${#expected_runtime_version} + 1))" ]] || {
   say "Go 二进制版本与发布包不一致；拒绝继续。" \
       "Go binary version does not match the release; refusing to continue." >&2
   exit 1
 }
 
-# 当通过 `curl ... | sudo bash` 调用时，stdin 是脚本流而不是用户终端。
+# 当通过 `curl ... | sudo /bin/bash -p` 调用时，stdin 是脚本流而不是用户终端。
 # 因此只在最终执行 Go 子命令时重定向到 /dev/tty，避免校验后卡住。
-# When invoked as `curl ... | sudo bash`, stdin is the script stream, not the
+# When invoked as `curl ... | sudo /bin/bash -p`, stdin is the script stream, not the
 # user terminal. Do not run a standalone `exec < /dev/tty` here: bash would then
 # start reading the remaining bootstrap script from the terminal and appear to
 # hang after checksum verification. Redirect stdin only on the final exec.
@@ -563,8 +756,8 @@ run_go() {
 run_menu() {
   { : < /dev/tty; } 2>/dev/null || {
     say "菜单需要交互式终端，但当前不可用。" "No interactive terminal is available for the menu." >&2
-    say "请使用非交互模式，例如：bash sun.sh install --non-interactive -y ..." \
-        "Run a non-interactive mode, for example: bash sun.sh install --non-interactive -y ..." >&2
+    say "请使用非交互模式，例如：/bin/bash -p sun.sh install --non-interactive -y ..." \
+        "Run a non-interactive mode, for example: /bin/bash -p sun.sh install --non-interactive -y ..." >&2
     exit 2
   }
   while true; do

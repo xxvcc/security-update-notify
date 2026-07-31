@@ -11,18 +11,23 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/xxvcc/security-update-notify/internal/httpx"
+	"github.com/xxvcc/security-update-notify/internal/textsafe"
 )
 
 const defaultBaseURL = "https://open.feishu.cn"
 
 const (
 	maxRespBytes        = 1 << 20
+	maxAppIDBytes       = 256
+	maxAppSecretBytes   = 64 << 10
 	maxTextRunes        = 20000
 	truncatedTextRunes  = 19900
 	truncationSuffix    = "\n…(truncated)"
@@ -35,9 +40,11 @@ func retryableStatus(status int) bool { return status == 429 || (status >= 500 &
 var openIDPattern = regexp.MustCompile(`^ou_[A-Za-z0-9_-]+$`)
 
 var (
-	errInvalidCardJSON = errors.New("invalid Feishu card JSON")
-	errCardSchema      = errors.New("Feishu card schema must be 2.0")
-	errCardTooLarge    = errors.New("Feishu card request exceeds 30 KB")
+	errInvalidCardJSON           = errors.New("invalid Feishu card JSON")
+	errCardSchema                = errors.New("Feishu card schema must be 2.0")
+	errCardTooLarge              = errors.New("Feishu card request exceeds 30 KB")
+	errResponseTooLarge          = errors.New("Feishu response too large")
+	errDirectoryResponseTooLarge = errors.New("Feishu directory response too large")
 )
 
 type temporaryError struct{ err error }
@@ -59,6 +66,35 @@ func temporary(err error) error {
 		return err
 	}
 	return &temporaryError{err: err}
+}
+
+type externalError struct {
+	prefix string
+	cause  error
+	safe   string
+}
+
+func (e *externalError) Error() string { return e.prefix + ": " + e.safe }
+func (e *externalError) Unwrap() error { return e.cause }
+
+func sanitizeExternalError(prefix string, err error, secrets ...string) error {
+	safe := err.Error()
+	for _, secret := range secrets {
+		if secret == "" {
+			continue
+		}
+		for _, encoded := range []string{secret, url.PathEscape(secret), url.QueryEscape(secret)} {
+			if encoded != "" {
+				safe = strings.ReplaceAll(safe, encoded, "[REDACTED]")
+			}
+		}
+	}
+	safe = textsafe.SingleLine(safe)
+	for len(safe) > 300 {
+		_, size := utf8.DecodeLastRuneInString(safe)
+		safe = safe[:len(safe)-size]
+	}
+	return &externalError{prefix: prefix, cause: err, safe: safe}
 }
 
 // Client carries an injectable HTTP client, API base URL, and sleeper for tests.
@@ -101,7 +137,7 @@ func (c *Client) SendText(ctx context.Context, appID, appSecret, receiveID, text
 	if err := validateMessageTarget(appID, appSecret, receiveID); err != nil {
 		return err
 	}
-	text = truncateText(text)
+	text = truncateText(textsafe.Multiline(text))
 	content, err := json.Marshal(map[string]string{"text": text})
 	if err != nil {
 		return err
@@ -156,11 +192,21 @@ func IsCardPreflightError(err error) bool {
 }
 
 func validateMessageTarget(appID, appSecret, receiveID string) error {
-	if appID == "" || appSecret == "" || receiveID == "" {
+	if err := validateCredentials(appID, appSecret); err != nil {
+		return err
+	}
+	if receiveID == "" {
 		return fmt.Errorf("missing Feishu app id, app secret, or receive id")
 	}
 	if len(receiveID) > 256 || !openIDPattern.MatchString(receiveID) {
 		return fmt.Errorf("invalid Feishu open_id")
+	}
+	return nil
+}
+
+func validateCredentials(appID, appSecret string) error {
+	if appID == "" || len(appID) > maxAppIDBytes || appSecret == "" || len(appSecret) > maxAppSecretBytes {
+		return fmt.Errorf("missing or invalid Feishu app id or app secret")
 	}
 	return nil
 }
@@ -182,8 +228,8 @@ func truncateText(text string) string {
 }
 
 func (c *Client) tenantToken(ctx context.Context, appID, appSecret string) (string, error) {
-	if appID == "" || appSecret == "" {
-		return "", fmt.Errorf("missing Feishu app id or app secret")
+	if err := validateCredentials(appID, appSecret); err != nil {
+		return "", err
 	}
 	base := c.base()
 	if err := httpx.GuardAPIBase(base); err != nil {
@@ -207,12 +253,14 @@ func (c *Client) tenantToken(ctx context.Context, appID, appSecret string) (stri
 		req.Header.Set("Content-Type", "application/json; charset=utf-8")
 		resp, err := client.Do(req)
 		if err != nil {
-			return true, 0, fmt.Errorf("Feishu token request failed: %w", err)
+			return true, 0, sanitizeExternalError("Feishu token request failed", err, appID, appSecret)
 		}
 		defer resp.Body.Close()
 		respBody, err := readResponseBody(resp.Body)
 		if err != nil {
-			return false, 0, temporary(err)
+			// Token issuance is safe to repeat; retry interrupted reads, but not a
+			// deterministic oversized response.
+			return !errors.Is(err, errResponseTooLarge), 0, temporary(err)
 		}
 		if retryableStatus(resp.StatusCode) {
 			return true, retryAfter(resp), fmt.Errorf("Feishu token HTTP %d", resp.StatusCode)
@@ -259,15 +307,18 @@ func (c *Client) doJSON(ctx context.Context, endpoint, token string, body []byte
 		req.Header.Set("Authorization", "Bearer "+token)
 		resp, err := client.Do(req)
 		if err != nil {
-			return true, 0, fmt.Errorf("Feishu message request failed: %w", err)
+			return false, 0, temporary(sanitizeExternalError("Feishu message request failed", err, token))
 		}
 		defer resp.Body.Close()
 		respBody, err := readResponseBody(resp.Body)
 		if err != nil {
 			return false, 0, temporary(err)
 		}
-		if retryableStatus(resp.StatusCode) {
+		if resp.StatusCode == http.StatusTooManyRequests {
 			return true, retryAfter(resp), fmt.Errorf("Feishu message HTTP %d", resp.StatusCode)
+		}
+		if resp.StatusCode >= 500 && resp.StatusCode < 600 {
+			return false, 0, temporary(fmt.Errorf("Feishu message HTTP %d", resp.StatusCode))
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return false, 0, fmt.Errorf("Feishu message HTTP %d", resp.StatusCode)
@@ -320,7 +371,7 @@ func readResponseBody(r io.Reader) ([]byte, error) {
 		return nil, fmt.Errorf("failed to read Feishu response")
 	}
 	if len(body) > maxRespBytes {
-		return nil, fmt.Errorf("Feishu response too large")
+		return nil, errResponseTooLarge
 	}
 	return body, nil
 }
@@ -330,8 +381,12 @@ func retryAfter(resp *http.Response) time.Duration {
 	if raw == "" {
 		return 0
 	}
-	if seconds, err := strconv.Atoi(raw); err == nil && seconds >= 0 {
-		return min(time.Duration(seconds)*time.Second, 30*time.Second)
+	if seconds, err := strconv.ParseUint(raw, 10, 64); err == nil {
+		const maxRetryAfterSeconds = uint64(30)
+		if seconds >= maxRetryAfterSeconds {
+			return 30 * time.Second
+		}
+		return time.Duration(seconds) * time.Second
 	}
 	if when, err := http.ParseTime(raw); err == nil {
 		delay := time.Until(when)

@@ -30,7 +30,7 @@ go run ./cmd/sun-release package
 cd dist && sha256sum -c security-update-notify-*.tar.gz.sha256
 ```
 
-`build/compat-test.sh`, `build/rollback-test.sh`, `build/interactive-test.sh`, `build/rocky-bootstrap-test.sh`, and `build/rpm-best-effort-test.sh` modify system paths and must only run in disposable Docker containers, never directly on the host. An official release must also pass CI's five-architecture execution, hostile-archive, signature, and public-asset verification gates.
+`build/compat-test.sh`, `build/rollback-test.sh`, `build/interactive-test.sh`, `build/rocky-bootstrap-test.sh`, `build/rpm-best-effort-test.sh`, and `build/dnf5-versionlock-test.sh` modify system paths and must only run in disposable Docker containers, never directly on the host. An official release must also pass CI's five-architecture execution, hostile-archive, signature, and public-asset verification gates.
 
 CI uses a documentation/version-binding fast path for documentation-only changes. Source, build-script, workflow, and release-input changes retain the complete quality, distribution-lifecycle, and five-architecture gates. See [3.x Go architecture](go-port.md) for the architecture and gate invariants.
 

@@ -1,6 +1,9 @@
 package version
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // 与 CI 里 is_newer_version 的表用例一一对应，锁定 Go 实现与 Bash/Python 行为等价。
 // Mirrors the is_newer_version CI table so the Go implementation stays equivalent to Bash/Python.
@@ -46,5 +49,30 @@ func TestCompareEquivalence(t *testing.T) {
 		if err != nil || c != 0 {
 			t.Errorf("Compare(%q,%q)=%d,%v want 0,nil", p[0], p[1], c, err)
 		}
+	}
+}
+
+func TestCompareRejectsMalformedVersionStructure(t *testing.T) {
+	for _, malformed := range []string{
+		"", "v", "-rc1", "1.0.0-", "1.0.0-alpha..1", "1.0.0-alpha_1",
+		"1.0.0-01", "1.0.0-alpha.01", "1.0.0+", "1.0.0+build..1",
+		"1.0.0+build+again", "1.0.0+bad_metadata",
+	} {
+		if _, err := Compare(malformed, "1.0.0"); err == nil {
+			t.Errorf("Compare accepted malformed version %q", malformed)
+		}
+		if IsNewer("1.0.0", malformed) {
+			t.Errorf("IsNewer accepted malformed latest version %q", malformed)
+		}
+	}
+}
+
+func TestCompareHandlesUnboundedNumericReleaseSegments(t *testing.T) {
+	huge := "1." + strings.Repeat("9", 100) + ".0"
+	if c, err := Compare(huge, "1.2.0"); err != nil || c <= 0 {
+		t.Fatalf("Compare(huge, 1.2.0) = %d, %v", c, err)
+	}
+	if c := cmpPre("1.1", "01.2"); c >= 0 {
+		t.Fatalf("cmpPre continued after numerically equal identifiers: %d", c)
 	}
 }

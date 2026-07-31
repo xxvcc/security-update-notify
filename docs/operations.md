@@ -151,6 +151,10 @@ security-update-notify check-upgrade
 sudo security-update-notify doctor
 ```
 
+配置文件默认仅 root 可读，因此普通用户执行 `check-upgrade` 时无法自动读取 `NOTIFY_LANG`；如需匹配安装语言，
+请显式传入 `--lang zh` 或 `--lang en`。普通用户直接执行 `upgrade` 且未给 `--lang` 时，程序会保留“未指定”状态，
+在 sudo 后由 root 子进程重新预读配置；显式语言则会原样传过 sudo。
+
 查看日志：
 
 ```bash

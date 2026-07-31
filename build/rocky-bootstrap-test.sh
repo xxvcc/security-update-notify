@@ -21,7 +21,7 @@ trap cleanup EXIT
   echo "build/rocky-bootstrap-test.sh must run only in a disposable container" >&2
   exit 2
 }
-awk '$5 == "/src" && $6 ~ /(^|,)ro(,|$)/ { found = 1 } END { exit !found }' /proc/self/mountinfo || {
+awk '$5 == "/src" { found = 1; if ($6 !~ /(^|,)ro(,|$)/) unsafe = 1 } END { exit !(found && !unsafe) }' /proc/self/mountinfo || {
   echo "build/rocky-bootstrap-test.sh requires /src to be mounted read-only" >&2
   exit 2
 }
@@ -150,7 +150,7 @@ version="$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' "$ROOT/VERSION")"
 [[ -n "$version" && "$(wc -l <"$ROOT/VERSION")" -eq 1 ]]
 
 set +e
-bash "$ROOT/sun.sh" --lang en --version "$version" --base-url https://127.0.0.1:9 \
+/bin/bash -p "$ROOT/sun.sh" --lang en --version "$version" --base-url https://127.0.0.1:9 \
   install --non-interactive >"$OUT" 2>&1
 rc=$?
 set -e
@@ -351,6 +351,7 @@ EOF
     chmod 0755 "$fake_bin/dnf"
   fi
   fixture_path="$fake_bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  export SUN_CONTAINER_TEST_COMMAND_PATH="$fake_bin"
   export SUN_SEED_DNF4_TIMER_VARIANTS=0
   export SUN_SEED_DNF5_COMPAT_TIMER=0
   if [[ "$engine" == dnf4 ]]; then
@@ -390,7 +391,7 @@ EOF
     grep -Fxq "/usr/lib/systemd/system/$automatic_timer" <<<"$plugin_files"
     advisory_json="$(mktemp)"
     dnf advisory list --security --updates --json >"$advisory_json"
-    python3 - "$advisory_json" <<'PY'
+    python3 -I - "$advisory_json" <<'PY'
 import json
 import sys
 

@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/xxvcc/security-update-notify/internal/sysexec"
 )
 
 func TestSystemctlQueriesHonorExitStatus(t *testing.T) {
@@ -26,37 +28,59 @@ esac
 	if err := os.WriteFile(systemctl, []byte(stub), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", dir)
-
-	if !Available() {
-		t.Fatal("Available()=false with systemctl on PATH")
-	}
-	if !IsEnabled("enabled.service") || !IsEnabled("runtime.service") {
+	if !isEnabledWithCommand(systemctl, "enabled.service", time.Second) ||
+		!isEnabledWithCommand(systemctl, "runtime.service", time.Second) {
 		t.Error("IsEnabled() rejected an enabled state")
 	}
 	for _, unit := range []string{"static.service", "alias.service", "disabled.service", "broken.service"} {
-		if IsEnabled(unit) {
+		if isEnabledWithCommand(systemctl, unit, time.Second) {
 			t.Errorf("IsEnabled(%q)=true for a state that does not guarantee enablement", unit)
 		}
 	}
-	if got := ShowValue("healthy.service", "ActiveState"); got != "active" {
-		t.Fatalf("ShowValue()=%q, want active", got)
+	if got, ok := showValueWithCommand(systemctl, "healthy.service", "ActiveState", time.Second); got != "active" || !ok {
+		t.Fatalf("ShowValue()=%q,%v, want active,true", got, ok)
 	}
-	if got := ShowValue("failed.service", "ActiveState"); got != "" {
-		t.Fatalf("ShowValue() returned stdout from failed systemctl: %q", got)
+	if got, ok := showValueWithCommand(systemctl, "failed.service", "ActiveState", time.Second); got != "" || ok {
+		t.Fatalf("ShowValue() returned a successful value from failed systemctl: %q,%v", got, ok)
 	}
 }
 
-func TestSystemctlUnavailable(t *testing.T) {
-	t.Setenv("PATH", t.TempDir())
-	if Available() {
-		t.Fatal("Available()=true without systemctl on PATH")
-	}
-	if IsEnabled("missing.service") {
+func TestSystemctlCommandUnavailable(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing-systemctl")
+	if isEnabledWithCommand(missing, "missing.service", time.Second) {
 		t.Fatal("IsEnabled()=true when systemctl cannot start")
 	}
-	if got := ShowValue("missing.service", "ActiveState"); got != "" {
-		t.Fatalf("ShowValue()=%q when systemctl cannot start", got)
+	if got, ok := showValueWithCommand(missing, "missing.service", "ActiveState", time.Second); got != "" || ok {
+		t.Fatalf("ShowValue()=%q,%v when systemctl cannot start", got, ok)
+	}
+}
+
+func TestPublicQueriesIgnoreCallerPATH(t *testing.T) {
+	dir := t.TempDir()
+	sentinel := filepath.Join(dir, "called")
+	stub := filepath.Join(dir, "systemctl")
+	script := "#!/bin/sh\ntouch '" + sentinel + "'\nprintf 'enabled\\n'\n"
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	if IsEnabled("security-update-notify-attacker-path-stub.service") {
+		t.Fatal("caller PATH stub controlled IsEnabled")
+	}
+	if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
+		t.Fatalf("caller PATH stub executed: %v", err)
+	}
+}
+
+func TestSystemctlQueriesRejectTruncatedOutput(t *testing.T) {
+	for _, result := range []sysexec.Result{
+		{Code: 0, Stdout: "enabled\n", StdoutTruncated: true},
+		{Code: 0, Stdout: "enabled\n", StderrTruncated: true},
+		{Code: 0, Stdout: "enabled\n", Stderr: "warning: incomplete query\n"},
+	} {
+		if completeSuccessfulResult(result) {
+			t.Fatalf("truncated result was accepted: %+v", result)
+		}
 	}
 }
 
@@ -66,14 +90,12 @@ func TestSystemctlQueriesTimeOut(t *testing.T) {
 	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\nexec /bin/sleep 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", dir)
-
 	started := time.Now()
-	if isEnabledWithTimeout("hung.service", 25*time.Millisecond) {
+	if isEnabledWithCommand(systemctl, "hung.service", 25*time.Millisecond) {
 		t.Fatal("timed-out is-enabled query reported enabled")
 	}
-	if got := showValueWithTimeout("hung.service", "Result", 25*time.Millisecond); got != "" {
-		t.Fatalf("timed-out show query returned %q", got)
+	if got, ok := showValueWithCommand(systemctl, "hung.service", "Result", 25*time.Millisecond); got != "" || ok {
+		t.Fatalf("timed-out show query returned %q,%v", got, ok)
 	}
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("systemctl queries took %s; timeout was not enforced", elapsed)

@@ -10,7 +10,9 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/config"
 	"github.com/xxvcc/security-update-notify/internal/dedup"
 	"github.com/xxvcc/security-update-notify/internal/delivery"
+	"github.com/xxvcc/security-update-notify/internal/filetrust"
 	"github.com/xxvcc/security-update-notify/internal/lock"
+	"github.com/xxvcc/security-update-notify/internal/textsafe"
 )
 
 // DryRunFlags 扩展 Flags：仅计算并打印 hash 与将发送的正文，不加锁、不发送、不写状态、不记日志。
@@ -54,10 +56,7 @@ func Execute(cfg *config.Config, f DryRunFlags) int {
 		flags := f.Flags
 		flags.NoStateWrites = true
 		out := Assemble(Collect(cfg, flags))
-		fmt.Println("HASH\t" + out.Hash())
-		if out.Send {
-			fmt.Print(out.Message)
-		}
+		fmt.Print(renderDryRun(out))
 		return 0
 	}
 	channels, err := configuredChannels(cfg)
@@ -67,8 +66,9 @@ func Execute(cfg *config.Config, f DryRunFlags) int {
 	}
 
 	// 单实例锁（与 Bash 一样尽早获取，抢不到说明已有实例在跑，静默退出 0）。
-	if err := os.MkdirAll(stateDirPath(), 0o750); err == nil {
-		_ = os.Chmod(stateDirPath(), 0o750)
+	if err := filetrust.EnsureDirectory(stateDirPath(), os.Geteuid()); err != nil {
+		fmt.Fprintln(os.Stderr, "state directory error: "+err.Error())
+		return 1
 	}
 	if !f.LockHeld {
 		release, acquired, exitCode := AcquireExecutionLock(f.RequireLock, f.LockWait)
@@ -94,14 +94,27 @@ func Execute(cfg *config.Config, f DryRunFlags) int {
 			return 0
 		}
 	} else {
-		logEvent(fmt.Sprintf("alert backend=%s host=%s reboot=%s svc_attn=%s health=%s eol=%s pending_sec=%d",
-			backend, host, b01(in.Restart.RebootRequired), b01(in.Restart.RestartAttention),
-			b01(in.Health.Attention), b01(in.EOL.Attention), in.Pending.Count))
+		logEvent(alertLogLine(in))
 	}
 
 	message := delivery.Message{Text: out.Message, FeishuCard: out.FeishuCard}
 	return deliverChannels(cfg, channels, message, out.Hash(), backend, host,
 		in.Restart.RebootRequired, in.Restart.RestartAttention, f.NoDedupe, time.Now().Unix(), senderFor)
+}
+
+func renderDryRun(out Output) string {
+	text := "HASH\t" + out.Hash() + "\n"
+	if out.Send {
+		text += textsafe.Multiline(out.Message)
+	}
+	return text
+}
+
+func alertLogLine(in Input) string {
+	return fmt.Sprintf("alert backend=%s host=%s reboot=%s svc_attn=%s health=%s patch=%s update=%s eol=%s pending_sec=%d",
+		in.Backend, in.Host, b01(in.Restart.RebootRequired), b01(in.Restart.RestartAttention),
+		b01(in.Health.Attention), b01(in.Patch.RiskAttention), b01(in.Patch.UpdateAvailable),
+		b01(in.EOL.Attention), in.Pending.Count)
 }
 
 type senderFactory func(*config.Config, string) (delivery.Sender, error)

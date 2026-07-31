@@ -16,6 +16,7 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/dist"
 	"github.com/xxvcc/security-update-notify/internal/i18n"
 	"github.com/xxvcc/security-update-notify/internal/run"
+	"github.com/xxvcc/security-update-notify/internal/textsafe"
 	"github.com/xxvcc/security-update-notify/internal/version"
 )
 
@@ -23,6 +24,10 @@ const defaultEnvFile = "/etc/security-update-notify/telegram.env"
 
 // Main 是进程入口逻辑，返回退出码。ver 为编译期注入的版本号。
 func Main(ver string, args []string) int {
+	return mainWithSystemd(ver, args, nil)
+}
+
+func mainWithSystemd(ver string, args []string, systemdQuery run.SystemdQuery) int {
 	if len(args) > 0 {
 		switch args[0] {
 		case "install":
@@ -30,13 +35,13 @@ func Main(ver string, args []string) int {
 		case "configure":
 			return configureMode(ver, args[1:])
 		case "run":
-			return runMode(ver, args[1:])
+			return runModeWithSystemd(ver, args[1:], systemdQuery)
 		case "doctor":
-			return runMode(ver, append([]string{"--doctor"}, args[1:]...))
+			return runModeWithSystemd(ver, append([]string{"--doctor"}, args[1:]...), systemdQuery)
 		case "check-upgrade":
-			return runMode(ver, append([]string{"--check-upgrade"}, args[1:]...))
+			return runModeWithSystemd(ver, append([]string{"--check-upgrade"}, args[1:]...), systemdQuery)
 		case "upgrade":
-			return runMode(ver, append([]string{"--upgrade"}, args[1:]...))
+			return runModeWithSystemd(ver, append([]string{"--upgrade"}, args[1:]...), systemdQuery)
 		case "test":
 			return testMode(ver, args[1:])
 		case "uninstall":
@@ -49,19 +54,29 @@ func Main(ver string, args []string) int {
 			return cmdCheckArchive(args[1:])
 		}
 	}
-	return runMode(ver, args)
+	return runModeWithSystemd(ver, args, systemdQuery)
 }
 
 // runMode 解析运行时 flag 并按模式分发（裸调用 = 运行检查）。
 func runMode(ver string, args []string) int {
+	return runModeWithSystemd(ver, args, nil)
+}
+
+func runModeWithSystemd(ver string, args []string, systemdQuery run.SystemdQuery) int {
 	var f run.DryRunFlags
 	f.Version = ver
 	var doctor, checkUpgrade, selfUpgrade, notifyUpgrade, skipTelegram, skipFeishu, skipNotify bool
+	var upgradeFromSet, upgradeToSet bool
+	var uiLangExplicit bool
 	var uiLang, upgradeFrom, upgradeTo string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--version":
-			fmt.Printf("security-update-notify %s\n", ver)
+			if len(args) != 1 {
+				fmt.Fprintln(os.Stderr, "--version cannot be combined with other run arguments")
+				return 2
+			}
+			fmt.Printf("security-update-notify %s\n", safeCLIText(ver))
 			return 0
 		case "--test-ok":
 			f.TestOK = true
@@ -106,30 +121,64 @@ func runMode(ver string, args []string) int {
 				fmt.Fprintln(os.Stderr, "Invalid --lang (expected zh or en)")
 				return 2
 			}
+			uiLangExplicit = true
 			f.Lang = uiLang
 		case "--upgrade-from":
 			var ok bool
 			if upgradeFrom, ok = takeValue(args, &i); !ok {
 				return 2
 			}
+			upgradeFromSet = true
 		case "--upgrade-to":
 			var ok bool
 			if upgradeTo, ok = takeValue(args, &i); !ok {
 				return 2
 			}
+			upgradeToSet = true
 		case "-h", "--help":
 			usage()
 			return 0
 		default:
-			fmt.Fprintf(os.Stderr, "Unknown argument: %s\n", args[i])
+			fmt.Fprintf(os.Stderr, "Unknown argument: %s\n", safeCLIText(args[i]))
 			return 2
 		}
+	}
+	primaryModes := 0
+	for _, selected := range []bool{doctor, checkUpgrade, selfUpgrade, notifyUpgrade} {
+		if selected {
+			primaryModes++
+		}
+	}
+	if primaryModes > 1 {
+		fmt.Fprintln(os.Stderr, "Conflicting run modes: choose only one of --doctor, --check-upgrade, --upgrade, or --notify-upgrade-event")
+		return 2
+	}
+	if f.TestOK && f.TestReboot {
+		fmt.Fprintln(os.Stderr, "Conflicting test modes: choose only one of --test-ok or --test-reboot")
+		return 2
+	}
+	invalidModeArgs := false
+	switch {
+	case doctor:
+		invalidModeArgs = f.TestOK || f.TestReboot || f.NoDedupe || upgradeFromSet || upgradeToSet
+	case checkUpgrade, selfUpgrade:
+		invalidModeArgs = f.TestOK || f.TestReboot || f.NoDedupe || f.DryRun || f.RequireLock ||
+			skipTelegram || skipFeishu || skipNotify || upgradeFromSet || upgradeToSet
+	case notifyUpgrade:
+		invalidModeArgs = f.TestOK || f.TestReboot || f.NoDedupe || f.DryRun ||
+			skipTelegram || skipFeishu || skipNotify || uiLangExplicit
+	default:
+		invalidModeArgs = skipTelegram || skipFeishu || skipNotify || upgradeFromSet || upgradeToSet
+	}
+	if invalidModeArgs {
+		fmt.Fprintln(os.Stderr, "One or more arguments do not apply to the selected run mode")
+		return 2
 	}
 
 	// --upgrade / --check-upgrade 在完整配置加载前退出：若未显式 --lang，则从 env 文件预读 NOTIFY_LANG。
 	if selfUpgrade {
 		lang := i18n.Display(uiLang, i18n.PreReadNotifyLang(envFile()))
-		return run.SelfUpgrade(ver, lang)
+		return run.SelfUpgrade(ver, lang, uiLangExplicit)
 	}
 	if checkUpgrade {
 		lang := i18n.Display(uiLang, i18n.PreReadNotifyLang(envFile()))
@@ -151,7 +200,7 @@ func runMode(ver string, args []string) int {
 
 	cfg, err := config.Load(envFile())
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
+		fmt.Fprintln(os.Stderr, safeCLIText(err.Error()))
 		return 2
 	}
 	displayLang := i18n.Display(uiLang, cfg.Get("NOTIFY_LANG"))
@@ -160,7 +209,7 @@ func runMode(ver string, args []string) int {
 	case doctor:
 		return run.Doctor(cfg, run.DoctorOpts{
 			Version: ver, Lang: displayLang, SkipTelegram: skipTelegram, SkipFeishu: skipFeishu,
-			SkipNotify: skipNotify, EnvPath: envFile(),
+			SkipNotify: skipNotify, EnvPath: envFile(), Systemd: systemdQuery,
 		})
 	case notifyUpgrade:
 		return run.NotifyUpgradeEvent(cfg, ver, upgradeFrom, upgradeTo)
@@ -190,7 +239,7 @@ func parseWaitLockSeconds(value string) (int, bool) {
 func takeValue(args []string, i *int) (string, bool) {
 	*i++
 	if *i >= len(args) {
-		fmt.Fprintf(os.Stderr, "Missing value for %s\n", args[*i-1])
+		fmt.Fprintf(os.Stderr, "Missing value for %s\n", safeCLIText(args[*i-1]))
 		return "", false
 	}
 	return args[*i], true
@@ -201,6 +250,10 @@ func envFile() string {
 		return v
 	}
 	return defaultEnvFile
+}
+
+func safeCLIText(value string) string {
+	return textsafe.SingleLine(value)
 }
 
 func usage() {
@@ -250,12 +303,16 @@ func cmdVerify(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "verify: unexpected positional arguments")
+		return 2
+	}
 	if *tarball == "" || *sha == "" || *asc == "" || *pub == "" || *fpr == "" {
 		fmt.Fprintln(os.Stderr, "verify: all of --tarball --sha256 --asc --pubkey --fingerprint are required")
 		return 2
 	}
 	if err := dist.VerifyRelease(*tarball, *sha, *asc, *pub, *fpr); err != nil {
-		fmt.Fprintln(os.Stderr, "verify: "+err.Error())
+		fmt.Fprintln(os.Stderr, safeCLIText("verify: "+err.Error()))
 		return 1
 	}
 	return 0
@@ -268,12 +325,16 @@ func cmdCheckArchive(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "check-archive: unexpected positional arguments")
+		return 2
+	}
 	if *tarball == "" || *topDir == "" {
 		fmt.Fprintln(os.Stderr, "check-archive: --tarball and --top-dir are required")
 		return 2
 	}
 	if err := dist.CheckArchive(*tarball, *topDir); err != nil {
-		fmt.Fprintln(os.Stderr, "check-archive: "+err.Error())
+		fmt.Fprintln(os.Stderr, safeCLIText("check-archive: "+err.Error()))
 		return 1
 	}
 	return 0

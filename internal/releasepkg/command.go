@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"debug/elf"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,9 +12,36 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/xxvcc/security-update-notify/internal/sysexec"
+	"github.com/xxvcc/security-update-notify/internal/textsafe"
 )
+
+const (
+	maxCombinedCommandOutput = 8 << 20
+	maxCommandErrorBytes     = 4 << 10
+)
+
+type cappedCombinedOutput struct {
+	buf       bytes.Buffer
+	truncated bool
+}
+
+func (c *cappedCombinedOutput) Write(p []byte) (int, error) {
+	remaining := maxCombinedCommandOutput - c.buf.Len()
+	if remaining > 0 {
+		if len(p) > remaining {
+			_, _ = c.buf.Write(p[:remaining])
+			c.truncated = true
+		} else {
+			_, _ = c.buf.Write(p)
+		}
+	} else if len(p) != 0 {
+		c.truncated = true
+	}
+	return len(p), nil
+}
 
 func findExecutable(name string) (string, error) {
 	path, err := exec.LookPath(name)
@@ -24,26 +52,47 @@ func findExecutable(name string) (string, error) {
 }
 
 func runCombined(ctx context.Context, dir string, env []string, name string, args ...string) ([]byte, error) {
+	return runCombinedFiles(ctx, dir, env, nil, name, args...)
+}
+
+func runCombinedFiles(ctx context.Context, dir string, env []string, files []*os.File, name string, args ...string) ([]byte, error) {
 	cmd := sysexec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
 	if env != nil {
 		cmd.Env = env
 	}
-	var output bytes.Buffer
+	cmd.ExtraFiles = append([]*os.File(nil), files...)
+	var output cappedCombinedOutput
 	cmd.Stdout = &output
 	cmd.Stderr = &output
 	err := cmd.Run()
+	captured := output.buf.Bytes()
+	if output.truncated {
+		return captured, fmt.Errorf("%s: combined output exceeds %d bytes", filepath.Base(name), maxCombinedCommandOutput)
+	}
 	if err != nil {
-		message := strings.TrimSpace(output.String())
+		message := commandErrorSummary(output.buf.Bytes())
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return output.Bytes(), fmt.Errorf("command timed out: %s", filepath.Base(name))
+			return captured, fmt.Errorf("command timed out: %s", filepath.Base(name))
 		}
 		if message != "" {
-			return output.Bytes(), fmt.Errorf("%s: %w: %s", filepath.Base(name), err, message)
+			return captured, fmt.Errorf("%s: %w: %s", filepath.Base(name), err, message)
 		}
-		return output.Bytes(), fmt.Errorf("%s: %w", filepath.Base(name), err)
+		return captured, fmt.Errorf("%s: %w", filepath.Base(name), err)
 	}
-	return output.Bytes(), nil
+	return captured, nil
+}
+
+func commandErrorSummary(output []byte) string {
+	message := strings.TrimSpace(textsafe.SingleLine(string(output)))
+	if len(message) <= maxCommandErrorBytes {
+		return message
+	}
+	limit := maxCommandErrorBytes
+	for limit > 0 && !utf8.ValidString(message[:limit]) {
+		limit--
+	}
+	return strings.TrimSpace(message[:limit])
 }
 
 func buildAllBinaries(ctx context.Context, root, pkgDir, version string, stdout, stderr interface{ Write([]byte) (int, error) }) error {
@@ -53,6 +102,9 @@ func buildAllBinaries(ctx context.Context, root, pkgDir, version string, stdout,
 	}
 	if err := validateRegularSource(filepath.Join(root, "go.mod")); err != nil {
 		return fmt.Errorf("required go.mod: %w", err)
+	}
+	if err := requirePinnedGoToolchain(ctx, root, goTool); err != nil {
+		return err
 	}
 
 	var nativeBinary string
@@ -107,6 +159,36 @@ func buildAllBinaries(ctx context.Context, root, pkgDir, version string, stdout,
 	}
 	if string(out) != productName+" "+version+"\n" {
 		return fmt.Errorf("binary version probe mismatch: got %q, want %q", string(out), productName+" "+version+"\n")
+	}
+	return nil
+}
+
+func requirePinnedGoToolchain(ctx context.Context, root, goTool string) error {
+	env := goBuildEnvironment(runtime.GOOS, runtime.GOARCH)
+	metadata, err := runCombined(ctx, root, env, goTool, "mod", "edit", "-json")
+	if err != nil {
+		return fmt.Errorf("read pinned Go toolchain: %w", err)
+	}
+	actual, err := runCombined(ctx, root, env, goTool, "env", "GOVERSION")
+	if err != nil {
+		return fmt.Errorf("read active Go toolchain: %w", err)
+	}
+	return validatePinnedGoToolchain(metadata, actual)
+}
+
+func validatePinnedGoToolchain(metadata, actualOutput []byte) error {
+	var module struct {
+		Toolchain string `json:"Toolchain"`
+	}
+	if err := json.Unmarshal(metadata, &module); err != nil {
+		return fmt.Errorf("parse go.mod metadata: %w", err)
+	}
+	if module.Toolchain == "" {
+		return errors.New("go.mod must pin an exact toolchain for release builds")
+	}
+	actual := strings.TrimSpace(string(actualOutput))
+	if actual != module.Toolchain {
+		return fmt.Errorf("active Go toolchain %q does not match pinned %q", actual, module.Toolchain)
 	}
 	return nil
 }

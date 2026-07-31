@@ -2,18 +2,22 @@ package dist
 
 import (
 	"archive/tar"
+	"bufio"
 	"compress/gzip"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 )
 
-// maxArchiveBytes 限制单个发布包的解压总量，防止解压炸弹。发布包实际仅数十 KB，此上限只作纵深防御。
+// maxArchiveBytes 限制单个发布包的解压总量，防止解压炸弹。发布包实际为数十 MiB，此上限只作纵深防御。
 // maxArchiveBytes bounds total decompressed bytes to defend against a decompression bomb. Real release
-// packages are tens of KB; this ceiling is purely defense in depth.
+// packages are tens of MiB; this ceiling is purely defense in depth.
 const maxArchiveBytes = 256 << 20 // 256 MiB
 const maxArchiveEntries = 10_000
+const maxArchivePathBytes = 4 << 10
+const maxArchivePathDepth = 64
+const maxArchiveComponentBytes = 255
+const maxArchivePathComponents = 100_000
 const legacyTarTypeReg = byte(0) // POSIX tar permits NUL as the regular-file type flag.
 
 // CheckArchive 复刻 safe_release_archive：只允许普通文件与目录，拒绝符号链接 / 硬链接 / 设备 /
@@ -30,21 +34,27 @@ const legacyTarTypeReg = byte(0) // POSIX tar permits NUL as the regular-file ty
 // rejected the same way (path.Clean would wrongly normalize it to `topDir/...`), and it additionally
 // rejects any `..` segment explicitly (fail-closed, stricter than Bash).
 func CheckArchive(tarball, topDir string) error {
-	f, err := os.Open(tarball)
+	if _, err := archivePathComponents(topDir, false); err != nil {
+		return fmt.Errorf("invalid expected top directory: %w", err)
+	}
+	f, _, err := openRegularInput(tarball, maxArchiveBytes)
 	if err != nil {
-		return err
+		return fmt.Errorf("open archive for inspection: %w", err)
 	}
 	defer f.Close()
-	gz, err := gzip.NewReader(f)
+	compressed := bufio.NewReader(f)
+	gz, err := gzip.NewReader(compressed)
 	if err != nil {
 		return err
 	}
+	gz.Multistream(false)
 	defer gz.Close()
 
 	limited := &io.LimitedReader{R: gz, N: maxArchiveBytes + 1}
 	tr := tar.NewReader(limited)
 	sawTop := false
 	entries := 0
+	pathComponents := 0
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -63,6 +73,14 @@ func CheckArchive(tarball, topDir string) error {
 		default:
 			return fmt.Errorf("unsupported archive entry type %q for %q", string(hdr.Typeflag), hdr.Name)
 		}
+		components, err := archivePathComponents(hdr.Name, hdr.Typeflag == tar.TypeDir)
+		if err != nil {
+			return err
+		}
+		pathComponents += len(components)
+		if pathComponents > maxArchivePathComponents {
+			return fmt.Errorf("archive exceeds path-component limit (%d)", maxArchivePathComponents)
+		}
 		name := hdr.Name
 		if strings.HasPrefix(name, "/") {
 			return fmt.Errorf("absolute path entry: %q", hdr.Name)
@@ -80,8 +98,37 @@ func CheckArchive(tarball, topDir string) error {
 	if !sawTop {
 		return fmt.Errorf("archive has no entries under top dir %q", topDir)
 	}
+	return finishCompressedArchive(limited, compressed)
+}
+
+// tar.Reader stops at the archive end blocks and can leave tar padding and the
+// gzip footer unread. Only zero padding is valid after the tar end marker;
+// rejecting other bytes prevents an archive from also acting as a hidden
+// payload container. Draining also validates gzip CRC/ISIZE, while the buffered
+// compressed reader lets us reject a concatenated member or trailing bytes.
+func finishCompressedArchive(limited *io.LimitedReader, compressed *bufio.Reader) error {
+	var buffer [32 << 10]byte
+	for {
+		n, err := limited.Read(buffer[:])
+		for _, value := range buffer[:n] {
+			if value != 0 {
+				return fmt.Errorf("archive contains non-zero data after the tar end marker")
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("validate compressed archive footer: %w", err)
+		}
+	}
 	if limited.N == 0 {
 		return fmt.Errorf("archive exceeds size limit")
+	}
+	if _, err := compressed.ReadByte(); err == nil {
+		return fmt.Errorf("archive contains trailing data or multiple gzip members")
+	} else if err != io.EOF {
+		return fmt.Errorf("inspect compressed archive trailer: %w", err)
 	}
 	return nil
 }

@@ -15,73 +15,29 @@ permissions:
   contents: read
 
 jobs:
-  verify-and-sync:
+  # Release programs run only on this runner, which has no mirror Environment.
+  verify-release:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.event == 'release' &&
        github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    environment: release-mirror
-    concurrency:
-      group: signed-release-mirror-${{ github.event.workflow_run.head_branch || inputs.tag || github.run_id }}
-      cancel-in-progress: false
+    outputs:
+      artifact_name: ${{ steps.bundle.outputs.artifact-name }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      bundle_digest: ${{ steps.bundle.outputs.bundle-digest }}
     env:
       TAG: ${{ github.event.workflow_run.head_branch || inputs.tag }}
-      MIRROR_BASE_URL: ${{ vars.MIRROR_BASE_URL }}
-      MIRROR_HOST: ${{ vars.MIRROR_HOST }}
-      MIRROR_PORT: ${{ vars.MIRROR_PORT }}
-      MIRROR_USER: ${{ vars.MIRROR_USER }}
     steps:
-      - name: Validate deployment configuration
+      - name: Validate release identity
         run: |
           set -euo pipefail
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z]+)?$ && "${#TAG}" -le 65 ]] || {
             echo "::error::invalid release tag: $TAG"
             exit 2
           }
-          [[ "$MIRROR_BASE_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]] || {
-            echo "::error::invalid MIRROR_BASE_URL"
-            exit 2
-          }
-          [[ "$MIRROR_USER" =~ ^[A-Za-z_][A-Za-z0-9._-]{0,31}$ ]] || {
-            echo "::error::mirror SSH variables are incomplete"
-            exit 2
-          }
-          python3 - "$MIRROR_BASE_URL" "$MIRROR_HOST" "$MIRROR_PORT" <<'PY'
-          import ipaddress
-          import re
-          import sys
-          import urllib.parse
 
-          base_url, ssh_host, ssh_port = sys.argv[1:]
-          try:
-              parsed = urllib.parse.urlsplit(base_url)
-              port = parsed.port
-          except ValueError as exc:
-              raise SystemExit(f"invalid MIRROR_BASE_URL: {exc}")
-          if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
-                  or parsed.query or parsed.fragment or port is not None and not 1 <= port <= 65535):
-              raise SystemExit("invalid MIRROR_BASE_URL components")
-          if any(part in (".", "..") for part in parsed.path.split("/")):
-              raise SystemExit("MIRROR_BASE_URL must not contain dot path segments")
-
-          if not ssh_host or len(ssh_host) > 253 or ":" in ssh_host:
-              raise SystemExit("invalid MIRROR_HOST")
-          if re.fullmatch(r"[0-9.]+", ssh_host):
-              try:
-                  if ipaddress.ip_address(ssh_host).version != 4:
-                      raise ValueError
-              except ValueError:
-                  raise SystemExit("invalid IPv4 MIRROR_HOST")
-          else:
-              labels = ssh_host.rstrip(".").split(".")
-              if any(not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
-                     for label in labels):
-                  raise SystemExit("invalid DNS MIRROR_HOST")
-          if not re.fullmatch(r"[0-9]{1,5}", ssh_port) or not 1 <= int(ssh_port) <= 65535:
-              raise SystemExit("invalid MIRROR_PORT")
-          PY
       - name: Require immutable release state
         env:
           GH_TOKEN: ${{ github.token }}
@@ -122,8 +78,14 @@ jobs:
       - name: Bind release tag to the verified commit
         env:
           EXPECTED_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+          TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::manual mirror dispatches must run from refs/heads/main"
+            exit 1
+          fi
           released_sha="$(git -C released-source rev-parse --verify 'HEAD^{commit}')"
           [[ "$released_sha" =~ ^[0-9a-f]{40}$ ]] || {
             echo "::error::released checkout did not resolve to a commit"
@@ -143,9 +105,36 @@ jobs:
               "refs/tags/$TAG^{}") peeled_sha="$object" ;;
             esac
           done < <(git -C released-source ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}")
-          tag_sha="${peeled_sha:-$direct_sha}"
-          [[ "$tag_sha" =~ ^[0-9a-f]{40}$ && "$tag_sha" == "$released_sha" ]] || {
-            echo "::error::release tag $TAG no longer resolves to checked commit $released_sha"
+          [[ "$direct_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::release tag $TAG is missing from the remote"
+            exit 1
+          }
+          [[ "$peeled_sha" =~ ^[0-9a-f]{40}$ && "$peeled_sha" == "$released_sha" ]] || {
+            echo "::error::release tag $TAG must be annotated and peel to checked commit $released_sha"
+            exit 1
+          }
+          default_branch="$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)"
+          [[ "$default_branch" == "main" ]] || {
+            echo "::error::unexpected default branch: $default_branch"
+            exit 1
+          }
+          default_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/$default_branch" --jq .sha)"
+          [[ "$default_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::default branch did not resolve to a commit"
+            exit 1
+          }
+          [[ "$TRUSTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::workflow revision did not resolve to a commit"
+            exit 1
+          }
+          workflow_ancestry="$(gh api "repos/$GITHUB_REPOSITORY/compare/$TRUSTED_WORKFLOW_SHA...$default_sha" --jq .status)"
+          [[ "$workflow_ancestry" == "ahead" || "$workflow_ancestry" == "identical" ]] || {
+            echo "::error::workflow revision $TRUSTED_WORKFLOW_SHA is not contained in protected main ($default_sha)"
+            exit 1
+          }
+          ancestry="$(gh api "repos/$GITHUB_REPOSITORY/compare/$released_sha...$default_sha" --jq .status)"
+          [[ "$ancestry" == "ahead" || "$ancestry" == "identical" ]] || {
+            echo "::error::release commit $released_sha is not contained in protected main ($default_sha)"
             exit 1
           }
 
@@ -155,6 +144,55 @@ jobs:
           sudo apt-get -o Acquire::Retries=3 update
           sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
             binutils qemu-user-static
+
+      - name: Prepare bounded HTTPS downloader
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/download-limited" <<'DOWNLOAD_SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          [[ $# -eq 3 && "$1" =~ ^[0-9]+$ && "$1" -gt 0 ]] || exit 2
+          limit="$1"
+          output="$2"
+          url="$3"
+          part="${output}.part"
+          rm -f -- "$part"
+          if /usr/bin/timeout --signal=TERM --kill-after=5s 180s \
+              /usr/bin/curl --disable --fail --location --silent --show-error \
+                --connect-timeout 20 --max-time 120 --retry 3 --retry-delay 1 \
+                --retry-all-errors --retry-max-time 150 --max-filesize "$limit" \
+                --proto '=https' --proto-redir '=https' "$url" | \
+              /usr/bin/python3 -I -c '
+          import os
+          import sys
+
+          limit = int(sys.argv[1])
+          path = sys.argv[2]
+          try:
+              with open(path, "xb") as output:
+                  remaining = limit
+                  while True:
+                      chunk = sys.stdin.buffer.read(min(65536, remaining + 1))
+                      if not chunk:
+                          break
+                      if len(chunk) > remaining:
+                          raise ValueError("download exceeds byte limit")
+                      output.write(chunk)
+                      remaining -= len(chunk)
+          except Exception as exc:
+              try:
+                  os.unlink(path)
+              except FileNotFoundError:
+                  pass
+              print(f"bounded download failed: {exc}", file=sys.stderr)
+              raise SystemExit(1)
+          ' "$limit" "$part" && mv -f -- "$part" "$output"; then
+            exit 0
+          fi
+          rm -f -- "$part"
+          exit 1
+          DOWNLOAD_SCRIPT
+          chmod 0700 "$RUNNER_TEMP/download-limited"
 
       - name: Download release assets
         env:
@@ -187,10 +225,8 @@ jobs:
             exit 1
           fi
           expected_assets=("$tarball" "$tarball.sha256" "$tarball.asc")
-          download_patterns=(--pattern 'security-update-notify-*.tar.gz*')
           if [[ -n "$bootstrap_signature_asset" ]]; then
             expected_assets+=("$bootstrap_signature_asset")
-            download_patterns+=(--pattern "$bootstrap_signature_asset")
           fi
           mapfile -t actual_assets < <(
             gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' |
@@ -201,8 +237,12 @@ jobs:
             echo "::error::unexpected GitHub release asset set"
             exit 1
           fi
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir rel \
-            "${download_patterns[@]}"
+          for asset in "${expected_assets[@]}"; do
+            limit=1048576
+            [[ "$asset" != "$tarball" ]] || limit=268435456
+            "$RUNNER_TEMP/download-limited" "$limit" "rel/$asset" \
+              "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$asset"
+          done
           printf 'BOOTSTRAP_SIGNATURE_ASSET=%s\nBOOTSTRAP_VERSION_NOTATION=%s\n' \
             "$bootstrap_signature_asset" "$bootstrap_version_notation" >> "$GITHUB_ENV"
 
@@ -268,9 +308,9 @@ jobs:
           GNUPGHOME="$(mktemp -d)"
           export GNUPGHOME
           chmod 700 "$GNUPGHOME"
-          gpg --batch --import files/release-signing.pub.asc
+          gpg --no-options --batch --import files/release-signing.pub.asc
           mapfile -t primary_fingerprints < <(
-            gpg --batch --with-colons --list-keys |
+            gpg --no-options --batch --with-colons --list-keys |
               awk -F: '$1 == "pub" {want = 1; next} want && $1 == "fpr" {print $10; want = 0}'
           )
           [[ "${#primary_fingerprints[@]}" -eq 1 && "${primary_fingerprints[0]}" == "$pin" ]] || {
@@ -280,22 +320,25 @@ jobs:
           actual_sha="$(sha256sum "rel/$tarball" | awk '{print $1}')"
           [[ "$actual_sha" == "$expected_sha" ]] || { echo "::error::checksum mismatch"; exit 1; }
           verify_log="$(mktemp)"
-          status="$(gpg --batch --status-fd=1 --verify "rel/$tarball.asc" "rel/$tarball" 2>"$verify_log")" || {
+          status="$(gpg --no-options --batch --status-fd=1 \
+            --verify "rel/$tarball.asc" "rel/$tarball" 2>"$verify_log")" || {
             cat "$verify_log" >&2
             exit 1
           }
           awk -v pin="$pin" '
+            $1 == "[GNUPG:]" && $2 == "GOODSIG" { outcome_count++; good_count++ }
+            $1 == "[GNUPG:]" && $2 ~ /^(EXPSIG|EXPKEYSIG|REVKEYSIG|BADSIG|ERRSIG)$/ { outcome_count++ }
             $1 == "[GNUPG:]" && $2 == "VALIDSIG" {
               valid_count++
               if ($3 == pin || $NF == pin) pinned_count++
             }
-            END { exit !(valid_count == 1 && pinned_count == 1) }
+            END { exit !(outcome_count == 1 && good_count == 1 && valid_count == 1 && pinned_count == 1) }
           ' <<<"$status" || {
             echo "::error::signature is not uniquely bound to the pinned primary key"
             exit 1
           }
           epoch="$(git -C released-source show -s --format=%ct HEAD)"
-          python3 build/release-archive-test.py \
+          python3 -I build/release-archive-test.py \
             "rel/$tarball" "$version" "$epoch" released-source
           if [[ -n "$BOOTSTRAP_SIGNATURE_ASSET" ]]; then
             verify_dir="$(mktemp -d)"
@@ -308,18 +351,21 @@ jobs:
             cmp released-source/sun.sh "$verify_dir/sun.sh"
             cmp released-source/files/release-signing.pub.asc "$verify_dir/release-signing.pub.asc"
             cmp files/release-signing.pub.asc "$verify_dir/release-signing.pub.asc"
-            bootstrap_status="$(gpg --batch --known-notation "$BOOTSTRAP_VERSION_NOTATION" \
+            bootstrap_status="$(gpg --no-options --batch --known-notation "$BOOTSTRAP_VERSION_NOTATION" \
               --status-fd=1 --show-notation \
               --verify "rel/$BOOTSTRAP_SIGNATURE_ASSET" "$verify_dir/sun.sh" 2>"$verify_dir/gpg.log")" || {
               cat "$verify_dir/gpg.log" >&2
               exit 1
             }
             awk -v pin="$pin" -v notation="$BOOTSTRAP_VERSION_NOTATION" -v version="$version" '
+              $1 == "[GNUPG:]" && $2 == "GOODSIG" { outcome_count++; good_count++ }
+              $1 == "[GNUPG:]" && $2 ~ /^(EXPSIG|EXPKEYSIG|REVKEYSIG|BADSIG|ERRSIG)$/ { outcome_count++ }
               $1 == "[GNUPG:]" && $2 == "VALIDSIG" { valid_count++; if ($3 == pin || $NF == pin) pinned_count++ }
               $1 == "[GNUPG:]" && $2 == "NOTATION_NAME" { name_count++; if (NF == 3 && $3 == notation) name_match++ }
               $1 == "[GNUPG:]" && $2 == "NOTATION_FLAGS" { flags_count++; if (NF == 4 && $3 == 1 && $4 == 1) flags_match++ }
               $1 == "[GNUPG:]" && $2 == "NOTATION_DATA" { data_count++; if (NF == 3 && $3 == version) data_match++ }
-              END { exit !(valid_count == 1 && pinned_count == 1 && name_count == 1 && name_match == 1 &&
+              END { exit !(outcome_count == 1 && good_count == 1 && valid_count == 1 && pinned_count == 1 &&
+                           name_count == 1 && name_match == 1 &&
                            flags_count == 1 && flags_match == 1 && data_count == 1 && data_match == 1) }
             ' <<<"$bootstrap_status" || {
               echo "::error::bootstrap signature is not uniquely bound to the pinned key and release version"
@@ -339,7 +385,7 @@ jobs:
           run_arch() {
             local arch="$1"
             local runtime="$package_dir/files/security-update-notify-linux-$arch"
-            local program_headers dynamic_section got
+            local program_headers dynamic_section got expected output part
             local -a command
             [[ -x "$runtime" ]] || {
               echo "::error::missing executable linux/$arch runtime"
@@ -368,13 +414,45 @@ jobs:
               s390x) command=(/usr/bin/qemu-s390x-static "$runtime") ;;
               *) echo "::error::unknown release architecture: $arch"; return 2 ;;
             esac
-            got="$(env -i LC_ALL=C PATH=/usr/bin:/bin \
-              /usr/bin/timeout --signal=TERM --kill-after=2s 10s \
-              "${command[@]}" --version)" || {
-              echo "::error::linux/$arch runtime version probe failed"
+            output="$release_work/runtime-version-$arch"
+            part="${output}.part"
+            rm -f -- "$part"
+            if ! env -i LC_ALL=C PATH=/usr/bin:/bin \
+                /usr/bin/timeout --signal=TERM --kill-after=2s 10s \
+                  "${command[@]}" --version 2>&1 | \
+                /usr/bin/python3 -I -c '
+          import os
+          import sys
+
+          limit = int(sys.argv[1])
+          path = sys.argv[2]
+          try:
+              with open(path, "xb") as output:
+                  remaining = limit
+                  while True:
+                      chunk = sys.stdin.buffer.read(min(65536, remaining + 1))
+                      if not chunk:
+                          break
+                      if len(chunk) > remaining:
+                          raise ValueError("runtime output exceeds byte limit")
+                      output.write(chunk)
+                      remaining -= len(chunk)
+          except Exception:
+              try:
+                  os.unlink(path)
+              except FileNotFoundError:
+                  pass
+              raise SystemExit(1)
+          ' 4096 "$part" || ! mv -f -- "$part" "$output"; then
+              rm -f -- "$part"
+              echo "::error::linux/$arch runtime version probe failed, timed out, or exceeded 4096 bytes"
               return 1
-            }
-            [[ "$got" == "security-update-notify $VERSION" ]] || {
+            fi
+            expected="security-update-notify $VERSION"
+            got=''
+            IFS= read -r got < "$output" || true
+            [[ "$got" == "$expected" \
+               && "$(wc -c < "$output")" -eq "$((${#expected} + 1))" ]] || {
               echo "::error::linux/$arch runtime reports an unexpected version"
               return 1
             }
@@ -384,6 +462,7 @@ jobs:
           done
 
       - name: Prepare immutable release directory and latest files
+        id: bundle
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -439,9 +518,510 @@ jobs:
             echo "::error::signed release archive contains multiple $bootstrap_member entries"
             exit 1
           fi
-          sha="$(awk 'NF {print $1; exit}' "rel/$TARBALL.sha256")"
           published_at="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json publishedAt --jq .publishedAt)"
-          python3 - "$VERSION" "$TAG" "$MIRROR_BASE_URL" "$sha" "$PIN" "$published_at" > latest.json <<'PY'
+          release_sha="$(git -C released-source rev-parse --verify 'HEAD^{commit}')"
+          workflow_sha="$(git rev-parse --verify 'HEAD^{commit}')"
+          source_epoch="$(git -C released-source show -s --format=%ct HEAD)"
+          install -d -m 0755 verified-bundle
+          mv deploy verified-bundle/deploy
+          python3 -I - \
+            "$TAG" "$VERSION" "$TARBALL" "$PIN" "$published_at" \
+            "$BOOTSTRAP_SIGNATURE_ASSET" "$BOOTSTRAP_VERSION_NOTATION" \
+            "$bootstrap_present" "$high_assurance_bootstrap" \
+            "$release_sha" "$workflow_sha" "$source_epoch" \
+            > verified-bundle/metadata.json <<'PY'
+          import json
+          import sys
+
+          (tag, version, tarball, fingerprint, published_at,
+           bootstrap_signature_asset, bootstrap_version_notation,
+           bootstrap_present, high_assurance_bootstrap,
+           release_sha, workflow_sha, source_epoch) = sys.argv[1:]
+          metadata = {
+              "bootstrap_present": bootstrap_present == "1",
+              "bootstrap_signature_asset": bootstrap_signature_asset,
+              "bootstrap_version_notation": bootstrap_version_notation,
+              "high_assurance_bootstrap": high_assurance_bootstrap == "1",
+              "published_at": published_at,
+              "release_sha": release_sha,
+              "schema": 1,
+              "signing_fingerprint": fingerprint,
+              "source_epoch": int(source_epoch),
+              "tag": tag,
+              "tarball": tarball,
+              "version": version,
+              "workflow_sha": workflow_sha,
+          }
+          json.dump(metadata, sys.stdout, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+          sys.stdout.write("\n")
+          PY
+          python3 -I - verified-bundle > verified-bundle/manifest.sha256 <<'PY'
+          import hashlib
+          import os
+          import pathlib
+          import stat
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          files = []
+          for path in root.rglob("*"):
+              mode = path.lstat().st_mode
+              if stat.S_ISDIR(mode):
+                  continue
+              if not stat.S_ISREG(mode) or path.is_symlink():
+                  raise SystemExit(f"non-regular bundle entry: {path}")
+              relative = path.relative_to(root).as_posix()
+              if relative != "manifest.sha256":
+                  files.append((relative, path))
+          for relative, path in sorted(files):
+              digest = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              print(f"{digest.hexdigest()}  {relative}")
+          PY
+          artifact_name="verified-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          bundle_digest="$(sha256sum verified-bundle/manifest.sha256 | awk '{print $1}')"
+          printf 'artifact-name=%s\nbundle-digest=%s\n' \
+            "$artifact_name" "$bundle_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Upload verified release bundle
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verified-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: verified-bundle
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  # This fresh runner treats the artifact as data and never executes release payloads.
+  verify-and-sync:
+    needs: verify-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: release-mirror
+    concurrency:
+      group: signed-release-mirror-${{ github.event.workflow_run.head_branch || inputs.tag }}
+      cancel-in-progress: false
+    env:
+      TAG: ${{ github.event.workflow_run.head_branch || inputs.tag }}
+      MIRROR_BASE_URL: ${{ vars.MIRROR_BASE_URL }}
+      MIRROR_HOST: ${{ vars.MIRROR_HOST }}
+      MIRROR_PORT: ${{ vars.MIRROR_PORT }}
+      MIRROR_USER: ${{ vars.MIRROR_USER }}
+    steps:
+      - name: Validate deployment configuration
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::manual mirror dispatches must run from refs/heads/main"
+            exit 1
+          fi
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z]+)?$ && "${#TAG}" -le 65 ]] || {
+            echo "::error::invalid release tag: $TAG"
+            exit 2
+          }
+          [[ "$MIRROR_BASE_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]] || {
+            echo "::error::invalid MIRROR_BASE_URL"
+            exit 2
+          }
+          [[ "$MIRROR_USER" =~ ^[A-Za-z_][A-Za-z0-9._-]{0,31}$ ]] || {
+            echo "::error::mirror SSH variables are incomplete"
+            exit 2
+          }
+          python3 -I - "$MIRROR_BASE_URL" "$MIRROR_HOST" "$MIRROR_PORT" <<'PY'
+          import ipaddress
+          import re
+          import sys
+          import urllib.parse
+
+          base_url, ssh_host, ssh_port = sys.argv[1:]
+          try:
+              parsed = urllib.parse.urlsplit(base_url)
+              port = parsed.port
+          except ValueError as exc:
+              raise SystemExit(f"invalid MIRROR_BASE_URL: {exc}")
+          if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+                  or parsed.query or parsed.fragment or port is not None and not 1 <= port <= 65535):
+              raise SystemExit("invalid MIRROR_BASE_URL components")
+          if any(part in (".", "..") for part in parsed.path.split("/")):
+              raise SystemExit("MIRROR_BASE_URL must not contain dot path segments")
+
+          if not ssh_host or len(ssh_host) > 253 or ":" in ssh_host:
+              raise SystemExit("invalid MIRROR_HOST")
+          if re.fullmatch(r"[0-9.]+", ssh_host):
+              try:
+                  if ipaddress.ip_address(ssh_host).version != 4:
+                      raise ValueError
+              except ValueError:
+                  raise SystemExit("invalid IPv4 MIRROR_HOST")
+          else:
+              labels = ssh_host.rstrip(".").split(".")
+              if any(not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                     for label in labels):
+                  raise SystemExit("invalid DNS MIRROR_HOST")
+          if not re.fullmatch(r"[0-9]{1,5}", ssh_port) or not 1 <= int(ssh_port) <= 65535:
+              raise SystemExit("invalid MIRROR_PORT")
+          PY
+
+      - name: Checkout the trusted workflow revision for deployment
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download verified release bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verified-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: verified-bundle
+          digest-mismatch: error
+
+      - name: Revalidate artifact structure and metadata
+        env:
+          EXPECTED_ARTIFACT_NAME: ${{ needs.verify-release.outputs.artifact_name }}
+          EXPECTED_ARTIFACT_DIGEST: ${{ needs.verify-release.outputs.artifact_digest }}
+          EXPECTED_BUNDLE_DIGEST: ${{ needs.verify-release.outputs.bundle_digest }}
+          EXPECTED_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          EXPECTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_ARTIFACT_NAME" == "verified-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ]] || {
+            echo "::error::verification job provided an unexpected artifact name"
+            exit 1
+          }
+          [[ "$EXPECTED_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "::error::upload-artifact did not provide a valid artifact digest"
+            exit 1
+          }
+          [[ "$EXPECTED_BUNDLE_DIGEST" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "::error::verification job did not provide a valid bundle digest"
+            exit 1
+          }
+          immutable="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .immutable)"
+          if [[ "$immutable" != "true" ]]; then
+            case "$TAG" in
+              v3.0.0|v3.0.1)
+                [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]] || {
+                  echo "::error::legacy mutable releases may only be repaired by a manual main-branch dispatch"
+                  exit 1
+                }
+                ;;
+              *) echo "::error::release $TAG is not immutable"; exit 1 ;;
+            esac
+          fi
+          direct_sha=""
+          peeled_sha=""
+          while read -r object ref; do
+            case "$ref" in
+              "refs/tags/$TAG") direct_sha="$object" ;;
+              "refs/tags/$TAG^{}") peeled_sha="$object" ;;
+            esac
+          done < <(git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          [[ "$direct_sha" =~ ^[0-9a-f]{40}$ && "$peeled_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::release tag $TAG is no longer an annotated remote tag"
+            exit 1
+          }
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_run" ]]; then
+            [[ "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ && "$peeled_sha" == "$EXPECTED_HEAD_SHA" ]] || {
+              echo "::error::release tag $TAG no longer resolves to the successful CI commit"
+              exit 1
+            }
+          fi
+          published_at="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json publishedAt --jq .publishedAt)"
+          commit_date="$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$peeled_sha" --jq .committer.date)"
+          python3 -I - \
+            verified-bundle "$TAG" "$EXPECTED_WORKFLOW_SHA" "$EXPECTED_HEAD_SHA" \
+            "$peeled_sha" "$published_at" "$commit_date" \
+            "$EXPECTED_BUNDLE_DIGEST" "$GITHUB_ENV" <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import stat
+          import sys
+
+          (root_arg, tag, workflow_sha, expected_head_sha, release_sha,
+           published_at, commit_date, expected_bundle_digest, github_env) = sys.argv[1:]
+          root = pathlib.Path(root_arg)
+          if root.is_symlink() or not root.is_dir():
+              raise SystemExit("verified bundle root is not a directory")
+
+          actual_directories = set()
+          actual_files = set()
+          for directory, names, files in os.walk(root, topdown=True, followlinks=False):
+              directory_path = pathlib.Path(directory)
+              relative_directory = directory_path.relative_to(root).as_posix()
+              actual_directories.add(relative_directory)
+              for name in names:
+                  path = directory_path / name
+                  mode = path.lstat().st_mode
+                  if not stat.S_ISDIR(mode) or path.is_symlink():
+                      raise SystemExit(f"invalid bundle directory: {path}")
+              for name in files:
+                  path = directory_path / name
+                  mode = path.lstat().st_mode
+                  if not stat.S_ISREG(mode) or path.is_symlink() or path.stat().st_nlink != 1:
+                      raise SystemExit(f"invalid bundle file: {path}")
+                  actual_files.add(path.relative_to(root).as_posix())
+
+          metadata_path = root / "metadata.json"
+          manifest_path = root / "manifest.sha256"
+          if (not metadata_path.is_file() or metadata_path.is_symlink()
+                  or not 0 < metadata_path.stat().st_size <= 16384):
+              raise SystemExit("invalid bundle metadata file")
+          if (not manifest_path.is_file() or manifest_path.is_symlink()
+                  or not 0 < manifest_path.stat().st_size <= 16384):
+              raise SystemExit("invalid bundle manifest file")
+
+          def reject_duplicates(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError(f"duplicate metadata key: {key}")
+                  result[key] = value
+              return result
+
+          try:
+              raw_metadata = metadata_path.read_text(encoding="ascii")
+              metadata = json.loads(raw_metadata, object_pairs_hook=reject_duplicates)
+          except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+              raise SystemExit(f"invalid bundle metadata: {exc}")
+          keys = {
+              "bootstrap_present", "bootstrap_signature_asset",
+              "bootstrap_version_notation", "high_assurance_bootstrap",
+              "published_at", "release_sha", "schema", "signing_fingerprint",
+              "source_epoch", "tag", "tarball", "version", "workflow_sha",
+          }
+          if type(metadata) is not dict or set(metadata) != keys:
+              raise SystemExit("bundle metadata schema mismatch")
+          canonical = json.dumps(
+              metadata, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+          ) + "\n"
+          if raw_metadata != canonical:
+              raise SystemExit("bundle metadata is not canonical JSON")
+
+          version_pattern = r"[0-9]+\.[0-9]+\.[0-9]+(?:[._-][0-9A-Za-z]+)?"
+          if not re.fullmatch("v" + version_pattern, tag) or len(tag) > 65:
+              raise SystemExit("invalid event release tag")
+          version = tag[1:]
+          tarball = f"security-update-notify-{version}.tar.gz"
+          fingerprint = "C678256ACBFC6491BF5076655F3AE24999921FFC"
+          if (type(metadata["schema"]) is not int or metadata["schema"] != 1
+                  or metadata["tag"] != tag
+                  or metadata["version"] != version or metadata["tarball"] != tarball
+                  or metadata["signing_fingerprint"] != fingerprint
+                  or metadata["published_at"] != published_at
+                  or metadata["release_sha"] != release_sha
+                  or metadata["workflow_sha"] != workflow_sha):
+              raise SystemExit("bundle metadata is not bound to this release run")
+          if expected_head_sha and metadata["release_sha"] != expected_head_sha:
+              raise SystemExit("bundle release commit differs from successful CI")
+          timestamp_pattern = r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
+          if (not re.fullmatch(timestamp_pattern, published_at)
+                  or not re.fullmatch(timestamp_pattern, commit_date)):
+              raise SystemExit("release API returned an invalid timestamp")
+          commit_epoch = int(datetime.datetime.fromisoformat(
+              commit_date.removesuffix("Z") + "+00:00"
+          ).timestamp())
+          if (type(metadata["source_epoch"]) is not int
+                  or metadata["source_epoch"] != commit_epoch
+                  or not 0 <= metadata["source_epoch"] <= 4102444800):
+              raise SystemExit("invalid source epoch")
+          if (type(metadata["bootstrap_present"]) is not bool
+                  or type(metadata["high_assurance_bootstrap"]) is not bool
+                  or type(metadata["bootstrap_signature_asset"]) is not str
+                  or type(metadata["bootstrap_version_notation"]) is not str):
+              raise SystemExit("invalid bootstrap metadata types")
+
+          signature_asset = metadata["bootstrap_signature_asset"]
+          notation = metadata["bootstrap_version_notation"]
+          bootstrap_present = metadata["bootstrap_present"]
+          high_assurance = metadata["high_assurance_bootstrap"]
+          legacy = tag in {"v3.0.0", "v3.0.1"}
+          if signature_asset:
+              if (signature_asset != "sun.sh.asc" or notation != "release-version@xxv.cc"
+                      or not bootstrap_present or not high_assurance):
+                  raise SystemExit("invalid high-assurance bootstrap metadata")
+          elif notation or high_assurance or not legacy:
+              raise SystemExit("only legacy releases may omit the bootstrap signature")
+
+          deploy_root = f"deploy/{tag}/"
+          expected_directories = {".", "deploy", f"deploy/{tag}"}
+          if actual_directories != expected_directories:
+              raise SystemExit(
+                  f"bundle directory allowlist mismatch: "
+                  f"missing={sorted(expected_directories - actual_directories)}, "
+                  f"extra={sorted(actual_directories - expected_directories)}"
+              )
+          expected_files = {
+              "metadata.json", "manifest.sha256",
+              deploy_root + tarball,
+              deploy_root + tarball + ".sha256",
+              deploy_root + tarball + ".asc",
+          }
+          if bootstrap_present:
+              expected_files.add(deploy_root + "sun.sh")
+          if high_assurance:
+              expected_files.update({
+                  deploy_root + signature_asset,
+                  deploy_root + "release-signing.pub.asc",
+              })
+          if actual_files != expected_files:
+              raise SystemExit(
+                  f"bundle file allowlist mismatch: missing={sorted(expected_files - actual_files)}, "
+                  f"extra={sorted(actual_files - expected_files)}"
+              )
+
+          size_limits = {
+              deploy_root + tarball: 268435456,
+              deploy_root + tarball + ".sha256": 1048576,
+              deploy_root + tarball + ".asc": 1048576,
+              "metadata.json": 16384,
+          }
+          for relative in expected_files - {"manifest.sha256"}:
+              size = (root / relative).stat().st_size
+              if not 0 < size <= size_limits.get(relative, 1048576):
+                  raise SystemExit(f"bundle file has invalid size: {relative}")
+
+          raw_manifest = manifest_path.read_text(encoding="ascii")
+          manifest_lines = raw_manifest.splitlines()
+          expected_manifest_files = expected_files - {"manifest.sha256"}
+          if len(manifest_lines) != len(expected_manifest_files):
+              raise SystemExit("bundle manifest entry count mismatch")
+          manifest = {}
+          for line in manifest_lines:
+              match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9@._/-]+)", line)
+              if not match or match.group(2) in manifest:
+                  raise SystemExit("invalid bundle manifest entry")
+              manifest[match.group(2)] = match.group(1)
+          if set(manifest) != expected_manifest_files:
+              raise SystemExit("bundle manifest file set mismatch")
+          if manifest_lines != [f"{manifest[path]}  {path}" for path in sorted(manifest)]:
+              raise SystemExit("bundle manifest is not in canonical order")
+          if raw_manifest != "".join(f"{line}\n" for line in manifest_lines):
+              raise SystemExit("bundle manifest is not canonically encoded")
+          for relative, expected_digest in manifest.items():
+              digest = hashlib.sha256()
+              with (root / relative).open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              if digest.hexdigest() != expected_digest:
+                  raise SystemExit(f"bundle digest mismatch: {relative}")
+          if hashlib.sha256(manifest_path.read_bytes()).hexdigest() != expected_bundle_digest:
+              raise SystemExit("normalized bundle digest differs from verification output")
+
+          values = {
+              "BOOTSTRAP_PRESENT": "1" if bootstrap_present else "0",
+              "BOOTSTRAP_SIGNATURE_ASSET": signature_asset,
+              "BOOTSTRAP_VERSION_NOTATION": notation,
+              "HIGH_ASSURANCE_BOOTSTRAP": "1" if high_assurance else "0",
+              "PIN": fingerprint,
+              "PUBLISHED_AT": published_at,
+              "SOURCE_EPOCH": str(metadata["source_epoch"]),
+              "TARBALL": tarball,
+              "VERSION": version,
+          }
+          with open(github_env, "a", encoding="utf-8") as stream:
+              for key, value in values.items():
+                  stream.write(f"{key}={value}\n")
+          PY
+          [[ ! -e deploy && ! -L deploy ]] || {
+            echo "::error::trusted checkout unexpectedly contains a deploy path"
+            exit 1
+          }
+          mv verified-bundle/deploy deploy
+
+      - name: Revalidate signed release data without executing it
+        run: |
+          set -euo pipefail
+          release_dir="deploy/$TAG"
+          [[ "$(wc -l < "$release_dir/$TARBALL.sha256")" -eq 1 ]] || {
+            echo "::error::checksum manifest must contain exactly one line"
+            exit 1
+          }
+          read -r expected_sha expected_name extra < "$release_dir/$TARBALL.sha256"
+          [[ "$expected_sha" =~ ^[0-9a-f]{64}$ \
+             && "$expected_name" == "$TARBALL" && -z "${extra:-}" ]] || {
+            echo "::error::checksum manifest is not bound to $TARBALL"
+            exit 1
+          }
+          actual_sha="$(sha256sum "$release_dir/$TARBALL" | awk '{print $1}')"
+          [[ "$actual_sha" == "$expected_sha" ]] || { echo "::error::checksum mismatch"; exit 1; }
+          GNUPGHOME="$(mktemp -d)"
+          export GNUPGHOME
+          chmod 700 "$GNUPGHOME"
+          gpg --no-options --batch --import files/release-signing.pub.asc
+          mapfile -t primary_fingerprints < <(
+            gpg --no-options --batch --with-colons --list-keys |
+              awk -F: '$1 == "pub" {want = 1; next} want && $1 == "fpr" {print $10; want = 0}'
+          )
+          [[ "${#primary_fingerprints[@]}" -eq 1 && "${primary_fingerprints[0]}" == "$PIN" ]] || {
+            echo "::error::deployment keyring is not exactly the pinned primary key"
+            exit 1
+          }
+          verify_log="$(mktemp)"
+          status="$(gpg --no-options --batch --status-fd=1 \
+            --verify "$release_dir/$TARBALL.asc" "$release_dir/$TARBALL" 2>"$verify_log")" || {
+            cat "$verify_log" >&2
+            exit 1
+          }
+          awk -v pin="$PIN" '
+            $1 == "[GNUPG:]" && $2 == "GOODSIG" { outcome_count++; good_count++ }
+            $1 == "[GNUPG:]" && $2 ~ /^(EXPSIG|EXPKEYSIG|REVKEYSIG|BADSIG|ERRSIG)$/ { outcome_count++ }
+            $1 == "[GNUPG:]" && $2 == "VALIDSIG" {
+              valid_count++
+              if ($3 == pin || $NF == pin) pinned_count++
+            }
+            END { exit !(outcome_count == 1 && good_count == 1 && valid_count == 1 && pinned_count == 1) }
+          ' <<<"$status" || {
+            echo "::error::deployment signature is not uniquely bound to the pinned primary key"
+            exit 1
+          }
+          python3 -I build/release-archive-test.py \
+            "$release_dir/$TARBALL" "$VERSION" "$SOURCE_EPOCH"
+          if [[ "$BOOTSTRAP_PRESENT" == "1" ]]; then
+            verify_dir="$(mktemp -d)"
+            top="security-update-notify-$VERSION"
+            env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT \
+              tar -xOzf "$release_dir/$TARBALL" "$top/sun.sh" > "$verify_dir/sun.sh"
+            cmp "$verify_dir/sun.sh" "$release_dir/sun.sh"
+            if [[ "$HIGH_ASSURANCE_BOOTSTRAP" == "1" ]]; then
+              env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT \
+                tar -xOzf "$release_dir/$TARBALL" "$top/files/release-signing.pub.asc" \
+                > "$verify_dir/release-signing.pub.asc"
+              cmp files/release-signing.pub.asc "$verify_dir/release-signing.pub.asc"
+              cmp files/release-signing.pub.asc "$release_dir/release-signing.pub.asc"
+              bootstrap_status="$(gpg --no-options --batch --known-notation "$BOOTSTRAP_VERSION_NOTATION" \
+                --status-fd=1 --show-notation \
+                --verify "$release_dir/$BOOTSTRAP_SIGNATURE_ASSET" "$release_dir/sun.sh" \
+                2>"$verify_log")" || {
+                cat "$verify_log" >&2
+                exit 1
+              }
+              awk -v pin="$PIN" -v notation="$BOOTSTRAP_VERSION_NOTATION" -v version="$VERSION" '
+                $1 == "[GNUPG:]" && $2 == "GOODSIG" { outcome_count++; good_count++ }
+                $1 == "[GNUPG:]" && $2 ~ /^(EXPSIG|EXPKEYSIG|REVKEYSIG|BADSIG|ERRSIG)$/ { outcome_count++ }
+                $1 == "[GNUPG:]" && $2 == "VALIDSIG" { valid_count++; if ($3 == pin || $NF == pin) pinned_count++ }
+                $1 == "[GNUPG:]" && $2 == "NOTATION_NAME" { name_count++; if (NF == 3 && $3 == notation) name_match++ }
+                $1 == "[GNUPG:]" && $2 == "NOTATION_FLAGS" { flags_count++; if (NF == 4 && $3 == 1 && $4 == 1) flags_match++ }
+                $1 == "[GNUPG:]" && $2 == "NOTATION_DATA" { data_count++; if (NF == 3 && $3 == version) data_match++ }
+                END { exit !(outcome_count == 1 && good_count == 1 && valid_count == 1 && pinned_count == 1 &&
+                             name_count == 1 && name_match == 1 &&
+                             flags_count == 1 && flags_match == 1 && data_count == 1 && data_match == 1) }
+              ' <<<"$bootstrap_status" || {
+                echo "::error::deployment bootstrap signature is not bound to the pinned key and version"
+                exit 1
+              }
+            fi
+          fi
+          python3 -I - "$VERSION" "$TAG" "$MIRROR_BASE_URL" "$expected_sha" "$PIN" "$PUBLISHED_AT" \
+            > latest.json <<'PY'
           import json
           import sys
 
@@ -456,8 +1036,57 @@ jobs:
           }, sys.stdout, ensure_ascii=True, separators=(",", ":"))
           sys.stdout.write("\n")
           PY
-          printf 'BOOTSTRAP_PRESENT=%s\nHIGH_ASSURANCE_BOOTSTRAP=%s\n' \
-            "$bootstrap_present" "$high_assurance_bootstrap" >> "$GITHUB_ENV"
+
+      - name: Prepare bounded HTTPS downloader for deployment
+        run: |
+          set -euo pipefail
+          downloader="${RUNNER_TEMP:?}/download-limited"
+          cat > "$downloader" <<'DOWNLOAD_SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          [[ $# -eq 3 && "$1" =~ ^[0-9]+$ && "$1" -gt 0 ]] || exit 2
+          limit="$1"
+          output="$2"
+          url="$3"
+          part="${output}.part"
+          rm -f -- "$part"
+          if /usr/bin/env -i PATH=/usr/bin:/bin \
+              /usr/bin/timeout --signal=TERM --kill-after=5s 180s \
+              curl --disable --fail --location --silent --show-error \
+                --connect-timeout 20 --max-time 120 --retry 3 --retry-delay 1 \
+                --retry-all-errors --retry-max-time 150 --max-filesize "$limit" \
+                --proto '=https' --proto-redir '=https' "$url" | \
+              /usr/bin/python3 -I -c '
+          import os
+          import sys
+
+          limit = int(sys.argv[1])
+          path = sys.argv[2]
+          try:
+              with open(path, "xb") as output:
+                  remaining = limit
+                  while True:
+                      chunk = sys.stdin.buffer.read(min(65536, remaining + 1))
+                      if not chunk:
+                          break
+                      if len(chunk) > remaining:
+                          raise ValueError("download exceeded configured limit")
+                      output.write(chunk)
+                      remaining -= len(chunk)
+          except Exception as exc:
+              try:
+                  os.unlink(path)
+              except FileNotFoundError:
+                  pass
+              print(f"bounded download failed: {exc}", file=sys.stderr)
+              raise SystemExit(1)
+          ' "$limit" "$part" && mv -f -- "$part" "$output"; then
+            exit 0
+          fi
+          rm -f -- "$part"
+          exit 1
+          DOWNLOAD_SCRIPT
+          chmod 0700 "$downloader"
 
       - name: Configure pinned SSH identity
         env:
@@ -494,19 +1123,19 @@ jobs:
             assets+=("$BOOTSTRAP_SIGNATURE_ASSET" release-signing.pub.asc)
           fi
           for asset in "${assets[@]}"; do
-            curl --fail --location --retry 3 --retry-all-errors \
-              --proto '=https' --proto-redir '=https' \
-              --output "public-check/$asset" \
-              "$MIRROR_BASE_URL/$TAG/$asset?run=$GITHUB_RUN_ID"
+            limit=1048576
+            [[ "$asset" != "$TARBALL" ]] || limit=268435456
+            "$RUNNER_TEMP/download-limited" "$limit" "public-check/$asset" \
+              "$MIRROR_BASE_URL/$TAG/$asset?run=$GITHUB_RUN_ID&attempt=$GITHUB_RUN_ATTEMPT"
             cmp "deploy/$TAG/$asset" "public-check/$asset"
           done
           (cd public-check && sha256sum -c "$TARBALL.sha256")
           GNUPGHOME="$(mktemp -d)"
           export GNUPGHOME
           chmod 700 "$GNUPGHOME"
-          gpg --batch --import files/release-signing.pub.asc
+          gpg --no-options --batch --import files/release-signing.pub.asc
           mapfile -t primary_fingerprints < <(
-            gpg --batch --with-colons --list-keys |
+            gpg --no-options --batch --with-colons --list-keys |
               awk -F: '$1 == "pub" {want = 1; next} want && $1 == "fpr" {print $10; want = 0}'
           )
           [[ "${#primary_fingerprints[@]}" -eq 1 && "${primary_fingerprints[0]}" == "$PIN" ]] || {
@@ -514,16 +1143,19 @@ jobs:
             exit 1
           }
           verify_log="$(mktemp)"
-          status="$(gpg --batch --status-fd=1 --verify "public-check/$TARBALL.asc" "public-check/$TARBALL" 2>"$verify_log")" || {
+          status="$(gpg --no-options --batch --status-fd=1 \
+            --verify "public-check/$TARBALL.asc" "public-check/$TARBALL" 2>"$verify_log")" || {
             cat "$verify_log" >&2
             exit 1
           }
           awk -v pin="$PIN" '
+            $1 == "[GNUPG:]" && $2 == "GOODSIG" { outcome_count++; good_count++ }
+            $1 == "[GNUPG:]" && $2 ~ /^(EXPSIG|EXPKEYSIG|REVKEYSIG|BADSIG|ERRSIG)$/ { outcome_count++ }
             $1 == "[GNUPG:]" && $2 == "VALIDSIG" {
               valid_count++
               if ($3 == pin || $NF == pin) pinned_count++
             }
-            END { exit !(valid_count == 1 && pinned_count == 1) }
+            END { exit !(outcome_count == 1 && good_count == 1 && valid_count == 1 && pinned_count == 1) }
           ' <<<"$status" || {
             echo "::error::public signature is not uniquely bound to the pinned primary key"
             exit 1
@@ -533,18 +1165,21 @@ jobs:
           fi
           if [[ "$HIGH_ASSURANCE_BOOTSTRAP" == "1" ]]; then
             cmp files/release-signing.pub.asc public-check/release-signing.pub.asc
-            bootstrap_status="$(gpg --batch --known-notation "$BOOTSTRAP_VERSION_NOTATION" \
+            bootstrap_status="$(gpg --no-options --batch --known-notation "$BOOTSTRAP_VERSION_NOTATION" \
               --status-fd=1 --show-notation \
               --verify "public-check/$BOOTSTRAP_SIGNATURE_ASSET" public-check/sun.sh 2>"$verify_log")" || {
               cat "$verify_log" >&2
               exit 1
             }
             awk -v pin="$PIN" -v notation="$BOOTSTRAP_VERSION_NOTATION" -v version="$VERSION" '
+              $1 == "[GNUPG:]" && $2 == "GOODSIG" { outcome_count++; good_count++ }
+              $1 == "[GNUPG:]" && $2 ~ /^(EXPSIG|EXPKEYSIG|REVKEYSIG|BADSIG|ERRSIG)$/ { outcome_count++ }
               $1 == "[GNUPG:]" && $2 == "VALIDSIG" { valid_count++; if ($3 == pin || $NF == pin) pinned_count++ }
               $1 == "[GNUPG:]" && $2 == "NOTATION_NAME" { name_count++; if (NF == 3 && $3 == notation) name_match++ }
               $1 == "[GNUPG:]" && $2 == "NOTATION_FLAGS" { flags_count++; if (NF == 4 && $3 == 1 && $4 == 1) flags_match++ }
               $1 == "[GNUPG:]" && $2 == "NOTATION_DATA" { data_count++; if (NF == 3 && $3 == version) data_match++ }
-              END { exit !(valid_count == 1 && pinned_count == 1 && name_count == 1 && name_match == 1 &&
+              END { exit !(outcome_count == 1 && good_count == 1 && valid_count == 1 && pinned_count == 1 &&
+                           name_count == 1 && name_match == 1 &&
                            flags_count == 1 && flags_match == 1 && data_count == 1 && data_match == 1) }
             ' <<<"$bootstrap_status" || {
               echo "::error::public bootstrap signature is not uniquely bound to the pinned key and release version"
@@ -552,11 +1187,197 @@ jobs:
             }
           fi
 
-      - name: Confirm GitHub Latest before stable update
+      - name: Publish stable files under one remote lock
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ \
+             && "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z]+)?$ \
+             && "${#TAG}" -le 65 ]] || {
+            echo "::error::invalid workflow run or release identity"
+            exit 2
+          }
+          remote_stage=".security-update-notify-stage-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${TAG}"
+          local_stage="$RUNNER_TEMP/security-update-notify-stable-stage"
+          ssh_command=(
+            ssh -i "$HOME/.ssh/mirror_key" -p "$MIRROR_PORT"
+            -o BatchMode=yes -o ConnectTimeout=20 -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o "UserKnownHostsFile=$HOME/.ssh/known_hosts"
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=3
+          )
+          lock_pid=""
+          lock_read_fd=""
+          lock_write_fd=""
+          cleanup_remote_publish() {
+            local status=$?
+            local remove_stage=1
+            trap - EXIT HUP INT TERM
+            set +e
+            if [[ -n "$lock_write_fd" ]]; then
+              printf '%s\n' ABORT >&"$lock_write_fd"
+            fi
+            if [[ -n "$lock_pid" ]]; then
+              if ! wait "$lock_pid"; then
+                remove_stage=0
+              fi
+            fi
+            if [[ "$remove_stage" -eq 1 ]]; then
+              /usr/bin/timeout --signal=TERM --kill-after=5s 60s \
+                "${ssh_command[@]}" "$MIRROR_USER@$MIRROR_HOST" \
+                "rm -rf -- '$remote_stage'"
+            else
+              echo "::error::remote rollback failed; preserved $remote_stage for recovery"
+            fi
+            exit "$status"
+          }
+          trap cleanup_remote_publish EXIT
+          trap 'exit 130' HUP INT TERM
+          install -d -m 0700 "$local_stage"
+          install -m 0600 latest.json "$local_stage/"
+          if [[ "$BOOTSTRAP_PRESENT" == "1" ]]; then
+            install -m 0600 "deploy/$TAG/sun.sh" "$local_stage/"
+          fi
+          cat > "$local_stage/mirror-lock.sh" <<'REMOTE_SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          stage="${1:-}"
+          [[ "$stage" =~ ^\.security-update-notify-stage-[0-9]+-[0-9]+-v[0-9A-Za-z._-]+$ ]] || exit 64
+          suffix="${stage#.security-update-notify-stage-}"
+          sun_tmp=".sun.sh.${suffix}.tmp"
+          latest_tmp=".latest.json.${suffix}.tmp"
+          sun_backup="$stage/.previous-sun.sh"
+          latest_backup="$stage/.previous-latest.json"
+          sun_existed=0
+          latest_existed=0
+          state=starting
+          committed=0
+          preserve_stage=0
+          rollback_stable() {
+            local failed=0
+            if [[ "$sun_existed" -eq 1 ]]; then
+              install -m 0644 -- "$sun_backup" "$sun_tmp" &&
+                mv -f -- "$sun_tmp" sun.sh || failed=1
+            else
+              rm -f -- sun.sh || failed=1
+            fi
+            if [[ "$latest_existed" -eq 1 ]]; then
+              install -m 0644 -- "$latest_backup" "$latest_tmp" &&
+                mv -f -- "$latest_tmp" latest.json || failed=1
+            else
+              rm -f -- latest.json || failed=1
+            fi
+            if [[ "$failed" -eq 0 ]]; then
+              state=rolled-back
+              return 0
+            fi
+            preserve_stage=1
+            return 1
+          }
+          # Invoked indirectly by the EXIT trap.
+          # shellcheck disable=SC2317
+          cleanup() {
+            local status=$?
+            trap - EXIT HUP INT TERM
+            set +e
+            if [[ "$committed" -ne 1 && ( "$state" == sun || "$state" == latest ) ]]; then
+              if ! rollback_stable; then
+                status=70
+              fi
+            fi
+            rm -f -- "$sun_tmp" "$latest_tmp"
+            if [[ "$preserve_stage" -eq 0 ]]; then
+              rm -rf -- "$stage"
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+          trap 'exit 130' HUP INT TERM
+          [[ -d "$stage" && ! -L "$stage" ]] || exit 64
+          for file in latest.json mirror-lock.sh; do
+            [[ -f "$stage/$file" && ! -L "$stage/$file" ]] || exit 64
+          done
+          [[ ! -L .security-update-notify-release.lock ]] || exit 64
+          umask 077
+          exec 9>>.security-update-notify-release.lock
+          flock --wait 180 --exclusive 9
+          printf '%s\n' LOCKED
+          state=locked
+          deadline=$((SECONDS + 720))
+          while (( SECONDS < deadline )); do
+            remaining=$((deadline - SECONDS))
+            IFS= read -r -t "$remaining" action || exit 124
+            case "$action" in
+              PUBLISH_SUN)
+                [[ "$state" == locked ]] || exit 65
+                [[ -f "$stage/sun.sh" && ! -L "$stage/sun.sh" ]] || exit 64
+                [[ ! -e "$sun_backup" && ! -L "$sun_backup" \
+                   && ! -e "$latest_backup" && ! -L "$latest_backup" ]] || exit 64
+                if [[ -e sun.sh || -L sun.sh ]]; then
+                  [[ -f sun.sh && ! -L sun.sh ]] || exit 64
+                  install -m 0600 -- sun.sh "$sun_backup"
+                  sun_existed=1
+                fi
+                if [[ -e latest.json || -L latest.json ]]; then
+                  [[ -f latest.json && ! -L latest.json ]] || exit 64
+                  install -m 0600 -- latest.json "$latest_backup"
+                  latest_existed=1
+                fi
+                state=sun
+                install -m 0644 -- "$stage/sun.sh" "$sun_tmp"
+                mv -f -- "$sun_tmp" sun.sh
+                printf '%s\n' SUN_PUBLISHED
+                ;;
+              PUBLISH_LATEST)
+                [[ "$state" == sun ]] || exit 65
+                state=latest
+                install -m 0644 -- "$stage/latest.json" "$latest_tmp"
+                mv -f -- "$latest_tmp" latest.json
+                printf '%s\n' LATEST_PUBLISHED
+                ;;
+              RELEASE)
+                [[ "$state" == locked || "$state" == latest ]] || exit 65
+                committed=1
+                exit 0
+                ;;
+              ABORT) exit 0 ;;
+              *) exit 65 ;;
+            esac
+          done
+          exit 124
+          REMOTE_SCRIPT
+          chmod 0700 "$local_stage/mirror-lock.sh"
+          rsync --archive --checksum --delay-updates --chmod=D700,F600 \
+            "$local_stage/" "$MIRROR_USER@$MIRROR_HOST:$remote_stage/"
+          coproc REMOTE_LOCK {
+            /usr/bin/timeout --signal=TERM --kill-after=5s 960s \
+              "${ssh_command[@]}" "$MIRROR_USER@$MIRROR_HOST" \
+              "bash --noprofile --norc '$remote_stage/mirror-lock.sh' '$remote_stage'"
+          }
+          lock_pid="$REMOTE_LOCK_PID"
+          lock_read_fd="${REMOTE_LOCK[0]}"
+          lock_write_fd="${REMOTE_LOCK[1]}"
+          read_reply() {
+            local expected="$1" timeout_seconds="$2" actual
+            if ! IFS= read -r -t "$timeout_seconds" -u "$lock_read_fd" actual; then
+              echo "::error::remote mirror lock closed before $expected"
+              return 1
+            fi
+            [[ "$actual" == "$expected" ]] || {
+              echo "::error::unexpected remote mirror lock response: $actual"
+              return 1
+            }
+          }
+          finish_remote_lock() {
+            printf '%s\n' RELEASE >&"$lock_write_fd"
+            wait "$lock_pid"
+            lock_pid=""
+            lock_read_fd=""
+            lock_write_fd=""
+          }
+          read_reply LOCKED 200
+
           latest_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
           update_latest=0
           stable_bootstrap_updated=0
@@ -569,35 +1390,26 @@ jobs:
               echo "::error::current Latest release has no verified high-assurance bootstrap set"
               exit 1
             }
+            printf '%s\n' PUBLISH_SUN >&"$lock_write_fd"
+            read_reply SUN_PUBLISHED 60
+            "$RUNNER_TEMP/download-limited" 1048576 public-sun.sh \
+              "$MIRROR_BASE_URL/sun.sh?run=$GITHUB_RUN_ID&attempt=$GITHUB_RUN_ATTEMPT"
+            cmp "deploy/$TAG/sun.sh" public-sun.sh
+
+            printf '%s\n' PUBLISH_LATEST >&"$lock_write_fd"
+            read_reply LATEST_PUBLISHED 60
+            "$RUNNER_TEMP/download-limited" 1048576 public-latest.json \
+              "$MIRROR_BASE_URL/latest.json?run=$GITHUB_RUN_ID&attempt=$GITHUB_RUN_ATTEMPT"
+            cmp latest.json public-latest.json
             update_latest=1
             stable_bootstrap_updated=1
           else
             echo "Mirrored $TAG without changing stable files (GitHub Latest is $latest_tag)."
           fi
+          finish_remote_lock
+          trap - EXIT HUP INT TERM
           printf 'UPDATE_LATEST=%s\nSTABLE_BOOTSTRAP_UPDATED=%s\n' \
             "$update_latest" "$stable_bootstrap_updated" >> "$GITHUB_ENV"
-
-      - name: Publish stable bootstrap
-        if: env.STABLE_BOOTSTRAP_UPDATED == '1'
-        run: |
-          set -euo pipefail
-          rsync --archive --checksum --delay-updates --chmod=F644 \
-            "deploy/$TAG/sun.sh" "$MIRROR_USER@$MIRROR_HOST:sun.sh"
-          curl --fail --location --retry 3 --retry-all-errors \
-            --proto '=https' --proto-redir '=https' \
-            "$MIRROR_BASE_URL/sun.sh?run=$GITHUB_RUN_ID" > public-sun.sh
-          cmp "deploy/$TAG/sun.sh" public-sun.sh
-
-      - name: Publish latest manifest last
-        if: env.UPDATE_LATEST == '1'
-        run: |
-          set -euo pipefail
-          rsync --archive --checksum --delay-updates --chmod=F644 \
-            latest.json "$MIRROR_USER@$MIRROR_HOST:latest.json"
-          curl --fail --location --retry 3 --retry-all-errors \
-            --proto '=https' --proto-redir '=https' \
-            "$MIRROR_BASE_URL/latest.json?run=$GITHUB_RUN_ID" > public-latest.json
-          cmp latest.json public-latest.json
 
       - name: Remove SSH identity
         if: always()

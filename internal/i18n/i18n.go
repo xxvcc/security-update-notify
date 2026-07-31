@@ -10,17 +10,23 @@ package i18n
 
 import (
 	"bufio"
+	"bytes"
+	"io"
 	"os"
 	"regexp"
 	"strings"
+	"syscall"
+
+	"github.com/xxvcc/security-update-notify/internal/filetrust"
 )
 
 // Lang 是 zh 或 en。
 type Lang string
 
 const (
-	ZH Lang = "zh"
-	EN Lang = "en"
+	ZH                    Lang = "zh"
+	EN                    Lang = "en"
+	maxPreReadConfigBytes      = 4 << 20
 )
 
 // Display 解析终端显示语言：uiLang 优先，否则 notifyLang，否则 zh；只有有效值恰为 "en" 才是英文。
@@ -56,27 +62,42 @@ func (l Lang) Pick(zh, en string) string {
 	return zh
 }
 
-// preReadRe 复刻运行时从 env 文件预读 NOTIFY_LANG 的 sed：
-//
-//	s/^[[:space:]]*NOTIFY_LANG[[:space:]]*=[[:space:]]*["']\{0,1\}\(zh\|en\)["']\{0,1\}.*/\1/p
-//
-// 只接受值恰为 zh 或 en（可选一层引号），取首个匹配。
-var preReadRe = regexp.MustCompile(`^[ \t]*NOTIFY_LANG[ \t]*=[ \t]*["']?(zh|en)["']?`)
+// preReadRe accepts the protected env-file forms that resolve to exactly zh or
+// en. Unquoted values may carry the same whitespace-prefixed inline comment
+// accepted by the full parser; quoted values must end after the closing quote.
+var preReadRe = regexp.MustCompile(`^(?:export )?[ \t]*NOTIFY_LANG[ \t]*=[ \t]*(?:"(zh|en)"[ \t]*|'(zh|en)'[ \t]*|(zh|en)(?:[ \t]*|[ \t]+#.*))$`)
 
 // PreReadNotifyLang 在完整配置加载前，从 env 文件里预读 NOTIFY_LANG（供 --check-upgrade/--upgrade
 // 的显示语言跟随已安装配置）。文件不可读或未命中返回 ""。取首个匹配行。
 func PreReadNotifyLang(envPath string) string {
-	f, err := os.Open(envPath)
+	return preReadNotifyLang(envPath, os.Geteuid())
+}
+
+func preReadNotifyLang(envPath string, euid int) string {
+	fd, err := syscall.Open(envPath, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return ""
 	}
+	f := os.NewFile(uintptr(fd), envPath)
 	defer f.Close()
-	sc := bufio.NewScanner(f)
+	info, err := f.Stat()
+	if err != nil || filetrust.ValidateRegular(info, euid, 0o077, true) != nil || info.Size() > maxPreReadConfigBytes {
+		return ""
+	}
+	contents, err := io.ReadAll(io.LimitReader(f, maxPreReadConfigBytes+1))
+	if err != nil || len(contents) > maxPreReadConfigBytes {
+		return ""
+	}
+	sc := bufio.NewScanner(bytes.NewReader(contents))
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024) // 放宽默认 64KB 行上限，避免超长行使后续行被跳过
 	for sc.Scan() {
 		line := strings.TrimRight(sc.Text(), "\r")
 		if m := preReadRe.FindStringSubmatch(line); m != nil {
-			return m[1]
+			for _, value := range m[1:] {
+				if value != "" {
+					return value
+				}
+			}
 		}
 	}
 	return ""

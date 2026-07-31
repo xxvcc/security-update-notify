@@ -25,12 +25,13 @@ bootstrap_version_notation="release-version@xxv.cc"
 mirror_root="https://dl.ll.cd/security-update-notify"
 work="$(mktemp -d "$RUNNER_TEMP/security-update-notify-canary.XXXXXX")"
 cleanup_failed=0
+canary_install_started=0
 
 cleanup() {
   local rc=$?
   trap - EXIT
   set +e
-  if [[ -x /usr/local/sbin/security-update-notify ]]; then
+  if [[ "$canary_install_started" -eq 1 && -x /usr/local/sbin/security-update-notify ]]; then
     if ! /usr/local/sbin/security-update-notify uninstall --purge-config --lang en; then
       cleanup_failed=1
     fi
@@ -122,13 +123,52 @@ assert_package_state_not_regressed() {
 }
 
 curl_args=(
-  --fail --silent --show-error --location
+  --disable --fail --silent --show-error --location
   --retry 4 --retry-all-errors --connect-timeout 15 --max-time 180
   --proto '=https' --proto-redir '=https'
 )
+
+download_limited() {
+  local limit="$1" output="$2" part="${2}.part"
+  shift 2
+  rm -f -- "$part"
+  if curl "${curl_args[@]}" --max-filesize "$limit" "$@" | python3 -I -c '
+import os
+import sys
+
+limit = int(sys.argv[1])
+path = sys.argv[2]
+if limit < 0:
+    raise SystemExit(1)
+try:
+    with open(path, "xb") as output:
+        remaining = limit
+        while True:
+            chunk = sys.stdin.buffer.read(min(65536, remaining + 1))
+            if not chunk:
+                break
+            if len(chunk) > remaining:
+                raise ValueError("download exceeds size limit")
+            output.write(chunk)
+            remaining -= len(chunk)
+except Exception:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    raise SystemExit(1)
+' "$limit" "$part"; then
+    if mv -f -- "$part" "$output"; then
+      return 0
+    fi
+  fi
+  rm -f -- "$part"
+  return 1
+}
+
 cache_key="${GITHUB_RUN_ID:-manual}-$(date +%s)"
-curl "${curl_args[@]}" --max-filesize 1048576 \
-  --output "$work/latest.json" "$mirror_root/latest.json?canary=$cache_key"
+download_limited 1048576 "$work/latest.json" \
+  "$mirror_root/latest.json?canary=$cache_key"
 
 jq -e '
   (keys | sort) == ["base_url", "published_at", "sha256", "signing_fingerprint", "tag", "version"] and
@@ -153,6 +193,9 @@ github_latest="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_nam
 [[ "$github_latest" == "$tag" ]] || die "mirror Latest $tag differs from GitHub Latest $github_latest"
 release_json="$work/release.json"
 gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" >"$release_json"
+# No downloaded bootstrap or release runtime should inherit the workflow token.
+# All GitHub API reads are complete before this point.
+unset GH_TOKEN GITHUB_TOKEN
 release_immutable="$(jq -r .immutable "$release_json")"
 if [[ "$release_immutable" != "true" && "$tag" != "v3.0.1" ]]; then
   die "release $tag is not immutable"
@@ -183,18 +226,16 @@ for suffix in "" .sha256 .asc; do
   asset="$archive$suffix"
   max_size=1048576
   [[ -z "$suffix" ]] && max_size=268435456
-  curl "${curl_args[@]}" --max-filesize "$max_size" \
-    --output "$work/github/$asset" "$github_base/$asset?canary=$cache_key"
-  curl "${curl_args[@]}" --max-filesize "$max_size" \
-    --output "$work/mirror/$asset" "$base_url/$asset?canary=$cache_key"
+  download_limited "$max_size" "$work/github/$asset" \
+    "$github_base/$asset?canary=$cache_key"
+  download_limited "$max_size" "$work/mirror/$asset" \
+    "$base_url/$asset?canary=$cache_key"
   cmp "$work/github/$asset" "$work/mirror/$asset" || die "GitHub/mirror mismatch: $asset"
 done
 if [[ -n "$bootstrap_signature_asset" ]]; then
-  curl "${curl_args[@]}" --max-filesize 1048576 \
-    --output "$work/github/$bootstrap_signature_asset" \
+  download_limited 1048576 "$work/github/$bootstrap_signature_asset" \
     "$github_base/$bootstrap_signature_asset?canary=$cache_key"
-  curl "${curl_args[@]}" --max-filesize 1048576 \
-    --output "$work/mirror/$bootstrap_signature_asset" \
+  download_limited 1048576 "$work/mirror/$bootstrap_signature_asset" \
     "$base_url/$bootstrap_signature_asset?canary=$cache_key"
   cmp "$work/github/$bootstrap_signature_asset" "$work/mirror/$bootstrap_signature_asset" ||
     die "GitHub/mirror mismatch: $bootstrap_signature_asset"
@@ -209,27 +250,29 @@ actual_sha="$(sha256sum "$work/mirror/$archive" | awk '{print $1}')"
 
 export GNUPGHOME="$work/gnupg"
 install -d -m 0700 "$GNUPGHOME"
-gpg --batch --import "$root_dir/files/release-signing.pub.asc" >/dev/null 2>&1
+gpg --no-options --batch --import "$root_dir/files/release-signing.pub.asc" >/dev/null 2>&1
 mapfile -t fingerprints < <(
-  gpg --batch --with-colons --list-keys |
+  gpg --no-options --batch --with-colons --list-keys |
     awk -F: '$1 == "pub" { want = 1; next } want && $1 == "fpr" { print $10; want = 0 }'
 )
 [[ "${#fingerprints[@]}" -eq 1 && "${fingerprints[0]}" == "$pin" ]] ||
   die "verification keyring does not contain exactly the pinned key"
-status="$(gpg --batch --status-fd=1 --verify \
+status="$(gpg --no-options --batch --status-fd=1 --verify \
   "$work/mirror/$archive.asc" "$work/mirror/$archive" 2>"$work/gpg.log")" || {
   cat "$work/gpg.log" >&2
   die "release signature verification failed"
 }
 awk -v pin="$pin" '
+  $1 == "[GNUPG:]" && $2 == "GOODSIG" { outcome_count++; good_count++ }
+  $1 == "[GNUPG:]" && $2 ~ /^(EXPSIG|EXPKEYSIG|REVKEYSIG|BADSIG|ERRSIG)$/ { outcome_count++ }
   $1 == "[GNUPG:]" && $2 == "VALIDSIG" {
     valid_count++
     if ($3 == pin || $NF == pin) pinned_count++
   }
-  END { exit !(valid_count == 1 && pinned_count == 1) }
+  END { exit !(outcome_count == 1 && good_count == 1 && valid_count == 1 && pinned_count == 1) }
 ' <<<"$status" || die "release signature is not uniquely bound to the pinned key"
 
-python3 - "$work/mirror/$archive" "security-update-notify-$version/sun.sh" "$work/signed-sun.sh" <<'PY'
+python3 -I - "$work/mirror/$archive" "security-update-notify-$version/sun.sh" "$work/signed-sun.sh" <<'PY'
 import pathlib
 import sys
 import tarfile
@@ -244,14 +287,13 @@ with tarfile.open(archive, "r:gz") as bundle:
         raise SystemExit("could not read signed sun.sh")
     pathlib.Path(output).write_bytes(stream.read())
 PY
-curl "${curl_args[@]}" --max-filesize 2097152 \
-  --output "$work/stable-sun.sh" "$mirror_root/sun.sh?canary=$cache_key"
+download_limited 2097152 "$work/stable-sun.sh" \
+  "$mirror_root/sun.sh?canary=$cache_key"
 cmp "$work/signed-sun.sh" "$work/stable-sun.sh" || die "stable bootstrap differs from signed release"
 if [[ -n "$bootstrap_signature_asset" ]]; then
-  curl "${curl_args[@]}" --max-filesize 2097152 \
-    --output "$work/versioned-sun.sh" "$base_url/sun.sh?canary=$cache_key"
-  curl "${curl_args[@]}" --max-filesize 1048576 \
-    --output "$work/versioned-release-signing.pub.asc" \
+  download_limited 2097152 "$work/versioned-sun.sh" \
+    "$base_url/sun.sh?canary=$cache_key"
+  download_limited 1048576 "$work/versioned-release-signing.pub.asc" \
     "$base_url/release-signing.pub.asc?canary=$cache_key"
   cmp "$work/signed-sun.sh" "$work/versioned-sun.sh" ||
     die "versioned bootstrap differs from signed release"
@@ -259,18 +301,21 @@ if [[ -n "$bootstrap_signature_asset" ]]; then
     die "stable bootstrap differs from versioned bootstrap"
   cmp "$root_dir/files/release-signing.pub.asc" "$work/versioned-release-signing.pub.asc" ||
     die "versioned verification key differs from the pinned source key"
-  bootstrap_status="$(gpg --batch --known-notation "$bootstrap_version_notation" \
+  bootstrap_status="$(gpg --no-options --batch --known-notation "$bootstrap_version_notation" \
     --status-fd=1 --show-notation --verify \
     "$work/mirror/$bootstrap_signature_asset" "$work/stable-sun.sh" 2>"$work/bootstrap-gpg.log")" || {
     cat "$work/bootstrap-gpg.log" >&2
     die "bootstrap signature verification failed"
   }
   awk -v pin="$pin" -v notation="$bootstrap_version_notation" -v version="$version" '
+    $1 == "[GNUPG:]" && $2 == "GOODSIG" { outcome_count++; good_count++ }
+    $1 == "[GNUPG:]" && $2 ~ /^(EXPSIG|EXPKEYSIG|REVKEYSIG|BADSIG|ERRSIG)$/ { outcome_count++ }
     $1 == "[GNUPG:]" && $2 == "VALIDSIG" { valid_count++; if ($3 == pin || $NF == pin) pinned_count++ }
     $1 == "[GNUPG:]" && $2 == "NOTATION_NAME" { name_count++; if (NF == 3 && $3 == notation) name_match++ }
     $1 == "[GNUPG:]" && $2 == "NOTATION_FLAGS" { flags_count++; if (NF == 4 && $3 == 1 && $4 == 1) flags_match++ }
     $1 == "[GNUPG:]" && $2 == "NOTATION_DATA" { data_count++; if (NF == 3 && $3 == version) data_match++ }
-    END { exit !(valid_count == 1 && pinned_count == 1 && name_count == 1 && name_match == 1 &&
+    END { exit !(outcome_count == 1 && good_count == 1 && valid_count == 1 && pinned_count == 1 &&
+                 name_count == 1 && name_match == 1 &&
                  flags_count == 1 && flags_match == 1 && data_count == 1 && data_match == 1) }
   ' <<<"$bootstrap_status" ||
     die "bootstrap signature is not uniquely bound to the pinned key and release version"
@@ -289,7 +334,8 @@ printf '%s\n' \
   'CHECK_EOL=0' \
   'CHECK_SELF_UPDATE=0' >"$canary_env"
 printf '%s\n' '123456:canary_ABCDEFGHIJKLMNOPQRSTUVWXYZ' >"$telegram_token_file"
-bash "$work/stable-sun.sh" \
+canary_install_started=1
+/bin/bash -p "$work/stable-sun.sh" \
   --lang en --version "$version" --base-url "$base_url" install \
   --env-file "$canary_env" \
   --notify-channels telegram \

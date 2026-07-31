@@ -4,8 +4,10 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -80,5 +82,137 @@ func TestArchiveEntryLimit(t *testing.T) {
 	}
 	if err := Extract(path, t.TempDir()); err == nil {
 		t.Fatal("archive entry bomb was extracted")
+	}
+}
+
+func TestArchiveReadersRejectCorruptedGzipFooter(t *testing.T) {
+	const top = "security-update-notify-9.9.9"
+	path := buildTarGz(t, []*tar.Header{dir(top + "/"), reg(top + "/VERSION")})
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) < 8 {
+		t.Fatal("test gzip stream is unexpectedly short")
+	}
+	b[len(b)-1] ^= 0xff // corrupt the gzip ISIZE footer without changing tar bytes
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckArchive(path, top); err == nil {
+		t.Fatal("archive check accepted a corrupt gzip footer")
+	}
+	if err := Extract(path, t.TempDir()); err == nil {
+		t.Fatal("archive extraction accepted a corrupt gzip footer")
+	}
+}
+
+func TestArchiveReadersRejectConcatenatedGzipStreams(t *testing.T) {
+	const top = "security-update-notify-9.9.9"
+	path := buildTarGz(t, []*tar.Header{dir(top + "/"), reg(top + "/VERSION")})
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz := gzip.NewWriter(f)
+	if _, err := gz.Write([]byte("unchecked second gzip member")); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckArchive(path, top); err == nil {
+		t.Fatal("archive check accepted concatenated gzip members")
+	}
+	if err := Extract(path, t.TempDir()); err == nil {
+		t.Fatal("archive extraction accepted concatenated gzip members")
+	}
+}
+
+func TestArchiveReadersRejectNonZeroDataAfterTarEnd(t *testing.T) {
+	const top = "security-update-notify-9.9.9"
+	path := buildTarGz(t, []*tar.Header{dir(top + "/"), reg(top + "/VERSION")})
+	compressed, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz, err := gzip.NewReader(compressed)
+	if err != nil {
+		_ = compressed.Close()
+		t.Fatal(err)
+	}
+	tarBytes, err := io.ReadAll(gz)
+	if err != nil {
+		_ = gz.Close()
+		_ = compressed.Close()
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		_ = compressed.Close()
+		t.Fatal(err)
+	}
+	if err := compressed.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gzWriter := gzip.NewWriter(output)
+	if _, err := gzWriter.Write(append(tarBytes, []byte("hidden trailing payload")...)); err != nil {
+		_ = gzWriter.Close()
+		_ = output.Close()
+		t.Fatal(err)
+	}
+	if err := gzWriter.Close(); err != nil {
+		_ = output.Close()
+		t.Fatal(err)
+	}
+	if err := output.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckArchive(path, top); err == nil {
+		t.Fatal("archive check accepted a non-zero payload after the tar end marker")
+	}
+	if err := Extract(path, t.TempDir()); err == nil {
+		t.Fatal("archive extraction accepted a non-zero payload after the tar end marker")
+	}
+}
+
+func TestArchivePathResourceLimits(t *testing.T) {
+	const top = "security-update-notify-9.9.9"
+	cases := map[string]string{
+		"bytes":     top + "/" + strings.Repeat(strings.Repeat("p", 240)+"/", 17) + "payload",
+		"depth":     top + "/" + strings.Repeat("d/", maxArchivePathDepth) + "payload",
+		"component": top + "/" + strings.Repeat("x", maxArchiveComponentBytes+1),
+	}
+	for name, entry := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := buildTarGz(t, []*tar.Header{reg(entry)})
+			if err := CheckArchive(path, top); err == nil {
+				t.Fatal("archive check accepted an over-limit path")
+			}
+			if err := Extract(path, t.TempDir()); err == nil {
+				t.Fatal("archive extraction accepted an over-limit path")
+			}
+		})
+	}
+}
+
+func TestArchiveTotalPathComponentLimit(t *testing.T) {
+	const top = "security-update-notify-9.9.9"
+	const componentsPerEntry = 16
+	prefix := top + "/" + strings.Repeat("d/", componentsPerEntry-2)
+	entryCount := maxArchivePathComponents/componentsPerEntry + 1
+	headers := make([]*tar.Header, 0, entryCount)
+	for index := 0; index < entryCount; index++ {
+		headers = append(headers, reg(prefix+fmt.Sprintf("file-%05d", index)))
+	}
+	if err := CheckArchive(buildTarGz(t, headers), top); err == nil {
+		t.Fatal("archive check accepted an excessive total path-component workload")
 	}
 }

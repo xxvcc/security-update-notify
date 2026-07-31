@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io/fs"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/xxvcc/security-update-notify/internal/backend"
 	"github.com/xxvcc/security-update-notify/internal/config"
+	"github.com/xxvcc/security-update-notify/internal/filetrust"
 	"github.com/xxvcc/security-update-notify/internal/osrel"
 )
 
@@ -203,7 +205,7 @@ func (i *Installer) probeInferredDNFProfile(ctx context.Context, release osrel.O
 		result := i.runner.Run(probeContext, Command{
 			Name: candidate, Args: []string{"--version"}, Timeout: 30 * time.Second,
 		})
-		if result.Err != nil || result.Code != 0 {
+		if commandResultIncomplete(result) || result.Err != nil || result.Code != 0 {
 			continue
 		}
 		generation, known := backend.ProbeDNFGeneration(candidate, string(result.Stdout)+"\n"+string(result.Stderr))
@@ -295,38 +297,58 @@ func normalizeAndValidateConfig(values map[string]string, allowMissingFeishuReci
 	switch values["DEDUP_MODE"] {
 	case "once", "daily":
 	case "interval":
-		if !positiveRE.MatchString(values["DEDUP_INTERVAL_DAYS"]) {
+		if !validDayCount(values["DEDUP_INTERVAL_DAYS"], false) {
 			return invalid("invalid dedup interval days")
 		}
 	default:
 		return invalid("invalid dedup mode: %s", values["DEDUP_MODE"])
 	}
 	for _, key := range []string{"STALE_UPDATE_DAYS", "PENDING_ALERT_DAYS", "RESTART_ALERT_DAYS"} {
-		if !nonNegativeRE.MatchString(values[key]) {
+		if !validDayCount(values[key], true) {
 			return invalid("invalid %s: expected a non-negative integer", key)
 		}
 	}
-	if !positiveRE.MatchString(values["SELF_UPDATE_CHECK_DAYS"]) {
+	if !validDayCount(values["SELF_UPDATE_CHECK_DAYS"], false) {
 		return invalid("invalid SELF_UPDATE_CHECK_DAYS: expected a positive integer")
 	}
 	return nil
 }
 
+// Official artifacts include 32-bit builds, so persisted day counts must have
+// identical integer semantics on every supported architecture.
+func validDayCount(value string, allowZero bool) bool {
+	pattern := positiveRE
+	if allowZero {
+		pattern = nonNegativeRE
+	}
+	if !pattern.MatchString(value) {
+		return false
+	}
+	_, err := strconv.ParseUint(value, 10, 31)
+	return err == nil
+}
+
 func normalizeChannels(raw string) (string, error) {
-	hasTelegram, hasFeishu := false, false
-	for _, item := range strings.Split(strings.ToLower(strings.Map(func(r rune) rune {
+	cleaned := strings.ToLower(strings.Map(func(r rune) rune {
 		if strings.ContainsRune(" \t\n\v\f\r", r) {
 			return -1
 		}
 		return r
-	}, raw)), ",") {
+	}, raw))
+	// Split never yields zero items, so without this guard an empty value reaches the loop as a
+	// single empty item and reports "invalid receiving platform:" naming nothing.
+	if cleaned == "" {
+		return "", invalid("receiving platforms cannot be empty")
+	}
+	hasTelegram, hasFeishu := false, false
+	for _, item := range strings.Split(cleaned, ",") {
 		switch item {
 		case "telegram":
 			hasTelegram = true
 		case "feishu":
 			hasFeishu = true
 		default:
-			return "", invalid("invalid receiving platform: %s", item)
+			return "", invalid("invalid receiving platform: %q", item)
 		}
 	}
 	switch {
@@ -334,10 +356,9 @@ func normalizeChannels(raw string) (string, error) {
 		return "telegram,feishu", nil
 	case hasTelegram:
 		return "telegram", nil
-	case hasFeishu:
-		return "feishu", nil
 	default:
-		return "", invalid("receiving platforms cannot be empty")
+		// A non-empty value whose every item was accepted must have set at least one flag.
+		return "feishu", nil
 	}
 }
 
@@ -419,9 +440,12 @@ func (i *Installer) readExistingConfig() (map[string]string, bool, error) {
 	if info.Size() > 4<<20 {
 		return nil, false, failure("read existing config", errors.New("config exceeds 4 MiB"))
 	}
-	data, _, err := i.fs.ReadRegularFile(ConfigPath, 4<<20)
+	data, openedInfo, err := i.fs.ReadRegularFile(ConfigPath, 4<<20)
 	if err != nil {
 		return nil, false, failure("read existing config", err)
+	}
+	if err := filetrust.ValidateRegular(openedInfo, int(i.rootOwnerUID), 0o077, true); err != nil {
+		return nil, false, failure("read existing config", fmt.Errorf("config must be a protected root-owned regular file with one hard link: %w", err))
 	}
 	if len(data) > 4<<20 {
 		return nil, false, failure("read existing config", errors.New("config exceeds 4 MiB"))
@@ -500,12 +524,15 @@ func (i *Installer) readExistingCheckTime() (string, error) {
 	if info.Mode()&fs.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return "", failure("inspect existing timer", errors.New("timer unit must be a regular file, not a symlink"))
 	}
-	data, _, err := i.fs.ReadRegularFile(TimerPath, 1<<20)
+	data, openedInfo, err := i.fs.ReadRegularFile(TimerPath, 1<<20)
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", nil
 	}
 	if err != nil {
 		return "", failure("read existing timer", err)
+	}
+	if err := filetrust.ValidateRegular(openedInfo, int(i.rootOwnerUID), 0o022, true); err != nil {
+		return "", failure("read existing timer", fmt.Errorf("timer unit must be a protected root-owned regular file with one hard link: %w", err))
 	}
 	if len(data) > 1<<20 {
 		return "", failure("read existing timer", errors.New("timer unit exceeds 1 MiB"))
@@ -526,9 +553,13 @@ func (i *Installer) readOSRelease() (osrel.OSRelease, error) {
 	} else if statErr != nil {
 		return osrel.OSRelease{}, failure("read "+path, statErr)
 	}
-	data, _, err := i.fs.ReadFileFollow(path, 4<<20)
+	data, openedInfo, err := i.fs.ReadFileFollow(path, 4<<20)
 	if err != nil {
 		return osrel.OSRelease{}, failure("read "+path, err)
+	}
+	if err := filetrust.ValidateRegular(openedInfo, int(i.rootOwnerUID), 0o022, false); err != nil {
+		return osrel.OSRelease{}, failure("read "+path,
+			fmt.Errorf("os-release must resolve to a protected root-owned regular file: %w", err))
 	}
 	if len(data) > 4<<20 {
 		return osrel.OSRelease{}, failure("read "+path, errors.New("file exceeds 4 MiB"))

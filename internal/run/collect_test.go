@@ -3,6 +3,8 @@ package run
 import (
 	"fmt"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/xxvcc/security-update-notify/internal/config"
 	"github.com/xxvcc/security-update-notify/internal/osrel"
+	"github.com/xxvcc/security-update-notify/internal/sysexec"
 )
 
 func TestUbuntu2004ESMSupportEndRequiresEnabledInfraService(t *testing.T) {
@@ -18,15 +21,15 @@ func TestUbuntu2004ESMSupportEndRequiresEnabledInfraService(t *testing.T) {
 		return `{"_schema_version":"v1","data":{"attributes":{"enabled_services":` + services + `},"type":"EnabledServices"},"errors":[],"result":"success"}`
 	}
 	for _, test := range []struct {
-		name   string
-		output string
-		code   int
-		want   string
+		name, output, stderr string
+		code                 int
+		want                 string
 	}{
 		{name: "esm infra enabled", output: status(`[{"name":"esm-apps"},{"name":"esm-infra"}]`), want: ubuntu2004ESMSupportEnd},
 		{name: "unattached", output: status(`[]`), want: "2025-05-31"},
 		{name: "only esm apps", output: status(`[{"name":"esm-apps"}]`), want: "2025-05-31"},
 		{name: "command failure", output: status(`[{"name":"esm-infra"}]`), code: 1, want: "2025-05-31"},
+		{name: "command warning", output: status(`[{"name":"esm-infra"}]`), stderr: "warning", want: "2025-05-31"},
 		{name: "schema drift", output: `{"_schema_version":"v2","data":{"attributes":{"enabled_services":[{"name":"esm-infra"}]},"type":"EnabledServices"},"errors":[],"result":"success"}`, want: "2025-05-31"},
 		{name: "missing errors", output: `{"_schema_version":"v1","data":{"attributes":{"enabled_services":[{"name":"esm-infra"}]},"type":"EnabledServices"},"result":"success"}`, want: "2025-05-31"},
 		{name: "null services", output: `{"_schema_version":"v1","data":{"attributes":{"enabled_services":null},"type":"EnabledServices"},"errors":[],"result":"success"}`, want: "2025-05-31"},
@@ -34,7 +37,12 @@ func TestUbuntu2004ESMSupportEndRequiresEnabledInfraService(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			dir := t.TempDir()
-			writeTestCommand(t, dir, "pro", fmt.Sprintf("printf '%%s\\n' '%s'\nexit %d\n", test.output, test.code))
+			body := fmt.Sprintf("printf '%%s\\n' '%s'\n", test.output)
+			if test.stderr != "" {
+				body += fmt.Sprintf("printf '%%s\\n' '%s' >&2\n", test.stderr)
+			}
+			body += fmt.Sprintf("exit %d\n", test.code)
+			writeTestCommand(t, dir, "pro", body)
 			t.Setenv("PATH", dir)
 			got := effectiveSupportEnd(osrel.OSRelease{ID: "ubuntu", VersionID: "20.04", PrettyName: "Ubuntu 20.04 LTS"})
 			if got != test.want {
@@ -45,7 +53,7 @@ func TestUbuntu2004ESMSupportEndRequiresEnabledInfraService(t *testing.T) {
 }
 
 func TestEffectiveSupportEndPreservesOSReleaseOverride(t *testing.T) {
-	t.Setenv("PATH", t.TempDir())
+	setTestCommandPath(t, t.TempDir())
 	o := osrel.OSRelease{ID: "custom", VersionID: "1", SupportEnd: "2032-06-30"}
 	if got := effectiveSupportEnd(o); got != o.SupportEnd {
 		t.Fatalf("effectiveSupportEnd()=%q want %q", got, o.SupportEnd)
@@ -53,7 +61,7 @@ func TestEffectiveSupportEndPreservesOSReleaseOverride(t *testing.T) {
 }
 
 func TestUbuntu2004IgnoresGenericSupportEndWithoutESM(t *testing.T) {
-	t.Setenv("PATH", t.TempDir())
+	setTestCommandPath(t, t.TempDir())
 	o := osrel.OSRelease{
 		ID: "ubuntu", VersionID: "20.04", PrettyName: "Ubuntu 20.04 LTS", SupportEnd: ubuntu2004ESMSupportEnd,
 	}
@@ -124,45 +132,98 @@ func TestCollectTestModeOrchestratesPackageCollection(t *testing.T) {
 func TestCollectHealthUsesSystemdCommandResults(t *testing.T) {
 	dir := t.TempDir()
 	epoch := time.Now().Unix()
-	callLog := filepath.Join(t.TempDir(), "systemctl.calls")
-	writeTestCommand(t, dir, "systemctl", `
-printf '%s\n' "$*" >> "$SUN_SYSTEMCTL_CALL_LOG"
-case "$1:$4" in
-  is-enabled:*) printf '%s\n' enabled ;;
-  show:ExecMainExitTimestamp) printf '%s\n' 'fixture timestamp' ;;
-  show:LastTriggerUSec) printf '%s\n' 'fixture timestamp' ;;
-  show:Result) printf '%s\n' 'success' ;;
-  *) exit 2 ;;
-esac
-`)
 	writeTestCommand(t, dir, "date", fmt.Sprintf("printf '%%s\\n' '%d'\n", epoch))
 	t.Setenv("PATH", dir)
-	t.Setenv("SUN_SYSTEMCTL_CALL_LOG", callLog)
+	query := &recordingSystemdQuery{
+		available: true,
+		enabled:   map[string]bool{"apt-daily-upgrade.timer": true},
+		values: map[string]string{
+			"apt-daily-upgrade.service\x00ExecMainExitTimestamp": "fixture timestamp",
+			"apt-daily-upgrade.timer\x00LastTriggerUSec":         "fixture timestamp",
+			"apt-daily-upgrade.service\x00Result":                "success",
+		},
+	}
 
-	health := collectHealth("apt", 7)
+	health := collectHealthWithSystemd("apt", 7, query)
 	for _, unexpected := range []string{"disabled", "failed", "stale", "never-success"} {
 		if strings.Contains(health.Sig, unexpected) {
 			t.Fatalf("health signal %q contains %q", health.Sig, unexpected)
 		}
 	}
-	calls, err := os.ReadFile(callLog)
-	if err != nil {
-		t.Fatal(err)
-	}
-	callText := string(calls)
 	for _, want := range []string{
-		"show apt-daily-upgrade.service -p ExecMainExitTimestamp --value",
-		"show apt-daily-upgrade.timer -p LastTriggerUSec --value",
+		"show apt-daily-upgrade.service ExecMainExitTimestamp",
+		"show apt-daily-upgrade.timer LastTriggerUSec",
 		"is-enabled apt-daily-upgrade.timer",
-		"show apt-daily-upgrade.service -p Result --value",
+		"show apt-daily-upgrade.service Result",
 	} {
-		if strings.Count(callText, want+"\n") != 1 {
-			t.Fatalf("systemctl calls missing or repeated %q:\n%s", want, callText)
+		if countString(query.calls, want) != 1 {
+			t.Fatalf("systemd calls missing or repeated %q: %v", want, query.calls)
 		}
 	}
-	if got := collectHealth("unsupported", 7); got.Attention || got.Sig != "" {
+	if got := collectHealthWithSystemd("unsupported", 7, query); got.Attention || got.Sig != "" {
 		t.Fatalf("unsupported backend health=%+v", got)
 	}
+}
+
+type recordingSystemdQuery struct {
+	available    bool
+	enabled      map[string]bool
+	values       map[string]string
+	showFailures map[string]bool
+	calls        []string
+}
+
+func (q *recordingSystemdQuery) Available() bool { return q.available }
+
+func (q *recordingSystemdQuery) IsEnabled(unit string) bool {
+	q.calls = append(q.calls, "is-enabled "+unit)
+	return q.enabled[unit]
+}
+
+func (q *recordingSystemdQuery) ShowValue(unit, prop string) (string, bool) {
+	q.calls = append(q.calls, "show "+unit+" "+prop)
+	key := unit + "\x00" + prop
+	return q.values[key], !q.showFailures[key]
+}
+
+func TestCollectHealthReportsSystemdShowFailure(t *testing.T) {
+	query := &recordingSystemdQuery{
+		available: true,
+		enabled:   map[string]bool{"apt-daily-upgrade.timer": true},
+		values: map[string]string{
+			"apt-daily-upgrade.service\x00Result": "success",
+		},
+		showFailures: map[string]bool{
+			"apt-daily-upgrade.service\x00ExecMainExitTimestamp": true,
+		},
+	}
+	health := collectHealthWithSystemd("apt", 7, query)
+	if !health.Attention || !strings.Contains(health.Sig, "query,") {
+		t.Fatalf("failed systemd show query health=%+v", health)
+	}
+	if !strings.Contains(health.TxtEN, "Could not reliably query systemd") {
+		t.Fatalf("missing query failure detail: %q", health.TxtEN)
+	}
+}
+
+func TestCollectHealthReportsSystemdUnavailable(t *testing.T) {
+	health := collectHealthWithSystemd("dnf", 7, &recordingSystemdQuery{})
+	if !health.Attention || !strings.Contains(health.Sig, "query,") {
+		t.Fatalf("unavailable systemd health=%+v", health)
+	}
+	if !strings.Contains(health.TxtEN, "Could not reliably query systemd") {
+		t.Fatalf("missing unavailable-systemd detail: %q", health.TxtEN)
+	}
+}
+
+func countString(values []string, want string) int {
+	count := 0
+	for _, value := range values {
+		if value == want {
+			count++
+		}
+	}
+	return count
 }
 
 func TestIdentityCommandErrorFallbacks(t *testing.T) {
@@ -199,6 +260,31 @@ func TestReadFilePrefixIsBounded(t *testing.T) {
 	if got := readFilePrefix(filepath.Join(t.TempDir(), "missing"), 7); got != "" {
 		t.Fatalf("missing file returned %q", got)
 	}
+	if got, _, err := readFilePrefixChecked(path, 32); err != nil || got != strings.Repeat("x", 32) {
+		t.Fatalf("exact-size checked read=%q err=%v", got, err)
+	}
+	if got, _, err := readFilePrefixChecked(path, 31); err == nil || got != "" {
+		t.Fatalf("truncated checked read=%q err=%v, want rejection", got, err)
+	}
+}
+
+func TestFetchPublicIPRequiresSuccessfulSingleIPResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/error":
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("203.0.113.1"))
+		case "/extra":
+			_, _ = w.Write([]byte("203.0.113.2 unexpected"))
+		default:
+			_, _ = w.Write([]byte("203.0.113.3\n"))
+		}
+	}))
+	defer server.Close()
+	got := fetchPublicIPFrom(server.Client(), []string{server.URL + "/error", server.URL + "/extra", server.URL + "/ok"})
+	if got != "203.0.113.3" {
+		t.Fatalf("public IP=%q", got)
+	}
 }
 
 func TestDiskAvailableKBSaturatesWithoutOverflow(t *testing.T) {
@@ -229,7 +315,8 @@ func TestBoundedCommandCollectionPreservesParsing(t *testing.T) {
 	writeTestCommand(t, dir, "needrestart", `
 [ "$1" = "-b" ] || exit 2
 printf '%s\n' \
-  'NEEDRESTART-KCUR: 6.1-old' \
+	  'NEEDRESTART-VER: 3.6' \
+	  'NEEDRESTART-KCUR: 6.1-old' \
   'NEEDRESTART-KEXP: 6.1-new' \
   'NEEDRESTART-KSTA: 3' \
   'NEEDRESTART-SVC: ssh.service'
@@ -266,6 +353,9 @@ printf '%s\n' '6.12-test'
 	apt := collectAPTWithTimeout(time.Second)
 	if !apt.RestartAttention {
 		t.Fatal("collectAPTWithTimeout() lost needrestart attention state")
+	}
+	if apt.ProbeIssue != "" {
+		t.Fatalf("successful needrestart probe issue=%q", apt.ProbeIssue)
 	}
 	wantAPTSignal := "KCUR=6.1-old\nKEXP=6.1-new\nKSTA=3\nssh.service"
 	if apt.RestartSignal != wantAPTSignal {
@@ -315,8 +405,8 @@ func TestBoundedCommandCollectionTimesOut(t *testing.T) {
 		t.Fatalf("bounded collectors took %s; a command likely escaped its timeout", elapsed)
 	}
 
-	if apt.RestartAttention {
-		t.Fatal("timed-out needrestart produced an attention signal")
+	if apt.RestartAttention || apt.ProbeIssue != "apt-restart-probe-failed" {
+		t.Fatalf("timed-out needrestart state=%+v", apt)
 	}
 	if dnf.RebootRequired || dnf.RestartAttention {
 		t.Fatalf("timed-out needs-restarting produced a signal: %+v", dnf)
@@ -326,12 +416,84 @@ func TestBoundedCommandCollectionTimesOut(t *testing.T) {
 	}
 }
 
+func TestIdentityCollectionRejectsAmbiguousOrOversizedOutput(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCommand(t, dir, "date", "printf '%s\\n' 1700000000\nprintf '%s\\n' warning >&2\n")
+	writeTestCommand(t, dir, "hostname", `
+if [ "$1" = "-f" ]; then
+  head -c 254 /dev/zero | tr '\0' x
+else
+  printf '%s\n' fallback-host
+fi
+`)
+	writeTestCommand(t, dir, "uname", "head -c 257 /dev/zero | tr '\\0' x\n")
+	t.Setenv("PATH", dir)
+	if got := parseSystemdTimeWithTimeout("fixture", time.Second); got != 0 {
+		t.Fatalf("ambiguous date output parsed as %d", got)
+	}
+	if got := hostLabelWithTimeout(loadEmptyConfig(t), time.Second); got != "fallback-host" {
+		t.Fatalf("hostname fallback=%q", got)
+	}
+	if got := kernelReleaseWithTimeout(time.Second); got != "unknown" {
+		t.Fatalf("oversized kernel release=%q", got)
+	}
+}
+
+func TestCollectAPTReportsMissingAndFailedNeedrestart(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{name: "missing"},
+		{name: "nonzero", body: "printf '%s\\n' 'NEEDRESTART-KSTA: 1'\nexit 2\n"},
+		{name: "stderr", body: "printf '%s\\n' 'NEEDRESTART-KSTA: 1'\nprintf '%s\\n' failed >&2\n"},
+		{name: "empty", body: "exit 0\n"},
+		{name: "missing version", body: "printf '%s\\n' 'NEEDRESTART-KCUR: 6.1' 'NEEDRESTART-KSTA: 1'\n"},
+		{name: "partial kernel fields", body: "printf '%s\\n' 'NEEDRESTART-VER: 3.6' 'NEEDRESTART-KSTA: 1'\n"},
+		{name: "invalid kernel status", body: "printf '%s\\n' 'NEEDRESTART-VER: 3.6' 'NEEDRESTART-KCUR: 6.1' 'NEEDRESTART-KSTA: green'\n"},
+		{name: "malformed line", body: "printf '%s\\n' 'NEEDRESTART-VER: 3.6' 'not batch protocol'\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			setTestCommandPath(t, dir)
+			if test.body != "" {
+				writeTestCommand(t, dir, "needrestart", test.body)
+			}
+			t.Setenv("PATH", dir)
+			state := collectAPTWithTimeout(time.Second)
+			if state.ProbeIssue != "apt-restart-probe-failed" {
+				t.Fatalf("state=%+v", state)
+			}
+		})
+	}
+}
+
+func TestValidNeedrestartBatchAcceptsContainerAndHostForms(t *testing.T) {
+	for _, output := range []string{
+		"NEEDRESTART-VER: 3.6\n",
+		"NEEDRESTART-VER: 3.6\nNEEDRESTART-SVC: ssh.service\n",
+		"NEEDRESTART-VER: 3.6\nNEEDRESTART-KCUR: 6.1\nNEEDRESTART-KEXP: 6.2\nNEEDRESTART-KSTA: 3\n",
+	} {
+		if !validNeedrestartBatch(output) {
+			t.Fatalf("valid needrestart batch output rejected: %q", output)
+		}
+	}
+}
+
 func writeTestCommand(t *testing.T, dir, name, body string) {
 	t.Helper()
 	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	setTestCommandPath(t, dir)
+}
+
+func setTestCommandPath(t *testing.T, path string) {
+	t.Helper()
+	restore := sysexec.SetCommandPathForTest(path)
+	t.Cleanup(restore)
+	t.Setenv("PATH", path)
 }
 
 func loadEmptyConfig(t *testing.T) *config.Config {

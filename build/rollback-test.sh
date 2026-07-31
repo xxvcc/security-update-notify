@@ -8,7 +8,7 @@ set -euo pipefail
   echo "build/rollback-test.sh must run only in a disposable container" >&2
   exit 2
 }
-awk '$5 == "/src" && $6 ~ /(^|,)ro(,|$)/ { found = 1 } END { exit !found }' /proc/self/mountinfo || {
+awk '$5 == "/src" { found = 1; if ($6 !~ /(^|,)ro(,|$)/) unsafe = 1 } END { exit !(found && !unsafe) }' /proc/self/mountinfo || {
   echo "build/rollback-test.sh requires /src to be mounted read-only" >&2
   exit 2
 }
@@ -26,6 +26,7 @@ export DEBIAN_FRONTEND=noninteractive
 mkdir -p /run/systemd/system /etc/systemd/system /usr/local/sbin /usr/local/bin \
   /etc/security-update-notify /var/lib/security-update-notify /var/log /etc/logrotate.d \
   /etc/apt/apt.conf.d /tmp/mock-systemd
+export SUN_CONTAINER_TEST_COMMAND_PATH=/usr/local/bin
 
 cat >/usr/local/bin/systemctl <<'EOF'
 #!/usr/bin/env bash
@@ -100,7 +101,7 @@ case "${1:-}" in
   daemon-reload)
     ;;
   list-timers)
-    if [[ "${FAIL_LIST_TIMERS:-0}" == 1 ]]; then
+    if [[ "${SUN_FAIL_LIST_TIMERS:-0}" == 1 ]]; then
       echo "forced list-timers failure" >&2
       exit 1
     fi
@@ -193,7 +194,7 @@ apt_sha="$(sha256sum /etc/apt/apt.conf.d/20auto-upgrades | awk '{print $1}')"
 
 echo "### Late upgrade failure rolls back files and timer state"
 set +e
-FAIL_LIST_TIMERS=1 "$runtime" install --host-label should-not-survive \
+SUN_FAIL_LIST_TIMERS=1 "$runtime" install --host-label should-not-survive \
   --skip-notify-test --non-interactive -y --skip-post-install-check --lang en \
   "${best_effort_args[@]}" \
   >/tmp/late-upgrade.out 2>&1

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/httpx"
 	"github.com/xxvcc/security-update-notify/internal/i18n"
 	"github.com/xxvcc/security-update-notify/internal/notify"
+	"github.com/xxvcc/security-update-notify/internal/textsafe"
 	"github.com/xxvcc/security-update-notify/internal/version"
 )
 
@@ -21,26 +23,42 @@ const Repo = "xxvcc/security-update-notify"
 
 // say 按语言输出一行（Go 版的 say 助手）。
 func say(w io.Writer, lang i18n.Lang, zh, en string) {
-	fmt.Fprintln(w, lang.Pick(zh, en))
+	fmt.Fprintln(w, textsafe.Multiline(lang.Pick(zh, en)))
 }
 
 // CheckUpgrade 复刻 run_check_upgrade：打印当前版本/仓库/最新版本，并给出可升级/已最新/本地更高。
-// 仅在获取最新版本失败时返回 1，其余返回 0（含“已最新”“本地更高”）。
+// 本地或远端版本非法、获取最新版本失败时返回 1；有效的比较结果返回 0（含“已最新”“本地更高”）。
 func CheckUpgrade(ver string, lang i18n.Lang) int {
-	out := os.Stdout
+	return checkUpgrade(ver, lang, dist.LatestRelease, os.Stdout, os.Stderr)
+}
+
+func checkUpgrade(ver string, lang i18n.Lang, latestRelease func(*http.Client, string) (string, error), out, errOut io.Writer) int {
+	if !validUpgradeLocalVersion(ver) {
+		say(errOut, lang, "本地版本数据无效，拒绝联网检查", "Invalid local version data; refusing the network check")
+		return 1
+	}
 	say(out, lang, "当前版本: "+ver, "Current version: "+ver)
 	say(out, lang, "仓库: "+Repo, "Repository: "+Repo)
-	latest, err := dist.LatestRelease(httpx.New(20*time.Second), Repo)
+	latest, err := latestRelease(httpx.New(20*time.Second), Repo)
 	if err != nil {
-		say(os.Stderr, lang, "无法检查最新版本", "Failed to check latest version")
+		say(errOut, lang, "无法检查最新版本", "Failed to check latest version")
+		return 1
+	}
+	if !validUpgradeLocalVersion(latest) {
+		say(errOut, lang, "版本数据无效，拒绝比较", "Invalid version data; refusing to compare")
 		return 1
 	}
 	say(out, lang, "最新版本: "+latest, "Latest version: "+latest)
-	if latest == ver {
+	comparison, err := version.Compare(latest, ver)
+	if err != nil {
+		say(errOut, lang, "版本数据无效，拒绝比较", "Invalid version data; refusing to compare")
+		return 1
+	}
+	if comparison == 0 {
 		say(out, lang, "已经是最新版本", "Already up to date")
 		return 0
 	}
-	if version.IsNewer(ver, latest) {
+	if comparison > 0 {
 		say(out, lang, "可升级: "+ver+" -> "+latest, "Upgrade available: "+ver+" -> "+latest)
 		return 0
 	}

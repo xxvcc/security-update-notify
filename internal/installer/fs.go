@@ -1,6 +1,8 @@
 package installer
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -8,9 +10,12 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"unsafe"
+
+	"github.com/xxvcc/security-update-notify/internal/filetrust"
 )
 
 const (
@@ -20,6 +25,8 @@ const (
 	atRemoveDir        = 0x200
 	oPath              = 0x200000
 	maxSymlinkDepth    = 40
+	temporaryAttempts  = 1000
+	removalPrefix      = ".security-update-notify-remove."
 )
 
 // RootFS applies logical absolute paths below Root. Root "/" addresses the
@@ -32,7 +39,31 @@ const (
 type RootFS struct {
 	Root string
 	root *os.File
+
+	// Tests use this hook to replace an atomic temporary entry at the last
+	// consistency boundary. Production instances leave it nil.
+	beforeAtomicPublish func(directory *os.File, temporary string) error
 }
+
+type regularFileState struct {
+	device    uint64
+	inode     uint64
+	mode      uint32
+	linkCount uint64
+	uid       uint32
+	gid       uint32
+	size      int64
+	mtime     syscall.Timespec
+	ctime     syscall.Timespec
+}
+
+type copyRegularFileCheckpoint uint8
+
+const (
+	copyRegularFileContentsCopied copyRegularFileCheckpoint = iota
+	copyRegularFileXattrsCaptured
+	copyRegularFileReadyToPublish
+)
 
 func NewRootFS(root string) (*RootFS, error) {
 	if root == "" || !filepath.IsAbs(root) {
@@ -305,7 +336,7 @@ func readOpenedRegularFile(file *os.File, maxBytes int64) ([]byte, fs.FileInfo, 
 	if maxBytes < 0 || info.Size() < 0 || info.Size() > maxBytes {
 		return nil, info, fmt.Errorf("file exceeds %d bytes", maxBytes)
 	}
-	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	data, err := io.ReadAll(io.LimitReader(file, limitWithOverflowByte(maxBytes)))
 	if err != nil {
 		return nil, info, err
 	}
@@ -347,18 +378,17 @@ func (f *RootFS) OpenFileNoFollow(logicalPath string, flag int, perm fs.FileMode
 	return file, nil
 }
 
-func (f *RootFS) WriteFileAtomic(logicalPath string, data []byte, perm fs.FileMode) error {
+func (f *RootFS) WriteFileAtomic(logicalPath string, data []byte, perm fs.FileMode) (returnErr error) {
 	directory, file, temporary, destination, err := f.newAtomicFile(logicalPath)
 	if err != nil {
 		return err
 	}
 	committed := false
 	defer func() {
-		_ = file.Close()
 		if !committed {
-			_ = syscall.Unlinkat(int(directory.Fd()), temporary)
+			returnErr = errors.Join(returnErr, cleanupAtomicFile(directory, file, temporary))
 		}
-		_ = directory.Close()
+		returnErr = errors.Join(returnErr, file.Close(), directory.Close())
 	}()
 	if err := file.Chmod(perm.Perm()); err != nil {
 		return err
@@ -369,20 +399,40 @@ func (f *RootFS) WriteFileAtomic(logicalPath string, data []byte, perm fs.FileMo
 	if err := file.Sync(); err != nil {
 		return err
 	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	if err := syscall.Renameat(int(directory.Fd()), temporary, int(directory.Fd()), destination); err != nil {
+	if err := f.publishAtomicFile(directory, file, temporary, destination); err != nil {
 		return err
 	}
 	committed = true
 	return directory.Sync()
 }
 
-// CopyRegularFileAtomic copies contents and the rollback-relevant metadata that
-// cp -a preserved in the shell installer: owner, mode, mtime, and xattrs (ACLs
-// are represented by system.posix_acl_* xattrs on Linux).
+// CopyRegularFileAtomic copies contents and rollback-relevant metadata from a
+// source inode trusted by the current process: current-euid ownership, no
+// group/other write bits, and exactly one hard link.
 func (f *RootFS) CopyRegularFileAtomic(source, destination string, maxBytes int64) error {
+	return f.CopyTrustedRegularFileAtomic(source, destination, maxBytes, uint32(os.Geteuid()))
+}
+
+// CopyTrustedRegularFileAtomic additionally requires the opened source inode
+// to be owned by ownerUID, non-writable by group/other, and singly linked. This
+// keeps an untrusted source owner from modifying the temporary inode after its
+// metadata has been preserved but before it is atomically published.
+func (f *RootFS) CopyTrustedRegularFileAtomic(source, destination string, maxBytes int64, ownerUID uint32) error {
+	return f.copyRegularFileAtomicValidated(source, destination, maxBytes, func(info fs.FileInfo) error {
+		if err := filetrust.ValidateRegular(info, int(ownerUID), 0o022, true); err != nil {
+			return fmt.Errorf("unsafe source file: %w", err)
+		}
+		return nil
+	}, nil)
+}
+
+// The checkpoint is nil in production and lets tests deterministically modify
+// the source at consistency boundaries.
+func (f *RootFS) copyRegularFileAtomic(source, destination string, maxBytes int64, checkpoint func(copyRegularFileCheckpoint)) (returnErr error) {
+	return f.copyRegularFileAtomicValidated(source, destination, maxBytes, nil, checkpoint)
+}
+
+func (f *RootFS) copyRegularFileAtomicValidated(source, destination string, maxBytes int64, validateSource func(fs.FileInfo) error, checkpoint func(copyRegularFileCheckpoint)) (returnErr error) {
 	if maxBytes < 0 {
 		return errors.New("invalid negative file limit")
 	}
@@ -395,10 +445,19 @@ func (f *RootFS) CopyRegularFileAtomic(source, destination string, maxBytes int6
 	if err != nil {
 		return err
 	}
+	sourceState, err := regularFileStateFromInfo(sourceInfo)
+	if err != nil {
+		return err
+	}
 	if !sourceInfo.Mode().IsRegular() {
 		return errors.New("not a regular file")
 	}
-	if sourceInfo.Size() < 0 || sourceInfo.Size() > maxBytes {
+	if validateSource != nil {
+		if err := validateSource(sourceInfo); err != nil {
+			return err
+		}
+	}
+	if sourceState.size < 0 || sourceState.size > maxBytes {
 		return fmt.Errorf("file exceeds %d bytes", maxBytes)
 	}
 
@@ -408,41 +467,106 @@ func (f *RootFS) CopyRegularFileAtomic(source, destination string, maxBytes int6
 	}
 	committed := false
 	defer func() {
-		_ = targetFile.Close()
 		if !committed {
-			_ = syscall.Unlinkat(int(directory.Fd()), temporary)
+			returnErr = errors.Join(returnErr, cleanupAtomicFile(directory, targetFile, temporary))
 		}
-		_ = directory.Close()
+		returnErr = errors.Join(returnErr, targetFile.Close(), directory.Close())
 	}()
 
-	written, err := io.Copy(targetFile, io.LimitReader(sourceFile, maxBytes+1))
+	written, err := io.Copy(targetFile, io.LimitReader(sourceFile, limitWithOverflowByte(maxBytes)))
 	if err != nil {
 		return err
 	}
 	if written > maxBytes {
 		return fmt.Errorf("file exceeds %d bytes", maxBytes)
 	}
-	finalSourceInfo, err := sourceFile.Stat()
+	if checkpoint != nil {
+		checkpoint(copyRegularFileContentsCopied)
+	}
+	if written != sourceState.size {
+		return errors.New("source file changed while copying")
+	}
+	if err := f.revalidateRegularFileState(source, sourceFile, sourceState); err != nil {
+		return err
+	}
+	sourceXattrs, sourceXattrsSupported, err := readFileXattrs(sourceFile)
 	if err != nil {
 		return err
 	}
-	if written != sourceInfo.Size() || finalSourceInfo.Size() != sourceInfo.Size() {
-		return errors.New("source file changed while copying")
+	if checkpoint != nil {
+		checkpoint(copyRegularFileXattrsCaptured)
 	}
-	if err := preserveRegularMetadata(sourceFile, sourceInfo, targetFile); err != nil {
+	if err := f.revalidateRegularFileState(source, sourceFile, sourceState); err != nil {
+		return err
+	}
+	if err := preserveRegularMetadata(sourceInfo, sourceXattrs, sourceXattrsSupported, targetFile); err != nil {
 		return err
 	}
 	if err := targetFile.Sync(); err != nil {
 		return err
 	}
-	if err := targetFile.Close(); err != nil {
+	if checkpoint != nil {
+		checkpoint(copyRegularFileReadyToPublish)
+	}
+	if err := f.revalidateRegularFileState(source, sourceFile, sourceState); err != nil {
 		return err
 	}
-	if err := syscall.Renameat(int(directory.Fd()), temporary, int(directory.Fd()), targetName); err != nil {
+	if err := f.publishAtomicFile(directory, targetFile, temporary, targetName); err != nil {
 		return err
 	}
 	committed = true
 	return directory.Sync()
+}
+
+func limitWithOverflowByte(maxBytes int64) int64 {
+	if maxBytes == int64(^uint64(0)>>1) {
+		return maxBytes
+	}
+	return maxBytes + 1
+}
+
+func regularFileStateFromInfo(info fs.FileInfo) (regularFileState, error) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return regularFileState{}, errors.New("source file identity metadata is unavailable")
+	}
+	return regularFileState{
+		device:    uint64(stat.Dev),
+		inode:     uint64(stat.Ino),
+		mode:      uint32(stat.Mode),
+		linkCount: uint64(stat.Nlink),
+		uid:       uint32(stat.Uid),
+		gid:       uint32(stat.Gid),
+		size:      stat.Size,
+		mtime:     stat.Mtim,
+		ctime:     stat.Ctim,
+	}, nil
+}
+
+func (f *RootFS) revalidateRegularFileState(source string, file *os.File, expected regularFileState) error {
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	current, err := regularFileStateFromInfo(info)
+	if err != nil {
+		return err
+	}
+	if current != expected {
+		return errors.New("source file changed while copying")
+	}
+	pathInfo, err := f.Lstat(source)
+	if err != nil {
+		return fmt.Errorf("reinspect source path while copying: %w", err)
+	}
+	pathState, err := regularFileStateFromInfo(pathInfo)
+	if err != nil {
+		return err
+	}
+	if pathState != expected {
+		return errors.New("source path changed while copying")
+	}
+	return nil
 }
 
 func (f *RootFS) newAtomicFile(logicalPath string) (*os.File, *os.File, string, string, error) {
@@ -450,8 +574,13 @@ func (f *RootFS) newAtomicFile(logicalPath string) (*os.File, *os.File, string, 
 	if err != nil {
 		return nil, nil, "", "", err
 	}
-	for sequence := 0; sequence < 1000; sequence++ {
-		temporary := fmt.Sprintf(".security-update-notify.%d.%d", os.Getpid(), sequence)
+	for range temporaryAttempts {
+		random := make([]byte, 16)
+		if _, err := rand.Read(random); err != nil {
+			_ = directory.Close()
+			return nil, nil, "", "", err
+		}
+		temporary := ".security-update-notify." + hex.EncodeToString(random)
 		fd, openErr := syscall.Openat(
 			int(directory.Fd()), temporary,
 			syscall.O_CREAT|syscall.O_EXCL|syscall.O_RDWR|syscall.O_NOFOLLOW|syscall.O_CLOEXEC,
@@ -476,7 +605,71 @@ func (f *RootFS) newAtomicFile(logicalPath string) (*os.File, *os.File, string, 
 	return nil, nil, "", "", errors.New("could not create atomic temporary file")
 }
 
-func preserveRegularMetadata(source *os.File, sourceInfo fs.FileInfo, target *os.File) error {
+func (f *RootFS) publishAtomicFile(directory, file *os.File, temporary, destination string) error {
+	if f.beforeAtomicPublish != nil {
+		if err := f.beforeAtomicPublish(directory, temporary); err != nil {
+			return err
+		}
+	}
+	owned, err := atomicEntryMatchesFile(directory, temporary, file)
+	if err != nil || !owned {
+		return errors.Join(
+			errors.New("atomic temporary file changed before publish: "+temporary),
+			err,
+		)
+	}
+	return syscall.Renameat(int(directory.Fd()), temporary, int(directory.Fd()), destination)
+}
+
+func atomicEntryMatchesFile(directory *os.File, name string, file *os.File) (bool, error) {
+	expected, err := file.Stat()
+	if err != nil {
+		return false, err
+	}
+	fd, err := syscall.Openat(
+		int(directory.Fd()), name,
+		oPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK,
+		0,
+	)
+	if err != nil {
+		return false, err
+	}
+	entry := os.NewFile(uintptr(fd), name)
+	if entry == nil {
+		_ = syscall.Close(fd)
+		return false, errors.New("could not create atomic entry handle")
+	}
+	current, statErr := entry.Stat()
+	closeErr := entry.Close()
+	if statErr != nil || closeErr != nil {
+		return false, errors.Join(statErr, closeErr)
+	}
+	if !expected.Mode().IsRegular() || !current.Mode().IsRegular() || !os.SameFile(expected, current) {
+		return false, nil
+	}
+	expectedStat, expectedOK := expected.Sys().(*syscall.Stat_t)
+	currentStat, currentOK := current.Sys().(*syscall.Stat_t)
+	if !expectedOK || !currentOK || expectedStat.Nlink != 1 || currentStat.Nlink != 1 {
+		return false, nil
+	}
+	return true, nil
+}
+
+func cleanupAtomicFile(directory, file *os.File, name string) error {
+	owned, err := atomicEntryMatchesFile(directory, name, file)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil || !owned {
+		return errors.Join(errors.New("atomic temporary entry changed; retained at "+name), err)
+	}
+	if err := syscall.Unlinkat(int(directory.Fd()), name); err != nil {
+		return fmt.Errorf("remove atomic temporary retained at %s: %w", name, err)
+	}
+	return nil
+}
+
+func preserveRegularMetadata(sourceInfo fs.FileInfo, sourceXattrs map[string][]byte, sourceXattrsSupported bool, target *os.File) error {
 	targetInfo, err := target.Stat()
 	if err != nil {
 		return err
@@ -492,21 +685,22 @@ func preserveRegularMetadata(source *os.File, sourceInfo fs.FileInfo, target *os
 	if err := target.Chmod(mode); err != nil {
 		return fmt.Errorf("preserve file mode: %w", err)
 	}
-	if err := copyFileXattrs(source, target); err != nil {
+	if err := applyFileXattrs(target, sourceXattrs, sourceXattrsSupported); err != nil {
 		return err
 	}
-	stamp := syscall.NsecToTimeval(sourceInfo.ModTime().UnixNano())
-	if err := syscall.Futimes(int(target.Fd()), []syscall.Timeval{stamp, stamp}); err != nil {
-		return fmt.Errorf("preserve file mtime: %w", err)
+	stamp := syscall.NsecToTimespec(sourceInfo.ModTime().UnixNano())
+	times := [2]syscall.Timespec{stamp, stamp}
+	_, _, errno := syscall.Syscall6(
+		syscall.SYS_UTIMENSAT,
+		target.Fd(), 0, uintptr(unsafe.Pointer(&times[0])), 0, 0, 0,
+	)
+	if errno != 0 {
+		return fmt.Errorf("preserve file mtime: %w", errno)
 	}
 	return nil
 }
 
-func copyFileXattrs(source, target *os.File) error {
-	xattrs, supported, err := readFileXattrs(source)
-	if err != nil {
-		return err
-	}
+func applyFileXattrs(target *os.File, xattrs map[string][]byte, supported bool) error {
 	if !supported {
 		return nil
 	}
@@ -675,15 +869,45 @@ func (f *RootFS) ReadDir(logicalPath string) ([]fs.DirEntry, error) {
 }
 
 func (f *RootFS) Readlink(logicalPath string) (string, error) {
+	return f.readlink(logicalPath, nil)
+}
+
+func (f *RootFS) readlink(logicalPath string, beforeRead func() error) (string, error) {
 	directory, name, err := f.openParent(logicalPath)
 	if err != nil {
 		return "", err
 	}
 	defer directory.Close()
+	fd, err := syscall.Openat(
+		int(directory.Fd()), name,
+		oPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK,
+		0,
+	)
+	if err != nil {
+		return "", err
+	}
+	link := os.NewFile(uintptr(fd), logicalPath)
+	if link == nil {
+		_ = syscall.Close(fd)
+		return "", errors.New("could not create symbolic link handle")
+	}
+	defer link.Close()
+	info, err := link.Stat()
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&fs.ModeSymlink == 0 {
+		return "", errors.New("not a symbolic link")
+	}
+	if beforeRead != nil {
+		if err := beforeRead(); err != nil {
+			return "", err
+		}
+	}
 	size := 256
 	for size <= maxXattrNameBytes {
 		buffer := make([]byte, size)
-		n, readErr := readlinkat(int(directory.Fd()), name, buffer)
+		n, readErr := readlinkat(int(link.Fd()), "", buffer)
 		if readErr != nil {
 			return "", readErr
 		}
@@ -746,6 +970,10 @@ func (f *RootFS) Chmod(logicalPath string, perm fs.FileMode) error {
 // Remove has rm -f semantics: it may unlink a file or symlink, but it never
 // broadens scope to removing a directory, including under a replacement race.
 func (f *RootFS) Remove(logicalPath string) error {
+	return f.remove(logicalPath, nil)
+}
+
+func (f *RootFS) remove(logicalPath string, beforeClaim func() error) error {
 	directory, name, err := f.openParent(logicalPath)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
@@ -754,14 +982,27 @@ func (f *RootFS) Remove(logicalPath string) error {
 		return err
 	}
 	defer directory.Close()
-	err = syscall.Unlinkat(int(directory.Fd()), name)
+	if err := cleanupRemovalArtifactsAt(directory); err != nil {
+		return fmt.Errorf("recover interrupted removal: %w", err)
+	}
+	expected, err := readRemovalEntry(directory, name)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	if expected.IsDir() {
+		return fmt.Errorf("refusing to remove directory as a file: %s", logicalPath)
+	}
+	return removeValidatedEntryAt(directory, name, expected, false, beforeClaim)
 }
 
 func (f *RootFS) RemoveAll(logicalPath string) error {
+	return f.removeAll(logicalPath, nil)
+}
+
+func (f *RootFS) removeAll(logicalPath string, beforeClaim func() error) error {
 	directory, name, err := f.openParent(logicalPath)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
@@ -770,48 +1011,266 @@ func (f *RootFS) RemoveAll(logicalPath string) error {
 		return err
 	}
 	defer directory.Close()
-	return removeAllAt(directory, name)
+	if err := cleanupRemovalArtifactsAt(directory); err != nil {
+		return fmt.Errorf("recover interrupted recursive removal: %w", err)
+	}
+	expected, err := readRemovalEntry(directory, name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return removeValidatedEntryAt(directory, name, expected, true, beforeClaim)
 }
 
 func removeAllAt(parent *os.File, name string) error {
+	expected, err := readRemovalEntry(parent, name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return removeValidatedEntryAt(parent, name, expected, true, nil)
+}
+
+func readRemovalEntry(parent *os.File, name string) (fs.FileInfo, error) {
+	if name == "" || name == "." || name == ".." || strings.ContainsRune(name, '/') {
+		return nil, fmt.Errorf("invalid removal entry: %q", name)
+	}
+	fd, err := syscall.Openat(
+		int(parent.Fd()), name,
+		oPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK,
+		0,
+	)
+	if err != nil {
+		return nil, err
+	}
+	entry := os.NewFile(uintptr(fd), name)
+	if entry == nil {
+		_ = syscall.Close(fd)
+		return nil, errors.New("could not create removal entry handle")
+	}
+	info, statErr := entry.Stat()
+	closeErr := entry.Close()
+	if statErr != nil || closeErr != nil {
+		return nil, errors.Join(statErr, closeErr)
+	}
+	return info, nil
+}
+
+func sameRemovalEntry(left, right fs.FileInfo) bool {
+	return sameRemovalIdentity(left, right) && left.Size() == right.Size() && left.ModTime().Equal(right.ModTime())
+}
+
+func sameRemovalIdentity(left, right fs.FileInfo) bool {
+	if left == nil || right == nil || !os.SameFile(left, right) || left.Mode() != right.Mode() {
+		return false
+	}
+	leftStat, leftOK := left.Sys().(*syscall.Stat_t)
+	rightStat, rightOK := right.Sys().(*syscall.Stat_t)
+	return leftOK == rightOK && (!leftOK || leftStat.Uid == rightStat.Uid && leftStat.Gid == rightStat.Gid)
+}
+
+func openRemovalDirectory(parent *os.File, name string) (*os.File, error) {
 	fd, err := syscall.Openat(
 		int(parent.Fd()), name,
 		syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK,
 		0,
 	)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
-		if errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.ELOOP) {
-			err = syscall.Unlinkat(int(parent.Fd()), name)
-			if errors.Is(err, fs.ErrNotExist) {
-				return nil
-			}
-			return err
-		}
-		return err
+		return nil, err
 	}
 	directory := os.NewFile(uintptr(fd), name)
 	if directory == nil {
 		_ = syscall.Close(fd)
-		return errors.New("could not create recursive directory handle")
+		return nil, errors.New("could not create recursive directory handle")
+	}
+	return directory, nil
+}
+
+func newRemovalPlaceholder(parent *os.File, directory bool) (string, fs.FileInfo, error) {
+	for range temporaryAttempts {
+		random := make([]byte, 16)
+		if _, err := rand.Read(random); err != nil {
+			return "", nil, err
+		}
+		name := removalPrefix + hex.EncodeToString(random)
+		if directory {
+			err := syscall.Mkdirat(int(parent.Fd()), name, 0o700)
+			if errors.Is(err, fs.ErrExist) {
+				continue
+			}
+			if err != nil {
+				return "", nil, err
+			}
+			info, statErr := readRemovalEntry(parent, name)
+			return name, info, statErr
+		}
+		fd, err := syscall.Openat(
+			int(parent.Fd()), name,
+			syscall.O_CREAT|syscall.O_EXCL|syscall.O_RDWR|syscall.O_NOFOLLOW|syscall.O_CLOEXEC,
+			0o600,
+		)
+		if errors.Is(err, fs.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return "", nil, err
+		}
+		placeholder := os.NewFile(uintptr(fd), name)
+		if placeholder == nil {
+			_ = syscall.Close(fd)
+			return "", nil, errors.New("could not create removal quarantine handle")
+		}
+		info, statErr := placeholder.Stat()
+		closeErr := placeholder.Close()
+		if statErr != nil || closeErr != nil {
+			return name, info, errors.Join(statErr, closeErr)
+		}
+		return name, info, nil
+	}
+	return "", nil, errors.New("could not create removal quarantine entry")
+}
+
+func isRemovalArtifactName(name string) bool {
+	suffix, found := strings.CutPrefix(name, removalPrefix)
+	if !found || len(suffix) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(suffix)
+	return err == nil
+}
+
+func cleanupRemovalArtifactsAt(parent *os.File) error {
+	fd, err := syscall.Openat(
+		int(parent.Fd()), ".",
+		syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC,
+		0,
+	)
+	if err != nil {
+		return err
+	}
+	directory := os.NewFile(uintptr(fd), parent.Name())
+	if directory == nil {
+		_ = syscall.Close(fd)
+		return errors.New("could not create removal recovery directory handle")
 	}
 	entries, readErr := directory.ReadDir(-1)
-	if readErr == nil {
-		for _, entry := range entries {
-			if err := removeAllAt(directory, entry.Name()); err != nil {
-				readErr = err
-				break
-			}
+	closeErr := directory.Close()
+	if readErr != nil || closeErr != nil {
+		return errors.Join(readErr, closeErr)
+	}
+	var errs []error
+	for _, entry := range entries {
+		if !isRemovalArtifactName(entry.Name()) {
+			continue
+		}
+		expected, err := readRemovalEntry(parent, entry.Name())
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err == nil {
+			err = removeValidatedEntryAt(parent, entry.Name(), expected, true, nil)
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("remove interrupted quarantine %s: %w", entry.Name(), err))
 		}
 	}
-	closeErr := directory.Close()
-	if readErr != nil {
-		return readErr
+	return errors.Join(errs...)
+}
+
+func cleanupRemovalPlaceholder(parent *os.File, name string, expected fs.FileInfo) error {
+	current, err := readRemovalEntry(parent, name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
 	}
-	if closeErr != nil {
-		return closeErr
+	if err != nil || !sameRemovalEntry(current, expected) {
+		return errors.Join(errors.New("removal quarantine placeholder changed; retained at "+name), err)
+	}
+	if expected.IsDir() {
+		return unlinkRemovalDirectory(parent, name, expected)
+	}
+	return syscall.Unlinkat(int(parent.Fd()), name)
+}
+
+func restoreUnexpectedRemovalClaim(parent *os.File, quarantine, name string, cause error) error {
+	restoreErr := renameEntryNoReplace(int(parent.Fd()), quarantine, name)
+	if restoreErr == nil {
+		return errors.Join(errors.New("entry changed before removal; concurrent entry restored"), cause)
+	}
+	return errors.Join(
+		errors.New("entry changed before removal; concurrent entry retained at "+quarantine),
+		cause, restoreErr,
+	)
+}
+
+func removeValidatedEntryAt(parent *os.File, name string, expected fs.FileInfo, recursive bool, beforeClaim func() error) (returnErr error) {
+	var claimedDirectory *os.File
+	if expected.IsDir() {
+		var err error
+		claimedDirectory, err = openRemovalDirectory(parent, name)
+		if err != nil {
+			return errors.Join(errors.New("entry changed before removal: validated directory changed before claim"), err)
+		}
+		info, err := claimedDirectory.Stat()
+		if err != nil || !sameRemovalEntry(info, expected) {
+			_ = claimedDirectory.Close()
+			return errors.Join(errors.New("entry changed before removal: validated directory changed before claim"), err)
+		}
+		defer func() {
+			returnErr = errors.Join(returnErr, claimedDirectory.Close())
+		}()
+	}
+	if beforeClaim != nil {
+		if err := beforeClaim(); err != nil {
+			return err
+		}
+	}
+	quarantine, placeholder, err := newRemovalPlaceholder(parent, expected.IsDir())
+	if err != nil {
+		return err
+	}
+	if err := syscall.Renameat(int(parent.Fd()), name, int(parent.Fd()), quarantine); err != nil {
+		cleanupErr := cleanupRemovalPlaceholder(parent, quarantine, placeholder)
+		if errors.Is(err, fs.ErrNotExist) {
+			return cleanupErr
+		}
+		return errors.Join(fmt.Errorf("claim validated entry; quarantine retained at %s: %w", quarantine, err), cleanupErr)
+	}
+	claimed, readErr := readRemovalEntry(parent, quarantine)
+	if readErr != nil || !sameRemovalEntry(claimed, expected) {
+		return restoreUnexpectedRemovalClaim(parent, quarantine, name, readErr)
+	}
+	if !claimed.IsDir() {
+		if err := syscall.Unlinkat(int(parent.Fd()), quarantine); err != nil {
+			return fmt.Errorf("remove claimed entry retained at %s: %w", quarantine, err)
+		}
+		return nil
+	}
+	if !recursive {
+		return restoreUnexpectedRemovalClaim(parent, quarantine, name, errors.New("validated leaf became a directory"))
+	}
+	if claimedDirectory == nil {
+		return restoreUnexpectedRemovalClaim(parent, quarantine, name, errors.New("validated directory handle is unavailable"))
+	}
+	entries, err := claimedDirectory.ReadDir(-1)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := removeAllAt(claimedDirectory, entry.Name()); err != nil {
+			return fmt.Errorf("remove quarantined tree retained at %s: %w", quarantine, err)
+		}
+	}
+	return unlinkRemovalDirectory(parent, quarantine, expected)
+}
+
+func unlinkRemovalDirectory(parent *os.File, name string, expected fs.FileInfo) error {
+	current, err := readRemovalEntry(parent, name)
+	if err != nil || !sameRemovalIdentity(current, expected) {
+		return errors.Join(errors.New("claimed directory changed before removal; retained at "+name), err)
 	}
 	namePointer, err := syscall.BytePtrFromString(name)
 	if err != nil {
@@ -822,7 +1281,48 @@ func removeAllAt(parent *os.File, name string) error {
 		parent.Fd(), uintptr(unsafe.Pointer(namePointer)), atRemoveDir, 0, 0, 0,
 	)
 	if errno != 0 && !errors.Is(errno, fs.ErrNotExist) {
+		return fmt.Errorf("remove claimed directory retained at %s: %w", name, errno)
+	}
+	return nil
+}
+
+func renameEntryNoReplace(directory int, oldName, newName string) error {
+	oldPointer, err := syscall.BytePtrFromString(oldName)
+	if err != nil {
+		return err
+	}
+	newPointer, err := syscall.BytePtrFromString(newName)
+	if err != nil {
+		return err
+	}
+	systemCall := renameat2SystemCall()
+	if systemCall == 0 {
+		return syscall.ENOSYS
+	}
+	_, _, errno := syscall.Syscall6(
+		systemCall,
+		uintptr(directory), uintptr(unsafe.Pointer(oldPointer)),
+		uintptr(directory), uintptr(unsafe.Pointer(newPointer)), 1, 0,
+	)
+	if errno != 0 {
 		return errno
 	}
 	return nil
+}
+
+func renameat2SystemCall() uintptr {
+	switch runtime.GOARCH {
+	case "amd64":
+		return 316
+	case "386":
+		return 353
+	case "arm64":
+		return 276
+	case "ppc64le":
+		return 357
+	case "s390x":
+		return 347
+	default:
+		return 0
+	}
 }

@@ -7,7 +7,7 @@ set -euo pipefail
   echo "build/interactive-test.sh must run only in a disposable container" >&2
   exit 2
 }
-awk '$5 == "/src" && $6 ~ /(^|,)ro(,|$)/ { found = 1 } END { exit !found }' /proc/self/mountinfo || {
+awk '$5 == "/src" { found = 1; if ($6 !~ /(^|,)ro(,|$)/) unsafe = 1 } END { exit !(found && !unsafe) }' /proc/self/mountinfo || {
   echo "build/interactive-test.sh requires /src to be mounted read-only" >&2
   exit 2
 }
@@ -63,7 +63,7 @@ run_pty() {
   local expected="$1" output="$2"
   shift 2
   set +e
-  python3 "$ROOT/build/pty-driver.py" --output "$output" "$@"
+  python3 -I "$ROOT/build/pty-driver.py" --output "$output" "$@"
   local actual=$?
   set -e
   if [[ "$actual" -ne "$expected" ]]; then
@@ -140,7 +140,7 @@ cat >"$EXPECTATIONS" <<EOF
 }
 EOF
 chmod 0600 "$EXPECTATIONS"
-python3 "$ROOT/build/fake-notify-api.py" \
+python3 -I "$ROOT/build/fake-notify-api.py" \
   --cert "$CERT_DIR/server.crt" --key "$CERT_DIR/server.key" --log "$API_LOG" \
   --expectations "$EXPECTATIONS" &
 API_PID=$!
@@ -238,7 +238,7 @@ case "$command" in
   show)
     ;;
   list-timers)
-    if [[ "${FAIL_LIST_TIMERS:-0}" == 1 ]]; then
+    if [[ "${SUN_FAIL_LIST_TIMERS:-0}" == 1 ]]; then
       echo "forced list-timers failure" >&2
       exit 1
     fi
@@ -307,6 +307,7 @@ EOF
 
 chmod 0755 "$MOCK_BIN"/*
 export SUN_PTY_STATE="$MOCK_STATE"
+export SUN_CONTAINER_TEST_COMMAND_PATH="$MOCK_BIN"
 export PATH="$MOCK_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 version="$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' "$ROOT/VERSION")"
@@ -391,7 +392,7 @@ echo "### Human-style failed upgrade rolls the installation back"
 run_pty 1 "$TMP/rollback.out" \
   --step visible '额外发送测试消息' $'invalid\n' \
   --step visible '额外发送测试消息' $'n\n' \
-  -- env FAIL_LIST_TIMERS=1 "$runtime" install --lang zh --skip-post-install-check \
+  -- env SUN_FAIL_LIST_TIMERS=1 "$runtime" install --lang zh --skip-post-install-check \
     --host-label pty-rollback-must-not-survive --include-public-ip 0
 assert_contains "$TMP/rollback.out" '无效输入，请输入 y 或 n。'
 assert_contains "$TMP/rollback.out" 'forced list-timers failure'

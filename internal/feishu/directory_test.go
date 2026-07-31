@@ -69,6 +69,16 @@ func TestScanDirectoryPaginatesAndAcceptsStaleFinalToken(t *testing.T) {
 	}
 }
 
+func TestSanitizeDisplayHintRemovesTerminalAndBidiControls(t *testing.T) {
+	input := "Alice\x1b]0;spoof\a\n\u202eAdmin\u2028Fake\u2029Entry"
+	if got, want := sanitizeDisplayHint(input), "Alice]0;spoofAdminFakeEntry"; got != want {
+		t.Fatalf("sanitizeDisplayHint(%q)=%q want %q", input, got, want)
+	}
+	if got := sanitizeDisplayHint("王小明"); got != "王小明" {
+		t.Fatalf("ordinary international name changed: %q", got)
+	}
+}
+
 func TestScanDirectoryRejectsBrokenPaginationAndPartialResults(t *testing.T) {
 	tests := map[string]func(call int32) string{
 		"repeated token": func(call int32) string {
@@ -159,6 +169,29 @@ func TestScanDirectoryRetriesNonJSONServerFailure(t *testing.T) {
 	}
 	if calls != 2 || *slept != 1 {
 		t.Fatalf("calls=%d sleeps=%d want 2,1", calls, *slept)
+	}
+}
+
+func TestScanDirectoryRetriesInterruptedResponseBody(t *testing.T) {
+	var directoryRequests int32
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		var body io.Reader
+		if strings.Contains(req.URL.Path, "tenant_access_token") {
+			body = strings.NewReader(`{"code":0,"tenant_access_token":"token"}`)
+		} else if atomic.AddInt32(&directoryRequests, 1) == 1 {
+			body = io.MultiReader(strings.NewReader(`{"code":0,`), interruptedReader{})
+		} else {
+			body = strings.NewReader(directoryPageJSON(false, "", ""))
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(body)}, nil
+	})}
+	c := &Client{HTTP: client, BaseURL: "https://open.feishu.test", Sleep: func(time.Duration) {}}
+	users, err := c.ScanDirectory(context.Background(), "cli_app", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(users) != 0 || directoryRequests != 2 {
+		t.Fatalf("users=%v directory requests=%d, want empty,2", users, directoryRequests)
 	}
 }
 

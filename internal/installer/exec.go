@@ -6,40 +6,52 @@ import (
 	"errors"
 	"os"
 	"os/exec"
-	"sort"
-	"strings"
 	"syscall"
 	"time"
 
+	"github.com/xxvcc/security-update-notify/internal/commandpath"
 	"github.com/xxvcc/security-update-notify/internal/sysexec"
 )
 
 const maxCommandOutput = 8 << 20
 
 type cappedBuffer struct {
-	b   bytes.Buffer
-	max int
+	b         bytes.Buffer
+	max       int
+	truncated bool
 }
 
 func (b *cappedBuffer) Write(p []byte) (int, error) {
 	if remaining := b.max - b.b.Len(); remaining > 0 {
 		if len(p) > remaining {
 			_, _ = b.b.Write(p[:remaining])
+			b.truncated = true
 		} else {
 			_, _ = b.b.Write(p)
 		}
+	} else if len(p) > 0 {
+		b.truncated = true
 	}
 	return len(p), nil
 }
 
-type ExecRunner struct{}
+type ExecRunner struct {
+	Resolve func(string) (string, error)
+}
 
-func (ExecRunner) LookPath(name string) bool {
-	_, err := exec.LookPath(name)
+func (r ExecRunner) resolve(name string) (string, error) {
+	if r.Resolve != nil {
+		return r.Resolve(name)
+	}
+	return commandpath.Resolve(name)
+}
+
+func (r ExecRunner) LookPath(name string) bool {
+	_, err := r.resolve(name)
 	return err == nil
 }
 
-func (ExecRunner) Run(parent context.Context, command Command) CommandResult {
+func (r ExecRunner) Run(parent context.Context, command Command) CommandResult {
 	ctx := parent
 	cancel := func() {}
 	if command.Timeout > 0 {
@@ -47,14 +59,24 @@ func (ExecRunner) Run(parent context.Context, command Command) CommandResult {
 	}
 	defer cancel()
 
-	cmd := sysexec.CommandContext(ctx, command.Name, command.Args...)
+	resolved, err := r.resolve(command.Name)
+	if err != nil {
+		return CommandResult{Code: -1, Err: err}
+	}
+	cmd := sysexec.CommandContext(ctx, resolved, command.Args...)
 	cmd.Env = commandEnv(command.Env)
 	cmd.Stdin = bytes.NewReader(command.Stdin)
+	cmd.ExtraFiles = command.ExtraFiles
 	out := &cappedBuffer{max: maxCommandOutput}
 	errOut := &cappedBuffer{max: maxCommandOutput}
 	cmd.Stdout, cmd.Stderr = out, errOut
-	err := cmd.Run()
-	result := CommandResult{Stdout: out.b.Bytes(), Stderr: errOut.b.Bytes()}
+	err = cmd.Run()
+	result := CommandResult{
+		Stdout:          out.b.Bytes(),
+		Stderr:          errOut.b.Bytes(),
+		StdoutTruncated: out.truncated,
+		StderrTruncated: errOut.truncated,
+	}
 	if err == nil {
 		return result
 	}
@@ -72,32 +94,12 @@ func (ExecRunner) Run(parent context.Context, command Command) CommandResult {
 }
 
 func commandEnv(overrides map[string]string) []string {
-	remove := make(map[string]bool, len(overrides)+1)
-	remove["LC_ALL"] = true
-	for key := range overrides {
-		remove[key] = true
-	}
-	env := make([]string, 0, len(os.Environ())+len(overrides)+1)
-	for _, value := range os.Environ() {
-		key, _, _ := strings.Cut(value, "=")
-		if !remove[key] {
-			env = append(env, value)
-		}
-	}
-	env = append(env, "LC_ALL=C")
-	keys := make([]string, 0, len(overrides))
-	for key := range overrides {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		env = append(env, key+"="+overrides[key])
-	}
-	return env
+	return commandpath.SanitizedEnvironment(commandpath.EffectivePATH(), overrides)
 }
 
 type FileLocker struct {
-	FS FileSystem
+	FS       FileSystem
+	OwnerUID uint32
 }
 
 func (l FileLocker) Acquire(ctx context.Context, path string, wait time.Duration) (UnlockFunc, error) {
@@ -108,19 +110,15 @@ func (l FileLocker) Acquire(ctx context.Context, path string, wait time.Duration
 	if err != nil {
 		return nil, err
 	}
-	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() {
+	if err := validateInstallerLockFile(file, l.OwnerUID); err != nil {
 		_ = file.Close()
-		if err != nil {
-			return nil, err
-		}
-		return nil, errors.New("lock path is not a regular file")
-	}
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok && (stat.Uid != 0 || stat.Nlink != 1) {
-		_ = file.Close()
-		return nil, errors.New("lock file must be root-owned and have exactly one link")
+		return nil, err
 	}
 	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if err := validateInstallerLockFile(file, l.OwnerUID); err != nil {
 		_ = file.Close()
 		return nil, err
 	}
@@ -128,6 +126,11 @@ func (l FileLocker) Acquire(ctx context.Context, path string, wait time.Duration
 	for {
 		err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 		if err == nil {
+			if err := validateInstallerLockPath(l.FS, path, file, l.OwnerUID); err != nil {
+				_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+				_ = file.Close()
+				return nil, err
+			}
 			return func() error {
 				unlockErr := syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
 				closeErr := file.Close()
@@ -152,4 +155,33 @@ func (l FileLocker) Acquire(ctx context.Context, path string, wait time.Duration
 		case <-time.After(25 * time.Millisecond):
 		}
 	}
+}
+
+func validateInstallerLockFile(file *os.File, ownerUID uint32) error {
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !info.Mode().IsRegular() || !ok || stat.Uid != ownerUID || stat.Nlink != 1 {
+		return errors.New("lock file must be regular, owned by the configured root uid, and have exactly one link")
+	}
+	return nil
+}
+
+func validateInstallerLockPath(filesystem FileSystem, path string, locked *os.File, ownerUID uint32) error {
+	lockedInfo, err := locked.Stat()
+	if err != nil {
+		return err
+	}
+	currentInfo, err := filesystem.Lstat(path)
+	if err != nil {
+		return errors.Join(errors.New("lock path changed while acquiring"), err)
+	}
+	currentStat, ok := currentInfo.Sys().(*syscall.Stat_t)
+	if !currentInfo.Mode().IsRegular() || !ok || currentStat.Uid != ownerUID || currentStat.Nlink != 1 ||
+		!os.SameFile(lockedInfo, currentInfo) {
+		return errors.New("lock path changed while acquiring")
+	}
+	return nil
 }

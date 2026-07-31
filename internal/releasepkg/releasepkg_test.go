@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -12,20 +13,22 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/xxvcc/security-update-notify/internal/assets"
 )
 
 func TestValidateVersion(t *testing.T) {
 	t.Parallel()
-	for _, version := range []string{"3.0.0", "3.0.0-rc1", "3.0.0_rc1", "3.0.0.1"} {
+	for _, version := range []string{"3.0.0", "3.0.0-rc1", "3.0.0.1"} {
 		if err := ValidateVersion(version); err != nil {
 			t.Errorf("ValidateVersion(%q): %v", version, err)
 		}
 	}
-	for _, version := range []string{"", "v3.0.0", "3.0", "3.0.0-rc.1", "3.0.0/evil", strings.Repeat("1", 65)} {
+	for _, version := range []string{"", "v3.0.0", "3.0", "3.0.0_rc1", "3.0.0-01", "3.0.0-rc.1", "3.0.0/evil", strings.Repeat("1", 65)} {
 		if err := ValidateVersion(version); err == nil {
 			t.Errorf("ValidateVersion(%q) unexpectedly succeeded", version)
 		}
@@ -268,6 +271,25 @@ func TestPackageTreeIsExactGoRuntimeAllowlistWithMigrationBridge(t *testing.T) {
 	}
 }
 
+func TestCopyRegularFileRejectsHardLinkedSource(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source")
+	alias := filepath.Join(dir, "alias")
+	if err := os.WriteFile(source, []byte("source bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(source, alias); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "target")
+	if err := copyRegularFile(source, target, 0o644); err == nil || !strings.Contains(err.Error(), "hard link") {
+		t.Fatalf("hard-linked source error=%v", err)
+	}
+	if _, err := os.Lstat(target); !os.IsNotExist(err) {
+		t.Fatalf("hard-link rejection created target: %v", err)
+	}
+}
+
 func TestDeterministicArchiveMetadataAndContents(t *testing.T) {
 	t.Parallel()
 	root := sourceFixture(t, "3.0.0")
@@ -375,6 +397,66 @@ func TestReadArchiveRegularFileReturnsFinalArchivedBytes(t *testing.T) {
 	if _, err := readArchiveRegularFile(archive, pkgName+"/sun.sh", 1); err == nil {
 		t.Fatal("oversized archive member was accepted")
 	}
+	corrupt, err := os.ReadFile(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt[len(corrupt)-1] ^= 0xff
+	corruptArchive := filepath.Join(t.TempDir(), "corrupt.tar.gz")
+	if err := os.WriteFile(corruptArchive, corrupt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readArchiveRegularFile(corruptArchive, pkgName+"/sun.sh", maxBootstrapSize); err == nil {
+		t.Fatal("corrupted gzip footer was accepted while reading archived bootstrap")
+	}
+	concatenatedArchive := filepath.Join(t.TempDir(), "concatenated.tar.gz")
+	validArchive, err := os.ReadFile(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(concatenatedArchive, validArchive, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(concatenatedArchive, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz := gzip.NewWriter(f)
+	if _, err := gz.Write([]byte("unchecked second gzip member")); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readArchiveRegularFile(concatenatedArchive, pkgName+"/sun.sh", maxBootstrapSize); err == nil {
+		t.Fatal("concatenated gzip members were accepted while reading archived bootstrap")
+	}
+}
+
+func TestWriteArchiveRejectsSymlinkedPackageAncestor(t *testing.T) {
+	root := sourceFixture(t, "3.0.0")
+	pkg := filepath.Join(t.TempDir(), productName+"-3.0.0")
+	if err := preparePackageTree(root, pkg, "3.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	writeDummyBinaries(t, pkg)
+	docs := filepath.Join(pkg, "docs")
+	if err := os.RemoveAll(docs); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), docs); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "release.tar.gz")
+	if err := writeDeterministicArchive(target, pkg, filepath.Base(pkg), 1_700_000_000); err == nil {
+		t.Fatal("symlinked package ancestor was archived")
+	}
+	if _, err := os.Lstat(target); !os.IsNotExist(err) {
+		t.Fatalf("failed archive output was retained: %v", err)
+	}
 }
 
 func TestForbiddenReleasePaths(t *testing.T) {
@@ -431,6 +513,212 @@ func TestInspectRepositoryFindsTrackedAndUntrackedReleaseChanges(t *testing.T) {
 	}
 	if !dirty.Dirty || !reflect.DeepEqual(dirty.DirtyFiles, []string{"README.md", "docs/new.md", "internal/new.go"}) {
 		t.Fatalf("dirty files=%v", dirty.DirtyFiles)
+	}
+}
+
+func TestVerifyReleaseSourceStateDetectsFurtherChangesToAnAlreadyDirtyFile(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git unavailable")
+	}
+	root := t.TempDir()
+	gitRun(t, root, "init", "-q")
+	gitRun(t, root, "config", "user.name", "SUN test")
+	gitRun(t, root, "config", "user.email", "sun@example.invalid")
+	readme := filepath.Join(root, "README.md")
+	if err := os.WriteFile(readme, []byte("committed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "add", "README.md")
+	gitRun(t, root, "commit", "-qm", "initial")
+	if err := os.WriteFile(readme, []byte("dirty before build\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before, err := captureReleaseSourceState(context.Background(), root, "3.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !before.repository.Dirty || !reflect.DeepEqual(before.repository.DirtyFiles, []string{"README.md"}) {
+		t.Fatalf("initial dirty state = %+v", before.repository)
+	}
+	if err := os.WriteFile(readme, []byte("dirty during build\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	after, err := captureReleaseSourceState(context.Background(), root, "3.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameRepositoryIdentity(before.repository, after.repository) {
+		t.Fatalf("dirty filename set changed unexpectedly: before=%+v after=%+v", before.repository, after.repository)
+	}
+	if err := verifyReleaseSourceState(context.Background(), root, "3.0.0", before); err == nil || !strings.Contains(err.Error(), "source files changed") {
+		t.Fatalf("continued mutation of an already-dirty file was accepted: %v", err)
+	}
+}
+
+func TestVerifyReleaseSourceStateDetectsGitIdentityChangeWithTheSameTree(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git unavailable")
+	}
+	root := t.TempDir()
+	gitRun(t, root, "init", "-q")
+	gitRun(t, root, "config", "user.name", "SUN test")
+	gitRun(t, root, "config", "user.email", "sun@example.invalid")
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("unchanged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "add", "README.md")
+	gitRun(t, root, "commit", "-qm", "initial")
+	before, err := captureReleaseSourceState(context.Background(), root, "3.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "commit", "--allow-empty", "-qm", "identity drift")
+	after, err := captureReleaseSourceState(context.Background(), root, "3.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.fingerprint != after.fingerprint {
+		t.Fatal("an empty commit unexpectedly changed the source fingerprint")
+	}
+	if err := verifyReleaseSourceState(context.Background(), root, "3.0.0", before); err == nil || !strings.Contains(err.Error(), "repository identity changed") {
+		t.Fatalf("HEAD identity drift with an unchanged tree was accepted: %v", err)
+	}
+}
+
+func TestFingerprintReleaseSourcesRejectsSymlinksAndCoversModes(t *testing.T) {
+	root := t.TempDir()
+	readme := filepath.Join(root, "README.md")
+	if err := os.WriteFile(readme, []byte("same bytes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	first, err := fingerprintReleaseSources(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(readme, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := fingerprintReleaseSources(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("source permission change did not change the fingerprint")
+	}
+	if err := os.Remove(readme); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("target", readme); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fingerprintReleaseSources(root); err == nil || !strings.Contains(err.Error(), "regular file or directory") {
+		t.Fatalf("symlinked release source was accepted: %v", err)
+	}
+}
+
+// A repository git refuses to inspect (dubious ownership, a broken gitfile, unreadable objects) must
+// not be reported as "no repository here": the zero state clears Dirty and TagExists, which silently
+// skips both the uncommitted-sources gate and the official-release signing escalation in Build.
+func TestInspectRepositoryFailsClosedWhenGitCannotReadTheRepository(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git unavailable")
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ".git"), []byte("gitdir: /nonexistent-sun-audit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	state, err := inspectRepository(context.Background(), root, "3.0.0")
+	if err == nil {
+		t.Fatalf("unreadable repository was reported as a clean non-repository: %+v", state)
+	}
+}
+
+func TestInspectRepositoryFailsClosedForBrokenGitMetadataLink(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git unavailable")
+	}
+	root := t.TempDir()
+	if err := os.Symlink("missing-git-metadata", filepath.Join(root, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	state, err := inspectRepository(context.Background(), root, "3.0.0")
+	if err == nil {
+		t.Fatalf("broken .git link was reported as a tree without git metadata: %+v", state)
+	}
+}
+
+// Packaging an extracted source tree has no .git at all and must still be allowed.
+func TestInspectRepositoryAllowsATreeWithoutGitMetadata(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git unavailable")
+	}
+	state, err := inspectRepository(context.Background(), t.TempDir(), "3.0.0")
+	if err != nil {
+		t.Fatalf("non-repository tree rejected: %v", err)
+	}
+	if state.InWorkTree || state.Dirty || state.TagExists {
+		t.Fatalf("non-repository tree produced state %+v", state)
+	}
+}
+
+func TestInspectRepositoryIgnoresAnUnrelatedParentWorkTree(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git unavailable")
+	}
+	parent := t.TempDir()
+	gitRun(t, parent, "init", "-q")
+	root := filepath.Join(parent, "extracted-source")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	state, err := inspectRepository(context.Background(), root, "3.0.0")
+	if err != nil {
+		t.Fatalf("source tree nested below an unrelated repository was rejected: %v", err)
+	}
+	if state.InWorkTree || state.Dirty || state.TagExists {
+		t.Fatalf("parent repository leaked into extracted source state: %+v", state)
+	}
+}
+
+func TestInspectRepositoryIgnoresAmbientGitRepositoryOverrides(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git unavailable")
+	}
+	root := t.TempDir()
+	gitRun(t, root, "init", "-q")
+	gitRun(t, root, "config", "user.email", "test@example.com")
+	gitRun(t, root, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("tracked\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "add", "README.md")
+	gitRun(t, root, "commit", "-qm", "initial")
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	other := t.TempDir()
+	gitRun(t, other, "init", "--bare", "-q")
+	t.Setenv("GIT_DIR", other)
+	t.Setenv("GIT_WORK_TREE", t.TempDir())
+	state, err := inspectRepository(context.Background(), root, "3.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.InWorkTree || !state.Dirty || !reflect.DeepEqual(state.DirtyFiles, []string{"README.md"}) {
+		t.Fatalf("ambient GIT_* variables changed repository inspection: %+v", state)
+	}
+}
+
+func TestInspectRepositoryRejectsBareGitMetadataAtTheReleaseRoot(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git unavailable")
+	}
+	root := t.TempDir()
+	gitRun(t, root, "init", "--bare", "-q")
+	state, err := inspectRepository(context.Background(), root, "3.0.0")
+	if err == nil {
+		t.Fatalf("bare repository metadata was reported as a source tree without git: %+v", state)
 	}
 }
 
@@ -503,8 +791,8 @@ func TestValidSignatureFingerprintAcceptsPrimaryOrSigningSubkey(t *testing.T) {
 	t.Parallel()
 	const primary = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 	const subkey = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-	primaryStatus := []byte("[GNUPG:] VALIDSIG " + primary + " 2026 0 0 0 0 0 0 0 " + primary + "\n")
-	subkeyStatus := []byte("[GNUPG:] VALIDSIG " + subkey + " 2026 0 0 0 0 0 0 0 " + primary + "\n")
+	primaryStatus := []byte("[GNUPG:] GOODSIG key signer\n[GNUPG:] VALIDSIG " + primary + " 2026 0 0 0 0 0 0 0 " + primary + "\n")
+	subkeyStatus := []byte("[GNUPG:] GOODSIG key signer\n[GNUPG:] VALIDSIG " + subkey + " 2026 0 0 0 0 0 0 0 " + primary + "\n")
 	if !validSignatureFingerprint(primaryStatus, primary) || !validSignatureFingerprint(subkeyStatus, primary) {
 		t.Fatal("valid signature fingerprint was rejected")
 	}
@@ -513,6 +801,16 @@ func TestValidSignatureFingerprintAcceptsPrimaryOrSigningSubkey(t *testing.T) {
 	}
 	if validSignatureFingerprint(append(append([]byte(nil), primaryStatus...), primaryStatus...), primary) {
 		t.Fatal("multiple valid signatures were accepted as one pinned signature")
+	}
+	for _, outcome := range []string{"EXPSIG", "EXPKEYSIG", "REVKEYSIG", "BADSIG", "ERRSIG"} {
+		status := []byte("[GNUPG:] " + outcome + " key signer\n[GNUPG:] VALIDSIG " + primary + " 2026 0 0 0 0 0 0 0 " + primary + "\n")
+		if validSignatureFingerprint(status, primary) {
+			t.Fatalf("%s outcome was accepted as a releasable signature", outcome)
+		}
+	}
+	const goodStatus = "[GNUPG:] GOODSIG key signer\n"
+	if validSignatureFingerprint(primaryStatus[len(goodStatus):], primary) {
+		t.Fatal("VALIDSIG without a GOODSIG outcome was accepted")
 	}
 }
 
@@ -571,14 +869,38 @@ func TestMaybeSignAuthenticatesArbitraryReleaseArtifact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	verificationKey := exportPublicKeyForTest(t, ctx, gpg, home, fingerprint)
 	artifact := filepath.Join(t.TempDir(), "sun.sh")
 	signature := artifact + ".asc"
 	if err := os.WriteFile(artifact, []byte("#!/bin/sh\necho verified\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	victim := filepath.Join(t.TempDir(), "must-not-be-overwritten")
+	if err := os.WriteFile(victim, []byte("preserved"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, signature); err != nil {
+		t.Fatal(err)
+	}
+	if signed, err := maybeSign(ctx, signOptions{
+		Mode: SignRequired, GPGKeyID: fingerprint, GPGHome: home,
+		PinnedFingerprint: fingerprint,
+		TrustedPublicKey:  verificationKey,
+		NotationName:      bootstrapVersionNotation,
+		NotationValue:     "3.0.2",
+	}, artifact, signature); err == nil || signed {
+		t.Fatalf("symlinked signature output was accepted: signed=%v err=%v", signed, err)
+	}
+	if got, err := os.ReadFile(victim); err != nil || string(got) != "preserved" {
+		t.Fatalf("signature output changed symlink target: %q err=%v", got, err)
+	}
+	if err := os.Remove(signature); err != nil {
+		t.Fatal(err)
+	}
 	signed, err := maybeSign(ctx, signOptions{
 		Mode: SignRequired, GPGKeyID: fingerprint, GPGHome: home,
 		PinnedFingerprint: fingerprint,
+		TrustedPublicKey:  verificationKey,
 		NotationName:      bootstrapVersionNotation,
 		NotationValue:     "3.0.2",
 	}, artifact, signature)
@@ -618,6 +940,82 @@ func TestMaybeSignAuthenticatesArbitraryReleaseArtifact(t *testing.T) {
 	}
 }
 
+func TestMaybeSignRejectsSigningSubkeyAbsentFromPublishedKey(t *testing.T) {
+	gpg, err := exec.LookPath("gpg")
+	if err != nil {
+		t.Skip("gpg unavailable")
+	}
+	home := filepath.Join(t.TempDir(), "gnupg")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	identity := "SUN unpublished subkey test <sun-unpublished-subkey@example.invalid>"
+	if err := runGPG(ctx, gpg, home,
+		"--pinentry-mode", "loopback", "--passphrase", "",
+		"--quick-generate-key", identity, "ed25519", "cert", "0",
+	); err != nil {
+		t.Fatalf("generate test primary key: %v", err)
+	}
+	fingerprint, err := secretKeyFingerprint(ctx, gpg, home, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Capture the public trust anchor before the local signer gains a signing
+	// subkey. This matches a stale published key file on release machines.
+	publishedKey := exportPublicKeyForTest(t, ctx, gpg, home, fingerprint)
+	if err := runGPG(ctx, gpg, home,
+		"--pinentry-mode", "loopback", "--passphrase", "",
+		"--quick-add-key", fingerprint, "ed25519", "sign", "0",
+	); err != nil {
+		t.Fatalf("add unpublished signing subkey: %v", err)
+	}
+
+	artifact := filepath.Join(t.TempDir(), "release.tar.gz")
+	signature := artifact + ".asc"
+	if err := os.WriteFile(artifact, []byte("release bytes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	signed, err := maybeSign(ctx, signOptions{
+		Mode: SignRequired, GPGKeyID: fingerprint, GPGHome: home,
+		PinnedFingerprint: fingerprint,
+		TrustedPublicKey:  publishedKey,
+	}, artifact, signature)
+	if err == nil || signed {
+		t.Fatalf("signature by an unpublished subkey was accepted: signed=%v err=%v", signed, err)
+	}
+	if _, statErr := os.Lstat(signature); !os.IsNotExist(statErr) {
+		t.Fatalf("rejected signature was not removed: %v", statErr)
+	}
+
+	// Once the same subkey is present in the published anchor, the identical
+	// signing path is usable. This proves the rejection is an anchor mismatch,
+	// not an invalid test key or artifact.
+	completeKey := exportPublicKeyForTest(t, ctx, gpg, home, fingerprint)
+	signed, err = maybeSign(ctx, signOptions{
+		Mode: SignRequired, GPGKeyID: fingerprint, GPGHome: home,
+		PinnedFingerprint: fingerprint,
+		TrustedPublicKey:  completeKey,
+	}, artifact, signature)
+	if err != nil || !signed {
+		t.Fatalf("published signing subkey was rejected: signed=%v err=%v", signed, err)
+	}
+}
+
+func exportPublicKeyForTest(t *testing.T, ctx context.Context, gpg, home, fingerprint string) []byte {
+	t.Helper()
+	cmd := exec.CommandContext(ctx, gpg, "--batch", "--no-tty", "--homedir", home, "--armor", "--export", "--", fingerprint)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("export test public key: %v", err)
+	}
+	if len(out) == 0 {
+		t.Fatal("exported test public key is empty")
+	}
+	return out
+}
+
 func TestCommitArtifactsCleansPartialCommit(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -634,9 +1032,11 @@ func TestCommitArtifactsCleansPartialCommit(t *testing.T) {
 	finalSig := finalTar + ".asc"
 	finalBootstrapSig := filepath.Join(dir, bootstrapSignatureName)
 	err := commitArtifacts(
+		context.Background(),
 		stageTar, stageSHA, stageSig, filepath.Join(dir, "missing-bootstrap.asc"),
 		finalTar, finalSHA, finalSig, finalBootstrapSig,
 		true,
+		nil,
 	)
 	if err == nil {
 		t.Fatal("missing staged signature unexpectedly committed")
@@ -669,9 +1069,11 @@ func TestCommitArtifactsPreservesPreviousSetOnPreflightFailure(t *testing.T) {
 		}
 	}
 	err := commitArtifacts(
+		context.Background(),
 		stageTar, stageSHA, stageSig, filepath.Join(dir, "missing-bootstrap.asc"),
 		finalTar, finalSHA, finalSig, finalBootstrapSig,
 		true,
+		nil,
 	)
 	if err == nil {
 		t.Fatal("missing staged bootstrap signature unexpectedly committed")
@@ -680,6 +1082,56 @@ func TestCommitArtifactsPreservesPreviousSetOnPreflightFailure(t *testing.T) {
 		if got, readErr := os.ReadFile(path); readErr != nil || string(got) != "old" {
 			t.Errorf("previous artifact %s=(%q,%v), want preserved", path, got, readErr)
 		}
+	}
+}
+
+func TestCommitArtifactsFailsClosedOnUnfinishedRecoveryDirectory(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	stageDir := filepath.Join(dir, "stage")
+	if err := os.Mkdir(stageDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stageTar := filepath.Join(stageDir, "final.tar.gz")
+	stageSHA := stageTar + ".sha256"
+	for _, path := range []string{stageTar, stageSHA} {
+		if err := os.WriteFile(path, []byte("new"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	finalTar := filepath.Join(dir, "final.tar.gz")
+	finalSHA := finalTar + ".sha256"
+	for _, path := range []string{finalTar, finalSHA} {
+		if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recoveryDir := filepath.Join(dir, ".sun-commit-backup-interrupted")
+	if err := os.Mkdir(recoveryDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	recoveryEvidence := filepath.Join(recoveryDir, "0-final.tar.gz")
+	if err := os.WriteFile(recoveryEvidence, []byte("previous"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := commitArtifacts(
+		context.Background(),
+		stageTar, stageSHA, "", "",
+		finalTar, finalSHA, finalTar+".asc", filepath.Join(dir, bootstrapSignatureName),
+		false,
+		nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "manual recovery") {
+		t.Fatalf("unfinished recovery error=%v", err)
+	}
+	for _, path := range []string{finalTar, finalSHA} {
+		if got, readErr := os.ReadFile(path); readErr != nil || string(got) != "old" {
+			t.Fatalf("existing artifact %s=(%q,%v), want unchanged", path, got, readErr)
+		}
+	}
+	if got, readErr := os.ReadFile(recoveryEvidence); readErr != nil || string(got) != "previous" {
+		t.Fatalf("recovery evidence=(%q,%v), want retained", got, readErr)
 	}
 }
 
@@ -703,9 +1155,11 @@ func TestCommitArtifactsUnsignedReplacesPayloadAndRemovesStaleSignatures(t *test
 		}
 	}
 	if err := commitArtifacts(
+		context.Background(),
 		stageTar, stageSHA, "", "",
 		finalTar, finalSHA, finalSig, finalBootstrapSig,
 		false,
+		nil,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -718,6 +1172,331 @@ func TestCommitArtifactsUnsignedReplacesPayloadAndRemovesStaleSignatures(t *test
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Errorf("stale signature remains at %s: %v", path, err)
 		}
+	}
+}
+
+func TestCommitArtifactsSerializesConcurrentCompleteSets(t *testing.T) {
+	dir := t.TempDir()
+	finalTar := filepath.Join(dir, "final.tar.gz")
+	finalSHA := finalTar + ".sha256"
+	finalSig := finalTar + ".asc"
+	finalBootstrapSig := filepath.Join(dir, bootstrapSignatureName)
+
+	type stagedSet struct {
+		tar, sha, sig, bootstrap string
+	}
+	makeSet := func(name, content string) stagedSet {
+		t.Helper()
+		stage := filepath.Join(dir, name)
+		if err := os.Mkdir(stage, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		set := stagedSet{
+			tar:       filepath.Join(stage, "final.tar.gz"),
+			sha:       filepath.Join(stage, "final.tar.gz.sha256"),
+			sig:       filepath.Join(stage, "final.tar.gz.asc"),
+			bootstrap: filepath.Join(stage, bootstrapSignatureName),
+		}
+		for _, path := range []string{set.tar, set.sha, set.sig, set.bootstrap} {
+			if err := os.WriteFile(path, []byte(content+"/"+filepath.Base(path)), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return set
+	}
+	first := makeSet("stage-first", "first")
+	second := makeSet("stage-second", "second")
+
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- withReleaseCommitLock(context.Background(), dir, func(directory *os.File) error {
+			close(firstEntered)
+			<-releaseFirst
+			return commitArtifactsUnlockedAt(
+				directory,
+				first.tar, first.sha, first.sig, first.bootstrap,
+				finalTar, finalSHA, finalSig, finalBootstrapSig,
+				true,
+			)
+		})
+	}()
+	<-firstEntered
+
+	probe, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer probe.Close()
+	if err := syscall.Flock(int(probe.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+		if err == nil {
+			_ = syscall.Flock(int(probe.Fd()), syscall.LOCK_UN)
+		}
+		t.Fatalf("concurrent release directory lock probe: %v", err)
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- commitArtifacts(
+			context.Background(),
+			second.tar, second.sha, second.sig, second.bootstrap,
+			finalTar, finalSHA, finalSig, finalBootstrapSig,
+			true,
+			nil,
+		)
+	}()
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first commit: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second commit: %v", err)
+	}
+	for _, path := range []string{finalTar, finalSHA, finalSig, finalBootstrapSig} {
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := "second/" + filepath.Base(path)
+		if string(got) != want {
+			t.Errorf("final artifact %s = %q, want %q", filepath.Base(path), got, want)
+		}
+	}
+}
+
+func TestCommitArtifactsWaitHonorsContextCancellation(t *testing.T) {
+	dir := t.TempDir()
+	held, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	if err := syscall.Flock(int(held.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Flock(int(held.Fd()), syscall.LOCK_UN)
+
+	stageTar := filepath.Join(dir, "stage.tar.gz")
+	stageSHA := stageTar + ".sha256"
+	for _, path := range []string{stageTar, stageSHA} {
+		if err := os.WriteFile(path, []byte("staged"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	preCommitCalled := false
+	err = commitArtifacts(
+		ctx,
+		stageTar, stageSHA, "", "",
+		filepath.Join(dir, "final.tar.gz"), filepath.Join(dir, "final.tar.gz.sha256"),
+		filepath.Join(dir, "final.tar.gz.asc"), filepath.Join(dir, bootstrapSignatureName),
+		false,
+		func() error {
+			preCommitCalled = true
+			return nil
+		},
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("contended commit error = %v, want context deadline", err)
+	}
+	if preCommitCalled {
+		t.Fatal("pre-commit source revalidation ran before the commit lock was acquired")
+	}
+}
+
+func TestCommitArtifactsRejectsAliasedPathsBeforeMutation(t *testing.T) {
+	dir := t.TempDir()
+	stageTar := filepath.Join(dir, "stage.tar.gz")
+	stageSHA := stageTar + ".sha256"
+	if err := os.WriteFile(stageTar, []byte("new archive"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stageSHA, []byte("new checksum"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	finalTar := filepath.Join(dir, "final.tar.gz")
+	if err := os.WriteFile(finalTar, []byte("old archive"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := commitArtifacts(
+		context.Background(),
+		stageTar, stageSHA, "", "",
+		finalTar, finalTar, finalTar+".asc", filepath.Join(dir, bootstrapSignatureName),
+		false,
+		nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "must be distinct") {
+		t.Fatalf("aliased final paths error=%v", err)
+	}
+	for path, want := range map[string]string{
+		stageTar: "new archive", stageSHA: "new checksum", finalTar: "old archive",
+	} {
+		if got, readErr := os.ReadFile(path); readErr != nil || string(got) != want {
+			t.Fatalf("artifact %s=(%q,%v), want unchanged %q", path, got, readErr, want)
+		}
+	}
+	recovery, globErr := filepath.Glob(filepath.Join(dir, ".sun-commit-backup-*"))
+	if globErr != nil || len(recovery) != 0 {
+		t.Fatalf("path preflight left recovery data: %v, %v", recovery, globErr)
+	}
+}
+
+func TestCommitArtifactsRejectsHardLinkedStagedArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	stageTar := filepath.Join(dir, "stage.tar.gz")
+	stageSHA := stageTar + ".sha256"
+	if err := os.WriteFile(stageTar, []byte("aliased staged bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(stageTar, stageSHA); err != nil {
+		t.Fatal(err)
+	}
+	finalTar := filepath.Join(dir, "final.tar.gz")
+	finalSHA := finalTar + ".sha256"
+	for _, path := range []string{finalTar, finalSHA} {
+		if err := os.WriteFile(path, []byte("previous"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := commitArtifacts(
+		context.Background(),
+		stageTar, stageSHA, "", "",
+		finalTar, finalSHA, finalTar+".asc", filepath.Join(dir, bootstrapSignatureName),
+		false, nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "hard link") {
+		t.Fatalf("hard-linked staged artifacts error=%v", err)
+	}
+	for _, path := range []string{finalTar, finalSHA} {
+		if got, readErr := os.ReadFile(path); readErr != nil || string(got) != "previous" {
+			t.Fatalf("existing output changed after hard-link rejection: %s=(%q,%v)", path, got, readErr)
+		}
+	}
+}
+
+func TestCommitArtifactsRemainsBoundToLockedOutputDirectory(t *testing.T) {
+	root := t.TempDir()
+	distDir := filepath.Join(root, "dist")
+	movedDir := filepath.Join(root, "opened-dist")
+	external := filepath.Join(root, "external")
+	stageDir := filepath.Join(root, "stage")
+	for _, path := range []string{distDir, external, stageDir} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stageTar := filepath.Join(stageDir, "release.tar.gz")
+	stageSHA := stageTar + ".sha256"
+	for _, path := range []string{stageTar, stageSHA} {
+		if err := os.WriteFile(path, []byte("new/"+filepath.Base(path)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	finalTar := filepath.Join(distDir, "release.tar.gz")
+	finalSHA := finalTar + ".sha256"
+	err := commitArtifacts(
+		context.Background(),
+		stageTar, stageSHA, "", "",
+		finalTar, finalSHA, finalTar+".asc", filepath.Join(distDir, bootstrapSignatureName),
+		false,
+		func() error {
+			if err := os.Rename(distDir, movedDir); err != nil {
+				return err
+			}
+			return os.Symlink(external, distDir)
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "output directory changed") {
+		t.Fatalf("replaced output directory error=%v", err)
+	}
+	for _, name := range []string{"release.tar.gz", "release.tar.gz.sha256"} {
+		got, readErr := os.ReadFile(filepath.Join(movedDir, name))
+		if readErr != nil || string(got) != "new/"+name {
+			t.Fatalf("opened output %s=(%q,%v)", name, got, readErr)
+		}
+		if _, statErr := os.Lstat(filepath.Join(external, name)); !os.IsNotExist(statErr) {
+			t.Fatalf("replacement output received %s: %v", name, statErr)
+		}
+	}
+}
+
+func TestValidatePinnedGoToolchainRequiresAnExactMatch(t *testing.T) {
+	metadata := []byte(`{"Toolchain":"go1.26.5"}`)
+	if err := validatePinnedGoToolchain(metadata, []byte("go1.26.5\n")); err != nil {
+		t.Fatalf("matching pinned toolchain rejected: %v", err)
+	}
+	for name, candidate := range map[string][]byte{
+		"newer local toolchain": []byte("go1.27.0\n"),
+		"missing directive":     []byte(`{"Go":"1.23"}`),
+		"malformed metadata":    []byte(`{"Toolchain":`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			input := metadata
+			actual := candidate
+			if name != "newer local toolchain" {
+				input = candidate
+				actual = []byte("go1.26.5\n")
+			}
+			if err := validatePinnedGoToolchain(input, actual); err == nil {
+				t.Fatal("release toolchain drift was accepted")
+			}
+		})
+	}
+}
+
+func TestCappedCombinedOutputDiscardsBytesBeyondLimit(t *testing.T) {
+	var output cappedCombinedOutput
+	payload := bytes.Repeat([]byte{'x'}, maxCombinedCommandOutput+1)
+	n, err := output.Write(payload)
+	if err != nil || n != len(payload) {
+		t.Fatalf("Write() = %d, %v; want %d, nil", n, err, len(payload))
+	}
+	if !output.truncated || output.buf.Len() != maxCombinedCommandOutput {
+		t.Fatalf("capped output = len %d, truncated %v", output.buf.Len(), output.truncated)
+	}
+}
+
+func TestCommandErrorSummaryIsBoundedAndTerminalSafe(t *testing.T) {
+	message := strings.Repeat("界", maxCommandErrorBytes/3) + "\nforged\r\x1b[31mred\u202eevil\u2028tail"
+	got := commandErrorSummary([]byte(message))
+	if !utf8.ValidString(got) || len(got) > maxCommandErrorBytes {
+		t.Fatalf("unsafe command error length=%d valid=%v", len(got), utf8.ValidString(got))
+	}
+	for _, forbidden := range []string{"\n", "\r", "\x1b", "\u202e", "\u2028"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("command error retained display control %q: %q", forbidden, got)
+		}
+	}
+}
+
+func TestRunGPGIgnoresHomeOptions(t *testing.T) {
+	gpg, err := exec.LookPath("gpg")
+	if err != nil {
+		t.Skip("gpg not available")
+	}
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, "gpg.conf"), []byte("not-a-real-gpg-option\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGPGOutput(context.Background(), gpg, home, "--with-colons", "--list-keys"); err != nil {
+		t.Fatalf("explicit GPG invocation read gpg.conf: %v", err)
+	}
+}
+
+func TestCurrentGoToolchainMatchesRepositoryPin(t *testing.T) {
+	goTool, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go unavailable")
+	}
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := requirePinnedGoToolchain(context.Background(), root, goTool); err != nil {
+		t.Fatal(err)
 	}
 }
 

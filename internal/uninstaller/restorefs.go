@@ -15,6 +15,8 @@ import (
 	"strings"
 	"syscall"
 	"unsafe"
+
+	"github.com/xxvcc/security-update-notify/internal/filetrust"
 )
 
 const (
@@ -29,9 +31,13 @@ const (
 )
 
 type restoreDirectory struct {
-	file          *os.File
-	hostPath      string
-	afterExchange func()
+	file                  *os.File
+	hostPath              string
+	ownerUID              int
+	afterExchange         func()
+	beforeTemporaryCommit func(string) error
+	beforeRemove          func(string) error
+	syncDirectory         func() error
 }
 
 type regularSnapshot struct {
@@ -70,7 +76,7 @@ func openRestoreDirectory(root, logical string) (*restoreDirectory, error) {
 		_ = syscall.Close(fd)
 		return nil, errors.New("could not create restore directory handle")
 	}
-	return &restoreDirectory{file: directory, hostPath: rooted(root, logical)}, nil
+	return &restoreDirectory{file: directory, hostPath: rooted(root, logical), ownerUID: os.Geteuid()}, nil
 }
 
 func (d *restoreDirectory) close() error {
@@ -268,7 +274,7 @@ func (d *restoreDirectory) readRegular(name string, maxBytes int64) (regularSnap
 	if err != nil {
 		return regularSnapshot{}, err
 	}
-	if !sameRestoreFileInfo(info, finalInfo) || xattrsSupported != finalXattrsSupported || !sameRestoreXattrs(xattrs, finalXattrs) {
+	if !sameRestoreFileState(info, finalInfo) || xattrsSupported != finalXattrsSupported || !sameRestoreXattrs(xattrs, finalXattrs) {
 		return regularSnapshot{}, errors.New("regular file changed while reading")
 	}
 	return regularSnapshot{
@@ -287,7 +293,17 @@ func sameRestoreFileInfo(left, right fs.FileInfo) bool {
 	}
 	leftStat, leftOK := left.Sys().(*syscall.Stat_t)
 	rightStat, rightOK := right.Sys().(*syscall.Stat_t)
-	return leftOK == rightOK && (!leftOK || leftStat.Uid == rightStat.Uid && leftStat.Gid == rightStat.Gid)
+	return leftOK && rightOK && leftStat.Uid == rightStat.Uid && leftStat.Gid == rightStat.Gid &&
+		leftStat.Nlink == rightStat.Nlink
+}
+
+func sameRestoreFileState(left, right fs.FileInfo) bool {
+	if !sameRestoreFileInfo(left, right) {
+		return false
+	}
+	leftStat, leftOK := left.Sys().(*syscall.Stat_t)
+	rightStat, rightOK := right.Sys().(*syscall.Stat_t)
+	return leftOK && rightOK && leftStat.Ctim == rightStat.Ctim
 }
 
 func sameRestoreXattrs(left, right map[string][]byte) bool {
@@ -310,8 +326,35 @@ func sameRegularSnapshot(left, right regularSnapshot) bool {
 	if !left.exists {
 		return true
 	}
+	return sameRestoreFileState(left.info, right.info) && bytes.Equal(left.data, right.data) &&
+		left.xattrsSupported == right.xattrsSupported && sameRestoreXattrs(left.xattrs, right.xattrs)
+}
+
+// A successful rename can advance ctime even though the same inode and all
+// rollback-relevant contents and metadata were moved. Post-rename verification
+// deliberately omits only ctime; pre-commit revalidation remains strict.
+func sameRenamedRegularSnapshot(left, right regularSnapshot) bool {
+	if left.exists != right.exists {
+		return false
+	}
+	if !left.exists {
+		return true
+	}
 	return sameRestoreFileInfo(left.info, right.info) && bytes.Equal(left.data, right.data) &&
 		left.xattrsSupported == right.xattrsSupported && sameRestoreXattrs(left.xattrs, right.xattrs)
+}
+
+func sameRestoredMetadataAndContents(restored, source regularSnapshot) bool {
+	if !restored.exists || !source.exists || restored.info == nil || source.info == nil ||
+		!restored.info.Mode().IsRegular() || restored.info.Mode() != source.info.Mode() ||
+		!restored.info.ModTime().Equal(source.info.ModTime()) || !bytes.Equal(restored.data, source.data) ||
+		restored.xattrsSupported != source.xattrsSupported || !sameRestoreXattrs(restored.xattrs, source.xattrs) {
+		return false
+	}
+	restoredStat, restoredOK := restored.info.Sys().(*syscall.Stat_t)
+	sourceStat, sourceOK := source.info.Sys().(*syscall.Stat_t)
+	return restoredOK && sourceOK && restoredStat.Uid == sourceStat.Uid && restoredStat.Gid == sourceStat.Gid &&
+		restoredStat.Nlink == 1
 }
 
 func (d *restoreDirectory) revalidate(name string, expected regularSnapshot, maxBytes int64) error {
@@ -329,6 +372,11 @@ func (d *restoreDirectory) remove(name string) error {
 	if err := validRestoreEntry(name); err != nil {
 		return err
 	}
+	if d.beforeRemove != nil {
+		if err := d.beforeRemove(name); err != nil {
+			return err
+		}
+	}
 	err := syscall.Unlinkat(int(d.file.Fd()), name)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -336,7 +384,36 @@ func (d *restoreDirectory) remove(name string) error {
 	return err
 }
 
+func (d *restoreDirectory) cleanupUncommittedPlaceholder(name string, cause error) error {
+	cleanupErr := d.remove(name)
+	if cleanupErr != nil {
+		cleanupErr = fmt.Errorf("remove uncommitted restore placeholder retained at %s: %w", d.host(name), cleanupErr)
+	}
+	return errors.Join(cause, cleanupErr)
+}
+
+func (d *restoreDirectory) removeOwnedTemporary(name string, opened *os.File) error {
+	expected, err := opened.Stat()
+	if err != nil {
+		return err
+	}
+	current, err := d.readRegular(name, restoreConfigLimit)
+	if err == nil && !current.exists {
+		return nil
+	}
+	if err != nil || !os.SameFile(expected, current.info) {
+		return errors.Join(errors.New("temporary restore entry changed; retained at "+d.host(name)), err)
+	}
+	if err := d.remove(name); err != nil {
+		return fmt.Errorf("remove temporary restore entry retained at %s: %w", d.host(name), err)
+	}
+	return nil
+}
+
 func (d *restoreDirectory) sync() error {
+	if d.syncDirectory != nil {
+		return d.syncDirectory()
+	}
 	return d.file.Sync()
 }
 
@@ -385,6 +462,9 @@ func (d *restoreDirectory) restoreFile(source, destination string, sourceSnapsho
 	if !sourceSnapshot.exists {
 		return regularSnapshot{}, os.ErrNotExist
 	}
+	if err := filetrust.ValidateRegular(sourceSnapshot.info, d.ownerUID, 0o022, true); err != nil {
+		return regularSnapshot{}, fmt.Errorf("unsafe backup source %s: %w", d.host(source), err)
+	}
 	if err := d.revalidate(source, sourceSnapshot, restoreConfigLimit); err != nil {
 		return regularSnapshot{}, d.recordConflict("backup changed before restore", err)
 	}
@@ -394,10 +474,10 @@ func (d *restoreDirectory) restoreFile(source, destination string, sourceSnapsho
 	}
 	removeTemporary := true
 	defer func() {
-		_ = temporary.Close()
 		if removeTemporary {
-			_ = d.remove(temporaryName)
+			retErr = errors.Join(retErr, d.removeOwnedTemporary(temporaryName, temporary))
 		}
+		retErr = errors.Join(retErr, temporary.Close())
 	}()
 	written, err := temporary.Write(sourceSnapshot.data)
 	if err != nil {
@@ -412,6 +492,11 @@ func (d *restoreDirectory) restoreFile(source, destination string, sourceSnapsho
 	if err := temporary.Sync(); err != nil {
 		return regularSnapshot{}, err
 	}
+	if d.beforeTemporaryCommit != nil {
+		if err := d.beforeTemporaryCommit(temporaryName); err != nil {
+			return regularSnapshot{}, err
+		}
+	}
 	committedInfo, err := temporary.Stat()
 	if err != nil {
 		return regularSnapshot{}, err
@@ -419,71 +504,72 @@ func (d *restoreDirectory) restoreFile(source, destination string, sourceSnapsho
 	if !committedInfo.Mode().IsRegular() || committedInfo.Size() != int64(len(sourceSnapshot.data)) {
 		return regularSnapshot{}, errors.New("temporary restore file changed before commit")
 	}
-	if err := temporary.Close(); err != nil {
-		return regularSnapshot{}, err
-	}
 	committedSnapshot, err := d.readRegular(temporaryName, restoreConfigLimit)
 	if err != nil {
 		return regularSnapshot{}, err
 	}
-	if !committedSnapshot.exists || !os.SameFile(committedInfo, committedSnapshot.info) ||
-		!bytes.Equal(committedSnapshot.data, sourceSnapshot.data) {
+	if !committedSnapshot.exists || !sameRestoreFileState(committedInfo, committedSnapshot.info) ||
+		!sameRestoredMetadataAndContents(committedSnapshot, sourceSnapshot) {
 		return regularSnapshot{}, errors.New("temporary restore file changed before commit")
 	}
-	retainTemporary, err := d.publishTemporary(temporaryName, destination, committedSnapshot, destinationSnapshot)
+	publishedSnapshot, retainTemporary, err := d.publishTemporary(temporaryName, destination, committedSnapshot, destinationSnapshot)
 	removeTemporary = !retainTemporary
 	if err != nil {
 		return regularSnapshot{}, err
 	}
 	removeTemporary = false
-	return committedSnapshot, nil
+	return publishedSnapshot, nil
 }
 
-func (d *restoreDirectory) publishTemporary(temporary, destination string, committed, expectedDestination regularSnapshot) (bool, error) {
+func (d *restoreDirectory) publishTemporary(temporary, destination string, committed, expectedDestination regularSnapshot) (regularSnapshot, bool, error) {
 	if err := d.revalidate(temporary, committed, restoreConfigLimit); err != nil {
-		return true, d.recordConflict("temporary restore file changed before publish", err)
+		return regularSnapshot{}, true, d.recordConflict("temporary restore file changed before publish", err)
 	}
 	if err := d.revalidate(destination, expectedDestination, restoreConfigLimit); err != nil {
-		return true, d.recordConflict("destination changed before restore", err)
+		return regularSnapshot{}, true, d.recordConflict("destination changed before restore", err)
 	}
 	if !expectedDestination.exists {
 		if err := renameRestoreEntry(int(d.file.Fd()), temporary, destination, restoreRenameNoReplace); err != nil {
-			return true, d.recordConflict("publish restored file without overwrite failed", err)
+			return regularSnapshot{}, true, d.recordConflict("publish restored file without overwrite failed", err)
 		}
 		published, err := d.readRegular(destination, restoreConfigLimit)
-		if err != nil || !sameRegularSnapshot(published, committed) {
-			return true, d.recordConflict("published restore file changed before verification", err)
+		if err != nil || !sameRenamedRegularSnapshot(published, committed) {
+			return regularSnapshot{}, true, d.recordConflict("published restore file changed before verification", err)
 		}
 		if err := d.sync(); err != nil {
-			return true, d.recordConflict("sync published restore file", err)
+			return regularSnapshot{}, true, d.recordConflict("sync published restore file", err)
 		}
-		return false, nil
+		return published, false, nil
 	}
 
 	if err := renameRestoreEntry(int(d.file.Fd()), temporary, destination, restoreRenameExchange); err != nil {
-		return true, d.recordConflict("exchange restored file with destination failed", err)
+		return regularSnapshot{}, true, d.recordConflict("exchange restored file with destination failed", err)
 	}
 	if d.afterExchange != nil {
 		d.afterExchange()
 	}
 	published, publishErr := d.readRegular(destination, restoreConfigLimit)
 	displaced, displacedErr := d.readRegular(temporary, restoreConfigLimit)
-	if publishErr != nil || displacedErr != nil || !sameRegularSnapshot(published, committed) || !sameRegularSnapshot(displaced, expectedDestination) {
-		return true, d.recordConflict(
+	if publishErr != nil || displacedErr != nil || !sameRenamedRegularSnapshot(published, committed) ||
+		!sameRenamedRegularSnapshot(displaced, expectedDestination) {
+		return regularSnapshot{}, true, d.recordConflict(
 			"restore exchange changed concurrently; entries retained at "+d.host(destination)+" and "+d.host(temporary),
 			publishErr, displacedErr,
 		)
 	}
 	if err := d.sync(); err != nil {
-		return true, err
+		return regularSnapshot{}, true, d.recordConflict(
+			"sync restore exchange; entries retained at "+d.host(destination)+" and "+d.host(temporary),
+			err,
+		)
 	}
 	if err := d.removeValidated(temporary, expectedDestination); err != nil {
-		return true, fmt.Errorf("remove displaced destination: %w", err)
+		return regularSnapshot{}, true, fmt.Errorf("remove displaced destination: %w", err)
 	}
 	if err := d.sync(); err != nil {
-		return true, d.recordConflict("sync completed restore exchange", err)
+		return regularSnapshot{}, true, d.recordConflict("sync completed restore exchange", err)
 	}
-	return false, nil
+	return published, false, nil
 }
 
 // removeValidated first moves the current directory entry to a private name.
@@ -495,8 +581,7 @@ func (d *restoreDirectory) removeValidated(name string, expected regularSnapshot
 		return err
 	}
 	if err := placeholder.Close(); err != nil {
-		_ = d.remove(quarantine)
-		return err
+		return d.cleanupUncommittedPlaceholder(quarantine, err)
 	}
 	if err := syscall.Renameat(int(d.file.Fd()), name, int(d.file.Fd()), quarantine); err != nil {
 		return errors.Join(
@@ -505,9 +590,9 @@ func (d *restoreDirectory) removeValidated(name string, expected regularSnapshot
 		)
 	}
 	moved, readErr := d.readRegular(quarantine, restoreConfigLimit)
-	if readErr == nil && sameRegularSnapshot(moved, expected) {
+	if readErr == nil && sameRenamedRegularSnapshot(moved, expected) {
 		if err := d.remove(quarantine); err != nil {
-			return err
+			return fmt.Errorf("remove validated file retained at %s: %w", d.host(quarantine), err)
 		}
 		if err := d.sync(); err != nil {
 			return d.recordConflict("sync validated file removal", err)
@@ -609,9 +694,14 @@ func preserveRestoreMetadata(source regularSnapshot, target *os.File) error {
 	if err := applyRestoreXattrs(source.xattrs, source.xattrsSupported, target); err != nil {
 		return err
 	}
-	stamp := syscall.NsecToTimeval(source.info.ModTime().UnixNano())
-	if err := syscall.Futimes(int(target.Fd()), []syscall.Timeval{stamp, stamp}); err != nil {
-		return fmt.Errorf("preserve file mtime: %w", err)
+	stamp := syscall.NsecToTimespec(source.info.ModTime().UnixNano())
+	times := [2]syscall.Timespec{stamp, stamp}
+	_, _, errno := syscall.Syscall6(
+		syscall.SYS_UTIMENSAT,
+		target.Fd(), 0, uintptr(unsafe.Pointer(&times[0])), 0, 0, 0,
+	)
+	if errno != 0 {
+		return fmt.Errorf("preserve file mtime: %w", errno)
 	}
 	return nil
 }

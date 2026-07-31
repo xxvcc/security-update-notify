@@ -30,7 +30,7 @@ func detectDNFRuntime(timeout time.Duration) dnfRuntime {
 			return dnfRuntime{Command: candidate, Generation: generation, GenerationKnown: true, Available: true}
 		}
 		version := sysexec.RunTimeout(timeout, candidate, "--version")
-		if version.Code != 0 {
+		if version.Err != nil || version.Code != 0 || version.StdoutTruncated || version.StderrTruncated {
 			continue
 		}
 		if generation, known := backend.ProbeDNFGeneration(candidate, version.Stdout+version.Stderr); known {

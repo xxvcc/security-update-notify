@@ -1,10 +1,13 @@
 package osrel
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"reflect"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestRead(t *testing.T) {
@@ -13,11 +16,11 @@ func TestRead(t *testing.T) {
 	if err := os.WriteFile(p, []byte("NAME=\"Debian GNU/Linux\"\r\nID=debian\r\nVERSION_ID=\"12\"\r\nPRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\r\nID_LIKE='x'\r\nSUPPORT_END=\"2028-06-30\"\r\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	o := Read(p)
+	o := readTrusted(p, os.Geteuid())
 	if o.ID != "debian" || o.VersionID != "12" || o.PrettyName != "Debian GNU/Linux 12 (bookworm)" || o.IDLike != "x" || o.SupportEnd != "2028-06-30" {
 		t.Errorf("Read = %+v", o)
 	}
-	if got := Read(filepath.Join(dir, "absent")); got != (OSRelease{}) {
+	if got := readTrusted(filepath.Join(dir, "absent"), os.Geteuid()); got != (OSRelease{}) {
 		t.Errorf("absent file: %+v", got)
 	}
 }
@@ -29,13 +32,13 @@ func TestReadFirstUsesFallbackOnlyWhenPrimaryIsMissing(t *testing.T) {
 	if err := os.WriteFile(fallback, []byte("ID=debian\nVERSION_ID=13\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := ReadFirst(primary, fallback); got.ID != "debian" || got.VersionID != "13" {
+	if got := readFirstTrusted(primary, fallback, os.Geteuid()); got.ID != "debian" || got.VersionID != "13" {
 		t.Fatalf("missing-primary fallback = %+v", got)
 	}
 	if err := os.WriteFile(primary, []byte("ID=ubuntu\nVERSION_ID=24.04\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := ReadFirst(primary, fallback); got.ID != "ubuntu" || got.VersionID != "24.04" {
+	if got := readFirstTrusted(primary, fallback, os.Geteuid()); got.ID != "ubuntu" || got.VersionID != "24.04" {
 		t.Fatalf("primary precedence = %+v", got)
 	}
 	if err := os.Remove(primary); err != nil {
@@ -44,7 +47,7 @@ func TestReadFirstUsesFallbackOnlyWhenPrimaryIsMissing(t *testing.T) {
 	if err := os.Mkdir(primary, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if got := ReadFirst(primary, fallback); got != (OSRelease{}) {
+	if got := readFirstTrusted(primary, fallback, os.Geteuid()); got != (OSRelease{}) {
 		t.Fatalf("primary read failure was hidden by fallback: %+v", got)
 	}
 	if err := os.Remove(primary); err != nil {
@@ -53,8 +56,77 @@ func TestReadFirstUsesFallbackOnlyWhenPrimaryIsMissing(t *testing.T) {
 	if err := os.Symlink(filepath.Join(dir, "missing-target"), primary); err != nil {
 		t.Fatal(err)
 	}
-	if got := ReadFirst(primary, fallback); got != (OSRelease{}) {
+	if got := readFirstTrusted(primary, fallback, os.Geteuid()); got != (OSRelease{}) {
 		t.Fatalf("broken primary symlink was hidden by fallback: %+v", got)
+	}
+}
+
+func TestReadAcceptsTrustedRegularSymlinkButRejectsSpecialAndOversizedFiles(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "os-release.target")
+	if err := os.WriteFile(target, []byte("ID=debian\nVERSION_ID=12\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "os-release.link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if got := readTrusted(link, os.Geteuid()); got.ID != "debian" || got.VersionID != "12" {
+		t.Fatalf("regular symlink was not parsed: %+v", got)
+	}
+
+	oversized := filepath.Join(dir, "os-release.oversized")
+	if err := os.WriteFile(oversized, bytes.Repeat([]byte{'x'}, maxOSReleaseBytes+1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := readTrusted(oversized, os.Geteuid()); got != (OSRelease{}) {
+		t.Fatalf("oversized os-release was accepted: %+v", got)
+	}
+
+	fifo := filepath.Join(dir, "os-release.fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan OSRelease, 1)
+	go func() { done <- readTrusted(fifo, os.Geteuid()) }()
+	select {
+	case got := <-done:
+		if got != (OSRelease{}) {
+			t.Fatalf("FIFO os-release was accepted: %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reading a FIFO os-release blocked")
+	}
+}
+
+func TestReadRequiresTrustedOwnerAndProtectedPermissionsButAllowsHardlinks(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "os-release")
+	if err := os.WriteFile(path, []byte("ID=debian\nVERSION_ID=12\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ownerUID := os.Geteuid()
+	if got := readTrusted(path, ownerUID+1); got != (OSRelease{}) {
+		t.Fatalf("wrong-owner os-release was accepted: %+v", got)
+	}
+
+	for _, mode := range []os.FileMode{0o664, 0o646} {
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		if got := readTrusted(path, ownerUID); got != (OSRelease{}) {
+			t.Fatalf("writable os-release mode %#o was accepted: %+v", mode, got)
+		}
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(dir, "os-release.alias")
+	if err := os.Link(path, alias); err != nil {
+		t.Fatal(err)
+	}
+	if got := readTrusted(path, ownerUID); got.ID != "debian" || got.VersionID != "12" {
+		t.Fatalf("protected hard-linked os-release was rejected: %+v", got)
 	}
 }
 

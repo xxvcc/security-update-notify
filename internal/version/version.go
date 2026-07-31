@@ -1,5 +1,5 @@
-// Package version 保留 SUN 2.x 的语义化版本比较：数字段逐段比较（缺省段补 0），pre-release
-// 后缀按 semver 规则排序，任何解析失败一律 fail-closed（视为“非更新”）。
+// Package version 保留 SUN 2.x 的扩展语义版本比较：数字段逐段比较（缺省段补 0），pre-release
+// 后缀按 SemVer 规则排序，任何解析失败一律 fail-closed（视为“非更新”）。
 //
 // Package version retains SUN's stable semantic-version ordering: numeric segments are compared pairwise
 // (missing = 0), pre-release suffixes are ranked per semver, and parse failures fail closed.
@@ -7,48 +7,74 @@ package version
 
 import (
 	"errors"
-	"strconv"
 	"strings"
 )
 
 // parsedVersion 拆成 release 数字段与 pre-release 后缀。
 // parsedVersion splits a version into numeric release segments and a pre-release suffix.
 type parsedVersion struct {
-	rel []int
+	rel []string
 	pre string
 }
 
 var errBadVersion = errors.New("unparseable version")
 
-// parseVersion 复刻 python 比较器的解析规则：去掉前导 v、丢弃 +构建元数据、按首个 '-' 切出
-// pre-release；release 数字段仅接受纯 ASCII 数字（拒绝下划线、Unicode 数字等），任何畸形一律
-// 报错，交由上层 fail-closed。
+// parseVersion 保留 python 比较器的排序规则，但在比较前严格校验版本结构：去掉前导 v、丢弃
+// +构建元数据、按首个 '-' 切出 pre-release；release 数字段仅接受纯 ASCII 数字，pre-release
+// 与构建元数据使用非空的 ASCII SemVer 标识符。任何畸形一律报错，交由上层 fail-closed。
 func parseVersion(v string) (parsedVersion, error) {
 	v = strings.TrimSpace(v)
 	v = strings.TrimPrefix(v, "v")
 	if i := strings.IndexByte(v, '+'); i >= 0 { // 构建元数据不参与优先级 / build metadata ignored
+		if !validSemverIdentifiers(v[i+1:], false) {
+			return parsedVersion{}, errBadVersion
+		}
 		v = v[:i]
 	}
 	rel, pre := v, ""
 	if i := strings.IndexByte(v, '-'); i >= 0 {
 		rel, pre = v[:i], v[i+1:]
+		if !validSemverIdentifiers(pre, true) {
+			return parsedVersion{}, errBadVersion
+		}
 	}
 	if rel == "" {
-		rel = "0"
+		return parsedVersion{}, errBadVersion
 	}
 	parts := strings.Split(rel, ".")
-	nums := make([]int, len(parts))
+	nums := make([]string, len(parts))
 	for i, p := range parts {
 		if !isASCIIDigits(p) {
 			return parsedVersion{}, errBadVersion
 		}
-		n, err := strconv.Atoi(p)
-		if err != nil {
-			return parsedVersion{}, errBadVersion
-		}
-		nums[i] = n
+		nums[i] = p
 	}
 	return parsedVersion{rel: nums, pre: pre}, nil
+}
+
+func validSemverIdentifiers(value string, rejectNumericLeadingZero bool) bool {
+	if value == "" {
+		return false
+	}
+	for _, identifier := range strings.Split(value, ".") {
+		if identifier == "" {
+			return false
+		}
+		for i := 0; i < len(identifier); i++ {
+			c := identifier[i]
+			if !isASCIIAlphaNumeric(c) && c != '-' {
+				return false
+			}
+		}
+		if rejectNumericLeadingZero && len(identifier) > 1 && identifier[0] == '0' && isASCIIDigits(identifier) {
+			return false
+		}
+	}
+	return true
+}
+
+func isASCIIAlphaNumeric(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z'
 }
 
 func isASCIIDigits(s string) bool {
@@ -84,24 +110,21 @@ func cmpNumericStr(x, y string) int {
 }
 
 // cmpRelease 逐段比较，缺省段按 0 补齐（故 1.7.0.1 > 1.7.0）。
-func cmpRelease(a, b []int) int {
+func cmpRelease(a, b []string) int {
 	n := len(a)
 	if len(b) > n {
 		n = len(b)
 	}
 	for i := 0; i < n; i++ {
-		var x, y int
+		x, y := "0", "0"
 		if i < len(a) {
 			x = a[i]
 		}
 		if i < len(b) {
 			y = b[i]
 		}
-		if x != y {
-			if x < y {
-				return -1
-			}
-			return 1
+		if c := cmpNumericStr(x, y); c != 0 {
+			return c
 		}
 	}
 	return 0
@@ -132,10 +155,10 @@ func cmpPre(a, b string) int {
 		}
 		xn, yn := isASCIIDigits(x), isASCIIDigits(y)
 		if xn && yn {
-			// 复刻 python 参考实现 `return (int(x)>int(y))-(int(x)<int(y))`：数字标识符按值比较并
-			// 立即返回（值相等即返回 0，结束整个 pre-release 比较）。用 cmpNumericStr 做任意长度的
-			// 十进制比较，避免 strconv.Atoi 对 >int64 标识符溢出（会把不同大数误判为相等）。
-			return cmpNumericStr(x, y)
+			if c := cmpNumericStr(x, y); c != 0 {
+				return c
+			}
+			continue
 		}
 		if xn != yn { // 数字标识符优先级低于字母标识符 / numeric < alphanumeric
 			if xn {

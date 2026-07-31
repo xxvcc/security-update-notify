@@ -67,10 +67,15 @@ func CheckPatch(in PatchInput) Patch {
 		zh = append(zh, "• 安全更新被 hold、versionlock 或 exclude 阻止："+summarize(blocked, 8))
 		en = append(en, "• Security updates are blocked by hold, versionlock, or exclude: "+summarize(blocked, 8))
 	}
+	seenIssues := make(map[Issue]bool, len(in.Issues))
 	for _, issue := range in.Issues {
 		if issue.Code == "" {
 			continue
 		}
+		if seenIssues[issue] {
+			continue
+		}
+		seenIssues[issue] = true
 		add(issue.Code, issue.ZH, issue.EN)
 	}
 	if in.RestartAlertDays > 0 && in.RebootAgeDays >= in.RestartAlertDays {

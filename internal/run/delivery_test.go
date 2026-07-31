@@ -44,15 +44,19 @@ func loadDeliveryConfig(t *testing.T, body string) *config.Config {
 func TestDecryptFeishuSecretKillsDescendants(t *testing.T) {
 	dir := t.TempDir()
 	marker := filepath.Join(dir, "descendant-survived")
+	credential := filepath.Join(dir, "credential")
+	if err := os.WriteFile(credential, []byte("encrypted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	command := filepath.Join(dir, "systemd-creds")
 	body := "#!/bin/sh\n(/bin/sleep 0.2; printf survived > '" + marker + "') &\nwait\n"
 	if err := os.WriteFile(command, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", dir)
+	setTestCommandPath(t, dir)
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 	defer cancel()
-	if _, err := decryptFeishuSecretContext(ctx, filepath.Join(dir, "credential")); err == nil {
+	if _, err := decryptFeishuSecretContext(ctx, credential); err == nil {
 		t.Fatal("timed-out credential decrypt succeeded")
 	}
 	time.Sleep(300 * time.Millisecond)
@@ -270,6 +274,42 @@ func TestReadFeishuSecretFromPlainCredentialFallback(t *testing.T) {
 	}
 }
 
+func TestReadFeishuSecretFallsBackWhenDefaultEncryptedCredentialIsMissing(t *testing.T) {
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "default-plain")
+	if err := os.WriteFile(plain, []byte("plain-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		"CREDENTIALS_DIRECTORY",
+		feishuSecretFileEnv,
+		feishuEncryptedCredentialEnv,
+		feishuPlainCredentialEnv,
+	} {
+		unsetTestEnvironment(t, name)
+	}
+
+	got, err := readFeishuSecretWithDefaults(filepath.Join(dir, "missing-encrypted"), plain)
+	if err != nil || got != "plain-secret" {
+		t.Fatalf("default plaintext fallback secret=%q err=%v", got, err)
+	}
+}
+
+func unsetTestEnvironment(t *testing.T, name string) {
+	t.Helper()
+	value, existed := os.LookupEnv(name)
+	if err := os.Unsetenv(name); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if existed {
+			_ = os.Setenv(name, value)
+		} else {
+			_ = os.Unsetenv(name)
+		}
+	})
+}
+
 func TestReadFeishuSecretDecryptsCredentialAndBoundsCommandOutput(t *testing.T) {
 	dir := t.TempDir()
 	credential := filepath.Join(dir, "encrypted-credential")
@@ -277,10 +317,18 @@ func TestReadFeishuSecretDecryptsCredentialAndBoundsCommandOutput(t *testing.T) 
 		t.Fatal(err)
 	}
 	command := filepath.Join(dir, "systemd-creds")
-	if err := os.WriteFile(command, []byte("#!/bin/sh\nprintf 'decrypted-secret\\n'\n"), 0o755); err != nil {
+	if err := os.WriteFile(command, []byte(`#!/bin/sh
+set -eu
+[ "$1" = decrypt ]
+[ "$2" = --name=feishu_app_secret ]
+[ "$3" = /proc/self/fd/3 ]
+[ "$4" = - ]
+[ "$(cat "$3")" = encrypted ]
+printf 'decrypted-secret\n'
+`), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", dir)
+	setTestCommandPath(t, dir)
 	t.Setenv("CREDENTIALS_DIRECTORY", "")
 	t.Setenv(feishuSecretFileEnv, "")
 	t.Setenv(feishuEncryptedCredentialEnv, credential)
@@ -300,6 +348,26 @@ func TestReadFeishuSecretDecryptsCredentialAndBoundsCommandOutput(t *testing.T) 
 	}
 	if n, err := output.Write([]byte("ignored")); n != len("ignored") || err != nil || len(output.data) != maxFeishuSecretBytes+1 {
 		t.Fatalf("full bounded write=(%d, %v), length=%d", n, err, len(output.data))
+	}
+}
+
+func TestEncryptedCredentialInputIsBoundedBeforeCommandExecution(t *testing.T) {
+	dir := t.TempDir()
+	credential := filepath.Join(dir, "encrypted-credential")
+	if err := os.WriteFile(credential, bytes.Repeat([]byte("x"), maxFeishuEncryptedCredBytes+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, "command-ran")
+	command := filepath.Join(dir, "systemd-creds")
+	if err := os.WriteFile(command, []byte("#!/bin/sh\nprintf ran > '"+marker+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	setTestCommandPath(t, dir)
+	if _, err := decryptFeishuSecret(credential); err == nil {
+		t.Fatal("oversized encrypted credential was accepted")
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("systemd-creds ran for oversized input: %v", err)
 	}
 }
 
@@ -359,6 +427,58 @@ func TestReadFeishuSecretRejectsSymlink(t *testing.T) {
 	}
 	if _, err := readSecretFile(link); err == nil {
 		t.Fatal("symlinked secret was accepted")
+	}
+}
+
+func TestCredentialFilesRequireEffectiveOwnerPrivateModeAndSingleLink(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		setup func(*testing.T, string)
+		read  func(string) error
+	}{
+		{
+			name: "group readable",
+			setup: func(t *testing.T, path string) {
+				if err := os.Chmod(path, 0o640); err != nil {
+					t.Fatal(err)
+				}
+			},
+			read: func(path string) error {
+				_, err := readSecretFile(path)
+				return err
+			},
+		},
+		{
+			name: "hardlinked",
+			setup: func(t *testing.T, path string) {
+				if err := os.Link(path, path+".link"); err != nil {
+					t.Fatal(err)
+				}
+			},
+			read: func(path string) error {
+				_, err := readSecretFile(path)
+				return err
+			},
+		},
+		{
+			name:  "owner mismatch",
+			setup: func(*testing.T, string) {},
+			read: func(path string) error {
+				_, err := readSecretFileForOwner(path, os.Geteuid()+1)
+				return err
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "secret")
+			if err := os.WriteFile(path, []byte("secret"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			test.setup(t, path)
+			if err := test.read(path); err == nil {
+				t.Fatal("unsafe credential metadata was accepted")
+			}
+		})
 	}
 }
 

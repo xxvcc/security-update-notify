@@ -24,6 +24,7 @@ STALE_UPDATE_DAYS=0
 CHECK_EOL=0
 CHECK_SELF_UPDATE=0
 EOF
+chmod 0600 "$TMP/valid.env"
 
 LOCK_FILE="$TMP/runtime.lock"
 STATE_DIR="$TMP/state"

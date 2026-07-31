@@ -89,12 +89,16 @@ func formatDNF(lang i18n.Lang, summary string, rebootRequired bool) string {
 	// services：awk '/^needs-restarting -s:$/{f=1; next} /^needs-restarting/{f=0} f && NF {print}' | sort -u
 	var collected []string
 	f := false
+	// DNF5 labels its sections "dnf needs-restarting[ -s]" while DNF4 uses the bare command name
+	// (internal/backend/dnf.go picks the label per generation). Both shapes must be recognised here:
+	// missing the dnf5 one drops the service list, so the body would report "no services need a
+	// restart" for the very alert those services raised.
 	for _, ln := range splitLines(summary) {
-		if ln == "needs-restarting -s:" {
+		if ln == "needs-restarting -s:" || ln == "dnf needs-restarting -s:" {
 			f = true
 			continue
 		}
-		if strings.HasPrefix(ln, "needs-restarting") {
+		if strings.HasPrefix(ln, "needs-restarting") || strings.HasPrefix(ln, "dnf needs-restarting") {
 			f = false
 		}
 		if f && strings.TrimSpace(ln) != "" { // awk 的 NF>0：非空白行
@@ -107,33 +111,39 @@ func formatDNF(lang i18n.Lang, summary string, rebootRequired bool) string {
 		serviceCount = len(strings.Split(services, "\n"))
 	}
 	sUnsupported := strings.Contains(summary, "lacks -s") || strings.Contains(summary, "不支持 -s")
+	probeCommand := "needs-restarting"
+	rebootCommand := "needs-restarting -r"
+	if strings.Contains(summary, "dnf needs-restarting:") {
+		probeCommand = "dnf needs-restarting"
+		rebootCommand = probeCommand
+	}
 
 	var out []string
 	if lang == i18n.EN {
 		if rebootRequired {
-			out = append(out, "Full reboot: required by needs-restarting -r")
+			out = append(out, "Full reboot: required by "+rebootCommand)
 		}
 		if sUnsupported {
-			out = append(out, "Note: this needs-restarting lacks -s; per-service detection unavailable (reboot-only).")
+			out = append(out, "Note: this "+probeCommand+" lacks -s; per-service detection unavailable (reboot-only).")
 		}
 		if serviceCount > 0 {
 			out = append(out, fmt.Sprintf("Services to review/restart (%d):", serviceCount))
 			out = appendBulleted(out, services, serviceCount, "• ... and %d more")
 		} else if !rebootRequired && !sUnsupported {
-			out = append(out, "No services were reported as needing a restart. Run needs-restarting on the server for details.")
+			out = append(out, "No services were reported as needing a restart. Run "+probeCommand+" on the server for details.")
 		}
 	} else {
 		if rebootRequired {
-			out = append(out, "整机重启：needs-restarting -r 判断为需要")
+			out = append(out, "整机重启："+rebootCommand+" 判断为需要")
 		}
 		if sUnsupported {
-			out = append(out, "提示：此版本 needs-restarting 不支持 -s，无法按服务检测（仅整机重启）。")
+			out = append(out, "提示：此版本 "+probeCommand+" 不支持 -s，无法按服务检测（仅整机重启）。")
 		}
 		if serviceCount > 0 {
 			out = append(out, fmt.Sprintf("建议评估/重启的服务（%d 个）：", serviceCount))
 			out = appendBulleted(out, services, serviceCount, "• ……另有 %d 个")
 		} else if !rebootRequired && !sUnsupported {
-			out = append(out, "没有服务被报告需要重启；可在服务器上运行 needs-restarting 查看详情。")
+			out = append(out, "没有服务被报告需要重启；可在服务器上运行 "+probeCommand+" 查看详情。")
 		}
 	}
 	return strings.Join(out, "\n")

@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/xxvcc/security-update-notify/internal/httpx"
 )
@@ -55,8 +57,8 @@ type directoryResponse struct {
 // ScanDirectory lists every visible active employee under Feishu's root department. It uses Directory v1,
 // requests open_id explicitly, rejects partial responses, and bounds pages, users, tokens, and response sizes.
 func (c *Client) ScanDirectory(ctx context.Context, appID, appSecret string) ([]DirectoryUser, error) {
-	if appID == "" || len(appID) > 256 || appSecret == "" {
-		return nil, fmt.Errorf("missing or invalid Feishu app id or app secret")
+	if err := validateCredentials(appID, appSecret); err != nil {
+		return nil, err
 	}
 	base := c.base()
 	if err := httpx.GuardAPIBase(base); err != nil {
@@ -106,8 +108,8 @@ func (c *Client) ScanDirectory(ctx context.Context, appID, appSecret string) ([]
 				name = employee.BaseInfo.Name.Name.DefaultValue
 			}
 			users = append(users, DirectoryUser{
-				Name:       truncateRunes(name, 256),
-				MobileTail: lastRunes(employee.BaseInfo.Mobile, 4),
+				Name:       truncateRunes(sanitizeDisplayHint(name), 256),
+				MobileTail: lastRunes(sanitizeDisplayHint(employee.BaseInfo.Mobile), 4),
 				OpenID:     openID,
 			})
 		}
@@ -166,12 +168,13 @@ func (c *Client) directoryPage(ctx context.Context, base, token, pageToken strin
 		req.Header.Set("Authorization", "Bearer "+token)
 		resp, err := client.Do(req)
 		if err != nil {
-			return true, 0, fmt.Errorf("Feishu directory request failed: %w", err)
+			return true, 0, sanitizeExternalError("Feishu directory request failed", err, token)
 		}
 		defer resp.Body.Close()
 		respBody, err := readDirectoryBody(resp.Body)
 		if err != nil {
-			return false, 0, temporary(err)
+			// Directory filtering is read-only, so interrupted reads are safe to retry.
+			return !errors.Is(err, errDirectoryResponseTooLarge), 0, temporary(err)
 		}
 		if retryableStatus(resp.StatusCode) {
 			return true, retryAfter(resp), fmt.Errorf("Feishu directory HTTP %d", resp.StatusCode)
@@ -199,7 +202,7 @@ func readDirectoryBody(r io.Reader) ([]byte, error) {
 		return nil, fmt.Errorf("failed to read Feishu directory response")
 	}
 	if len(body) > maxDirectoryRespBytes {
-		return nil, fmt.Errorf("Feishu directory response too large")
+		return nil, errDirectoryResponseTooLarge
 	}
 	return body, nil
 }
@@ -207,6 +210,18 @@ func readDirectoryBody(r io.Reader) ([]byte, error) {
 func rawJSONNonEmpty(raw json.RawMessage) bool {
 	s := strings.TrimSpace(string(raw))
 	return s != "" && s != "null" && s != "[]" && s != "{}"
+}
+
+// Directory names and phone hints are printed in a privileged interactive
+// terminal. Remove terminal controls and Unicode formatting controls before
+// they cross that display boundary while retaining ordinary international text.
+func sanitizeDisplayHint(value string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) {
+			return -1
+		}
+		return r
+	}, value)
 }
 
 func truncateRunes(value string, max int) string {

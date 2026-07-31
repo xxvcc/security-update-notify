@@ -21,17 +21,22 @@ Go installer plus a non-executable version marker. Neither is installed or resto
 
 1. `sun.sh` 在可信 SUN 二进制存在之前运行，因此保留下载、SHA-256、固定指纹 GPG 验签、安全归档检查、
    解包和五架构选择。它是唯一维护的 Shell 产品实现，也是首次安装的引导信任边界。3.0 归档中的迁移启动器
-   是签名包内的固定生成物，只把旧客户端交给 Go 安装器，不承担下载、验签或安装逻辑。
+   是签名包内的固定生成物，只把旧客户端交给 Go 安装器，不承担下载、验签或安装逻辑。引导入口强制 Bash
+   `-p`，使 `BASH_ENV` 和导出函数在脚本读取前失效；脚本随后再清除非白名单环境。
 2. `apt-get`、`dpkg`、`dnf`、`dnf5`、`microdnf`、`yum`、`rpm`、`needrestart`、`needs-restarting`、`systemctl`、`systemd-creds` 和
-   `gpg` 是操作系统或信任链的数据源。Go 代码以有界超时和净化环境执行它们，而不是不准确地重写它们。
+   `gpg` 是操作系统或信任链的数据源。Go 代码以有界超时和白名单环境执行它们：只继承终端、时区和代理变量，
+   固定 `PATH`/`LC_ALL`，并丢弃 `LD_*`、Shell 启动文件、包管理器及 systemd/Git 配置覆盖，而不是不准确地重写它们。
 
 Two boundaries remain explicit:
 
 1. `sun.sh` runs before a trusted SUN binary exists. It therefore retains downloading, SHA-256,
    pinned-fingerprint GPG verification, archive validation, extraction, and five-architecture selection.
+   Its entry point requires Bash `-p`, suppressing `BASH_ENV` and exported functions before the script is
+   read; the script then removes non-allowlisted environment variables.
 2. OS/trust commands such as `apt-get`, `dpkg`, `dnf`, `dnf5`, `microdnf`, `yum`, `rpm`, `needrestart`,
    `needs-restarting`, `systemctl`, `systemd-creds`, and `gpg` remain authoritative inputs executed with bounded timeouts and
-   a sanitized environment.
+   an allowlisted environment. Only terminal, timezone, and proxy settings are inherited; `PATH` and `LC_ALL` are fixed,
+   while loader, shell-startup, package-manager, systemd, and Git overrides are discarded.
 
 这些外部命令统一在独立 Linux 进程组中运行；context 超时会终止整个组，入口进程也会把 `Ctrl+C`、
 `SIGHUP` 和 `SIGTERM` 转发给所有活动组，并在父进程异常死亡时触发直接子进程死亡信号。这样既限制等待时间，
@@ -154,8 +159,8 @@ distributions, but the same doctor is a mandatory rollback-producing support gat
   22 个白名单键、固定顺序和既有 shell-like quote 格式；默认用单引号，值含单引号时才用双引号，禁止
   同时含两种引号，不使用反斜杠/JSON 转义；文件权限为 `0600`。旧配置缺 `NOTIFY_CHANNELS` 时按
   `telegram`，`DEDUP_MODE=always` 迁移为 `once`。
-- 配置文件不可读时运行检查保持 fail-open；畸形行、非法键、非白名单键、缺必需凭据或不支持后端以
-  配置错误 `2` fail-closed。
+- 仅当配置文件不存在时返回空配置，以兼容未安装状态；符号链接、非常规文件、超大文件、其它读取错误、
+  畸形行、非法键、非白名单键、缺必需凭据或不支持后端均以配置错误 `2` fail-closed。
 - 布尔兼容语义刻意不完全统一：`INCLUDE_PUBLIC_IP`、`CHECK_UPDATE_HEALTH`、`CHECK_EOL` 和
   `CHECK_SELF_UPDATE` 接受小写化后的 `1/true/yes/on`，`NOTIFY_OK` 与 `NOTIFY_UPGRADE` 仍只接受精确 `1`。
 - 告警哈希保持恰好 11 个换行终止字段：主机、后端、语言、重启状态/包/摘要、健康状态/签名、EOL
@@ -172,17 +177,22 @@ distributions, but the same doctor is a mandatory rollback-producing support gat
 - 普通 timer 运行才写补丁 first-seen 与版本缓存；doctor 强制只读刷新；测试模拟与 dry-run 不写这些
   状态，也不触发周期版本请求。周期版本检查只通知，绝不自动升级。
 - Telegram token 必须匹配 `^\d+:[A-Za-z0-9_-]+$`；正文超过 4096 rune 时截为前 4000 rune 加固定提示。
-  最多尝试三次、间隔一秒，只重试网络错误、HTTP 429 和任意 5xx；`ok=false` 与其他 4xx 立即永久失败。
+  只读 `getMe` 对网络错误、HTTP 429 和 5xx 最多尝试三次；会产生副作用的 `sendMessage`
+  只在服务端明确以 HTTP 429 拒绝时重试。传输错误、5xx、响应中断或非法响应均返回临时失败，
+  但不立即重发，避免服务端已收件时重复告警；`ok=false` 与其他 4xx 立即永久失败。
 - 飞书固定向应用级 `open_id` 发送内嵌 Card JSON 2.0，不增加事件订阅或回调。App Secret 只从隐藏输入、
   systemd credential 或已验证的 root-only 普通文件进入内存；Directory v1 扫描只用于选人。更换 App ID
-  时必须重新选择或显式提供接收人，不能跨应用复用 `open_id`。
+  时必须重新选择或显式提供接收人，不能跨应用复用 `open_id`。消息 POST 仅对明确 HTTP 429 或飞书业务
+  限流码重试；传输错误、5xx 和响应中断只返回临时失败，不在同一轮立即重发。
 - DNF5 的 JSON 安全公告必须与实际可执行的 `check-upgrade` 候选取交集；忽略 versionlock/exclude 的查询只使用单次命令选项，不修改持久 DNF 配置。DNF4 安装成功后只保留主 `dnf-automatic.timer` 启用，并禁用三个互斥变体；安装回滚恢复四个 unit 的精确原状态。
 - 退出码保持 `0/1/2/75`：成功或无需动作 / 操作或发送失败 / 参数配置错误 / 显式锁等待超时。默认运行
   锁竞争仍安静返回成功，避免 timer 重叠产生噪声。
 
-Existing schema-4 config, state, notification text, per-platform retry behavior, and exit-code contracts
-remain compatible. The tests treat the 11-field dedup frame, newline details, atomic commit order, and
-read-only diagnostic/test behavior as byte-level invariants.
+Existing schema-4 config, state, notification text, and exit-code contracts remain compatible. Delivery
+retries are intentionally narrower for side-effecting sends: ambiguous transport and 5xx failures return
+temporary failure without an immediate resend, while explicit rate limits remain retryable. The tests treat
+the 11-field dedup frame, newline details, atomic commit order, and read-only diagnostic/test behavior as
+byte-level invariants.
 
 ## 分发与信任链 / Distribution and trust chain
 
@@ -218,13 +228,13 @@ SHA-256-only 应急分支仅在本机确实没有 `gpg` 且管理员显式设置
 要求签名，只有显式 `--verify-signature off` 才会关闭。归档检查拒绝绝对路径、`..`、顶层目录外条目、
 链接/特殊文件、过多条目和超出声明上限的内容，并剥离归档所有者及特殊权限。
 
-首次安装另有一条更早的信任边界：便捷 `curl | bash` 必须在脚本能够自验之前先信任 HTTPS。正式发布工具
+首次安装另有一条更早的信任边界：便捷 `curl | /bin/bash -p` 必须在脚本能够自验之前先信任 HTTPS。正式发布工具
 因此使用同一离线密钥额外生成 `sun.sh.asc`；其 hashed 子包以关键 notation 绑定根 `VERSION`。镜像将它绑定到
 已验签归档内的 `sun.sh` 和公钥，并只发布在不可变版本目录。高保障文档流程由管理员显式固定目标版本和主密钥指纹，在 root 自有临时目录完成脚本、指纹、critical 标志和版本 notation 的唯一性校验后
 才运行脚本；它刻意不把未签名 `latest.json` 当作版本新鲜度证明。稳定 `sun.sh` 仅保留旧的一行入口兼容性，
 不假装与多文件版本化信任集具有原子更新语义。
 
-First install has an earlier trust boundary: convenient `curl | bash` must trust HTTPS before the script can
+First install has an earlier trust boundary: convenient `curl | /bin/bash -p` must trust HTTPS before the script can
 authenticate anything. Official packaging therefore creates `sun.sh.asc` with the same offline key and binds
 the root `VERSION` in a critical notation inside the signature's hashed subpackets. The mirror binds it to
 `sun.sh` and the public key from the verified archive and publishes the set only under an immutable version
@@ -263,7 +273,7 @@ CI/发布门禁包括：
 - 五个正式 APT 版本的 schema-3 迁移、失败回滚/purge 和 PTY 通知生命周期；八个正式 RPM 镜像与八个尽力支持镜像的真实依赖、安装、升级和卸载；
 - amd64、arm64、386、ppc64le、s390x 均实际执行关键恢复 syscall 测试，而不只做交叉编译；
 - GitHub Release 公开资产及镜像公开回读的 SHA-256、GPG、指纹和版本复验。
-- 所有 GitHub Actions 固定完整 commit SHA，正式 Release 不可变；无权限 release CI 仅作为事件信号，镜像由默认分支的受信 workflow revision 按固定 `head_sha` 独立复验 tag、签名、归档、五架构静态运行时与版本，tag 仅作为不执行的数据；部署密钥只存在于仅允许 `main` 的 `release-mirror` Environment，旧可变 Release 只允许手动修复；每次镜像成功后及每周在 GitHub 托管 Ubuntu 22.04/24.04 真机执行公网下载、安装、诊断、timer、卸载和 APT 基线恢复 canary。
+- 所有 GitHub Actions 固定完整 commit SHA，正式 Release 不可变；无权限 release CI 仅作为事件信号。镜像 workflow 的无 Environment `verify-release` runner 由默认分支受信 revision 按固定 `head_sha` 独立复验 tag、签名、归档、五架构静态运行时与版本，tag 源码不执行，验签运行时只在空环境和有界探针中执行 `--version`；新的 `verify-and-sync` runner 才取得仅允许 `main` 的 `release-mirror` Environment，重新完成不执行载荷的签名/归档/引导器验证后部署。旧可变 Release 只允许手动修复；每次镜像成功后及每周在 GitHub 托管 Ubuntu 22.04/24.04 真机执行公网下载、安装、诊断、timer、卸载和 APT 基线恢复 canary。
 
 容器兼容与回滚脚本会改系统路径，必须只在一次性容器中运行，禁止直接在宿主机执行。
 

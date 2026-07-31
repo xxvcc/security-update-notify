@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/xxvcc/security-update-notify/internal/backend"
@@ -13,7 +14,7 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/i18n"
 	"github.com/xxvcc/security-update-notify/internal/osrel"
 	"github.com/xxvcc/security-update-notify/internal/sysexec"
-	"github.com/xxvcc/security-update-notify/internal/systemd"
+	"github.com/xxvcc/security-update-notify/internal/textsafe"
 	"github.com/xxvcc/security-update-notify/internal/watchdog"
 )
 
@@ -27,6 +28,7 @@ type DoctorOpts struct {
 	SkipFeishu   bool
 	SkipNotify   bool
 	EnvPath      string
+	Systemd      SystemdQuery
 }
 
 // Doctor 复刻 run_doctor：打印环境/后端/systemd/依赖命令/Telegram/看门狗自检；有失败项返回 1，否则 0。
@@ -36,7 +38,8 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 	lang := opts.Lang
 	ok := true
 	backendReady := true
-	fmt.Fprintf(out, "security-update-notify %s\n", opts.Version)
+	systemdQuery := systemdQueryOrDefault(opts.Systemd)
+	fmt.Fprintf(out, "security-update-notify %s\n", textsafe.SingleLine(opts.Version))
 	say(out, lang, "配置文件: "+opts.EnvPath, "Config: "+opts.EnvPath)
 	if fileReadable(opts.EnvPath) {
 		say(out, lang, "正常：配置可读", "OK config readable")
@@ -45,7 +48,9 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 		ok = false
 	}
 
-	o := osrel.Read(osReleasePath)
+	// Same reader as Collect: an image that ships only /usr/lib/os-release runs correctly, so doctor
+	// must not report it as an unsupported backend.
+	o := osrel.ReadFirst(osReleasePath, osReleaseFallbackPath)
 	be := cfg.Get("BACKEND")
 	if be == "" || be == "auto" {
 		be = osrel.AutoBackend(o)
@@ -60,9 +65,9 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 	kernel := kernelRelease()
 	say(out, lang, "内核: "+kernel, "Kernel: "+kernel)
 
-	if fileExists("/run/systemd/system") && sysexec.Look("systemctl") {
+	if systemdQuery.Available() {
 		say(out, lang, "正常：systemd 存在", "OK systemd present")
-		if systemd.IsEnabled("security-update-notify.timer") {
+		if systemdQuery.IsEnabled("security-update-notify.timer") {
 			say(out, lang, "正常：timer 已启用", "OK timer enabled")
 		} else {
 			say(out, lang, "警告：timer 未启用", "WARN timer not enabled")
@@ -78,7 +83,7 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 		backendReady = doctorAPTDependencies(out, lang, sysexec.Look, func(name string, args ...string) sysexec.Result {
 			return sysexec.RunTimeout(doctorCommandTimeout, name, args...)
 		})
-		if probe := sysexec.RunTimeout(doctorCommandTimeout, "unattended-upgrade", "--help"); probe.Code != 0 {
+		if probe := sysexec.RunTimeout(doctorCommandTimeout, "unattended-upgrade", "--help"); probe.Code != 0 || commandOutputIncomplete(probe) {
 			say(out, lang, "失败：unattended-upgrade 命令不可用", "FAIL unattended-upgrade command unavailable")
 			backendReady = false
 		}
@@ -86,7 +91,7 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 			say(out, lang, "失败：APT 自动更新配置不可读", "FAIL APT automatic-update configuration not readable")
 			backendReady = false
 		}
-		if systemd.IsEnabled("apt-daily-upgrade.timer") {
+		if systemdQuery.IsEnabled("apt-daily-upgrade.timer") {
 			say(out, lang, "正常：apt-daily-upgrade.timer 已启用", "OK apt-daily-upgrade.timer enabled")
 		} else {
 			say(out, lang, "失败：apt-daily-upgrade.timer 未启用", "FAIL apt-daily-upgrade.timer not enabled")
@@ -117,7 +122,7 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 		if !generationProbeFailed {
 			if runtime.isDNF5() {
 				probe := sysexec.RunTimeout(doctorCommandTimeout, runtime.Command, "needs-restarting", "--help")
-				if probe.Code == 0 {
+				if probe.Code == 0 && !commandOutputIncomplete(probe) {
 					say(out, lang, "正常：命令存在 dnf needs-restarting", "OK command dnf needs-restarting")
 				} else {
 					say(out, lang, "失败：缺少 dnf needs-restarting 子命令", "FAIL missing dnf needs-restarting command")
@@ -139,7 +144,7 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 			} else {
 				automaticProbe.Code = -1
 			}
-			if automaticProbe.Code == 0 {
+			if automaticProbe.Code == 0 && !commandOutputIncomplete(automaticProbe) {
 				say(out, lang, "正常：DNF automatic 命令可用", "OK DNF automatic command available")
 			} else {
 				say(out, lang, "失败：DNF automatic 命令不可用", "FAIL DNF automatic command unavailable")
@@ -147,7 +152,7 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 				backendReady = false
 			}
 		}
-		if content, err := os.ReadFile(dnfAutomaticConfigPath()); err == nil {
+		if content, err := readBoundedFile(dnfAutomaticConfigPath(), maxAutomaticConfigBytes); err == nil {
 			say(out, lang, "正常：DNF automatic 配置可读", "OK DNF automatic configuration readable")
 			for _, issue := range watchdog.CheckDNFPolicy(string(content)) {
 				say(out, lang, "失败："+issue.ZH, "FAIL "+issue.EN)
@@ -160,7 +165,7 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 			backendReady = false
 		}
 		if !generationProbeFailed {
-			unit := selectDNFAutomaticUnit(runtime.Generation, systemd.IsEnabled)
+			unit := selectDNFAutomaticUnit(runtime.Generation, systemdQuery.IsEnabled)
 			if unit.Enabled {
 				say(out, lang, "正常："+unit.Timer+" 已启用", "OK "+unit.Timer+" enabled")
 			} else {
@@ -210,7 +215,7 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 	case "dnf":
 		restart = collectDNF()
 	}
-	health, pending, patch, eol := collectWatchdog(cfg, be, o, restart, opts.Version, false, true, false)
+	health, pending, patch, eol := collectWatchdogWithSystemd(cfg, be, o, restart, opts.Version, false, true, false, systemdQuery)
 	if health.Attention || !backendReady {
 		say(out, lang, "失败：自动安全更新机制异常", "FAIL automatic security-update mechanism issue")
 		if health.Attention && (health.TxtZH != "" || health.TxtEN != "") {
@@ -267,7 +272,7 @@ func doctorAPTDependencies(out io.Writer, lang i18n.Lang, look func(string) bool
 	}
 	for _, pkg := range []string{"unattended-upgrades", "needrestart", "apt-listchanges", "ca-certificates"} {
 		result := run("dpkg", "-s", pkg)
-		if result.Err == nil && result.Code == 0 && dpkgStatusIsInstalled(result.Stdout) {
+		if result.Err == nil && result.Code == 0 && !result.StdoutTruncated && !result.StderrTruncated && dpkgStatusIsInstalled(result.Stdout) {
 			say(out, lang, "正常：软件包 "+pkg+" 已完整安装", "OK package "+pkg+" fully installed")
 		} else {
 			say(out, lang, "失败：软件包 "+pkg+" 未完整安装", "FAIL package "+pkg+" not fully installed")
@@ -287,10 +292,15 @@ func dpkgStatusIsInstalled(output string) bool {
 }
 
 func fileReadable(p string) bool {
-	f, err := os.Open(p)
+	fd, err := syscall.Open(p, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return false
 	}
-	f.Close()
+	f := os.NewFile(uintptr(fd), p)
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
 	return true
 }

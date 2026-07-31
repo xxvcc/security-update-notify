@@ -7,6 +7,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/xxvcc/security-update-notify/internal/i18n"
+	"github.com/xxvcc/security-update-notify/internal/textsafe"
 )
 
 const (
@@ -183,7 +184,10 @@ func checkCardPresentation(m Message, en bool) (string, string) {
 		return pick(en, "自动安全更新机制异常", "Automatic security updates need attention"), "red"
 	case m.PatchAttention:
 		return pick(en, "补丁维护风险", "Patch maintenance risk"), "red"
-	case m.UpdateAvailable:
+	// The self-update notice is informational, so it must not outrank a restart requirement: a host
+	// needing a reboot while a newer SUN release happens to exist would otherwise be presented as a
+	// blue "SUN update available" card, burying the reason the alert actually fired.
+	case m.UpdateAvailable && !m.RebootRequired && !m.RestartAttention:
 		return pick(en, "SUN 新版本可用", "SUN update available"), "blue"
 	default:
 		return pick(en, "主机需要安全维护", "Host maintenance required"), "orange"
@@ -403,13 +407,7 @@ func limitCardText(s string, maxBytes int, en bool) string {
 func sanitizeCardText(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "\n")
-	s = strings.Map(func(r rune) rune {
-		if r == '\n' || r == '\t' || (r >= 0x20 && r != 0x7f) {
-			return r
-		}
-		return -1
-	}, s)
-	return strings.TrimSpace(s)
+	return strings.TrimSpace(textsafe.Multiline(s))
 }
 
 func pick(en bool, zh, english string) string {

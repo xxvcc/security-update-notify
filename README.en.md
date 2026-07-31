@@ -9,7 +9,7 @@
   <img alt="License" src="https://img.shields.io/badge/License-MIT-green?style=flat-square">
 </p>
 
-> Automatically install security updates, then notify through Telegram, Feishu, or both only when a server/service restart or patch-maintenance problem needs attention.
+> Automatically install security updates, then notify through Telegram, Feishu, or both when a server/service restart, patch-maintenance problem, or SUN release needs attention.
 
 **security-update-notify** (**SUN**) is designed for servers, VPS hosts, and small infrastructure. It uses native apt/dnf automatic-update mechanisms and a systemd timer. It never reboots automatically, listens on no inbound port, and accepts no message commands.
 
@@ -23,7 +23,7 @@ Convenient interactive install:
 
 ```bash
 set -o pipefail
-curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash
+curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo /bin/bash -p
 ```
 
 This compatibility entry point initially trusts the bootstrap delivered over HTTPS; the bootstrap still requires checksum and GPG verification for the Release it downloads. For production or a threat model that includes the download origin, use the [explicit-version, pinned-fingerprint procedure that verifies before execution](docs/installation.en.md#high-assurance-first-install-recommended-for-production).
@@ -140,6 +140,10 @@ Check for and install a SUN update:
 security-update-notify check-upgrade
 sudo security-update-notify upgrade
 ```
+
+The configuration is root-readable by default. When running `check-upgrade` as an unprivileged user,
+pass `--lang zh` or `--lang en` if its terminal language must match the installed configuration. A direct
+unprivileged `upgrade` preserves an omitted language across sudo so the root process can read it again.
 
 Change notification platforms, application, or recipient:
 

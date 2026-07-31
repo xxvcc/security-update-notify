@@ -53,6 +53,21 @@ func TestCheckHealthStale(t *testing.T) {
 	}
 }
 
+func TestCheckHealthRejectsInvalidSystemdTimestamps(t *testing.T) {
+	now := int64(1_700_000_000)
+	for _, test := range []HealthInput{
+		{Backend: "apt", TimerEnabled: true, HaveSvcExit: true, SvcExitEpoch: 0, Now: now, StaleDays: 7},
+		{Backend: "apt", TimerEnabled: true, HaveSvcExit: true, SvcExitEpoch: now + 1, Now: now, StaleDays: 7},
+		{Backend: "dnf", TimerEnabled: true, HaveTimerTrigger: true, TimerTriggerEpoch: 0, Now: now, StaleDays: 7},
+		{Backend: "dnf", TimerEnabled: true, HaveTimerTrigger: true, TimerTriggerEpoch: now + 1, Now: now, StaleDays: 7},
+	} {
+		health := CheckHealth(test)
+		if !health.Attention || health.Sig != "timestamp," {
+			t.Errorf("invalid timestamp input=%+v health=%+v", test, health)
+		}
+	}
+}
+
 func TestCheckHealthHealthy(t *testing.T) {
 	h := CheckHealth(HealthInput{
 		Backend: "apt", TimerEnabled: true, SvcResult: "success", StaleDays: 7,
@@ -60,6 +75,19 @@ func TestCheckHealthHealthy(t *testing.T) {
 	})
 	if h.Attention || h.Sig != "" {
 		t.Errorf("healthy host: Attention=%v Sig=%q", h.Attention, h.Sig)
+	}
+}
+
+func TestCheckHealthReportsSystemdQueryFailure(t *testing.T) {
+	h := CheckHealth(HealthInput{
+		Backend: "apt", TimerEnabled: true, SystemdQueryFailed: true,
+		Disks: []DiskAvail{{Mount: "/", AvailKB: 99000000}},
+	})
+	if !h.Attention || h.Sig != "query," {
+		t.Fatalf("query failure health=%+v", h)
+	}
+	if !strings.Contains(h.TxtZH, "无法可靠查询 systemd") || !strings.Contains(h.TxtEN, "Could not reliably query systemd") {
+		t.Fatalf("query failure text zh=%q en=%q", h.TxtZH, h.TxtEN)
 	}
 }
 
@@ -171,6 +199,25 @@ Unattended-Upgrade::Automatic-Reboot "false";`
 			t.Errorf("APT true value %q issues=%v", value, issues)
 		}
 	}
+	for _, origin := range []string{
+		`Unattended-Upgrade::Allowed-Origins:: "${distro_id}:${distro_codename}-security";`,
+		`Unattended-Upgrade::Origins-Pattern:: "origin=${distro_id}ESMApps";`,
+	} {
+		candidate := strings.Replace(apt, `Unattended-Upgrade::Origins-Pattern:: "origin=Debian,label=Debian-Security";`, origin, 1)
+		if issues := CheckAPTPolicy(candidate, true); len(issues) != 0 {
+			t.Errorf("valid APT security origin %q issues=%v", origin, issues)
+		}
+	}
+	for _, lookalike := range []string{
+		`Unattended-Upgrade::Origins-Pattern:: "origin=Example,label=NotSecurity";`,
+		`Nested::Unattended-Upgrade::Origins-Pattern:: "origin=Example,label=Security";`,
+	} {
+		candidate := strings.Replace(apt, `Unattended-Upgrade::Origins-Pattern:: "origin=Debian,label=Debian-Security";`, lookalike, 1)
+		issues := CheckAPTPolicy(candidate, true)
+		if !hasIssueCode(issues, "apt-security-origin-missing") {
+			t.Errorf("APT origin lookalike %q was accepted: issues=%v", lookalike, issues)
+		}
+	}
 	for _, value := range []string{"1", "true", "yes", "on"} {
 		aptAutoReboot := strings.Replace(apt, `"false"`, `"`+value+`"`, 1)
 		issues := CheckAPTPolicy(aptAutoReboot, true)
@@ -201,4 +248,13 @@ Unattended-Upgrade::Automatic-Reboot "false";`
 			t.Errorf("malformed DNF policy issues=%v", issues)
 		}
 	}
+}
+
+func hasIssueCode(issues []Issue, code string) bool {
+	for _, issue := range issues {
+		if issue.Code == code {
+			return true
+		}
+	}
+	return false
 }

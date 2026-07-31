@@ -1,10 +1,11 @@
 [Unit]
-Description=安全更新需要整机重启或服务重启时发送通知 / Notify configured channels when security updates require reboot or service restart
+Description=安全补丁维护风险、重启需求与 SUN 新版本提醒 / Notify security patch maintenance risks, restart needs, and new SUN releases
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=oneshot
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
 TimeoutStartSec=15min
 ExecStart=/usr/local/sbin/security-update-notify
 NoNewPrivileges=true

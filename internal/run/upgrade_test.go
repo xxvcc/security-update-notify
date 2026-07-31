@@ -1,6 +1,7 @@
 package run
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -10,7 +11,54 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/xxvcc/security-update-notify/internal/i18n"
 )
+
+func TestCheckUpgradeRejectsInvalidLocalVersionBeforeNetwork(t *testing.T) {
+	var calls int
+	var stdout, stderr bytes.Buffer
+	rc := checkUpgrade(" 3.1.1\n", i18n.EN, func(*http.Client, string) (string, error) {
+		calls++
+		return "9.9.9", nil
+	}, &stdout, &stderr)
+	if rc != 1 {
+		t.Fatalf("rc=%d want 1", rc)
+	}
+	if calls != 0 {
+		t.Fatalf("latest release was queried %d times", calls)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("invalid local version was displayed: %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "Invalid local version") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+}
+
+func TestCheckUpgradeRejectsInvalidLatestVersionBeforeDisplayingIt(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	rc := checkUpgrade("3.1.1", i18n.EN, func(*http.Client, string) (string, error) {
+		return " 3.1.2\n", nil
+	}, &stdout, &stderr)
+	if rc != 1 {
+		t.Fatalf("rc=%d want 1", rc)
+	}
+	if strings.Contains(stdout.String(), "3.1.2") || strings.Contains(stdout.String(), "Latest version") {
+		t.Fatalf("invalid latest version was displayed: %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "Invalid version data") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+}
+
+func TestSaySanitizesTerminalControls(t *testing.T) {
+	var out bytes.Buffer
+	say(&out, i18n.EN, "unused", "first\nsecond\r\x1b[31m\u202Espoof\u2028tail")
+	if got, want := out.String(), "first\nsecond  [31m spoof tail\n"; got != want {
+		t.Fatalf("say output = %q, want %q", got, want)
+	}
+}
 
 func TestNotifyUpgradeEventIsBestEffortAcrossChannels(t *testing.T) {
 	var telegramSends atomic.Int32

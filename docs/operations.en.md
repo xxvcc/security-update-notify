@@ -151,6 +151,11 @@ security-update-notify check-upgrade
 sudo security-update-notify doctor
 ```
 
+The configuration is root-readable by default, so an unprivileged `check-upgrade` cannot discover
+`NOTIFY_LANG`; pass `--lang zh` or `--lang en` when its terminal language must match the installation.
+For a direct unprivileged `upgrade`, an omitted language remains omitted across sudo so the root child can
+pre-read the configuration again, while an explicit language is passed through unchanged.
+
 View logs:
 
 ```bash

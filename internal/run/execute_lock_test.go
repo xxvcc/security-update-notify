@@ -5,10 +5,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	runlock "github.com/xxvcc/security-update-notify/internal/lock"
+	"github.com/xxvcc/security-update-notify/internal/watchdog"
 )
 
 func TestAcquireExecutionLockSuccessAndFilesystemError(t *testing.T) {
@@ -51,6 +54,18 @@ func TestExecuteDryRunDoesNotCreateState(t *testing.T) {
 	}
 	if _, err := os.Stat(stateDir); !os.IsNotExist(err) {
 		t.Fatalf("dry-run created state directory: %v", err)
+	}
+}
+
+func TestRenderDryRunSanitizesTerminalControls(t *testing.T) {
+	got := renderDryRun(Output{Send: true, Message: "first\nsecond\tvalue\r\x1b[31m\u202Espoof\u2069"})
+	if !strings.HasPrefix(got, "HASH\t") || !strings.Contains(got, "\nfirst\nsecond\tvalue") {
+		t.Fatalf("dry-run output lost its stable framing: %q", got)
+	}
+	for _, forbidden := range []string{"\r", "\x1b", "\u202e", "\u2069"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("dry-run output retained display control %q: %q", forbidden, got)
+		}
 	}
 }
 
@@ -117,6 +132,91 @@ func TestExecuteTelegramNetworkOutcome(t *testing.T) {
 	}
 }
 
+func TestAlertLogLineSeparatesHealthPatchAndUpdateReasons(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		input Input
+		want  string
+	}{
+		{name: "health", input: Input{Health: watchdog.Health{Attention: true}}, want: "health=1 patch=0 update=0"},
+		{name: "patch", input: Input{Patch: watchdog.Patch{RiskAttention: true}}, want: "health=0 patch=1 update=0"},
+		{name: "update", input: Input{Patch: watchdog.Patch{UpdateAvailable: true}}, want: "health=0 patch=0 update=1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			line := alertLogLine(test.input)
+			if !strings.Contains(line, test.want) {
+				t.Fatalf("alert log %q does not contain %q", line, test.want)
+			}
+		})
+	}
+}
+
+// A stale-patch alert can fire while CHECK_UPDATE_HEALTH=0. The integration path must preserve the
+// distinct source fields instead of emitting an alert line with no stated reason.
+func TestExecuteAlertLogReportsPatchAttention(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	writeTestCommand(t, dir, "dnf", `
+if [ "$*" = "--version" ]; then
+  printf '%s\n' '4.14.0'
+  exit 0
+fi
+printf '%s\n' 'RHSA-2026:0001 Important/Sec. openssl.x86_64'
+exit 0
+`)
+	writeTestCommand(t, dir, "uname", "printf '%s\\n' '6.12-merged'\n")
+	t.Setenv("PATH", dir)
+
+	stateDir := t.TempDir()
+	t.Setenv("SECURITY_UPDATE_NOTIFY_STATE_DIR", stateDir)
+	// Pending security updates first seen 30 days ago, well past the 3-day default threshold.
+	stale := time.Now().Unix() - 30*86400
+	if err := os.WriteFile(filepath.Join(stateDir, "pending-security.first_seen"),
+		[]byte(strconv.FormatInt(stale, 10)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(t.TempDir(), "notify.log")
+	t.Setenv("SECURITY_UPDATE_NOTIFY_LOG_FILE", logPath)
+	t.Setenv(telegramBaseURLEnv, server.URL)
+
+	cfg := loadDeliveryConfig(t, strings.Join([]string{
+		"NOTIFY_CHANNELS=telegram",
+		"TELEGRAM_BOT_TOKEN=123456:test_token",
+		"TELEGRAM_CHAT_ID=-100123",
+		"BACKEND=dnf",
+		"HOST_LABEL=merged-host",
+		"INCLUDE_PUBLIC_IP=0",
+		"CHECK_UPDATE_HEALTH=0",
+		"CHECK_EOL=0",
+		"CHECK_SELF_UPDATE=0",
+		"DEDUP_MODE=once",
+	}, "\n")+"\n")
+
+	if got := Execute(cfg, DryRunFlags{LockHeld: true}); got != 0 {
+		t.Fatalf("Execute()=%d want 0", got)
+	}
+	b, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alert := ""
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.Contains(line, " alert backend=") {
+			alert = line
+		}
+	}
+	if alert == "" {
+		t.Fatalf("no alert line was logged:\n%s", b)
+	}
+	if !strings.Contains(alert, "health=0 patch=1 update=0") {
+		t.Fatalf("alert line does not report the patch attention flag: %q", alert)
+	}
+}
+
 func TestExecuteMakesRequiredLockContentionExplicit(t *testing.T) {
 	lockPath := filepath.Join(t.TempDir(), "notify.lock")
 	release, acquired, err := runlock.Acquire(lockPath)
@@ -133,5 +233,18 @@ func TestExecuteMakesRequiredLockContentionExplicit(t *testing.T) {
 	}
 	if got := Execute(cfg, DryRunFlags{RequireLock: true}); got != 75 {
 		t.Fatalf("required lock contention exit=%d want 75", got)
+	}
+}
+
+func TestExecuteRejectsSymlinkedStateDirectoryBeforeCollection(t *testing.T) {
+	target := t.TempDir()
+	link := filepath.Join(t.TempDir(), "state-link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SECURITY_UPDATE_NOTIFY_STATE_DIR", link)
+	cfg := loadDeliveryConfig(t, "NOTIFY_CHANNELS=telegram\n")
+	if got := Execute(cfg, DryRunFlags{LockHeld: true}); got != 1 {
+		t.Fatalf("Execute()=%d want 1", got)
 	}
 }

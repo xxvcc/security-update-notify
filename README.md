@@ -9,7 +9,7 @@
   <img alt="License" src="https://img.shields.io/badge/License-MIT-green?style=flat-square">
 </p>
 
-> 自动安装安全更新；只有在需要重启服务器、重启服务或补丁维护异常时，才通过 Telegram、飞书或两者发送提醒。
+> 自动安装安全更新；在需要重启服务器、重启服务、处理补丁维护异常或发现 SUN 新版本时，通过 Telegram、飞书或两者发送提醒。
 
 **security-update-notify**（简称 **SUN**）适合维护服务器、VPS 和小型基础设施。它使用发行版原生 apt/dnf 自动更新机制，通过 systemd timer 定时检查，不自动重启，不监听入站端口，也不接收消息命令。
 
@@ -23,7 +23,7 @@
 
 ```bash
 set -o pipefail
-curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash
+curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo /bin/bash -p
 ```
 
 这条兼容入口首先信任 HTTPS 下载到的引导脚本；脚本随后仍会强制校验 Release 的 checksum 和 GPG 签名。生产环境或下载源属于威胁模型时，请使用[固定版本、固定指纹且执行前验签的高保障流程](docs/installation.md#高保障首次安装生产环境推荐)。
@@ -140,6 +140,9 @@ sudo security-update-notify test --send-test --no-dedupe
 security-update-notify check-upgrade
 sudo security-update-notify upgrade
 ```
+
+配置文件默认仅 root 可读。普通用户运行 `check-upgrade` 时，如需终端语言与已安装配置一致，请显式加
+`--lang zh` 或 `--lang en`；普通用户直接运行 `upgrade` 时，未显式指定的语言会在 sudo 后由 root 进程重新读取。
 
 修改通知平台、应用或接收人：
 

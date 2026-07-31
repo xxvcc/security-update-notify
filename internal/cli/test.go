@@ -34,9 +34,13 @@ func testMode(ver string, args []string) int {
 			fmt.Fprintln(os.Stderr, "Usage: security-update-notify test [--send-test] [--simulate-reboot] [--no-dedupe] [--verbose] [--lang zh|en]")
 			return 0
 		default:
-			fmt.Fprintf(os.Stderr, "Unknown test argument: %s\n", args[i])
+			fmt.Fprintf(os.Stderr, "Unknown test argument: %s\n", safeCLIText(args[i]))
 			return 2
 		}
+	}
+	if noDedupe && !sendOK && !simulateReboot {
+		fmt.Fprintln(os.Stderr, "test --no-dedupe requires --send-test or --simulate-reboot")
+		return 2
 	}
 
 	doctorArgs := []string{"--doctor"}

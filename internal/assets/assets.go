@@ -10,7 +10,10 @@
 // are managed copies of the originals under files/; a CI drift guard asserts they are byte-identical.
 package assets
 
-import _ "embed"
+import (
+	"bytes"
+	_ "embed"
+)
 
 // ReleaseSigningFingerprint 是 release 签名公钥的 pin 指纹（40 位十六进制，大写）。刻意为常量。
 const ReleaseSigningFingerprint = "C678256ACBFC6491BF5076655F3AE24999921FFC"
@@ -28,13 +31,13 @@ var needrestartConf []byte
 var logrotateConf []byte
 
 // ReleaseSigningPublicKey 返回内置的 ASCII-armored 签名公钥。
-func ReleaseSigningPublicKey() []byte { return releaseSigningPubKey }
+func ReleaseSigningPublicKey() []byte { return bytes.Clone(releaseSigningPubKey) }
 
 // SystemdServiceUnit 返回内置的 systemd service 单元内容。
-func SystemdServiceUnit() []byte { return systemdService }
+func SystemdServiceUnit() []byte { return bytes.Clone(systemdService) }
 
 // NeedrestartConf 返回内置的 needrestart “仅报告” 配置。
-func NeedrestartConf() []byte { return needrestartConf }
+func NeedrestartConf() []byte { return bytes.Clone(needrestartConf) }
 
 // LogrotateConf 返回内置的 logrotate 配置。
-func LogrotateConf() []byte { return logrotateConf }
+func LogrotateConf() []byte { return bytes.Clone(logrotateConf) }

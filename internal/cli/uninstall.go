@@ -31,7 +31,7 @@ func uninstallMode(args []string) int {
 		case "-h", "--help":
 			help = true
 		default:
-			fmt.Fprintf(os.Stderr, "Unknown uninstall argument: %s\n", args[i])
+			fmt.Fprintf(os.Stderr, "Unknown uninstall argument: %s\n", safeCLIText(args[i]))
 			return 2
 		}
 	}
@@ -63,7 +63,7 @@ func uninstallMode(args []string) int {
 			"WARNING: systemd cleanup commands failed, but file and credential cleanup continued.")
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, safeCLIText(err.Error()))
 		return uninstaller.ExitCode(err)
 	}
 	if purge {
@@ -76,8 +76,8 @@ func uninstallMode(args []string) int {
 
 func cliSay(out *os.File, lang, zh, en string) {
 	if lang == "en" {
-		fmt.Fprintln(out, en)
+		fmt.Fprintln(out, safeCLIText(en))
 		return
 	}
-	fmt.Fprintln(out, zh)
+	fmt.Fprintln(out, safeCLIText(zh))
 }

@@ -32,16 +32,17 @@ type DiskAvail struct {
 
 // HealthInput 是 check_update_health 的已采集输入。
 type HealthInput struct {
-	Backend           string // apt|dnf；其它直接返回空 Health
-	TimerEnabled      bool   // systemctl is-enabled <timer> 成功
-	SvcResult         string // systemctl show <svc> -p Result --value（可空）
-	HaveSvcExit       bool   // ExecMainExitTimestamp 是否非空
-	SvcExitEpoch      int64  // 解析后的 epoch（解析失败为 0）
-	HaveTimerTrigger  bool   // LastTriggerUSec 是否非空且非 n/a
-	TimerTriggerEpoch int64
-	Now               int64
-	StaleDays         int
-	Disks             []DiskAvail
+	Backend            string // apt|dnf；其它直接返回空 Health
+	TimerEnabled       bool   // systemctl is-enabled <timer> 成功
+	SystemdQueryFailed bool   // one or more required systemctl show queries failed
+	SvcResult          string // systemctl show <svc> -p Result --value（可空）
+	HaveSvcExit        bool   // ExecMainExitTimestamp 是否非空
+	SvcExitEpoch       int64  // 解析后的 epoch（解析失败为 0）
+	HaveTimerTrigger   bool   // LastTriggerUSec 是否非空且非 n/a
+	TimerTriggerEpoch  int64
+	Now                int64
+	StaleDays          int
+	Disks              []DiskAvail
 }
 
 // CheckHealth 复刻 check_update_health：定时器未启用 / 上次失败 / 超期未成功 / 磁盘将满，任一命中即
@@ -60,6 +61,12 @@ func CheckHealth(in HealthInput) Health {
 	var reasons []string
 	var zh, en strings.Builder
 
+	if in.SystemdQueryFailed {
+		h.Attention = true
+		reasons = append(reasons, "query")
+		zh.WriteString("• 无法可靠查询 systemd 自动安全更新状态\n")
+		en.WriteString("• Could not reliably query systemd automatic-update state\n")
+	}
 	if !in.TimerEnabled {
 		h.Attention = true
 		reasons = append(reasons, "disabled")
@@ -78,7 +85,12 @@ func CheckHealth(in HealthInput) Health {
 	}
 	if staleDays > 0 {
 		if in.HaveSvcExit {
-			if in.SvcExitEpoch > 0 && in.Now-in.SvcExitEpoch > int64(staleDays)*86400 {
+			if in.SvcExitEpoch <= 0 || (in.Now > 0 && in.SvcExitEpoch > in.Now) {
+				h.Attention = true
+				reasons = append(reasons, "timestamp")
+				fmt.Fprintf(&zh, "• 无法解析自动安全更新服务的上次运行时间（%s）\n", svc)
+				fmt.Fprintf(&en, "• Could not validate the last automatic-update run time (%s)\n", svc)
+			} else if olderThanDays(in.Now, in.SvcExitEpoch, staleDays) {
 				days := (in.Now - in.SvcExitEpoch) / 86400
 				h.Attention = true
 				reasons = append(reasons, "stale")
@@ -86,7 +98,12 @@ func CheckHealth(in HealthInput) Health {
 				fmt.Fprintf(&en, "• No successful automatic security update for %d days (threshold %d)\n", days, staleDays)
 			}
 		} else if in.HaveTimerTrigger {
-			if in.TimerTriggerEpoch > 0 && in.Now-in.TimerTriggerEpoch > int64(staleDays)*86400 {
+			if in.TimerTriggerEpoch <= 0 || (in.Now > 0 && in.TimerTriggerEpoch > in.Now) {
+				h.Attention = true
+				reasons = append(reasons, "timestamp")
+				fmt.Fprintf(&zh, "• 无法解析自动安全更新定时器的上次触发时间（%s）\n", timer)
+				fmt.Fprintf(&en, "• Could not validate the last automatic-update timer trigger (%s)\n", timer)
+			} else if olderThanDays(in.Now, in.TimerTriggerEpoch, staleDays) {
 				days := (in.Now - in.TimerTriggerEpoch) / 86400
 				h.Attention = true
 				reasons = append(reasons, "never-success")
@@ -109,6 +126,17 @@ func CheckHealth(in HealthInput) Health {
 		h.Sig = sortUniqCSV(reasons)
 	}
 	return h
+}
+
+func olderThanDays(now, then int64, days int) bool {
+	if days < 0 || then <= 0 || now <= then {
+		return false
+	}
+	const secondsPerDay int64 = 86400
+	if int64(days) > int64(^uint64(0)>>1)/secondsPerDay {
+		return false
+	}
+	return now-then > int64(days)*secondsPerDay
 }
 
 // sortUniqCSV 复刻 `printf '%s\n' reasons | sort -u | tr '\n' ','`：字节序去重排序后逗号连接，带尾逗号。

@@ -14,6 +14,14 @@ set -euo pipefail
 usage() { echo "usage: build/build.sh GOOS GOARCH VERSION OUTPUT" >&2; exit 2; }
 [[ $# -eq 4 ]] || usage
 GOOS="$1"; GOARCH="$2"; VERSION="$3"; OUT="$4"
+[[ "$GOOS" =~ ^[a-z0-9]+$ && "$GOARCH" =~ ^[a-z0-9]+$ ]] || {
+  echo "invalid GOOS/GOARCH: $GOOS/$GOARCH" >&2
+  exit 2
+}
+[[ ${#VERSION} -le 128 && "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]] || {
+  echo "invalid VERSION: $VERSION" >&2
+  exit 2
+}
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -21,6 +29,13 @@ cd "$ROOT"
 export CGO_ENABLED=0 GOOS GOARCH GOTOOLCHAIN=local
 export GOFLAGS="" GOWORK=off GOENV=off GO111MODULE=on
 export GOEXPERIMENT="" GOFIPS140=off GOAMD64=v1 GO386=sse2 GOARM64=v8.0 GOPPC64=power8
+pinned_toolchains=()
+mapfile -t pinned_toolchains < <(sed -n 's/^toolchain[[:space:]][[:space:]]*\(go[0-9][0-9.]*\)$/\1/p' go.mod)
+active_toolchain="$(go env GOVERSION)"
+if [[ "${#pinned_toolchains[@]}" -ne 1 || "$active_toolchain" != "${pinned_toolchains[0]}" ]]; then
+  echo "active Go toolchain $active_toolchain does not match the exact go.mod toolchain pin ${pinned_toolchains[0]:-missing}" >&2
+  exit 1
+fi
 go build -trimpath -buildvcs=false \
   -ldflags "-s -w -buildid= -X main.Version=${VERSION}" \
   -o "$OUT" ./cmd/security-update-notify

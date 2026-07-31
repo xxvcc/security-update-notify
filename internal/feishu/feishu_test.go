@@ -7,11 +7,23 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+type interruptedReader struct{}
+
+func (interruptedReader) Read([]byte) (int, error) {
+	return 0, errors.New("connection reset while reading response")
+}
 
 func newTestClient(h http.HandlerFunc) (*Client, *httptest.Server, *int32) {
 	srv := httptest.NewServer(h)
@@ -53,6 +65,38 @@ func TestSendText(t *testing.T) {
 	}
 	if auth != "Bearer tenant-token" {
 		t.Errorf("authorization=%q", auth)
+	}
+}
+
+func TestSendTextSanitizesDisplayControls(t *testing.T) {
+	var got string
+	c, srv, _ := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			_, _ = io.WriteString(w, `{"code":0,"tenant_access_token":"tenant-token"}`)
+		case "/open-apis/im/v1/messages":
+			var envelope map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&envelope); err != nil {
+				t.Fatal(err)
+			}
+			var content map[string]string
+			if err := json.Unmarshal([]byte(envelope["content"]), &content); err != nil {
+				t.Fatal(err)
+			}
+			got = content["text"]
+			_, _ = io.WriteString(w, `{"code":0}`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	defer srv.Close()
+
+	input := "first\nsecond\r\x1b[31m\u202Espoof\u2028tail"
+	if err := c.SendText(context.Background(), "cli_app", "secret", "ou_lanny", input); err != nil {
+		t.Fatal(err)
+	}
+	if want := "first\nsecond  [31m spoof tail"; got != want {
+		t.Fatalf("sent text = %q, want %q", got, want)
 	}
 }
 
@@ -165,6 +209,130 @@ func TestRetryOn429(t *testing.T) {
 	if delay != 2*time.Second {
 		t.Errorf("retry delay=%v want 2s", delay)
 	}
+}
+
+func TestMessageRetryOnExplicitHTTP429(t *testing.T) {
+	var messages int32
+	c, srv, slept := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "tenant_access_token") {
+			_, _ = io.WriteString(w, `{"code":0,"tenant_access_token":"tenant-token"}`)
+			return
+		}
+		if atomic.AddInt32(&messages, 1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"code":999}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"code":0}`)
+	})
+	defer srv.Close()
+	if err := c.SendText(context.Background(), "cli_app", "secret", "ou_lanny", "hello"); err != nil {
+		t.Fatal(err)
+	}
+	if messages != 2 || *slept != 1 {
+		t.Fatalf("messages=%d sleeps=%d want 2,1", messages, *slept)
+	}
+}
+
+func TestRetryAfterCapsHugeSecondsWithoutOverflow(t *testing.T) {
+	resp := &http.Response{Header: make(http.Header)}
+	resp.Header.Set("Retry-After", "18446744073709551615")
+	if got := retryAfter(resp); got != 30*time.Second {
+		t.Fatalf("retry delay=%v, want 30s", got)
+	}
+}
+
+func TestInterruptedResponseBodyRetriesOnlyIdempotentRequest(t *testing.T) {
+	t.Run("tenant token retries", func(t *testing.T) {
+		var requests int32
+		client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			body := io.Reader(strings.NewReader(`{"code":0,"tenant_access_token":"token"}`))
+			if atomic.AddInt32(&requests, 1) == 1 {
+				body = io.MultiReader(strings.NewReader(`{"code":0,`), interruptedReader{})
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(body)}, nil
+		})}
+		c := &Client{HTTP: client, BaseURL: "https://open.feishu.test", Sleep: func(time.Duration) {}}
+		if err := c.Probe(context.Background(), "cli_app", "secret"); err != nil {
+			t.Fatal(err)
+		}
+		if requests != 2 {
+			t.Fatalf("requests=%d, want 2", requests)
+		}
+	})
+
+	t.Run("message does not risk a duplicate", func(t *testing.T) {
+		var tokenRequests, messageRequests int32
+		client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			var body io.Reader
+			if strings.Contains(req.URL.Path, "tenant_access_token") {
+				atomic.AddInt32(&tokenRequests, 1)
+				body = strings.NewReader(`{"code":0,"tenant_access_token":"token"}`)
+			} else {
+				atomic.AddInt32(&messageRequests, 1)
+				body = io.MultiReader(strings.NewReader(`{"code":`), interruptedReader{})
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(body)}, nil
+		})}
+		c := &Client{HTTP: client, BaseURL: "https://open.feishu.test", Sleep: func(time.Duration) {}}
+		err := c.SendText(context.Background(), "cli_app", "secret", "ou_target", "hello")
+		if err == nil || !IsTemporary(err) {
+			t.Fatalf("error=%v, want temporary read failure", err)
+		}
+		if tokenRequests != 1 || messageRequests != 1 {
+			t.Fatalf("token requests=%d message requests=%d, want 1,1", tokenRequests, messageRequests)
+		}
+	})
+}
+
+func TestMessageTransportAndServerFailuresAreNotRetried(t *testing.T) {
+	t.Run("transport", func(t *testing.T) {
+		var tokenRequests, messageRequests, slept int32
+		client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if strings.Contains(req.URL.Path, "tenant_access_token") {
+				atomic.AddInt32(&tokenRequests, 1)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`{"code":0,"tenant_access_token":"token"}`)),
+				}, nil
+			}
+			atomic.AddInt32(&messageRequests, 1)
+			return nil, errors.New("ambiguous connection reset")
+		})}
+		c := &Client{
+			HTTP:    client,
+			BaseURL: "https://open.feishu.test",
+			Sleep:   func(time.Duration) { atomic.AddInt32(&slept, 1) },
+		}
+		err := c.SendText(context.Background(), "cli_app", "secret", "ou_lanny", "hello")
+		if err == nil || !IsTemporary(err) {
+			t.Fatalf("error=%v, want temporary transport failure", err)
+		}
+		if tokenRequests != 1 || messageRequests != 1 || slept != 0 {
+			t.Fatalf("token=%d messages=%d sleeps=%d want 1,1,0", tokenRequests, messageRequests, slept)
+		}
+	})
+
+	t.Run("server failure", func(t *testing.T) {
+		var messages int32
+		c, srv, slept := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "tenant_access_token") {
+				_, _ = io.WriteString(w, `{"code":0,"tenant_access_token":"token"}`)
+				return
+			}
+			atomic.AddInt32(&messages, 1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+		})
+		defer srv.Close()
+		err := c.SendText(context.Background(), "cli_app", "secret", "ou_lanny", "hello")
+		if err == nil || !IsTemporary(err) {
+			t.Fatalf("error=%v, want temporary server failure", err)
+		}
+		if messages != 1 || *slept != 0 {
+			t.Fatalf("messages=%d sleeps=%d want 1,0", messages, *slept)
+		}
+	})
 }
 
 func TestRetryOnAny5xx(t *testing.T) {
@@ -293,6 +461,22 @@ func TestPermanentAPIErrorIsNotRetriedOrLeaked(t *testing.T) {
 	}
 }
 
+func TestTransportErrorsAreSafeAndRedacted(t *testing.T) {
+	secret := "secret/value+with space"
+	underlying := errors.New("line one\n\x1b[31m" + secret + " " + url.PathEscape(secret) + " " + strings.Repeat("界", 200))
+	err := sanitizeExternalError("Feishu request failed", underlying, secret)
+	if !errors.Is(err, underlying) {
+		t.Fatal("sanitized error no longer unwraps to its cause")
+	}
+	message := err.Error()
+	if strings.ContainsAny(message, "\n\r\x1b") || strings.Contains(message, secret) || strings.Contains(message, url.PathEscape(secret)) {
+		t.Fatalf("unsafe transport error: %q", message)
+	}
+	if !utf8.ValidString(message) || len(strings.TrimPrefix(message, "Feishu request failed: ")) > 300 {
+		t.Fatalf("transport error was not bounded UTF-8: %q", message)
+	}
+}
+
 func TestExhaustedServerFailureIsTemporary(t *testing.T) {
 	var requests int32
 	c, srv, slept := newTestClient(func(w http.ResponseWriter, _ *http.Request) {
@@ -340,6 +524,22 @@ func TestMissingReceiveID(t *testing.T) {
 	c := &Client{HTTP: http.DefaultClient}
 	if err := c.SendText(context.Background(), "a", "s", "", "text"); err == nil {
 		t.Fatal("expected missing receive id")
+	}
+}
+
+func TestCredentialLengthsAreBoundedBeforeNetworkAccess(t *testing.T) {
+	c := &Client{HTTP: http.DefaultClient}
+	for _, test := range []struct {
+		name, appID, secret string
+	}{
+		{name: "app id", appID: strings.Repeat("a", maxAppIDBytes+1), secret: "secret"},
+		{name: "app secret", appID: "cli_app", secret: strings.Repeat("s", maxAppSecretBytes+1)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := c.Probe(context.Background(), test.appID, test.secret); err == nil {
+				t.Fatal("oversized credential was accepted")
+			}
+		})
 	}
 }
 

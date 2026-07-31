@@ -51,6 +51,51 @@ func TestFormatRestartSummaryEdges(t *testing.T) {
 	}
 }
 
+// internal/backend/dnf.go labels the DNF5 sections "dnf needs-restarting[ -s]" instead of the bare
+// DNF4 command name. Identical restart facts must therefore render identically on both generations:
+// when the dnf5 labels were unrecognised the service list was dropped and the body claimed no service
+// needed a restart, contradicting the very alert those services raised.
+func TestFormatRestartSummaryHandlesBothDNFGenerations(t *testing.T) {
+	const (
+		reboot   = "Reboot should not be necessary."
+		services = "crond.service\nsshd.service"
+	)
+	dnf4 := "needs-restarting -r:\\n" + reboot + "\\n\\nneeds-restarting -s:\\n" + services
+	dnf5 := "dnf needs-restarting:\\n" + reboot + "\\n\\ndnf needs-restarting -s:\\n" + services
+
+	for _, lang := range []i18n.Lang{i18n.EN, i18n.ZH} {
+		got4 := formatRestartSummary(lang, "dnf", dnf4, false)
+		got5 := formatRestartSummary(lang, "dnf", dnf5, false)
+		if got5 != got4 {
+			t.Errorf("lang %s: dnf5 rendering differs from dnf4:\n--- dnf4 ---\n%s\n--- dnf5 ---\n%s", lang, got4, got5)
+		}
+		for _, service := range []string{"crond.service", "sshd.service"} {
+			if !strings.Contains(got5, service) {
+				t.Errorf("lang %s: dnf5 rendering dropped %s:\n%s", lang, service, got5)
+			}
+		}
+	}
+}
+
+func TestFormatRestartSummaryUsesNativeDNF5Command(t *testing.T) {
+	const summary = "dnf needs-restarting:\\nReboot is required to fully utilize these updates.\\n\\ndnf needs-restarting -s:\\n"
+
+	for _, lang := range []i18n.Lang{i18n.EN, i18n.ZH} {
+		got := formatRestartSummary(lang, "dnf", summary, true)
+		if !strings.Contains(got, "dnf needs-restarting") {
+			t.Errorf("lang %s: missing native DNF5 command:\n%s", lang, got)
+		}
+		if strings.Contains(got, "needs-restarting -r") {
+			t.Errorf("lang %s: DNF5 message recommends the DNF4-only -r form:\n%s", lang, got)
+		}
+	}
+
+	got := formatRestartSummary(i18n.EN, "dnf", strings.Replace(summary, "Reboot is required to fully utilize these updates.", "Reboot should not be necessary.", 1), false)
+	if !strings.Contains(got, "Run dnf needs-restarting on the server") {
+		t.Fatalf("DNF5 no-service guidance uses the wrong command:\n%s", got)
+	}
+}
+
 func pad2(i int) string {
 	if i < 10 {
 		return "0" + string(rune('0'+i))

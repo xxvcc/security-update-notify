@@ -13,21 +13,28 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/xxvcc/security-update-notify/internal/commandpath"
 )
 
 // Result 是一次命令执行的结果。Code 是退出码（命令无法启动时为 -1，Err 非空）。
 type Result struct {
-	Stdout string
-	Stderr string
-	Code   int
-	Err    error // 命令无法启动或 context 取消/超时时非空；普通非零退出不算 Err
+	Stdout          string
+	Stderr          string
+	StdoutTruncated bool
+	StderrTruncated bool
+	Code            int
+	Err             error // 命令无法启动或 context 取消/超时时非空；普通非零退出不算 Err
 }
 
 // maxCapturedBytes 限制单个流（stdout/stderr）缓冲的字节数，防止被攻破的包源/needrestart 返回
@@ -43,37 +50,52 @@ var (
 	signalForwardingOnce sync.Once
 	terminating          atomic.Bool
 	terminationBarrier   = make(chan struct{})
+	terminationCleanupMu sync.Mutex
+	terminationCleanups  = make(map[uint64]func())
+	terminationCleanupID atomic.Uint64
+	commandPathMu        sync.RWMutex
+	testCommandPath      string
+	testCommandPathSet   bool
 )
 
 // capBuffer 是带上限的写入缓冲：达到上限后丢弃多余字节，但始终向子进程声明"已全部写入"，
 // 避免因短写让子进程收到写错误（镜像运行时 `set +e` 的宽松语义）。
 type capBuffer struct {
-	buf bytes.Buffer
-	max int
+	buf       bytes.Buffer
+	max       int
+	truncated bool
 }
 
 func (c *capBuffer) Write(p []byte) (int, error) {
 	if rem := c.max - c.buf.Len(); rem > 0 {
 		if len(p) > rem {
 			c.buf.Write(p[:rem])
+			c.truncated = true
 		} else {
 			c.buf.Write(p)
 		}
+	} else if len(p) > 0 {
+		c.truncated = true
 	}
 	return len(p), nil
 }
 
-// forcedEnv 在当前环境基础上强制 LC_ALL=C（去掉已有的 LC_ALL/LANG 影响，追加权威值）。
+// forcedEnv 在当前环境基础上强制 LC_ALL=C 和受信 PATH。测试搜索路径只影响测试二进制，
+// 且保留系统目录供夹具脚本调用基础工具；生产进程始终使用 commandpath.TrustedPATH。
 func forcedEnv() []string {
-	env := os.Environ()
-	out := env[:0]
-	for _, kv := range env {
-		if len(kv) >= 7 && kv[:7] == "LC_ALL=" {
-			continue
+	path := commandpath.EffectivePATH()
+	var overrides map[string]string
+	if testPath, ok := commandPathOverride(); ok && testPath != "" {
+		path = testPath + string(os.PathListSeparator) + path
+		overrides = make(map[string]string)
+		for _, item := range os.Environ() {
+			key, value, found := strings.Cut(item, "=")
+			if found && strings.HasPrefix(key, "SUN_") {
+				overrides[key] = value
+			}
 		}
-		out = append(out, kv)
 	}
-	return append(out, "LC_ALL=C")
+	return commandpath.SanitizedEnvironment(path, overrides)
 }
 
 // Run 执行命令并捕获 stdout/stderr/退出码。非零退出不作为错误返回（镜像 `set +e`）。
@@ -91,13 +113,17 @@ func RunTimeout(timeout time.Duration, name string, args ...string) Result {
 // RunContext 是带 context 的 Run（用于超时/取消）。
 func RunContext(ctx context.Context, name string, args ...string) Result {
 	cmd := CommandContext(ctx, name, args...)
-	cmd.Env = forcedEnv()
 	stdout := &capBuffer{max: maxCapturedBytes}
 	stderr := &capBuffer{max: maxCapturedBytes}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	err := cmd.Run()
-	res := Result{Stdout: stdout.buf.String(), Stderr: stderr.buf.String()}
+	res := Result{
+		Stdout:          stdout.buf.String(),
+		Stderr:          stderr.buf.String(),
+		StdoutTruncated: stdout.truncated,
+		StderrTruncated: stderr.truncated,
+	}
 	if err == nil {
 		res.Code = 0
 		return res
@@ -161,7 +187,17 @@ func (c *Cmd) Run() error {
 }
 
 func CommandContext(ctx context.Context, name string, args ...string) *Cmd {
-	cmd := exec.CommandContext(ctx, name, args...)
+	resolved, resolveErr := resolveCommand(name)
+	if resolveErr != nil {
+		// Build a non-runnable command without asking os/exec to search caller PATH.
+		resolved = "/__security_update_notify_command_unavailable__"
+	}
+	cmd := exec.CommandContext(ctx, resolved, args...)
+	cmd.Args[0] = name
+	cmd.Env = forcedEnv()
+	if resolveErr != nil {
+		cmd.Err = resolveErr
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
@@ -192,6 +228,7 @@ func InstallSignalForwarding() {
 				sig = syscall.SIGTERM
 			}
 			terminating.Store(true)
+			runTerminationCleanups()
 			signalActiveProcessGroups(sig)
 
 			timer := time.NewTimer(signalGraceDelay)
@@ -212,6 +249,53 @@ func InstallSignalForwarding() {
 	})
 }
 
+// RegisterTerminationCleanup registers a short, non-blocking cleanup that must
+// run before InstallSignalForwarding re-raises a termination signal. This is
+// intended for process-local state, such as restoring terminal attributes,
+// whose normal defer cannot run after signal re-raising. The returned function
+// unregisters the cleanup and synchronizes with an invocation already in
+// progress.
+func RegisterTerminationCleanup(cleanup func()) func() {
+	if cleanup == nil {
+		return func() {}
+	}
+	id := terminationCleanupID.Add(1)
+	terminationCleanupMu.Lock()
+	if terminating.Load() {
+		terminationCleanupMu.Unlock()
+		callTerminationCleanup(cleanup)
+		return func() {}
+	}
+	terminationCleanups[id] = cleanup
+	terminationCleanupMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			terminationCleanupMu.Lock()
+			delete(terminationCleanups, id)
+			terminationCleanupMu.Unlock()
+		})
+	}
+}
+
+func runTerminationCleanups() {
+	// Holding the lock while callbacks run makes unregister a synchronization
+	// point: once it returns, a callback cannot touch a resource that its owner
+	// is about to release or reuse.
+	terminationCleanupMu.Lock()
+	defer terminationCleanupMu.Unlock()
+	for id, cleanup := range terminationCleanups {
+		callTerminationCleanup(cleanup)
+		delete(terminationCleanups, id)
+	}
+}
+
+func callTerminationCleanup(cleanup func()) {
+	defer func() { _ = recover() }()
+	cleanup()
+}
+
 func signalActiveProcessGroups(sig syscall.Signal) {
 	activeProcessGroups.Range(func(key, _ any) bool {
 		processGroup, ok := key.(int)
@@ -222,8 +306,47 @@ func signalActiveProcessGroups(sig syscall.Signal) {
 	})
 }
 
-// Look 报告命令是否在 PATH 中（复刻 `command -v`）。
+// Look reports whether a command exists on the fixed privileged PATH.
 func Look(name string) bool {
-	_, err := exec.LookPath(name)
+	_, err := resolveCommand(name)
 	return err == nil
+}
+
+func resolveCommand(name string) (string, error) {
+	if filepath.IsAbs(name) || strings.ContainsRune(name, filepath.Separator) {
+		return commandpath.Resolve(name)
+	}
+	if path, ok := commandPathOverride(); ok {
+		for _, directory := range filepath.SplitList(path) {
+			if directory == "" || !filepath.IsAbs(directory) {
+				continue
+			}
+			candidate := filepath.Join(directory, name)
+			if resolved, err := commandpath.Resolve(candidate); err == nil {
+				return resolved, nil
+			}
+		}
+		return "", fmt.Errorf("command is unavailable on injected test PATH: %s", name)
+	}
+	return commandpath.Resolve(name)
+}
+
+func commandPathOverride() (string, bool) {
+	commandPathMu.RLock()
+	defer commandPathMu.RUnlock()
+	return testCommandPath, testCommandPathSet
+}
+
+// SetCommandPathForTest replaces command lookup for deterministic tests. Production code must not
+// call this hook; normal command execution always resolves through commandpath.TrustedPATH.
+func SetCommandPathForTest(path string) func() {
+	commandPathMu.Lock()
+	previousPath, previousSet := testCommandPath, testCommandPathSet
+	testCommandPath, testCommandPathSet = path, true
+	commandPathMu.Unlock()
+	return func() {
+		commandPathMu.Lock()
+		testCommandPath, testCommandPathSet = previousPath, previousSet
+		commandPathMu.Unlock()
+	}
 }

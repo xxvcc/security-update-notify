@@ -29,11 +29,14 @@ During an interactive install, SUN accepts the App ID and a hidden App Secret, t
 
 #### High-assurance first install (recommended for production)
 
-This procedure never pipes a network response into a shell. First confirm an explicit version from a trusted release announcement and replace `X.Y.Z` below. It downloads the versioned `sun.sh`, detached signature, and public key into a root-owned temporary directory, checks the pinned primary-key fingerprint and the critical version notation in the signature, and executes the script only after every check succeeds. The machine must already have `bash`, `curl`, and `gpg`; install them first through the distribution package manager or trusted offline media.
+This procedure never pipes a network response into a shell. First confirm an explicit version from a trusted release announcement and replace `X.Y.Z` below. It downloads the versioned `sun.sh`, detached signature, and public key into a root-owned temporary directory, checks the pinned primary-key fingerprint and the critical version notation in the signature, and executes the script only after every check succeeds. The machine must already have `bash`, `curl`, `python3`, and `gpg`; install them first through the distribution package manager or trusted offline media.
 
 ```bash
-sudo bash <<'SUN_ROOT'
+sudo /bin/bash -p <<'SUN_ROOT'
 set -euo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+LC_ALL=C
+export PATH LC_ALL
 
 SUN_VERSION='X.Y.Z' # replace with an explicit version confirmed through a trusted announcement
 SUN_PIN='C678256ACBFC6491BF5076655F3AE24999921FFC'
@@ -45,18 +48,55 @@ SUN_NOTATION='release-version@xxv.cc'
 }
 
 SUN_BASE="https://dl.ll.cd/security-update-notify/v${SUN_VERSION}"
-SUN_WORK="$(mktemp -d)"
+SUN_WORK="$(mktemp -d /tmp/security-update-notify.XXXXXX)"
 trap 'rm -rf "$SUN_WORK"' EXIT
 chmod 0700 "$SUN_WORK"
 mkdir "$SUN_WORK/gnupg"
 chmod 0700 "$SUN_WORK/gnupg"
 
+download_limited() {
+  local asset="$1" output part
+  output="$SUN_WORK/$asset"
+  part="${output}.part"
+  rm -f -- "$part"
+  if curl --disable --fail --silent --show-error --location \
+      --proto '=https' --proto-redir '=https' \
+      --connect-timeout 20 --retry 4 --retry-delay 1 --retry-max-time 180 \
+      --max-time 180 --max-filesize 1048576 "$SUN_BASE/$asset" |
+      python3 -I -c '
+import os
+import sys
+
+limit = 1048576
+path = sys.argv[1]
+try:
+    with open(path, "xb") as output:
+        remaining = limit
+        while True:
+            chunk = sys.stdin.buffer.read(min(65536, remaining + 1))
+            if not chunk:
+                break
+            if len(chunk) > remaining:
+                raise ValueError("download exceeds size limit")
+            output.write(chunk)
+            remaining -= len(chunk)
+except Exception:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    raise SystemExit(1)
+' "$part"; then
+    if mv -f -- "$part" "$output"; then
+      return 0
+    fi
+  fi
+  rm -f -- "$part"
+  return 1
+}
+
 for asset in sun.sh sun.sh.asc release-signing.pub.asc; do
-  curl --disable --fail --silent --show-error --location \
-    --proto '=https' --proto-redir '=https' \
-    --connect-timeout 20 --retry 4 --retry-delay 1 --retry-max-time 180 \
-    --max-filesize 1048576 \
-    --output "$SUN_WORK/$asset" "$SUN_BASE/$asset"
+  download_limited "$asset"
 done
 
 gpg_cmd=(gpg --no-options --batch --no-tty --homedir "$SUN_WORK/gnupg")
@@ -85,6 +125,8 @@ status="$("${gpg_cmd[@]}" --known-notation "$SUN_NOTATION" --status-fd=1 --show-
   cat "$SUN_WORK/gpg.log" >&2
   exit 1
 }
+good_count=0
+outcome_count=0
 valid_count=0
 pinned_count=0
 name_count=0
@@ -96,6 +138,13 @@ data_match=0
 while read -r -a fields; do
   [[ "${fields[0]:-}" == '[GNUPG:]' ]] || continue
   case "${fields[1]:-}" in
+    GOODSIG)
+      outcome_count=$((outcome_count + 1))
+      good_count=$((good_count + 1))
+      ;;
+    EXPSIG|EXPKEYSIG|REVKEYSIG|BADSIG|ERRSIG)
+      outcome_count=$((outcome_count + 1))
+      ;;
     VALIDSIG)
       valid_count=$((valid_count + 1))
       last="${fields[${#fields[@]}-1]:-}"
@@ -120,7 +169,8 @@ while read -r -a fields; do
       ;;
   esac
 done <<<"$status"
-[[ "$valid_count" -eq 1 && "$pinned_count" -eq 1 \
+[[ "$outcome_count" -eq 1 && "$good_count" -eq 1 \
+   && "$valid_count" -eq 1 && "$pinned_count" -eq 1 \
    && "$name_count" -eq 1 && "$name_match" -eq 1 \
    && "$flags_count" -eq 1 && "$flags_match" -eq 1 \
    && "$data_count" -eq 1 && "$data_match" -eq 1 ]] || {
@@ -129,7 +179,7 @@ done <<<"$status"
 }
 
 chmod 0700 "$SUN_WORK/sun.sh"
-bash "$SUN_WORK/sun.sh" --version "$SUN_VERSION" --base-url "$SUN_BASE"
+/bin/bash -p "$SUN_WORK/sun.sh" --version "$SUN_VERSION" --base-url "$SUN_BASE"
 SUN_ROOT
 ```
 
@@ -141,12 +191,12 @@ The website-hosted bootstrap downloads the latest signed Release, verifies the `
 
 ```bash
 set -o pipefail
-curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash
+curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo /bin/bash -p
 ```
 
 This command preserves the existing experience, but the downloaded `sun.sh` executes before that script has been checked against its detached signature. The first stage therefore trusts HTTPS, the domain, and the mirror/CDN; verifying the Release afterward cannot retroactively authenticate code that already ran. Use the high-assurance procedure above when the threat model includes a compromised download host or TLS endpoint.
 
-When starting from the URL, `curl` must already be installed: the bootstrap cannot install a command before the script itself has been obtained. `set -o pipefail` makes a missing `curl`, DNS/TLS error, or failed download fail the complete pipeline instead of allowing the trailing `bash` to read empty input and report success. Once running, the bootstrap requires `curl`, `tar`, `sha256sum`, `mktemp`, `python3`, `env`, `uname`, `gpg`, and `timeout`. It installs only the packages corresponding to missing commands through apt, dnf, microdnf, or yum and then checks each command again; this avoids replacing `curl-minimal/coreutils-single` with conflicting full packages on minimal RPM systems. It fails before downloading or installing SUN when no supported package manager exists or a command is still missing. Release GPG verification is required by default.
+When starting from the URL, `curl` must already be installed: the bootstrap cannot install a command before the script itself has been obtained. `set -o pipefail` makes a missing `curl`, DNS/TLS error, or failed download fail the complete pipeline instead of allowing the trailing Bash process to read empty input and report success. The documented entry requires `/bin/bash -p`, causing Bash to ignore `BASH_ENV` and exported shell functions before it reads the bootstrap. The script then rebuilds the privileged child environment from a fixed `PATH`/`LC_ALL`, a UI language validated as `zh` or `en`, terminal and timezone settings, and upper/lowercase proxy variables; caller-supplied aliases, dynamic-loader, Python, package-manager, and systemd/Git environment overrides do not survive. Once running, the bootstrap requires `curl`, `tar`, `sha256sum`, `mktemp`, `python3`, `env`, `uname`, `gpg`, `timeout`, and `wc`. It installs only the packages corresponding to missing commands through apt, dnf, microdnf, or yum and then checks each command again; this avoids replacing `curl-minimal/coreutils-single` with conflicting full packages on minimal RPM systems. It fails before downloading or installing SUN when no supported package manager exists or a command is still missing. Release GPG verification is required by default.
 
 If you prefer running from source:
 
@@ -174,7 +224,7 @@ To skip the interactive language prompt, pass `--lang zh` or `--lang en`.
 
 Before writing the config, it performs receiving-platform preflight checks:
 
-- Telegram: `getMe` validates the bot token, then `sendMessage` validates the chat ID and permission. Connection resets, timeouts, HTTP 429, and 5xx responses are retried three times. A persistent temporary network failure is not mislabeled as an invalid token and does not clear existing credentials; interactive mode can retry, skip this preflight, or abort, while non-interactive mode fails with exit `75` and rolls back;
+- Telegram: `getMe` validates the bot token, then `sendMessage` validates the chat ID and permission. Read-only `getMe` makes up to three attempts when it encounters connection resets, timeouts, HTTP 429, or 5xx responses. To avoid duplicate messages, `sendMessage` retries only when the server explicitly returns HTTP 429; transport errors, 5xx responses, and interrupted responses return a temporary failure without an immediate resend. A persistent temporary network failure is not mislabeled as an invalid token and does not clear existing credentials; interactive mode can retry, skip this preflight, or abort, while non-interactive mode fails with exit `75` and rolls back;
 - Feishu: obtains a `tenant_access_token` and scans active employees in the application's directory scope. If an `open_id` was supplied explicitly, it performs only the application-credential preflight. No message is sent during installation preflight.
 
 Results are limited by the Feishu application's directory data scope. If scanning fails or returns no visible employees, the interactive installer can retry, accept a current-app `open_id` manually, or abort. Non-interactive mode requires `--feishu-receive-id` explicitly.
@@ -197,7 +247,7 @@ Useful for provisioning scripts:
 
 ```bash
 set -o pipefail
-curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- install \
+curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo /bin/bash -p -s -- install \
   --notify-channels telegram \
   --telegram-token '123456:ABC...' \
   --telegram-chat-id 'CHAT_ID' \
@@ -218,7 +268,7 @@ sudo install -m 600 /dev/null /root/.security-update-notify-feishu-secret
 sudoedit /root/.security-update-notify-feishu-secret
 
 set -o pipefail
-curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- install \
+curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo /bin/bash -p -s -- install \
   --notify-channels feishu \
   --feishu-app-id 'cli_xxx' \
   --feishu-receive-id 'ou_xxx' \
@@ -242,7 +292,7 @@ sudoedit .env
 
 set -o pipefail
 curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | \
-  sudo bash -s -- install --env-file "$PWD/.env" --non-interactive -y
+  sudo /bin/bash -p -s -- install --env-file "$PWD/.env" --non-interactive -y
 ```
 
 You can also keep only the token in a root-only file:
@@ -252,7 +302,7 @@ sudo install -m 600 /dev/null /root/.security-update-notify-token
 sudoedit /root/.security-update-notify-token
 
 set -o pipefail
-curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- install \
+curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo /bin/bash -p -s -- install \
   --telegram-token-file /root/.security-update-notify-token \
   --telegram-chat-id 'CHAT_ID' \
   --non-interactive \
@@ -294,7 +344,7 @@ Rerun the one-line installer to upgrade to the latest release:
 
 ```bash
 set -o pipefail
-curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo bash -s -- upgrade --non-interactive -y
+curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo /bin/bash -p -s -- upgrade --non-interactive -y
 ```
 
 Once SUN is installed you can also run `sudo security-update-notify upgrade` directly. Both the bootstrap and built-in upgrade first read `https://dl.ll.cd/security-update-notify/latest.json` and download the signed assets from that mirror; they fall back to GitHub when the mirror index or complete asset-set transfer is unavailable. The downloaded package still must pass `.sha256` and GPG verification against the embedded pinned fingerprint (fail-closed by default; a missing signature is rejected). The mirror improves transport availability but is not a trust root.

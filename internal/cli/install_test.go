@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -275,6 +276,39 @@ func TestInstallReportsAdvisoryDoctorOutputWithoutFailing(t *testing.T) {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("stderr missing %q: %q", want, stderr.String())
 		}
+	}
+}
+
+func TestPostInstallReportingTreatsTruncatedSuccessAsAdvisoryFailure(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		report func(*installCommand, string, *installer.CommandResult)
+		want   string
+	}{
+		{name: "additional test", report: (*installCommand).reportPostInstallTest, want: "Additional test message command output exceeded the capture limit"},
+		{name: "doctor", report: (*installCommand).reportPostInstallDoctor, want: "Post-install self-check command output exceeded the capture limit"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			command := &installCommand{console: installConsole{out: &stdout, errOut: &stderr}}
+			test.report(command, "en", &installer.CommandResult{
+				Stdout: []byte("partial output"), Code: 0, StdoutTruncated: true,
+			})
+			if !strings.Contains(stdout.String(), "partial output\n") {
+				t.Fatalf("captured output was hidden: %q", stdout.String())
+			}
+			if !strings.Contains(stderr.String(), test.want) || !strings.Contains(stderr.String(), "Warning: installation completed") {
+				t.Fatalf("truncated success was not reported as advisory failure: %q", stderr.String())
+			}
+		})
+	}
+}
+
+func TestWriteCommandOutputSanitizesTerminalControls(t *testing.T) {
+	var out bytes.Buffer
+	writeCommandOutput(&out, []byte("first\nsecond\t\x1b[31m\u202Espoof\u2028tail"))
+	if got, want := out.String(), "first\nsecond\t [31m spoof tail\n"; got != want {
+		t.Fatalf("command output=%q want %q", got, want)
 	}
 }
 
@@ -724,6 +758,48 @@ func TestReadHiddenLineFallsBackForPipe(t *testing.T) {
 	}
 }
 
+func TestTerminalEchoGuardRestoresAfterTerminationDuringDisable(t *testing.T) {
+	original := syscall.Termios{Lflag: syscall.ECHO}
+	hidden := original
+	hidden.Lflag &^= syscall.ECHO
+	disableStarted := make(chan struct{})
+	allowDisable := make(chan struct{})
+	var calls []uint32
+	guard := terminalEchoGuard{
+		fd:       1,
+		original: original,
+		ioctl: func(_ uintptr, request uintptr, state *syscall.Termios) error {
+			if request != syscall.TCSETS {
+				return fmt.Errorf("request=%d, want TCSETS", request)
+			}
+			calls = append(calls, state.Lflag)
+			if len(calls) == 1 {
+				close(disableStarted)
+				<-allowDisable
+			}
+			return nil
+		},
+	}
+	disableDone := make(chan error, 1)
+	go func() { disableDone <- guard.disable(&hidden) }()
+	<-disableStarted
+	terminationDone := make(chan error, 1)
+	go func() { terminationDone <- guard.terminate() }()
+	close(allowDisable)
+	if err := <-disableDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-terminationDone; err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 2 || calls[0]&syscall.ECHO != 0 || calls[1]&syscall.ECHO == 0 {
+		t.Fatalf("terminal transitions=%#v, want hidden then restored", calls)
+	}
+	if err := guard.disable(&hidden); !errors.Is(err, errTerminalTermination) {
+		t.Fatalf("disable after termination error=%v", err)
+	}
+}
+
 func TestPromptSecretAcceptsFinalLineAtEOF(t *testing.T) {
 	command, _, _, _ := newInstallTestCommand(t, nil, "", nil)
 	command.console.readSecret = func(string) (string, error) { return "secret-without-newline", io.EOF }
@@ -801,6 +877,61 @@ func TestInstallEnvCompatibilityAndSymlinkRejection(t *testing.T) {
 	}
 	if err := command.loadInstallEnv(filepath.Join(linkedDirectory, "nested.env"), &installArguments{config: make(map[string]string)}); err == nil {
 		t.Fatal("env file below a symlinked ancestor was accepted")
+	}
+}
+
+func TestNormalizeCLIChannelsReportsEmptyInput(t *testing.T) {
+	for _, input := range []string{"", " \t\n"} {
+		got, err := normalizeCLIChannels(input)
+		if err == nil || got != "" || !strings.Contains(err.Error(), "cannot be empty") {
+			t.Fatalf("normalizeCLIChannels(%q) = %q, %v", input, got, err)
+		}
+	}
+	if got, err := normalizeCLIChannels(" feishu "); err != nil || got != "feishu" {
+		t.Fatalf("normalizeCLIChannels(feishu) = %q, %v", got, err)
+	}
+	for _, input := range []string{",", "telegram,,feishu", "email"} {
+		if got, err := normalizeCLIChannels(input); err == nil || got != "" {
+			t.Fatalf("normalizeCLIChannels(%q) = %q, %v; want fail-closed error", input, got, err)
+		}
+	}
+}
+
+func TestOpenRegularNoFollowDoesNotBlockOnFIFO(t *testing.T) {
+	fifo := filepath.Join(t.TempDir(), "install.env")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		file *os.File
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		file, err := openRegularNoFollow(fifo)
+		done <- result{file: file, err: err}
+	}()
+	select {
+	case opened := <-done:
+		if opened.err != nil {
+			t.Fatal(opened.err)
+		}
+		defer opened.file.Close()
+		info, err := opened.file.Stat()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().IsRegular() {
+			t.Fatal("FIFO was reported as a regular file")
+		}
+	case <-time.After(time.Second):
+		// Opening a writer releases a regressed blocking reader so the test does
+		// not leave a stuck goroutine while reporting the failure.
+		writer, _ := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if writer != nil {
+			_ = writer.Close()
+		}
+		t.Fatal("opening a FIFO blocked")
 	}
 }
 

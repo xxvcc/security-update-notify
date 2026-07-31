@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/xxvcc/security-update-notify/internal/config"
@@ -20,7 +21,10 @@ func TestDoctorReportsControlledDNFFailures(t *testing.T) {
 	cfg := patchTestConfig(t, "BACKEND=dnf\nHOST_LABEL=doctor-host\nINCLUDE_PUBLIC_IP=0\nNOTIFY_CHANNELS=unsupported\nCHECK_UPDATE_HEALTH=0\nCHECK_EOL=0\nCHECK_SELF_UPDATE=0\n")
 
 	output, got := captureDoctorOutput(t, func() int {
-		return Doctor(cfg, DoctorOpts{Version: "2.7.3", Lang: i18n.EN, EnvPath: filepath.Join(t.TempDir(), "missing.env")})
+		return Doctor(cfg, DoctorOpts{
+			Version: "2.7.3", Lang: i18n.EN, EnvPath: filepath.Join(t.TempDir(), "missing.env"),
+			Systemd: &recordingSystemdQuery{},
+		})
 	})
 	if got != 1 {
 		t.Fatalf("Doctor()=%d want 1", got)
@@ -40,17 +44,8 @@ func TestDoctorReportsControlledDNFFailures(t *testing.T) {
 }
 
 func TestDoctorDNFHappyPathWithSkippedNotificationProbe(t *testing.T) {
-	if !fileExists("/run/systemd/system") {
-		t.Skip("doctor's systemd success path requires /run/systemd/system")
-	}
 	dir := t.TempDir()
 	writeTestCommand(t, dir, "uname", "printf '%s\\n' '6.12-doctor'\n")
-	writeTestCommand(t, dir, "systemctl", `
-if [ "$1" = "is-enabled" ]; then
-  printf '%s\n' enabled
-fi
-exit 0
-`)
 	writeTestCommand(t, dir, "dnf", `
 if [ "$*" = "--version" ]; then
   printf '%s\n' '4.14.0'
@@ -80,8 +75,15 @@ esac
 	if err != nil {
 		t.Fatal(err)
 	}
+	systemdQuery := &recordingSystemdQuery{
+		available: true,
+		enabled: map[string]bool{
+			"security-update-notify.timer": true,
+			"dnf-automatic.timer":          true,
+		},
+	}
 
-	if got := Doctor(cfg, DoctorOpts{Version: "2.7.3", Lang: i18n.EN, EnvPath: envPath, SkipNotify: true}); got != 0 {
+	if got := Doctor(cfg, DoctorOpts{Version: "2.7.3", Lang: i18n.EN, EnvPath: envPath, SkipNotify: true, Systemd: systemdQuery}); got != 0 {
 		t.Fatalf("Doctor()=%d want 0", got)
 	}
 
@@ -89,7 +91,7 @@ esac
 		t.Fatal(err)
 	}
 	output, got := captureDoctorOutput(t, func() int {
-		return Doctor(cfg, DoctorOpts{Version: "2.7.3", Lang: i18n.EN, EnvPath: envPath, SkipNotify: true})
+		return Doctor(cfg, DoctorOpts{Version: "2.7.3", Lang: i18n.EN, EnvPath: envPath, SkipNotify: true, Systemd: systemdQuery})
 	})
 	if got != 1 {
 		t.Fatalf("Doctor() with policy drift=%d want 1", got)
@@ -154,12 +156,27 @@ exit 99
 }
 
 func TestFileReadable(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.env")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.env")
 	if err := os.WriteFile(path, []byte("BACKEND=apt\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if !fileReadable(path) || fileReadable(filepath.Join(t.TempDir(), "missing")) {
 		t.Fatal("fileReadable did not distinguish readable and missing paths")
+	}
+	link := filepath.Join(dir, "linked.env")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if fileReadable(link) {
+		t.Fatal("fileReadable accepted a symlink")
+	}
+	fifo := filepath.Join(dir, "fifo.env")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if fileReadable(fifo) {
+		t.Fatal("fileReadable accepted a FIFO")
 	}
 }
 
@@ -205,6 +222,19 @@ func TestDoctorAPTDependenciesRejectsConfigFilesState(t *testing.T) {
 	}
 	if text := output.String(); !strings.Contains(text, "FAIL package unattended-upgrades not fully installed") || strings.Contains(text, "OK package unattended-upgrades") {
 		t.Fatalf("unexpected doctor output:\n%s", text)
+	}
+}
+
+func TestDoctorAPTDependenciesRejectsTruncatedPackageStatus(t *testing.T) {
+	var output bytes.Buffer
+	ready := doctorAPTDependencies(&output, i18n.EN, func(string) bool { return true }, func(string, ...string) sysexec.Result {
+		return sysexec.Result{
+			Stdout:          "Status: install ok installed\n",
+			StdoutTruncated: true,
+		}
+	})
+	if ready || !strings.Contains(output.String(), "not fully installed") {
+		t.Fatalf("truncated dpkg status was accepted:\n%s", output.String())
 	}
 }
 

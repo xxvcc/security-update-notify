@@ -207,10 +207,14 @@ jobs:
 
       - name: Compile Python test helpers
         run: |
-          python3 -m py_compile \
+          python3 -I -m py_compile \
             build/fake-notify-api.py \
             build/pty-driver.py \
+            build/pty-driver-test.py \
             build/release-archive-test.py
+
+      - name: Test PTY process-group cleanup
+        run: python3 -I build/pty-driver-test.py
 
       - name: Hostile bootstrap archive gate
         run: build/archive-safety-test.sh
@@ -229,7 +233,9 @@ jobs:
 
       - name: Stable mirror publication invariants
         run: |
-          python3 - <<'PY'
+          python3 -I - <<'PY'
+          import subprocess
+          import tempfile
           from pathlib import Path
 
           workflow = Path('.github/workflows/mirror-release.yml').read_text(encoding='utf-8')
@@ -237,27 +243,55 @@ jobs:
           release_sha_ref = 'ref: $' + '{{ github.event.workflow_run.head_sha || inputs.tag }}'
           upstream_sha_env = 'EXPECTED_HEAD_SHA: $' + '{{ github.event.workflow_run.head_sha }}'
           tag_concurrency = 'group: signed-release-mirror-$' + \
-              '{{ github.event.workflow_run.head_branch || inputs.tag || github.run_id }}'
+              '{{ github.event.workflow_run.head_branch || inputs.tag }}'
+          concurrency_groups = [
+              line.strip()
+              for line in workflow.splitlines()
+              if line.startswith('      group:')
+          ]
+          if concurrency_groups != [tag_concurrency]:
+              raise SystemExit(
+                  'mirror workflow must isolate concurrency by release tag: '
+                  f'{concurrency_groups}'
+              )
           required = [
               "workflows: ['CI']",
               'environment: release-mirror',
-              tag_concurrency,
+              '- name: Validate release identity',
               '- name: Require immutable release state',
               workflow_sha_ref,
               release_sha_ref,
               'path: released-source',
               '- name: Bind release tag to the verified commit',
               upstream_sha_env,
+              'release tag $TAG must be annotated and peel to checked commit $released_sha',
+              'manual mirror dispatches must run from refs/heads/main',
+              'workflow revision $TRUSTED_WORKFLOW_SHA is not contained in protected main',
+              'repos/$GITHUB_REPOSITORY/compare/$released_sha...$default_sha',
+              'release commit $released_sha is not contained in protected main',
               '- name: Install runtime verification tools',
+              '- name: Prepare bounded HTTPS downloader',
               '- name: Verify every packaged runtime',
               '/usr/bin/qemu-aarch64-static',
               'readelf -W -l "$runtime"',
               'env -i LC_ALL=C PATH=/usr/bin:/bin',
+              'raise ValueError("runtime output exceeds byte limit")',
+              '"$(wc -c < "$output")" -eq "$((${#expected} + 1))"',
               '"rel/$tarball" "$version" "$epoch" released-source',
+              '/usr/bin/timeout --signal=TERM --kill-after=5s 180s',
+              'raise ValueError("download exceeds byte limit")',
+              'gpg --no-options --batch --status-fd=1',
               'cmp "deploy/$TAG/$asset" "public-check/$asset"',
-              '- name: Confirm GitHub Latest before stable update',
-              '- name: Publish stable bootstrap',
-              '- name: Publish latest manifest last',
+              '- name: Publish stable files under one remote lock',
+              'flock --wait 180 --exclusive 9',
+              'deadline=$((SECONDS + 720))',
+              'read_reply LOCKED 200',
+              'if [[ "$BOOTSTRAP_PRESENT" == "1" ]]; then',
+              '[[ -f "$stage/sun.sh" && ! -L "$stage/sun.sh" ]] || exit 64',
+              'rollback_stable() {',
+              'sun_backup="$stage/.previous-sun.sh"',
+              'latest_backup="$stage/.previous-latest.json"',
+              'committed=1',
               'needs: verify-and-sync',
               'uses: ./.github/workflows/live-canary.yml',
           ]
@@ -265,11 +299,13 @@ jobs:
               if item not in workflow:
                   raise SystemExit(f'mirror workflow invariant missing: {item}')
           ordered = [
+              '- name: Validate release identity',
               '- name: Require immutable release state',
               '- name: Checkout the trusted workflow revision',
               '- name: Checkout the released tag as untrusted data',
               '- name: Bind release tag to the verified commit',
               '- name: Install runtime verification tools',
+              '- name: Prepare bounded HTTPS downloader',
               '- name: Download release assets',
               '- name: Verify checksum and pinned GPG signature',
               '- name: Verify every packaged runtime',
@@ -277,9 +313,7 @@ jobs:
               '- name: Configure pinned SSH identity',
               '- name: Upload immutable signed release files',
               '- name: Verify release files through the public mirror',
-              '- name: Confirm GitHub Latest before stable update',
-              '- name: Publish stable bootstrap',
-              '- name: Publish latest manifest last',
+              '- name: Publish stable files under one remote lock',
           ]
           positions = [workflow.index(item) for item in ordered]
           if positions != sorted(positions):
@@ -288,10 +322,144 @@ jobs:
               raise SystemExit('mirror workflow must not run directly from a release tag')
           if 'GH_TOKEN:' in workflow.split('    steps:', 1)[0]:
               raise SystemExit('mirror job must not expose GITHUB_TOKEN to every verification step')
+          if '${peeled_sha:-$direct_sha}' in workflow or 'tag_sha=' in workflow:
+              raise SystemExit('mirror workflow must reject lightweight release tags')
+          if 'gpg --batch' in workflow:
+              raise SystemExit('mirror verification must ignore runner GPG option files')
+          if 'gh release download' in workflow or workflow.count('/usr/bin/curl') != 1:
+              raise SystemExit('every release download must use the bounded HTTPS helper')
+          if (workflow.count('raise ValueError("download exceeds byte limit")') != 1 or
+                  workflow.count('"$RUNNER_TEMP/download-limited"') != 6):
+              raise SystemExit('the bounded HTTPS helper and all four call sites must remain intact')
+
+          stable = workflow.split(
+              '- name: Publish stable files under one remote lock', 1
+          )[1].split('- name: Remove SSH identity', 1)[0]
+          remote_script, controller = stable.split('\n          REMOTE_SCRIPT\n', 1)
+          latest_handler = remote_script.split(
+              '              PUBLISH_LATEST)', 1
+          )[1].split('              RELEASE)', 1)[0]
+          latest_handler_order = [
+              'install -m 0644 -- "$stage/latest.json" "$latest_tmp"',
+              'mv -f -- "$latest_tmp" latest.json',
+              "printf '%s\\n' LATEST_PUBLISHED",
+          ]
+          latest_handler_positions = [latest_handler.index(item) for item in latest_handler_order]
+          if latest_handler_positions != sorted(latest_handler_positions):
+              raise SystemExit('latest.json must be the final stable artifact write')
+          controller_order = [
+              'read_reply LOCKED 200',
+              'latest_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"',
+              "printf '%s\\n' PUBLISH_SUN",
+              'read_reply SUN_PUBLISHED 60',
+              '"$MIRROR_BASE_URL/sun.sh?run=$GITHUB_RUN_ID&attempt=$GITHUB_RUN_ATTEMPT"',
+              "printf '%s\\n' PUBLISH_LATEST",
+              'read_reply LATEST_PUBLISHED 60',
+              '"$MIRROR_BASE_URL/latest.json?run=$GITHUB_RUN_ID&attempt=$GITHUB_RUN_ATTEMPT"',
+              '\n          finish_remote_lock\n',
+          ]
+          controller_positions = [controller.index(item) for item in controller_order]
+          if controller_positions != sorted(controller_positions):
+              raise SystemExit('stable files must be published and read back inside one ordered lock')
+          snapshot_order = [
+              'install -m 0600 -- sun.sh "$sun_backup"',
+              'install -m 0600 -- latest.json "$latest_backup"',
+              'install -m 0644 -- "$stage/sun.sh" "$sun_tmp"',
+              'mv -f -- "$sun_tmp" sun.sh',
+          ]
+          publish_sun_handler = remote_script.split(
+              '              PUBLISH_SUN)', 1
+          )[1].split('              PUBLISH_LATEST)', 1)[0]
+          snapshot_positions = [publish_sun_handler.index(item) for item in snapshot_order]
+          if snapshot_positions != sorted(snapshot_positions):
+              raise SystemExit('stable files must be snapshotted before publishing sun.sh')
+          cleanup_handler = remote_script.split('          cleanup() {', 1)[1].split(
+              '          }\n          trap cleanup EXIT', 1
+          )[0]
+          for item in ['rollback_stable', 'committed', 'preserve_stage']:
+              if item not in cleanup_handler:
+                  raise SystemExit(f'remote cleanup must retain transactional rollback: {item}')
+
+          remote_body = remote_script.split(
+              'cat > "$local_stage/mirror-lock.sh" <<\'REMOTE_SCRIPT\'\n', 1
+          )[1]
+
+          def protocol_case(name, actions, expected_sun, expected_latest, expected_rc):
+              with tempfile.TemporaryDirectory(prefix=f'sun-mirror-{name}-') as temporary:
+                  root = Path(temporary)
+                  stage_name = '.security-update-notify-stage-123-1-v3.1.1'
+                  stage = root / stage_name
+                  stage.mkdir()
+                  (stage / 'sun.sh').write_text('new sun\n', encoding='ascii')
+                  (stage / 'latest.json').write_text('new latest\n', encoding='ascii')
+                  (stage / 'mirror-lock.sh').write_text('fixture\n', encoding='ascii')
+                  if expected_sun is not None:
+                      (root / 'sun.sh').write_text('old sun\n', encoding='ascii')
+                  if expected_latest is not None:
+                      (root / 'latest.json').write_text('old latest\n', encoding='ascii')
+                  script = root / 'remote-lock.sh'
+                  script.write_text(remote_body, encoding='utf-8')
+                  completed = subprocess.run(
+                      ['bash', '--noprofile', '--norc', str(script), stage_name],
+                      cwd=root, input=actions, text=True, capture_output=True,
+                      timeout=10, check=False,
+                  )
+                  if completed.returncode != expected_rc:
+                      raise SystemExit(
+                          f'{name}: remote protocol returned {completed.returncode}, '
+                          f'want {expected_rc}: {completed.stderr}'
+                      )
+                  actual_sun = (root / 'sun.sh').read_text(encoding='ascii').strip() \
+                      if (root / 'sun.sh').exists() else None
+                  actual_latest = (root / 'latest.json').read_text(encoding='ascii').strip() \
+                      if (root / 'latest.json').exists() else None
+                  if (actual_sun, actual_latest) != (expected_sun, expected_latest):
+                      raise SystemExit(
+                          f'{name}: stable rollback produced '
+                          f'{(actual_sun, actual_latest)}, want '
+                          f'{(expected_sun, expected_latest)}'
+                      )
+                  if stage.exists():
+                      raise SystemExit(f'{name}: completed protocol retained its stage')
+
+          protocol_case('abort', 'PUBLISH_SUN\nABORT\n', 'old sun', 'old latest', 0)
+          protocol_case(
+              'commit', 'PUBLISH_SUN\nPUBLISH_LATEST\nRELEASE\n',
+              'new sun', 'new latest', 0,
+          )
+          protocol_case('eof', 'PUBLISH_SUN\n', 'old sun', 'old latest', 124)
+          protocol_case('initial', 'PUBLISH_SUN\nABORT\n', None, None, 0)
 
           canary = Path('.github/workflows/live-canary.yml').read_text(encoding='utf-8')
           if 'workflow_call:' not in canary or 'workflow_run:' in canary or '\nconcurrency:' in canary:
               raise SystemExit('release canary must be directly callable without dropping pending runs')
+          PY
+
+      - name: Release event verifier invariants
+        run: |
+          python3 -I - <<'PY'
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/ci.yml').read_text(encoding='utf-8')
+          release = workflow.split('\n  verify-signed-release:\n', 1)[1]
+          required = [
+              '- name: Prepare bounded release I/O helper',
+              'raise ValueError("input exceeds byte limit")',
+              '/usr/bin/curl --disable --fail --location --silent --show-error',
+              '--max-filesize "$limit"',
+              '/usr/bin/python3 -I "$RUNNER_TEMP/write-limited.py" "$limit" "$part"',
+              '/usr/bin/env -i LC_ALL=C PATH=/usr/bin:/bin',
+              '/usr/bin/timeout --signal=TERM --kill-after=5s 15s "$runtime" --version',
+              '/usr/bin/python3 -I "$RUNNER_TEMP/write-limited.py" 4096 "$runtime_version_part"',
+              'gpg --no-options --batch --status-fd=1 --verify',
+          ]
+          for item in required:
+              if item not in release:
+                  raise SystemExit(f'release verifier invariant missing: {item}')
+          if 'gh release download' in release:
+              raise SystemExit('release verifier must not download assets without a byte limit')
+          if 'environment:' in release.split('    steps:', 1)[0]:
+              raise SystemExit('unprivileged release verifier must not receive an Environment')
           PY
 
   package:
@@ -362,7 +530,7 @@ jobs:
           cmp "dist-a/$archive" "dist-b/$archive"
           cmp "dist-a/$archive.sha256" "dist-b/$archive.sha256"
           epoch="$(git show -s --format=%ct HEAD)"
-          python3 build/release-archive-test.py "dist-a/$archive" "$version" "$epoch" .
+          python3 -I build/release-archive-test.py "dist-a/$archive" "$version" "$epoch" .
           mkdir dist
           cp "dist-a/$archive" "dist-a/$archive.sha256" dist/
 
@@ -616,7 +784,7 @@ jobs:
           STALE_UPDATE_DAYS=0
           CHECK_SELF_UPDATE=0
           EOF
-          want="$(python3 -c "import json; print({x['name']: x['hash'] for x in json.load(open('internal/golden/testdata/scenarios.json'))}['apt-test-reboot-zh'])")"
+          want="$(python3 -I -c "import json; print({x['name']: x['hash'] for x in json.load(open('internal/golden/testdata/scenarios.json'))}['apt-test-reboot-zh'])")"
           run_arch() {
             local arch="$1"
             local binary="$package_dir/files/security-update-notify-linux-$arch"
@@ -664,7 +832,7 @@ jobs:
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import json
           import os
 
@@ -736,6 +904,40 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Prepare bounded release I/O helper
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/write-limited.py" <<'PY'
+          import os
+          import sys
+
+          if len(sys.argv) != 3:
+              raise SystemExit(2)
+          limit = int(sys.argv[1])
+          path = sys.argv[2]
+          if limit <= 0:
+              raise SystemExit(2)
+          try:
+              with open(path, "xb") as output:
+                  remaining = limit
+                  while True:
+                      chunk = sys.stdin.buffer.read(min(65536, remaining + 1))
+                      if not chunk:
+                          break
+                      if len(chunk) > remaining:
+                          raise ValueError("input exceeds byte limit")
+                      output.write(chunk)
+                      remaining -= len(chunk)
+          except Exception as exc:
+              try:
+                  os.unlink(path)
+              except FileNotFoundError:
+                  pass
+              print(f"bounded input failed: {exc}", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+          chmod 0600 "$RUNNER_TEMP/write-limited.py"
+
       - name: Download the exact release asset set
         env:
           GH_TOKEN: ${{ github.token }}
@@ -743,6 +945,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir rel
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([._-][0-9A-Za-z]+)?$ && "${#TAG}" -le 65 ]] || {
+            echo "::error::invalid release tag: $TAG"
+            exit 1
+          }
           version="${TAG#v}"
           archive="security-update-notify-${version}.tar.gz"
           declaration_count="$(grep -c '^BOOTSTRAP_SIGNATURE_ASSET=' released-source/sun.sh || true)"
@@ -768,10 +974,8 @@ jobs:
             exit 1
           fi
           expected_assets=("$archive" "$archive.sha256" "$archive.asc")
-          download_patterns=(--pattern 'security-update-notify-*.tar.gz*')
           if [[ -n "$bootstrap_signature_asset" ]]; then
             expected_assets+=("$bootstrap_signature_asset")
-            download_patterns+=(--pattern "$bootstrap_signature_asset")
           fi
           mapfile -t actual_assets < <(
             gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' |
@@ -782,8 +986,27 @@ jobs:
             echo "::error::unexpected GitHub release asset set"
             exit 1
           fi
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir rel \
-            "${download_patterns[@]}"
+          download_limited() {
+            local limit="$1" output="$2" url="$3" part="${2}.part"
+            rm -f -- "$part"
+            if /usr/bin/timeout --signal=TERM --kill-after=5s 180s \
+                /usr/bin/curl --disable --fail --location --silent --show-error \
+                  --connect-timeout 20 --max-time 120 --retry 3 --retry-delay 1 \
+                  --retry-all-errors --retry-max-time 150 --max-filesize "$limit" \
+                  --proto '=https' --proto-redir '=https' "$url" | \
+                /usr/bin/python3 -I "$RUNNER_TEMP/write-limited.py" "$limit" "$part" && \
+                mv -f -- "$part" "$output"; then
+              return 0
+            fi
+            rm -f -- "$part"
+            return 1
+          }
+          github_base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          for asset in "${expected_assets[@]}"; do
+            limit=1048576
+            [[ "$asset" != "$archive" ]] || limit=268435456
+            download_limited "$limit" "rel/$asset" "$github_base/$asset"
+          done
           printf 'BOOTSTRAP_SIGNATURE_ASSET=%s\nBOOTSTRAP_VERSION_NOTATION=%s\n' \
             "$bootstrap_signature_asset" "$bootstrap_version_notation" >> "$GITHUB_ENV"
 
@@ -850,32 +1073,35 @@ jobs:
           GNUPGHOME="$(mktemp -d)"
           export GNUPGHOME
           chmod 0700 "$GNUPGHOME"
-          gpg --batch --import files/release-signing.pub.asc
+          gpg --no-options --batch --import files/release-signing.pub.asc
           mapfile -t primary_fingerprints < <(
-            gpg --batch --with-colons --list-keys |
+            gpg --no-options --batch --with-colons --list-keys |
               awk -F: '$1 == "pub" {want = 1; next} want && $1 == "fpr" {print $10; want = 0}'
           )
           [[ "${#primary_fingerprints[@]}" -eq 1 && "${primary_fingerprints[0]}" == "$pin" ]] || {
             echo "::error::release keyring is not exactly the pinned primary key"
             exit 1
           }
-          status="$(gpg --batch --status-fd=1 --verify "rel/$archive.asc" "rel/$archive" 2>/tmp/gpg-verify.log)" || {
+          status="$(gpg --no-options --batch --status-fd=1 --verify \
+            "rel/$archive.asc" "rel/$archive" 2>/tmp/gpg-verify.log)" || {
             cat /tmp/gpg-verify.log >&2
             exit 1
           }
           awk -v pin="$pin" '
+            $1 == "[GNUPG:]" && $2 == "GOODSIG" { outcome_count++; good_count++ }
+            $1 == "[GNUPG:]" && $2 ~ /^(EXPSIG|EXPKEYSIG|REVKEYSIG|BADSIG|ERRSIG)$/ { outcome_count++ }
             $1 == "[GNUPG:]" && $2 == "VALIDSIG" {
               valid_count++
               if ($3 == pin || $NF == pin) pinned_count++
             }
-            END { exit !(valid_count == 1 && pinned_count == 1) }
+            END { exit !(outcome_count == 1 && good_count == 1 && valid_count == 1 && pinned_count == 1) }
           ' <<<"$status" || {
             echo "::error::signature is not uniquely bound to the pinned primary key"
             exit 1
           }
 
           epoch="$(git -C released-source show -s --format=%ct HEAD)"
-          python3 build/release-archive-test.py \
+          python3 -I build/release-archive-test.py \
             "rel/$archive" "$version" "$epoch" released-source
 
           release_work="$(mktemp -d)"
@@ -902,8 +1128,23 @@ jobs:
               exit 1
             fi
           done
-          [[ "$("$package_dir/files/security-update-notify-linux-amd64" --version)" == \
-              "security-update-notify $version" ]] || {
+          runtime="$package_dir/files/security-update-notify-linux-amd64"
+          runtime_version_file="$release_work/runtime-version"
+          runtime_version_part="${runtime_version_file}.part"
+          rm -f -- "$runtime_version_part"
+          if ! /usr/bin/env -i LC_ALL=C PATH=/usr/bin:/bin \
+              /usr/bin/timeout --signal=TERM --kill-after=5s 15s "$runtime" --version 2>/dev/null | \
+              /usr/bin/python3 -I "$RUNNER_TEMP/write-limited.py" 4096 "$runtime_version_part" || \
+              ! mv -f -- "$runtime_version_part" "$runtime_version_file"; then
+            rm -f -- "$runtime_version_part"
+            echo "::error::released amd64 runtime version probe failed, timed out, or exceeded 4096 bytes"
+            exit 1
+          fi
+          expected_runtime_version="security-update-notify $version"
+          runtime_version=''
+          IFS= read -r runtime_version < "$runtime_version_file" || true
+          [[ "$runtime_version" == "$expected_runtime_version" \
+             && "$(wc -c < "$runtime_version_file")" -eq "$((${#expected_runtime_version} + 1))" ]] || {
             echo "::error::released amd64 runtime version is not bound to $TAG"
             exit 1
           }
@@ -920,13 +1161,15 @@ jobs:
               echo "::error::signed archive verification key differs from the trusted workflow key"
               exit 1
             }
-            bootstrap_status="$(gpg --batch --known-notation "$BOOTSTRAP_VERSION_NOTATION" \
+            bootstrap_status="$(gpg --no-options --batch --known-notation "$BOOTSTRAP_VERSION_NOTATION" \
               --status-fd=1 --show-notation \
               --verify "rel/$BOOTSTRAP_SIGNATURE_ASSET" "$package_dir/sun.sh" 2>/tmp/gpg-bootstrap-verify.log)" || {
               cat /tmp/gpg-bootstrap-verify.log >&2
               exit 1
             }
             awk -v pin="$pin" -v notation="$BOOTSTRAP_VERSION_NOTATION" -v version="$version" '
+              $1 == "[GNUPG:]" && $2 == "GOODSIG" { outcome_count++; good_count++ }
+              $1 == "[GNUPG:]" && $2 ~ /^(EXPSIG|EXPKEYSIG|REVKEYSIG|BADSIG|ERRSIG)$/ { outcome_count++ }
               $1 == "[GNUPG:]" && $2 == "VALIDSIG" {
                 valid_count++
                 if ($3 == pin || $NF == pin) pinned_count++
@@ -944,7 +1187,8 @@ jobs:
                 if (NF == 3 && $3 == version) data_match++
               }
               END {
-                exit !(valid_count == 1 && pinned_count == 1 &&
+                exit !(outcome_count == 1 && good_count == 1 &&
+                       valid_count == 1 && pinned_count == 1 &&
                        name_count == 1 && name_match == 1 &&
                        flags_count == 1 && flags_match == 1 &&
                        data_count == 1 && data_match == 1)

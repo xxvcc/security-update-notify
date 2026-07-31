@@ -30,7 +30,7 @@ go run ./cmd/sun-release package
 cd dist && sha256sum -c security-update-notify-*.tar.gz.sha256
 ```
 
-`build/compat-test.sh`、`build/rollback-test.sh`、`build/interactive-test.sh`、`build/rocky-bootstrap-test.sh` 和 `build/rpm-best-effort-test.sh` 会修改系统路径，只能在一次性 Docker 容器中运行，禁止直接在宿主机执行。正式发布还必须完成 CI 的五架构实跑、恶意归档、签名和公开资产复验门禁。
+`build/compat-test.sh`、`build/rollback-test.sh`、`build/interactive-test.sh`、`build/rocky-bootstrap-test.sh`、`build/rpm-best-effort-test.sh` 和 `build/dnf5-versionlock-test.sh` 会修改系统路径，只能在一次性 Docker 容器中运行，禁止直接在宿主机执行。正式发布还必须完成 CI 的五架构实跑、恶意归档、签名和公开资产复验门禁。
 
 CI 会对纯文档变更运行文档结构和版本绑定快速门禁；源码、构建脚本、workflow 或发布输入变化仍运行完整质量、发行版生命周期和五架构门禁。具体架构与门禁不变量见 [3.x Go 架构](go-port.md)。
 

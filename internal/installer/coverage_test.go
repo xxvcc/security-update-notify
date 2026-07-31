@@ -29,6 +29,40 @@ func TestExecRunnerClassifiesCommandOutcomesAndBoundsOutput(t *testing.T) {
 		t.Fatalf("non-zero command result = %+v", result)
 	}
 
+	extra, err := os.CreateTemp(t.TempDir(), "extra-file-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer extra.Close()
+	if _, err := extra.WriteString("descriptor-bound-data"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := extra.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	fromDescriptor := runner.Run(context.Background(), Command{
+		Name: "cat", Args: []string{"/proc/self/fd/3"}, ExtraFiles: []*os.File{extra},
+	})
+	if fromDescriptor.Err != nil || fromDescriptor.Code != 0 || string(fromDescriptor.Stdout) != "descriptor-bound-data" {
+		t.Fatalf("extra-file command result = %+v", fromDescriptor)
+	}
+
+	executablePath := filepath.Join(t.TempDir(), "descriptor-command")
+	if err := os.WriteFile(executablePath, []byte("#!/bin/sh\nprintf descriptor-executed\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Open(executablePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer executable.Close()
+	executedDescriptor := runner.Run(context.Background(), Command{
+		Name: "env", Args: []string{"/proc/self/fd/3"}, ExtraFiles: []*os.File{executable},
+	})
+	if executedDescriptor.Err != nil || executedDescriptor.Code != 0 || string(executedDescriptor.Stdout) != "descriptor-executed" {
+		t.Fatalf("descriptor executable result = %+v", executedDescriptor)
+	}
+
 	missing := runner.Run(context.Background(), Command{Name: "/definitely/missing/security-update-notify"})
 	if missing.Code != -1 || missing.Err == nil {
 		t.Fatalf("missing command result = %+v", missing)
@@ -48,8 +82,32 @@ func TestExecRunnerClassifiesCommandOutcomesAndBoundsOutput(t *testing.T) {
 	if n, err := buffer.Write([]byte("defgh")); n != 5 || err != nil || buffer.b.String() != "abcde" {
 		t.Fatalf("truncated bounded write n=%d err=%v data=%q", n, err, buffer.b.String())
 	}
-	if n, err := buffer.Write([]byte("ignored")); n != 7 || err != nil || buffer.b.String() != "abcde" {
+	if !buffer.truncated {
+		t.Fatal("bounded buffer did not record truncation")
+	}
+	if n, err := buffer.Write([]byte("ignored")); n != 7 || err != nil || buffer.b.String() != "abcde" || !buffer.truncated {
 		t.Fatalf("full bounded write n=%d err=%v data=%q", n, err, buffer.b.String())
+	}
+}
+
+func TestExecRunnerIgnoresCallerPATH(t *testing.T) {
+	directory := t.TempDir()
+	sentinel := filepath.Join(directory, "called")
+	stub := filepath.Join(directory, "sh")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\ntouch '"+sentinel+"'\nexit 99\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", directory)
+	result := (ExecRunner{}).Run(context.Background(), Command{
+		Name: "sh",
+		Args: []string{"-c", `test "$PATH" = '/usr/sbin:/usr/bin:/sbin:/bin' && test "$LC_ALL" = C`},
+		Env:  map[string]string{"PATH": directory, "LC_ALL": "hostile"},
+	})
+	if result.Err != nil || result.Code != 0 {
+		t.Fatalf("trusted sh result = %+v", result)
+	}
+	if _, err := os.Stat(sentinel); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("caller PATH stub executed: %v", err)
 	}
 }
 
@@ -82,6 +140,7 @@ func TestInstallerExitErrorsAndCommandDiagnostics(t *testing.T) {
 		{name: "stderr", result: CommandResult{Code: 4, Stderr: []byte(" stderr detail \n")}, want: "stderr detail"},
 		{name: "stdout fallback", result: CommandResult{Code: 5, Stdout: []byte(" stdout detail \n")}, want: "stdout detail"},
 		{name: "status fallback", result: CommandResult{Code: 6}, want: "command exited with status 6"},
+		{name: "truncated stdout", result: CommandResult{StdoutTruncated: true}, want: "command output exceeded the capture limit"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := commandResultError(test.result).Error(); got != test.want {
@@ -131,7 +190,12 @@ func TestNormalizeAndValidateConfigRejectsUnsafeAndInconsistentValues(t *testing
 		}},
 		{name: "invalid dedup mode", mutate: func(v map[string]string) { v["DEDUP_MODE"] = "hourly" }},
 		{name: "negative stale days", mutate: func(v map[string]string) { v["STALE_UPDATE_DAYS"] = "-1" }},
+		{name: "overflow stale days", mutate: func(v map[string]string) { v["STALE_UPDATE_DAYS"] = "2147483648" }},
+		{name: "overflow dedup interval", mutate: func(v map[string]string) {
+			v["DEDUP_MODE"], v["DEDUP_INTERVAL_DAYS"] = "interval", "2147483648"
+		}},
 		{name: "zero self-update interval", mutate: func(v map[string]string) { v["SELF_UPDATE_CHECK_DAYS"] = "0" }},
+		{name: "overflow self-update interval", mutate: func(v map[string]string) { v["SELF_UPDATE_CHECK_DAYS"] = "2147483648" }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -149,6 +213,15 @@ func TestNormalizeAndValidateConfigRejectsUnsafeAndInconsistentValues(t *testing
 	values["FEISHU_RECEIVE_ID"] = ""
 	values["DEDUP_MODE"] = "always"
 	values["NOTIFY_OK"] = "YES"
+	if got, err := normalizeChannels(""); err == nil || !strings.Contains(err.Error(), "receiving platforms cannot be empty") {
+		t.Fatalf("normalizeChannels(%q) = %q, err=%v; want the empty-value diagnostic", "", got, err)
+	}
+	if got, err := normalizeChannels(" \t "); err == nil || !strings.Contains(err.Error(), "receiving platforms cannot be empty") {
+		t.Fatalf("normalizeChannels(%q) = %q, err=%v; want the empty-value diagnostic", " \t ", got, err)
+	}
+	if got, err := normalizeChannels("feishu"); err != nil || got != "feishu" {
+		t.Fatalf("normalizeChannels(%q) = %q, err=%v", "feishu", got, err)
+	}
 	if err := normalizeAndValidateConfig(values, true); err != nil {
 		t.Fatal(err)
 	}
@@ -341,6 +414,15 @@ func TestPrepareProbesUnknownDNFDerivativeBeforeSelectingProfile(t *testing.T) {
 			want: "unambiguous successful version",
 		},
 		{
+			name: "truncated output",
+			setup: func(runner *fakeRunner) {
+				runner.missingCommands["dnf5"] = true
+				runner.missingCommands["yum"] = true
+				runner.failedCommands["dnf --version"] = CommandResult{Stdout: []byte("dnf5 version 5\n"), StdoutTruncated: true}
+			},
+			want: "unambiguous successful version",
+		},
+		{
 			name: "only microdnf",
 			setup: func(runner *fakeRunner) {
 				runner.missingCommands["dnf"] = true
@@ -402,6 +484,52 @@ func TestUnknownDNFProbeFailurePrecedesInstallerWrites(t *testing.T) {
 		if strings.HasPrefix(command, "rpm ") || strings.Contains(command, " install ") {
 			t.Fatalf("probe failure reached package transaction: %v", runner.commands)
 		}
+	}
+}
+
+func TestDependencyPackageProbeTruncationIsTreatedAsMissing(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		release string
+		result  CommandResult
+	}{
+		{
+			name:    "dpkg stdout",
+			release: "ID=debian\nVERSION_ID=13\n",
+			result:  CommandResult{Stdout: []byte("Package: partial\nStatus: install ok installed\n"), StdoutTruncated: true},
+		},
+		{
+			name:    "rpm stderr",
+			release: "ID=rocky\nVERSION_ID=9.6\n",
+			result:  CommandResult{Stderr: []byte("partial diagnostic\n"), StderrTruncated: true},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			installer, _, runner, _ := setupInstaller(t, test.release)
+			plan, err := installer.prepare(context.Background(), telegramOptions())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(plan.profile.Packages) == 0 {
+				t.Fatal("test profile has no dependency packages")
+			}
+			pkg := plan.profile.Packages[0]
+			args := append(append([]string(nil), plan.profile.PackageProbe.Args...), pkg)
+			commandLine := plan.profile.PackageProbe.Name + " " + strings.Join(args, " ")
+			runner.failedCommands[commandLine] = test.result
+
+			var request DependencyRequest
+			attempted, err := installer.installDependencies(context.Background(), plan, func(_ context.Context, got DependencyRequest) (bool, error) {
+				request = got
+				return false, nil
+			})
+			if attempted || err == nil || !strings.Contains(err.Error(), "declined") {
+				t.Fatalf("attempted=%v error=%v, want pre-install decline", attempted, err)
+			}
+			if request.Backend != plan.backend || !reflect.DeepEqual(request.Packages, []string{pkg}) {
+				t.Fatalf("dependency request=%+v, want truncated probe package %q", request, pkg)
+			}
+		})
 	}
 }
 
@@ -549,6 +677,24 @@ func TestExistingConfigAndTimerRejectUnsafeFiles(t *testing.T) {
 	if err := root.Remove(ConfigPath); err != nil {
 		t.Fatal(err)
 	}
+	write(t, root, ConfigPath, "CONFIG_VERSION='4'\n", 0o640)
+	if _, _, err := installer.readExistingConfig(); err == nil || !strings.Contains(err.Error(), "protected root-owned") {
+		t.Fatalf("group-readable config error=%v", err)
+	}
+	if err := root.Remove(ConfigPath); err != nil {
+		t.Fatal(err)
+	}
+	write(t, root, ConfigPath, "CONFIG_VERSION='4'\n", 0o600)
+	configHostPath := filepath.Join(root.Root, strings.TrimPrefix(ConfigPath, "/"))
+	if err := os.Link(configHostPath, configHostPath+".alias"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := installer.readExistingConfig(); err == nil || !strings.Contains(err.Error(), "one hard link") {
+		t.Fatalf("hard-linked config error=%v", err)
+	}
+	if err := root.Remove(ConfigPath); err != nil {
+		t.Fatal(err)
+	}
 
 	truncate(TimerPath, (1<<20)+1)
 	if _, err := installer.readExistingCheckTime(); err == nil || !strings.Contains(err.Error(), "exceeds 1 MiB") {
@@ -563,11 +709,237 @@ func TestExistingConfigAndTimerRejectUnsafeFiles(t *testing.T) {
 	if _, err := installer.readExistingCheckTime(); err == nil || !strings.Contains(err.Error(), "regular file") {
 		t.Fatalf("symlinked timer error=%v", err)
 	}
+	if err := root.Remove(TimerPath); err != nil {
+		t.Fatal(err)
+	}
+	write(t, root, TimerPath, "[Timer]\nOnCalendar=*-*-* 09:00:00\n", 0o664)
+	if _, err := installer.readExistingCheckTime(); err == nil || !strings.Contains(err.Error(), "protected root-owned") {
+		t.Fatalf("group-writable timer error=%v", err)
+	}
+}
+
+func TestBaselineAndProvenanceReadsRejectUnsafeMetadata(t *testing.T) {
+	readers := []struct {
+		name     string
+		path     string
+		contents string
+		read     func(*Installer) (bool, error)
+	}{
+		{
+			name: "stable-baseline", path: aptStableBackupPath, contents: "vendor baseline\n",
+			read: func(installer *Installer) (bool, error) {
+				return installer.validBaselineFile(aptStableBackupPath)
+			},
+		},
+		{
+			name: "absence-marker", path: aptAbsentMarkerPath, contents: aptAbsentMarkerContents,
+			read: func(installer *Installer) (bool, error) {
+				return installer.validAPTAbsentMarkerAt(aptAbsentMarkerPath)
+			},
+		},
+		{
+			name: "dependency-proof", path: aptDependencyProofPath,
+			contents: string(aptDependencyProofContents([]byte("vendor default\n"))),
+			read: func(installer *Installer) (bool, error) {
+				return installer.validAPTDependencyProof([]byte("vendor default\n"))
+			},
+		},
+	}
+	mutations := []struct {
+		name   string
+		mutate func(*testing.T, *Installer, *RootFS, string)
+	}{
+		{
+			name: "group-writable",
+			mutate: func(t *testing.T, _ *Installer, root *RootFS, name string) {
+				t.Helper()
+				if err := root.Chmod(name, 0o620); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "wrong-owner",
+			mutate: func(_ *testing.T, installer *Installer, _ *RootFS, _ string) {
+				installer.rootOwnerUID = uint32(os.Geteuid() + 1)
+			},
+		},
+		{
+			name: "hard-linked",
+			mutate: func(t *testing.T, _ *Installer, root *RootFS, name string) {
+				t.Helper()
+				hostPath := filepath.Join(root.Root, strings.TrimPrefix(name, "/"))
+				if err := os.Link(hostPath, hostPath+".alias"); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+
+	for _, reader := range readers {
+		reader := reader
+		t.Run(reader.name+"/protected", func(t *testing.T) {
+			installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+			write(t, root, reader.path, reader.contents, 0o600)
+			exists, err := reader.read(installer)
+			if err != nil || !exists {
+				t.Fatalf("protected file rejected: exists=%t err=%v", exists, err)
+			}
+		})
+		for _, mutation := range mutations {
+			mutation := mutation
+			t.Run(reader.name+"/"+mutation.name, func(t *testing.T) {
+				installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+				write(t, root, reader.path, reader.contents, 0o600)
+				mutation.mutate(t, installer, root, reader.path)
+				if exists, err := reader.read(installer); err == nil || exists || !strings.Contains(err.Error(), "protected root-owned") {
+					t.Fatalf("unsafe file accepted: exists=%t err=%v", exists, err)
+				}
+			})
+		}
+	}
+}
+
+func TestEnsureLogFileValidatesOpenedInodeBeforeChangingMode(t *testing.T) {
+	t.Run("create-and-normalize", func(t *testing.T) {
+		installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+		if err := installer.ensureLogFile(); err != nil {
+			t.Fatal(err)
+		}
+		info, err := root.Lstat(LogPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o640 {
+			t.Fatalf("created log mode=%04o want 0640", info.Mode().Perm())
+		}
+		if err := root.Chmod(LogPath, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := installer.ensureLogFile(); err != nil {
+			t.Fatal(err)
+		}
+		info, err = root.Lstat(LogPath)
+		if err != nil || info.Mode().Perm() != 0o640 {
+			t.Fatalf("normalized log info=%v err=%v", info, err)
+		}
+	})
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, *Installer, *RootFS, string)
+	}{
+		{
+			name: "group-writable",
+			mutate: func(t *testing.T, _ *Installer, root *RootFS, _ string) {
+				t.Helper()
+				if err := root.Chmod(LogPath, 0o620); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "wrong-owner",
+			mutate: func(_ *testing.T, installer *Installer, _ *RootFS, _ string) {
+				installer.rootOwnerUID = uint32(os.Geteuid() + 1)
+			},
+		},
+		{
+			name: "hard-linked",
+			mutate: func(t *testing.T, _ *Installer, _ *RootFS, hostPath string) {
+				t.Helper()
+				if err := os.Link(hostPath, hostPath+".alias"); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+			write(t, root, LogPath, "existing log\n", 0o600)
+			hostPath := filepath.Join(root.Root, strings.TrimPrefix(LogPath, "/"))
+			test.mutate(t, installer, root, hostPath)
+			before, err := os.Lstat(hostPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := installer.ensureLogFile(); err == nil || !strings.Contains(err.Error(), "protected root-owned") {
+				t.Fatalf("unsafe log accepted: %v", err)
+			}
+			after, err := os.Lstat(hostPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.Mode().Perm() != before.Mode().Perm() {
+				t.Fatalf("unsafe log mode changed from %04o to %04o", before.Mode().Perm(), after.Mode().Perm())
+			}
+		})
+	}
+}
+
+func TestOSReleaseRequiresTrustedFinalFile(t *testing.T) {
+	t.Run("standard-relative-symlink", func(t *testing.T) {
+		installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+		if err := root.Remove("/etc/os-release"); err != nil {
+			t.Fatal(err)
+		}
+		write(t, root, "/usr/lib/os-release", "ID=ubuntu\nVERSION_ID=24.04\n", 0o644)
+		if err := root.Symlink("../usr/lib/os-release", "/etc/os-release"); err != nil {
+			t.Fatal(err)
+		}
+		release, err := installer.readOSRelease()
+		if err != nil || release.ID != "ubuntu" || release.VersionID != "24.04" {
+			t.Fatalf("standard os-release symlink: release=%+v err=%v", release, err)
+		}
+	})
+	t.Run("protected-hard-link", func(t *testing.T) {
+		installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+		hostPath := filepath.Join(root.Root, "etc/os-release")
+		if err := os.Link(hostPath, hostPath+".alias"); err != nil {
+			t.Fatal(err)
+		}
+		release, err := installer.readOSRelease()
+		if err != nil || release.ID != "debian" || release.VersionID != "13" {
+			t.Fatalf("protected hard-linked os-release: release=%+v err=%v", release, err)
+		}
+	})
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, *Installer, *RootFS)
+	}{
+		{
+			name: "group-writable",
+			mutate: func(t *testing.T, _ *Installer, root *RootFS) {
+				t.Helper()
+				if err := root.Chmod("/etc/os-release", 0o666); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "wrong-owner",
+			mutate: func(_ *testing.T, installer *Installer, _ *RootFS) {
+				installer.rootOwnerUID = uint32(os.Geteuid() + 1)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+			test.mutate(t, installer, root)
+			if _, err := installer.readOSRelease(); err == nil || !strings.Contains(err.Error(), "protected root-owned") {
+				t.Fatalf("unsafe os-release accepted: %v", err)
+			}
+		})
+	}
 }
 
 func TestCommandEnvironmentOverridesAreUniqueAndDeterministic(t *testing.T) {
 	t.Setenv("SUN_ENV_B", "old-b")
 	t.Setenv("SUN_ENV_A", "old-a")
+	t.Setenv("APT_CONFIG", "/tmp/attacker-apt.conf")
+	t.Setenv("BASH_ENV", "/tmp/attacker.sh")
+	t.Setenv("LD_PRELOAD", "/tmp/attacker.so")
 	env := commandEnv(map[string]string{"SUN_ENV_B": "new-b", "SUN_ENV_A": "new-a"})
 	joined := strings.Join(env, "\n")
 	if strings.Count(joined, "SUN_ENV_A=") != 1 || strings.Count(joined, "SUN_ENV_B=") != 1 ||
@@ -576,6 +948,14 @@ func TestCommandEnvironmentOverridesAreUniqueAndDeterministic(t *testing.T) {
 	}
 	if strings.Count(joined, "LC_ALL=") != 1 || !strings.Contains(joined, "LC_ALL=C") {
 		t.Fatalf("command environment did not force C locale:\n%s", joined)
+	}
+	if strings.Count(joined, "PATH=") != 1 || !strings.Contains(joined, "PATH=/usr/sbin:/usr/bin:/sbin:/bin") {
+		t.Fatalf("command environment did not force the trusted PATH:\n%s", joined)
+	}
+	for _, forbidden := range []string{"APT_CONFIG=", "BASH_ENV=", "LD_PRELOAD="} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("unsafe inherited environment %q survived:\n%s", forbidden, joined)
+		}
 	}
 	if value := os.Getenv("SUN_ENV_A"); value != "old-a" {
 		t.Fatalf("test environment was mutated: %q", value)

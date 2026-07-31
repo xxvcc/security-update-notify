@@ -1,8 +1,11 @@
 package dedup
 
 import (
+	"errors"
+	"math"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -90,6 +93,16 @@ func TestShouldSend(t *testing.T) {
 	}
 }
 
+func TestShouldSendDoesNotOverflowHugeInterval(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	if int64(maxInt) <= math.MaxInt64/86400 {
+		t.Skip("int is too narrow to construct an overflowing day interval")
+	}
+	if ShouldSend(false, "same", "same", 1, math.MaxInt64, "interval", maxInt) {
+		t.Fatal("an interval too large to elapse was treated as expired")
+	}
+}
+
 func TestStoreRoundTripAndAtomicity(t *testing.T) {
 	dir := t.TempDir()
 	s := NewStore(dir)
@@ -112,6 +125,98 @@ func TestStoreRoundTripAndAtomicity(t *testing.T) {
 	}
 }
 
+func TestStoreSyncsEachFileBeforeRenameAndDirectoryAfterRename(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	if err := os.WriteFile(store.HashFile, []byte("old-hash\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.TimeFile, []byte("100\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	phase := 0
+	store.fileSync = func(file *os.File) error {
+		phase++
+		contents, err := os.ReadFile(file.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch phase {
+		case 1:
+			if string(contents) != "200\n" {
+				t.Fatalf("first temporary file=%q, want timestamp", contents)
+			}
+		case 3:
+			if string(contents) != "new-hash\n" {
+				t.Fatalf("second temporary file=%q, want hash", contents)
+			}
+		default:
+			t.Fatalf("temporary file sync occurred at phase %d", phase)
+		}
+		return file.Sync()
+	}
+	store.directorySync = func(directory *os.File) error {
+		phase++
+		hash, hashErr := os.ReadFile(store.HashFile)
+		sentAt, timeErr := os.ReadFile(store.TimeFile)
+		if hashErr != nil || timeErr != nil {
+			t.Fatalf("read committed state: hashErr=%v timeErr=%v", hashErr, timeErr)
+		}
+		switch phase {
+		case 2:
+			if string(hash) != "old-hash\n" || string(sentAt) != "200\n" {
+				t.Fatalf("first rename state=(%q,%q), want old hash and new timestamp", hash, sentAt)
+			}
+		case 4:
+			if string(hash) != "new-hash\n" || string(sentAt) != "200\n" {
+				t.Fatalf("second rename state=(%q,%q), want new hash and timestamp", hash, sentAt)
+			}
+		default:
+			t.Fatalf("directory sync occurred at phase %d", phase)
+		}
+		return directory.Sync()
+	}
+	if err := store.Write("new-hash", 200); err != nil {
+		t.Fatal(err)
+	}
+	if phase != 4 {
+		t.Fatalf("completed at phase %d, want 4", phase)
+	}
+}
+
+func TestStoreHashSyncFailureKeepsCrashBiasTowardResending(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	if err := os.WriteFile(store.HashFile, []byte("old-hash\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.TimeFile, []byte("100\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("hash sync failed")
+	syncs := 0
+	store.fileSync = func(file *os.File) error {
+		syncs++
+		if syncs == 2 {
+			return wantErr
+		}
+		return file.Sync()
+	}
+	if err := store.Write("new-hash", 200); !errors.Is(err, wantErr) {
+		t.Fatalf("Write error=%v, want %v", err, wantErr)
+	}
+	hash, sentAt := NewStore(dir).ReadLast()
+	if hash != "old-hash" || sentAt != 200 {
+		t.Fatalf("failed hash sync state=(%q,%d), want old hash and new timestamp", hash, sentAt)
+	}
+	if !ShouldSend(false, "new-hash", hash, sentAt, 200, "daily", 3) {
+		t.Fatal("failed hash sync could silently suppress the delivered alert")
+	}
+	if leftovers, err := filepath.Glob(filepath.Join(dir, ".state.*")); err != nil || len(leftovers) != 0 {
+		t.Fatalf("hash sync failure left temporary files: files=%v err=%v", leftovers, err)
+	}
+}
+
 func TestStoreWriteFailurePreservesExistingState(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(dir)
@@ -122,7 +227,7 @@ func TestStoreWriteFailurePreservesExistingState(t *testing.T) {
 	if err := store.Write("new-hash", 1738000000); err == nil {
 		t.Fatal("expected state write failure")
 	}
-	hash, sentAt := store.ReadLast()
+	hash, sentAt := NewStore(dir).ReadLast()
 	if hash != "old-hash" || sentAt != 1737000000 {
 		t.Fatalf("failed write changed state to %q,%d", hash, sentAt)
 	}
@@ -160,6 +265,164 @@ func TestReadLastTrimsNewlines(t *testing.T) {
 	h, ts := s.ReadLast()
 	if h != "deadbeef" || ts != 1737000000 {
 		t.Errorf("ReadLast=%q,%d want deadbeef,1737000000", h, ts)
+	}
+}
+
+func TestReadLastIgnoresOversizedStateFiles(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir)
+	if err := os.WriteFile(s.HashFile, []byte(string(make([]byte, 257))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.TimeFile, []byte(string(make([]byte, 65))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hash, sentAt := s.ReadLast()
+	if hash != "" || sentAt != 0 {
+		t.Fatalf("oversized state accepted: hash=%q sentAt=%d", hash, sentAt)
+	}
+}
+
+func TestReadLastRejectsSymlinksAndFIFOsWithoutBlocking(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte("attacker-controlled\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, store.HashFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(store.TimeFile, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		hash, sentAt := store.ReadLast()
+		if hash != "" || sentAt != 0 {
+			t.Errorf("special-file state accepted: hash=%q sentAt=%d", hash, sentAt)
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("ReadLast blocked on a FIFO")
+	}
+}
+
+func TestStateFileMetadataRequiresOwnerAndProtectedModeButAllowsHardlinks(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state")
+	if err := os.WriteFile(path, []byte("value\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readStateFile(path, 64, os.Geteuid()+1); err == nil {
+		t.Fatal("wrong-owner state file was accepted")
+	}
+	if err := os.Chmod(path, 0o622); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readStateFile(path, 64, os.Geteuid()); err == nil {
+		t.Fatal("group/other-writable state file was accepted")
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "state-link")
+	if err := os.Link(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := readStateFile(link, 64, os.Geteuid()); err != nil || string(got) != "value\n" {
+		t.Fatalf("protected hardlinked state=(%q, %v)", got, err)
+	}
+}
+
+func TestStoreRejectsUnsafeDirectoryForReadAndWrite(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	if err := os.WriteFile(store.HashFile, []byte("old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.TimeFile, []byte("100\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if hash, sentAt := store.ReadLast(); hash != "" || sentAt != 0 {
+		t.Fatalf("unsafe directory state was read: %q,%d", hash, sentAt)
+	}
+	if err := store.Write("new", 200); err == nil {
+		t.Fatal("unsafe directory accepted a state write")
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o777 {
+		t.Fatalf("unsafe directory was chmodded to %#o", info.Mode().Perm())
+	}
+}
+
+func TestStoreOperationsStayBoundToValidatedDirectoryAfterPathExchange(t *testing.T) {
+	for _, operation := range []string{"read", "write"} {
+		t.Run(operation, func(t *testing.T) {
+			root := t.TempDir()
+			directory := filepath.Join(root, "state")
+			replacement := filepath.Join(root, "replacement")
+			openedDirectory := filepath.Join(root, "opened-state")
+			if err := os.Mkdir(directory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(replacement, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			for _, fixture := range []struct {
+				name, validated, replaced string
+			}{
+				{name: "last-alert.sha256", validated: "validated-hash\n", replaced: "replacement-hash\n"},
+				{name: "last-alert.sent_at", validated: "100\n", replaced: "200\n"},
+			} {
+				if err := os.WriteFile(filepath.Join(directory, fixture.name), []byte(fixture.validated), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(replacement, fixture.name), []byte(fixture.replaced), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			store := NewStore(directory)
+			store.afterDirectoryOpen = func() {
+				if err := os.Rename(directory, openedDirectory); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(replacement, directory); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if operation == "read" {
+				hash, sentAt := store.ReadLast()
+				if hash != "validated-hash" || sentAt != 100 {
+					t.Fatalf("ReadLast()=(%q, %d), want validated directory state", hash, sentAt)
+				}
+			} else {
+				if err := store.Write("new-hash", 300); err != nil {
+					t.Fatal(err)
+				}
+				opened := NewStore(openedDirectory)
+				if hash, sentAt := opened.ReadLast(); hash != "new-hash" || sentAt != 300 {
+					t.Fatalf("validated directory state=(%q, %d)", hash, sentAt)
+				}
+			}
+
+			replaced := NewStore(replacement)
+			if hash, sentAt := replaced.ReadLast(); hash != "replacement-hash" || sentAt != 200 {
+				t.Fatalf("replacement directory was modified: (%q, %d)", hash, sentAt)
+			}
+		})
 	}
 }
 

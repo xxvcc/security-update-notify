@@ -7,7 +7,7 @@ set -euo pipefail
   echo "build/dnf5-versionlock-test.sh must run only in a disposable container" >&2
   exit 2
 }
-awk '$5 == "/src" && $6 ~ /(^|,)ro(,|$)/ { found = 1 } END { exit !found }' /proc/self/mountinfo || {
+awk '$5 == "/src" { found = 1; if ($6 !~ /(^|,)ro(,|$)/) unsafe = 1 } END { exit !(found && !unsafe) }' /proc/self/mountinfo || {
   echo "build/dnf5-versionlock-test.sh requires /src to be mounted read-only" >&2
   exit 2
 }

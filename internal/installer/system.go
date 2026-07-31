@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path"
 	"strings"
 	"syscall"
@@ -14,6 +15,7 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/aptconfig"
 	"github.com/xxvcc/security-update-notify/internal/dependencyproof"
 	"github.com/xxvcc/security-update-notify/internal/dnfconfig"
+	"github.com/xxvcc/security-update-notify/internal/filetrust"
 	"github.com/xxvcc/security-update-notify/internal/osrel"
 )
 
@@ -78,7 +80,10 @@ func (i *Installer) ensureDir(directory string, mode fs.FileMode) error {
 		if err := i.fs.MkdirAll(directory, mode); err != nil {
 			return err
 		}
-		return i.fs.Chmod(directory, mode)
+		if err := i.fs.Chmod(directory, mode); err != nil {
+			return err
+		}
+		info, err = i.fs.Lstat(directory)
 	}
 	if err != nil {
 		return err
@@ -92,7 +97,7 @@ func (i *Installer) ensureDir(directory string, mode fs.FileMode) error {
 	if !info.IsDir() {
 		return fmt.Errorf("%s must be a directory, not a symlink", directory)
 	}
-	return nil
+	return i.validateTrustedDirectory(directory, info)
 }
 
 func (i *Installer) validateLocalSbinAlias(linkInfo fs.FileInfo) error {
@@ -100,7 +105,11 @@ func (i *Installer) validateLocalSbinAlias(linkInfo fs.FileInfo) error {
 	if err != nil || target != "bin" {
 		return errors.New("/usr/local/sbin must be a real directory or the exact relative symlink 'bin'")
 	}
-	if stat, ok := linkInfo.Sys().(*syscall.Stat_t); ok && stat.Uid != i.rootOwnerUID {
+	stat, ok := linkInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		return errors.New("cannot verify owner of /usr/local/sbin")
+	}
+	if stat.Uid != i.rootOwnerUID {
 		return errors.New("/usr/local/sbin must be owned by root")
 	}
 	for _, name := range []string{"/usr/local", "/usr/local/bin"} {
@@ -111,18 +120,67 @@ func (i *Installer) validateLocalSbinAlias(linkInfo fs.FileInfo) error {
 		if info.Mode()&fs.ModeSymlink != 0 || !info.IsDir() {
 			return fmt.Errorf("standard /usr/local/sbin target %s must be a real directory", name)
 		}
-		if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Uid != i.rootOwnerUID {
-			return fmt.Errorf("%s must be owned by root", name)
+		if err := i.validateTrustedDirectory(name, info); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
 func (i *Installer) ensureManagedDir(directory string, mode fs.FileMode) error {
+	info, err := i.fs.Lstat(directory)
+	if err == nil {
+		if err := i.validateManagedDir(directory, info, 0); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
 	if err := i.ensureDir(directory, mode); err != nil {
 		return err
 	}
-	return i.fs.Chmod(directory, mode)
+	info, err = i.fs.Lstat(directory)
+	if err != nil {
+		return err
+	}
+	if err := i.validateManagedDir(directory, info, 0); err != nil {
+		return err
+	}
+	if err := i.fs.Chmod(directory, mode); err != nil {
+		return err
+	}
+	info, err = i.fs.Lstat(directory)
+	if err != nil {
+		return err
+	}
+	return i.validateManagedDir(directory, info, mode)
+}
+
+func (i *Installer) validateManagedDir(directory string, info fs.FileInfo, expectedMode fs.FileMode) error {
+	if info.Mode()&fs.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("%s must be a real directory", directory)
+	}
+	if err := i.validateTrustedDirectory(directory, info); err != nil {
+		return err
+	}
+	if expectedMode != 0 && info.Mode().Perm() != expectedMode.Perm() {
+		return fmt.Errorf("managed directory %s has mode %04o, want %04o", directory, info.Mode().Perm(), expectedMode.Perm())
+	}
+	return nil
+}
+
+func (i *Installer) validateTrustedDirectory(directory string, info fs.FileInfo) error {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("cannot verify owner of privileged directory %s", directory)
+	}
+	if stat.Uid != i.rootOwnerUID {
+		return fmt.Errorf("privileged directory %s must be owned by root", directory)
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("privileged directory %s must not be writable by group or other users", directory)
+	}
+	return nil
 }
 
 func (i *Installer) requireSystemd() error {
@@ -132,6 +190,9 @@ func (i *Installer) requireSystemd() error {
 	}
 	if info.Mode()&fs.ModeSymlink != 0 || !info.IsDir() {
 		return failure("detect systemd", errors.New("/run/systemd/system must be a real directory"))
+	}
+	if err := i.validateTrustedDirectory("/run/systemd/system", info); err != nil {
+		return failure("detect systemd", err)
 	}
 	if !i.runner.LookPath("systemctl") {
 		return failure("detect systemd", errors.New("systemctl is required"))
@@ -224,8 +285,8 @@ func restorableAutomaticEnablement(enablement string) bool {
 
 func (i *Installer) snapshotUnit(ctx context.Context, unit string) (unitSnapshot, error) {
 	enabled := i.runner.Run(ctx, Command{Name: "systemctl", Args: []string{"is-enabled", unit}, Timeout: 30 * time.Second})
-	if enabled.Err != nil {
-		return unitSnapshot{}, failure("snapshot automatic-update unit "+unit, enabled.Err)
+	if enabled.Err != nil || commandResultIncomplete(enabled) {
+		return unitSnapshot{}, failure("snapshot automatic-update unit "+unit, commandResultError(enabled))
 	}
 	enablement := strings.TrimSpace(string(enabled.Stdout))
 	if !knownUnitEnablement[enablement] || strings.TrimSpace(string(enabled.Stderr)) != "" ||
@@ -238,8 +299,8 @@ func (i *Installer) snapshotUnit(ctx context.Context, unit string) (unitSnapshot
 		}
 	}
 	activityResult := i.runner.Run(ctx, Command{Name: "systemctl", Args: []string{"is-active", unit}, Timeout: 30 * time.Second})
-	if activityResult.Err != nil {
-		return unitSnapshot{}, failure("snapshot automatic-update unit "+unit, activityResult.Err)
+	if activityResult.Err != nil || commandResultIncomplete(activityResult) {
+		return unitSnapshot{}, failure("snapshot automatic-update unit "+unit, commandResultError(activityResult))
 	}
 	activity := strings.TrimSpace(string(activityResult.Stdout))
 	if strings.TrimSpace(string(activityResult.Stderr)) != "" ||
@@ -256,14 +317,14 @@ func (i *Installer) confirmUnitNotFound(ctx context.Context, unit string, enable
 	// Real systemctl writes the missing-unit diagnostic to stderr and leaves
 	// is-enabled stdout empty. Confirm that one special case through the stable
 	// LoadState property; all other stderr and exit-status mismatches remain fatal.
-	if enabled.Code == 0 || strings.TrimSpace(string(enabled.Stdout)) != "" ||
+	if commandResultIncomplete(enabled) || enabled.Code == 0 || strings.TrimSpace(string(enabled.Stdout)) != "" ||
 		strings.TrimSpace(string(enabled.Stderr)) == "" {
 		return false
 	}
 	load := i.runner.Run(ctx, Command{
 		Name: "systemctl", Args: []string{"show", "--property=LoadState", "--value", unit}, Timeout: 30 * time.Second,
 	})
-	return load.Err == nil && load.Code == 0 && strings.TrimSpace(string(load.Stderr)) == "" &&
+	return !commandResultIncomplete(load) && load.Err == nil && load.Code == 0 && strings.TrimSpace(string(load.Stderr)) == "" &&
 		strings.TrimSpace(string(load.Stdout)) == "not-found"
 }
 
@@ -324,60 +385,99 @@ func (i *Installer) disableAutomaticTimerVariants(ctx context.Context, plan inst
 }
 
 func (i *Installer) quiesceAutomaticUnits(snapshots []unitSnapshot) error {
+	var errs []error
 	for _, snapshot := range snapshots {
 		if snapshot.enablement == "not-found" {
 			continue
 		}
-		if err := i.requiredCommand("stop automatic-update unit during rollback", Command{
+		if err := i.requiredCommand("stop automatic-update unit during rollback: "+snapshot.name, Command{
 			Name: "systemctl", Args: []string{"stop", snapshot.name}, Timeout: 30 * time.Second,
 		}); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
+}
+
+func (i *Installer) containIncompleteRollback(snapshots []unitSnapshot) error {
+	var errs []error
+	for _, args := range [][]string{
+		{"disable", "--now", "security-update-notify.timer"},
+		{"disable", "--runtime", "security-update-notify.timer"},
+	} {
+		if err := i.requiredCommand("disable project timer after incomplete rollback", Command{
+			Name: "systemctl", Args: args, Timeout: 30 * time.Second,
+		}); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	for _, snapshot := range snapshots {
+		if snapshot.enablement == "not-found" {
+			continue
+		}
+		for _, args := range [][]string{
+			{"disable", "--now", snapshot.name},
+			{"disable", "--runtime", snapshot.name},
+		} {
+			if err := i.requiredCommand("disable automatic-update unit after incomplete rollback: "+snapshot.name, Command{
+				Name: "systemctl", Args: args, Timeout: 30 * time.Second,
+			}); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (i *Installer) restoreAutomaticUnits(snapshots []unitSnapshot) error {
+	var errs []error
 	for _, want := range snapshots {
-		got, err := i.snapshotUnit(context.Background(), want.name)
-		if err != nil {
+		if err := i.restoreAutomaticUnit(want); err != nil {
+			errs = append(errs, fmt.Errorf("restore automatic-update unit %s: %w", want.name, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (i *Installer) restoreAutomaticUnit(want unitSnapshot) error {
+	got, err := i.snapshotUnit(context.Background(), want.name)
+	if err != nil {
+		return err
+	}
+	if want.active && isMaskedEnablement(want.enablement) {
+		if err := i.restoreMaskedActiveUnit(want, got); err != nil {
 			return err
 		}
-		if want.active && isMaskedEnablement(want.enablement) {
-			if err := i.restoreMaskedActiveUnit(want, got); err != nil {
+	} else {
+		if got.enablement != want.enablement {
+			if err := i.restoreUnitEnablement(want, got); err != nil {
 				return err
-			}
-		} else {
-			if got.enablement != want.enablement {
-				if err := i.restoreUnitEnablement(want, got); err != nil {
-					return err
-				}
-			}
-			got, err = i.snapshotUnit(context.Background(), want.name)
-			if err != nil {
-				return err
-			}
-			if got.active != want.active {
-				action := "stop"
-				if want.active {
-					action = "start"
-				}
-				if err := i.requiredCommand("restore automatic-update unit activity", Command{
-					Name: "systemctl", Args: []string{action, want.name}, Timeout: 30 * time.Second,
-				}); err != nil {
-					return err
-				}
 			}
 		}
 		got, err = i.snapshotUnit(context.Background(), want.name)
 		if err != nil {
 			return err
 		}
-		if got.enablement != want.enablement || got.active != want.active {
-			return failure("verify automatic-update unit after rollback", fmt.Errorf(
-				"%s has enablement=%q active=%t, want enablement=%q active=%t",
-				want.name, got.enablement, got.active, want.enablement, want.active))
+		if got.active != want.active {
+			action := "stop"
+			if want.active {
+				action = "start"
+			}
+			if err := i.requiredCommand("restore automatic-update unit activity", Command{
+				Name: "systemctl", Args: []string{action, want.name}, Timeout: 30 * time.Second,
+			}); err != nil {
+				return err
+			}
 		}
+	}
+	got, err = i.snapshotUnit(context.Background(), want.name)
+	if err != nil {
+		return err
+	}
+	if got.enablement != want.enablement || got.active != want.active {
+		return failure("verify automatic-update unit after rollback", fmt.Errorf(
+			"%s has enablement=%q active=%t, want enablement=%q active=%t",
+			want.name, got.enablement, got.active, want.enablement, want.active))
 	}
 	return nil
 }
@@ -462,7 +562,18 @@ func (i *Installer) restoreUnitEnablement(want, got unitSnapshot) error {
 	}
 }
 
-func (i *Installer) quiesceExisting(ctx context.Context, upgrade bool, wait time.Duration) error {
+func (i *Installer) acquireRuntimeLock(ctx context.Context, wait time.Duration) (UnlockFunc, error) {
+	unlock, err := i.locker.Acquire(ctx, RuntimeLockPath, wait)
+	if err == nil {
+		return unlock, nil
+	}
+	if errors.Is(err, ErrLockBusy) || errors.Is(err, context.DeadlineExceeded) {
+		return nil, temporary("quiesce runtime", errors.New("timed out waiting for the existing security-update-notify run"))
+	}
+	return nil, failure("acquire runtime lock", err)
+}
+
+func (i *Installer) quiesceExisting(ctx context.Context, upgrade bool) error {
 	if !upgrade {
 		return nil
 	}
@@ -479,14 +590,6 @@ func (i *Installer) quiesceExisting(ctx context.Context, upgrade bool, wait time
 			return err
 		}
 	}
-	unlock, err := i.locker.Acquire(ctx, RuntimeLockPath, wait)
-	if err != nil {
-		if errors.Is(err, ErrLockBusy) || errors.Is(err, context.DeadlineExceeded) {
-			return temporary("quiesce runtime", errors.New("timed out waiting for the existing security-update-notify run"))
-		}
-		return failure("acquire runtime lock", err)
-	}
-	defer func() { _ = unlock() }()
 	serviceExists, err := i.exists(ServicePath)
 	if err != nil {
 		return failure("inspect service before upgrade", err)
@@ -499,35 +602,31 @@ func (i *Installer) quiesceExisting(ctx context.Context, upgrade bool, wait time
 	return nil
 }
 
-func (i *Installer) quiesceForRollback(wait time.Duration, timer timerSnapshot) error {
+func (i *Installer) quiesceForRollback(timer timerSnapshot) error {
+	var errs []error
 	hasTimer := timer.active
 	for _, name := range []string{TimerPath, PersistentTimerLink, RuntimeTimerLink} {
 		exists, err := i.exists(name)
 		if err != nil {
-			return failure("inspect timer during rollback", err)
+			errs = append(errs, failure("inspect timer during rollback: "+name, err))
+			continue
 		}
 		hasTimer = hasTimer || exists
 	}
-	if hasTimer && i.runner.LookPath("systemctl") {
+	if hasTimer {
 		if err := i.requiredCommand("disable timer during rollback", Command{Name: "systemctl", Args: []string{"disable", "--now", "security-update-notify.timer"}, Timeout: 30 * time.Second}); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
-	unlock, err := i.locker.Acquire(context.Background(), RuntimeLockPath, wait)
-	if err != nil {
-		return failure("acquire runtime lock during rollback", err)
-	}
-	defer func() { _ = unlock() }()
 	serviceExists, err := i.exists(ServicePath)
 	if err != nil {
-		return failure("inspect service during rollback", err)
-	}
-	if serviceExists && i.runner.LookPath("systemctl") {
+		errs = append(errs, failure("inspect service during rollback", err))
+	} else if serviceExists {
 		if err := i.requiredCommand("stop service during rollback", Command{Name: "systemctl", Args: []string{"stop", "security-update-notify.service"}, Timeout: 30 * time.Second}); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // installDependencies reports whether the package installation command was
@@ -554,7 +653,7 @@ func (i *Installer) installDependencies(ctx context.Context, plan installPlan, c
 	for _, pkg := range packages {
 		args := append(append([]string(nil), profile.PackageProbe.Args...), pkg)
 		result := i.runner.Run(ctx, Command{Name: profile.PackageProbe.Name, Args: args, Timeout: 30 * time.Second})
-		installed := result.Err == nil && result.Code == 0
+		installed := !commandResultIncomplete(result) && result.Err == nil && result.Code == 0
 		if profile.PackageProbe.Name == "dpkg" {
 			installed = installed && dpkgStatusInstalled(result.Stdout)
 		}
@@ -617,18 +716,14 @@ func (i *Installer) verifyBackendPolicyFile(plan installPlan) error {
 	if plan.profile.AutomaticConfig == "" {
 		return failure("verify backend readiness", errors.New("automatic-update configuration path is unavailable"))
 	}
-	info, err := i.fs.Lstat(plan.profile.AutomaticConfig)
+	data, exists, err := i.readTrustedRegularFile(plan.profile.AutomaticConfig, 4<<20)
 	if err != nil {
 		return failure("verify automatic-update configuration", err)
 	}
-	if info.Mode()&fs.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > 4<<20 {
-		return failure("verify automatic-update configuration", errors.New("configuration must be a regular file no larger than 4 MiB"))
+	if !exists {
+		return failure("verify automatic-update configuration", fs.ErrNotExist)
 	}
 	if plan.backend == "dnf" {
-		data, _, err := i.fs.ReadRegularFile(plan.profile.AutomaticConfig, 4<<20)
-		if err != nil {
-			return failure("verify automatic-update configuration", err)
-		}
 		values, err := parseStrictINI(data)
 		if err != nil {
 			return failure("verify automatic-update configuration", err)
@@ -718,9 +813,9 @@ func (i *Installer) migrateAPTMetadata(b *backup) error {
 			return failure("inspect migrated apt backup", err)
 		}
 		if destinationExists {
-			sourceData, _, sourceErr := i.fs.ReadRegularFile(source, 4<<20)
-			destinationData, _, destinationErr := i.fs.ReadRegularFile(destination, 4<<20)
-			if sourceErr != nil || destinationErr != nil || !bytes.Equal(sourceData, destinationData) {
+			sourceData, sourceStillExists, sourceErr := i.readTrustedRegularFile(source, 4<<20)
+			destinationData, destinationStillExists, destinationErr := i.readTrustedRegularFile(destination, 4<<20)
+			if sourceErr != nil || destinationErr != nil || !sourceStillExists || !destinationStillExists || !bytes.Equal(sourceData, destinationData) {
 				return failure("migrate apt backup", errors.New("legacy and migrated backups differ: "+name))
 			}
 		} else if err := i.copyNode(source, destination); err != nil {
@@ -767,13 +862,9 @@ func (i *Installer) validDNFAbsentMarkerAt(markerPath, engine string) (bool, err
 }
 
 func (i *Installer) validAbsentMarkerAt(markerPath, contents, backend string) (bool, error) {
-	exists, err := i.validBaselineFile(markerPath)
+	data, exists, err := i.readTrustedRegularFile(markerPath, 256)
 	if err != nil || !exists {
 		return exists, err
-	}
-	data, _, err := i.fs.ReadRegularFile(markerPath, 256)
-	if err != nil {
-		return false, err
 	}
 	if string(data) != contents {
 		return false, fmt.Errorf("%s absence marker has invalid contents", backend)
@@ -821,16 +912,12 @@ func (i *Installer) recordDNFAbsentBaseline(plan installPlan) error {
 // to the package transaction that created it. A retry or immediate purge can
 // then preserve the exact bytes without guessing from the file's presence.
 func (i *Installer) recordAPTDependencyProof() error {
-	exists, err := i.validBaselineFile(aptPeriodicPath)
+	data, exists, err := i.readTrustedRegularFile(aptPeriodicPath, 4<<20)
 	if err != nil {
 		return failure("inspect partial apt dependency config", err)
 	}
 	if !exists {
 		return nil
-	}
-	data, _, err := i.fs.ReadRegularFile(aptPeriodicPath, 4<<20)
-	if err != nil {
-		return failure("read partial apt dependency config", err)
 	}
 	matched, err := i.validAPTDependencyProof(data)
 	if err != nil {
@@ -850,19 +937,9 @@ func aptDependencyProofContents(data []byte) []byte {
 }
 
 func (i *Installer) validAPTDependencyProof(config []byte) (bool, error) {
-	info, err := i.fs.Lstat(aptDependencyProofPath)
-	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if info.Mode()&fs.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > 256 {
-		return false, fmt.Errorf("%s must be a regular file no larger than 256 bytes", aptDependencyProofPath)
-	}
-	proof, _, err := i.fs.ReadRegularFile(aptDependencyProofPath, 256)
-	if err != nil {
-		return false, err
+	proof, exists, err := i.readTrustedRegularFile(aptDependencyProofPath, 256)
+	if err != nil || !exists {
+		return exists, err
 	}
 	if !bytes.Equal(proof, aptDependencyProofContents(config)) {
 		return false, errors.New("apt dependency proof does not match 20auto-upgrades")
@@ -906,8 +983,11 @@ func (i *Installer) persistAPTDependencyBaseline(b *backup, configOriginallyAbse
 				}
 				return nil
 			}
-			data, _, err := i.fs.ReadRegularFile(aptPeriodicPath, 4<<20)
-			if err != nil {
+			data, currentExists, err := i.readTrustedRegularFile(aptPeriodicPath, 4<<20)
+			if err != nil || !currentExists {
+				if err == nil {
+					err = fs.ErrNotExist
+				}
 				return failure("read apt vendor baseline", err)
 			}
 			if !configOriginallyAbsent || !packageInstallAttempted {
@@ -960,16 +1040,12 @@ func (i *Installer) recordDNF4DependencyProof(plan installPlan) error {
 	if plan.profile.Engine != osrel.EngineDNF4 {
 		return nil
 	}
-	exists, err := i.validBaselineFile(dnfAutomaticPath)
+	data, exists, err := i.readTrustedRegularFile(dnfAutomaticPath, 4<<20)
 	if err != nil {
 		return failure("inspect partial dnf dependency config", err)
 	}
 	if !exists {
 		return nil
-	}
-	data, _, err := i.fs.ReadRegularFile(dnfAutomaticPath, 4<<20)
-	if err != nil {
-		return failure("read partial dnf dependency config", err)
 	}
 	if _, err := parseStrictINI(data); err != nil {
 		return failure("validate partial dnf dependency config", err)
@@ -992,19 +1068,9 @@ func dnfDependencyProofContents(data []byte) []byte {
 }
 
 func (i *Installer) validDNFDependencyProof(config []byte) (bool, error) {
-	info, err := i.fs.Lstat(dnfDependencyProofPath)
-	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if info.Mode()&fs.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > 256 {
-		return false, fmt.Errorf("%s must be a regular file no larger than 256 bytes", dnfDependencyProofPath)
-	}
-	proof, _, err := i.fs.ReadRegularFile(dnfDependencyProofPath, 256)
-	if err != nil {
-		return false, err
+	proof, exists, err := i.readTrustedRegularFile(dnfDependencyProofPath, 256)
+	if err != nil || !exists {
+		return exists, err
 	}
 	if !bytes.Equal(proof, dnfDependencyProofContents(config)) {
 		return false, errors.New("dnf dependency proof does not match automatic.conf")
@@ -1048,8 +1114,11 @@ func (i *Installer) persistDNF4DependencyBaseline(plan installPlan, b *backup, c
 			}
 			baseline = dnfAutomaticPath
 		}
-		data, _, err := i.fs.ReadRegularFile(baseline, 4<<20)
-		if err != nil {
+		data, baselineExists, err := i.readTrustedRegularFile(baseline, 4<<20)
+		if err != nil || !baselineExists {
+			if err == nil {
+				err = fs.ErrNotExist
+			}
 			return failure("read dnf vendor baseline", err)
 		}
 		if _, err := parseStrictINI(data); err != nil {
@@ -1092,17 +1161,26 @@ func (i *Installer) persistDNF4DependencyBaseline(plan installPlan, b *backup, c
 }
 
 func (i *Installer) validBaselineFile(name string) (bool, error) {
-	info, err := i.fs.Lstat(name)
+	_, exists, err := i.readTrustedRegularFile(name, 4<<20)
+	return exists, err
+}
+
+// readTrustedRegularFile validates the metadata returned by the opened inode,
+// not a preceding pathname lookup. Baselines and provenance records can affect
+// what privileged configuration is preserved or restored, so writable,
+// foreign-owned, or hard-linked files must never participate in that decision.
+func (i *Installer) readTrustedRegularFile(name string, maxBytes int64) ([]byte, bool, error) {
+	data, info, err := i.fs.ReadRegularFile(name, maxBytes)
 	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
+		return nil, false, nil
 	}
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
-	if info.Mode()&fs.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > 4<<20 {
-		return false, fmt.Errorf("%s must be a regular file no larger than 4 MiB", name)
+	if err := filetrust.ValidateRegular(info, int(i.rootOwnerUID), 0o022, true); err != nil {
+		return nil, false, fmt.Errorf("%s must be a protected root-owned regular file with one hard link: %w", name, err)
 	}
-	return true, nil
+	return data, true, nil
 }
 
 func (i *Installer) installFiles(ctx context.Context, plan installPlan, options Options, secret []byte, b *backup) (string, error) {
@@ -1124,18 +1202,8 @@ func (i *Installer) installFiles(ctx context.Context, plan installPlan, options 
 			return "", failure("create managed install directory", err)
 		}
 	}
-	logInfo, logErr := i.fs.Lstat(LogPath)
-	if errors.Is(logErr, fs.ErrNotExist) {
-		if err := i.fs.WriteFileAtomic(LogPath, nil, 0o640); err != nil {
-			return "", failure("create log file", err)
-		}
-	} else if logErr != nil {
-		return "", failure("inspect log file", logErr)
-	} else if logInfo.Mode()&fs.ModeSymlink != 0 || !logInfo.Mode().IsRegular() {
-		return "", failure("inspect log file", errors.New("log path must be a regular file, not a symlink"))
-	}
-	if err := i.fs.Chmod(LogPath, 0o640); err != nil {
-		return "", failure("set log permissions", err)
+	if err := i.ensureLogFile(); err != nil {
+		return "", err
 	}
 	if logrotateDir, err := i.fs.Lstat("/etc/logrotate.d"); err == nil && logrotateDir.IsDir() && logrotateDir.Mode()&fs.ModeSymlink == 0 {
 		if err := i.fs.WriteFileAtomic(LogrotatePath, payload.Logrotate, 0o644); err != nil {
@@ -1171,6 +1239,43 @@ func (i *Installer) installFiles(ctx context.Context, plan installPlan, options 
 		return "", failure("install timer unit", err)
 	}
 	return storage, nil
+}
+
+func (i *Installer) ensureLogFile() (returnErr error) {
+	file, err := i.fs.OpenFileNoFollow(LogPath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if errors.Is(err, fs.ErrNotExist) {
+		if err := i.fs.WriteFileAtomic(LogPath, nil, 0o640); err != nil {
+			return failure("create log file", err)
+		}
+		file, err = i.fs.OpenFileNoFollow(LogPath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	}
+	if err != nil {
+		return failure("inspect log file", err)
+	}
+	defer func() {
+		returnErr = errors.Join(returnErr, file.Close())
+	}()
+	info, err := file.Stat()
+	if err != nil {
+		return failure("inspect log file", err)
+	}
+	if err := filetrust.ValidateRegular(info, int(i.rootOwnerUID), 0o022, true); err != nil {
+		return failure("inspect log file", fmt.Errorf("log must be a protected root-owned regular file with one hard link: %w", err))
+	}
+	if err := file.Chmod(0o640); err != nil {
+		return failure("set log permissions", err)
+	}
+	info, err = file.Stat()
+	if err != nil {
+		return failure("verify log file", err)
+	}
+	if err := filetrust.ValidateRegular(info, int(i.rootOwnerUID), 0o022, true); err != nil || info.Mode().Perm() != 0o640 {
+		if err == nil {
+			err = fmt.Errorf("mode is %04o, want 0640", info.Mode().Perm())
+		}
+		return failure("verify log file", err)
+	}
+	return nil
 }
 
 func (i *Installer) installBackendPolicy(plan installPlan, payload Payload, b *backup) error {
@@ -1250,8 +1355,12 @@ func (i *Installer) installBackendPolicy(plan installPlan, payload Payload, b *b
 	}
 	var data []byte
 	if !exists && stable {
-		data, _, err = i.fs.ReadRegularFile(dnfStableBackupPath, 4<<20)
-		if err != nil {
+		var baselineExists bool
+		data, baselineExists, err = i.readTrustedRegularFile(dnfStableBackupPath, 4<<20)
+		if err != nil || !baselineExists {
+			if err == nil {
+				err = fs.ErrNotExist
+			}
 			return failure("read stable dnf backup", err)
 		}
 		if _, err := parseStrictINI(data); err != nil {
@@ -1269,8 +1378,12 @@ func (i *Installer) installBackendPolicy(plan installPlan, payload Payload, b *b
 		if info.Size() < 0 || info.Size() > 4<<20 {
 			return failure("inspect dnf automatic config", errors.New("automatic.conf exceeds 4 MiB"))
 		}
-		data, _, err = i.fs.ReadRegularFile(automatic, 4<<20)
-		if err != nil {
+		var currentExists bool
+		data, currentExists, err = i.readTrustedRegularFile(automatic, 4<<20)
+		if err != nil || !currentExists {
+			if err == nil {
+				err = fs.ErrNotExist
+			}
 			return failure("read dnf automatic config", err)
 		}
 		// Validate before creating any persistent baseline or timestamp. Otherwise a failed first
@@ -1345,8 +1458,11 @@ func (i *Installer) oldestAPTProjectBackup(skipManagedPolicy bool) (string, erro
 			return "", fmt.Errorf("%s must be a regular file no larger than 4 MiB", candidate)
 		}
 		if skipManagedPolicy {
-			data, _, err := i.fs.ReadRegularFile(candidate, 4<<20)
-			if err != nil {
+			data, exists, err := i.readTrustedRegularFile(candidate, 4<<20)
+			if err != nil || !exists {
+				if err == nil {
+					err = fs.ErrNotExist
+				}
 				return "", err
 			}
 			if bytes.Equal(data, []byte(aptPeriodicConfig)) {
@@ -1415,12 +1531,16 @@ func setINI(data []byte, section, key, value string) []byte {
 	inSection, seenSection, written := false, false, false
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+		if len(trimmed) >= 2 && strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
 			if inSection && !written {
 				output = append(output, key+" = "+value)
 				written = true
 			}
-			inSection = strings.EqualFold(trimmed, "["+section+"]")
+			// Normalize the header exactly like dnfconfig.ParseStrict. Both run as a pair over the
+			// same file, so a shape one accepts and the other misses (e.g. the padded "[ commands ]")
+			// would append a second "[commands]" and make the managed config fail its own duplicate
+			// -section validation, aborting the install.
+			inSection = strings.EqualFold(strings.TrimSpace(trimmed[1:len(trimmed)-1]), section)
 			seenSection = seenSection || inSection
 			output = append(output, line)
 			continue
@@ -1485,7 +1605,7 @@ func (i *Installer) installFeishuCredential(ctx context.Context, channels string
 			Name: "systemd-creds", Args: []string{"encrypt", "--name=feishu_app_secret", "--with-key=host", "-", "-"},
 			Stdin: secret, Timeout: 30 * time.Second,
 		})
-		if result.Err != nil || result.Code != 0 || len(result.Stdout) == 0 || len(result.Stdout) > 128<<10 {
+		if commandResultIncomplete(result) || result.Err != nil || result.Code != 0 || len(result.Stdout) == 0 || len(result.Stdout) > 128<<10 {
 			return "", failure("encrypt Feishu App Secret", commandResultError(result))
 		}
 		if err := i.ensureManagedDir(path.Dir(FeishuEncryptedCredPath), 0o700); err != nil {
@@ -1529,44 +1649,40 @@ func (i *Installer) writeCredentialDropIn() error {
 }
 
 func (i *Installer) regularCredentialExists(name string) (bool, error) {
-	info, err := i.fs.Lstat(name)
-	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, failure("inspect Feishu credential", err)
-	}
-	if info.Mode()&fs.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return false, failure("inspect Feishu credential", errors.New("credential must be a regular file, not a symlink"))
-	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return false, failure("inspect Feishu credential", errors.New("credential must not be accessible by group or other users"))
-	}
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Uid != i.rootOwnerUID {
-		return false, failure("inspect Feishu credential", errors.New("credential must be owned by root"))
-	}
 	limit := int64(64 << 10)
 	if name == FeishuEncryptedCredPath {
 		limit = 128 << 10
 	}
-	if info.Size() < 0 || info.Size() > limit {
-		return false, failure("inspect Feishu credential", errors.New("credential is too large"))
+	file, _, exists, err := i.openFeishuCredential(name, limit)
+	if err != nil {
+		return false, failure("inspect Feishu credential", err)
+	}
+	if !exists {
+		return false, nil
+	}
+	if err := file.Close(); err != nil {
+		return false, failure("inspect Feishu credential", err)
 	}
 	return true, nil
 }
 
 func (i *Installer) loadFeishuSecret(ctx context.Context) ([]byte, error) {
-	if exists, err := i.regularCredentialExists(FeishuEncryptedCredPath); err != nil {
-		return nil, err
-	} else if exists {
+	encrypted, _, exists, err := i.openFeishuCredential(FeishuEncryptedCredPath, 128<<10)
+	if err != nil {
+		return nil, failure("inspect Feishu credential", err)
+	}
+	if exists {
+		defer encrypted.Close()
 		if !i.runner.LookPath("systemd-creds") {
 			return nil, failure("decrypt Feishu credential", errors.New("systemd-creds is required"))
 		}
 		result := i.runner.Run(ctx, Command{
-			Name: "systemd-creds", Args: []string{"decrypt", "--name=feishu_app_secret", FeishuEncryptedCredPath, "-"},
-			Timeout: 10 * time.Second,
+			Name:       "systemd-creds",
+			Args:       []string{"decrypt", "--name=feishu_app_secret", "/proc/self/fd/3", "-"},
+			ExtraFiles: []*os.File{encrypted},
+			Timeout:    10 * time.Second,
 		})
-		if result.Err != nil || result.Code != 0 {
+		if commandResultIncomplete(result) || result.Err != nil || result.Code != 0 {
 			return nil, failure("decrypt Feishu credential", commandResultError(result))
 		}
 		if err := validateSecret(result.Stdout); err != nil {
@@ -1574,10 +1690,13 @@ func (i *Installer) loadFeishuSecret(ctx context.Context) ([]byte, error) {
 		}
 		return bytes.Clone(result.Stdout), nil
 	}
-	if exists, err := i.regularCredentialExists(FeishuPlainCredentialPath); err != nil {
-		return nil, err
-	} else if exists {
-		data, _, err := i.fs.ReadRegularFile(FeishuPlainCredentialPath, 64<<10)
+	plain, _, exists, err := i.openFeishuCredential(FeishuPlainCredentialPath, 64<<10)
+	if err != nil {
+		return nil, failure("inspect Feishu credential", err)
+	}
+	if exists {
+		defer plain.Close()
+		data, _, err := readOpenedRegularFile(plain, 64<<10)
 		if err != nil {
 			return nil, failure("read Feishu credential", err)
 		}
@@ -1591,7 +1710,7 @@ func (i *Installer) loadFeishuSecret(ctx context.Context) ([]byte, error) {
 
 func renderTimer(checkTime string) string {
 	return `[Unit]
-Description=安全更新每日重启/服务重启通知 / Daily security update reboot/service-restart notification
+Description=每日检查安全补丁维护风险、重启需求与 SUN 新版本 / Daily check for security patch maintenance risks, restart needs, and new SUN releases
 
 [Timer]
 OnCalendar=*-*-* ` + checkTime + `:00
@@ -1609,7 +1728,7 @@ func (i *Installer) requiredCommand(op string, command Command) error {
 
 func (i *Installer) requiredCommandContext(ctx context.Context, op string, command Command) error {
 	result := i.runner.Run(ctx, command)
-	if result.Err != nil || result.Code != 0 {
+	if commandResultIncomplete(result) || result.Err != nil || result.Code != 0 {
 		return failure(op, commandResultError(result))
 	}
 	return nil
@@ -1618,6 +1737,9 @@ func (i *Installer) requiredCommandContext(ctx context.Context, op string, comma
 func commandResultError(result CommandResult) error {
 	if result.Err != nil {
 		return result.Err
+	}
+	if commandResultIncomplete(result) {
+		return errors.New("command output exceeded the capture limit")
 	}
 	detail := strings.TrimSpace(string(result.Stderr))
 	if detail == "" {
@@ -1630,4 +1752,8 @@ func commandResultError(result CommandResult) error {
 		detail = fmt.Sprintf("command exited with status %d", result.Code)
 	}
 	return errors.New(detail)
+}
+
+func commandResultIncomplete(result CommandResult) bool {
+	return result.StdoutTruncated || result.StderrTruncated
 }

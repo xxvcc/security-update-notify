@@ -10,7 +10,18 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+type interruptedReader struct{}
+
+func (interruptedReader) Read([]byte) (int, error) {
+	return 0, errors.New("connection reset while reading response")
+}
 
 func newTestClient(h http.HandlerFunc) (*Client, *httptest.Server, *int32) {
 	srv := httptest.NewServer(h)
@@ -86,6 +97,26 @@ func TestSendSuccess(t *testing.T) {
 	}
 }
 
+func TestSendSanitizesDisplayControls(t *testing.T) {
+	var got string
+	c, srv, _ := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		got = r.PostForm.Get("text")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	})
+	defer srv.Close()
+
+	input := "first\nsecond\tvalue\r\x1b[31m\u202Espoof\u2069\u2028tail\u0085end"
+	if err := c.SendMessage(context.Background(), "123:abc", "-100", input); err != nil {
+		t.Fatal(err)
+	}
+	if want := "first\nsecond\tvalue  [31m spoof  tail end"; got != want {
+		t.Fatalf("sent text = %q, want %q", got, want)
+	}
+}
+
 func TestSendOKFalseNoRetry(t *testing.T) {
 	var n int32
 	c, srv, slept := newTestClient(func(w http.ResponseWriter, r *http.Request) {
@@ -128,7 +159,7 @@ func TestSendRetryOn429ThenSuccess(t *testing.T) {
 	}
 }
 
-func TestSend5xxExhausts(t *testing.T) {
+func TestSend5xxIsTemporaryButNotRetried(t *testing.T) {
 	var n int32
 	c, srv, slept := newTestClient(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&n, 1)
@@ -140,11 +171,31 @@ func TestSend5xxExhausts(t *testing.T) {
 	} else if !IsTemporary(err) {
 		t.Errorf("exhausted 5xx error=%v, want temporary", err)
 	}
-	if n != 3 {
-		t.Errorf("requests=%d want 3", n)
+	if n != 1 {
+		t.Errorf("requests=%d want 1 to avoid duplicate delivery", n)
 	}
-	if *slept != 2 {
-		t.Errorf("slept=%d want 2", *slept)
+	if *slept != 0 {
+		t.Errorf("slept=%d want 0", *slept)
+	}
+}
+
+func TestSendTransportFailureIsTemporaryButNotRetried(t *testing.T) {
+	var requests, slept int32
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		atomic.AddInt32(&requests, 1)
+		return nil, errors.New("ambiguous connection reset")
+	})}
+	c := &Client{
+		HTTP:    client,
+		BaseURL: "https://api.telegram.test",
+		Sleep:   func(time.Duration) { atomic.AddInt32(&slept, 1) },
+	}
+	err := c.SendMessage(context.Background(), "123:abc", "-100", "hi")
+	if err == nil || !IsTemporary(err) {
+		t.Fatalf("error=%v, want temporary transport failure", err)
+	}
+	if requests != 1 || slept != 0 {
+		t.Fatalf("requests=%d sleeps=%d want 1,0", requests, slept)
 	}
 }
 
@@ -163,6 +214,43 @@ func TestOversizedResponseRejected(t *testing.T) {
 	} else if !IsTemporary(err) {
 		t.Fatalf("SendMessage oversized response error=%v, want temporary", err)
 	}
+}
+
+func TestInterruptedResponseBodyRetriesOnlyReadOnlyRequest(t *testing.T) {
+	t.Run("getMe retries", func(t *testing.T) {
+		var requests int32
+		client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			body := io.Reader(strings.NewReader(`{"ok":true}`))
+			if atomic.AddInt32(&requests, 1) == 1 {
+				body = io.MultiReader(strings.NewReader(`{"ok":`), interruptedReader{})
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(body)}, nil
+		})}
+		c := &Client{HTTP: client, BaseURL: "https://api.telegram.test", Sleep: func(time.Duration) {}}
+		if err := c.GetMe(context.Background(), "123:abc"); err != nil {
+			t.Fatal(err)
+		}
+		if requests != 2 {
+			t.Fatalf("requests=%d, want 2", requests)
+		}
+	})
+
+	t.Run("sendMessage does not risk a duplicate", func(t *testing.T) {
+		var requests int32
+		client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			atomic.AddInt32(&requests, 1)
+			body := io.MultiReader(strings.NewReader(`{"ok":`), interruptedReader{})
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(body)}, nil
+		})}
+		c := &Client{HTTP: client, BaseURL: "https://api.telegram.test", Sleep: func(time.Duration) {}}
+		err := c.SendMessage(context.Background(), "123:abc", "-100", "hello")
+		if err == nil || !IsTemporary(err) {
+			t.Fatalf("error=%v, want temporary read failure", err)
+		}
+		if requests != 1 {
+			t.Fatalf("requests=%d, want 1 to avoid duplicate delivery", requests)
+		}
+	})
 }
 
 func TestSend4xxPermanent(t *testing.T) {
@@ -205,6 +293,26 @@ func TestSendTruncatesOKFalseError(t *testing.T) {
 	err := c.SendMessage(context.Background(), "123:abc", "-100", "hi")
 	if err == nil || len(err.Error()) > 300 {
 		t.Fatalf("error length=%d err=%v", len(err.Error()), err)
+	}
+}
+
+func TestErrorTextIsTerminalSafeRedactedAndValidUTF8(t *testing.T) {
+	const secret = "123:secret"
+	input := "\x1b[31m\u202Espoof\n" + secret + strings.Repeat("界", 120)
+	got := truncErr(input, secret)
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated error is invalid UTF-8: %q", got)
+	}
+	if len(got) > 300 {
+		t.Fatalf("truncated error has %d bytes, want <= 300", len(got))
+	}
+	for _, forbidden := range []string{"\x1b", "\u202e", "\n", secret} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("error retained unsafe or secret text %q: %q", forbidden, got)
+		}
+	}
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("error did not retain a redaction marker: %q", got)
 	}
 }
 

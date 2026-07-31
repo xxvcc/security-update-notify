@@ -135,7 +135,7 @@ func TestPurgeRestorePreservesFileMetadataAndXattrs(t *testing.T) {
 	if err := os.Chmod(fixed, 0o641); err != nil {
 		t.Fatal(err)
 	}
-	wantMtime := time.Unix(1_700_000_000, 123_000_000)
+	wantMtime := time.Unix(1_700_000_000, 123_456_789)
 	if err := os.Chtimes(fixed, wantMtime, wantMtime); err != nil {
 		t.Fatal(err)
 	}
@@ -153,6 +153,9 @@ func TestPurgeRestorePreservesFileMetadataAndXattrs(t *testing.T) {
 	wantInfo, err := os.Stat(fixed)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !wantInfo.ModTime().Equal(wantMtime) {
+		t.Skipf("filesystem does not preserve nanosecond mtimes: got %s want %s", wantInfo.ModTime(), wantMtime)
 	}
 
 	if _, err := restoreAPT(root); err != nil {
@@ -187,6 +190,59 @@ func TestPurgeRestorePreservesFileMetadataAndXattrs(t *testing.T) {
 		if !reflect.DeepEqual(gotXattr[:n], wantXattr) {
 			t.Fatalf("restored xattr = %q, want %q", gotXattr[:n], wantXattr)
 		}
+	}
+}
+
+func TestRestoreFileInfoDetectsHardLinkStateChange(t *testing.T) {
+	root := t.TempDir()
+	file := writeFixture(t, root, "/etc/apt/apt.conf.d/backup", "backup")
+	before, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(file, file+".alias"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sameRestoreFileInfo(before, after) {
+		t.Fatal("hard-link count change was accepted as a stable restore file")
+	}
+}
+
+func TestRestoreFileStateDetectsSameSizeRewriteWithRestoredMtime(t *testing.T) {
+	root := t.TempDir()
+	file := writeFixture(t, root, "/etc/apt/apt.conf.d/backup", "original")
+	mtime := time.Unix(1_700_000_000, 123_456_789)
+	if err := os.Chtimes(file, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("modified"), before.Mode().Perm()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(file, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeStat := before.Sys().(*syscall.Stat_t)
+	afterStat := after.Sys().(*syscall.Stat_t)
+	if beforeStat.Ctim == afterStat.Ctim {
+		t.Skip("filesystem did not expose a ctime change for the rewrite")
+	}
+	if !sameRestoreFileInfo(before, after) {
+		t.Fatal("rewrite fixture changed metadata other than ctime")
+	}
+	if sameRestoreFileState(before, after) {
+		t.Fatal("same-size rewrite with restored mtime was accepted as a stable restore file")
 	}
 }
 
@@ -580,6 +636,213 @@ func TestRestoreFileRetainsConcurrentDestinationChangedAfterExchange(t *testing.
 	}
 	assertContent(t, root, aptPeriodicLogical, concurrent)
 	assertContent(t, root, aptStableLogical, "vendor baseline")
+}
+
+func TestRestoreFileRecordsRecoverableStateWhenExchangeSyncFails(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, aptPeriodicLogical, "managed")
+	writeFixture(t, root, aptStableLogical, "vendor baseline")
+	directory, err := openRestoreDirectory(root, filepath.Dir(aptPeriodicLogical))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directory.close()
+
+	sourceName := filepath.Base(aptStableLogical)
+	destinationName := filepath.Base(aptPeriodicLogical)
+	sourceSnapshot, err := directory.readRegular(sourceName, restoreConfigLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destinationSnapshot, err := directory.readRegular(destinationName, restoreConfigLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncFailure := errors.New("forced directory sync failure")
+	syncCalls := 0
+	directory.syncDirectory = func() error {
+		syncCalls++
+		if syncCalls == 1 {
+			return syncFailure
+		}
+		return directory.file.Sync()
+	}
+
+	if _, err := directory.restoreFile(sourceName, destinationName, sourceSnapshot, destinationSnapshot); err == nil ||
+		!errors.Is(err, syncFailure) || !strings.Contains(err.Error(), "sync restore exchange; entries retained at") ||
+		!strings.Contains(err.Error(), "recovery marker retained") {
+		t.Fatalf("restoreFile error = %v, want recoverable exchange sync failure", err)
+	}
+	assertContent(t, root, aptPeriodicLogical, "vendor baseline")
+	names, err := directory.names()
+	if err != nil {
+		t.Fatal(err)
+	}
+	temporaryNames := restoreNamesWithPrefix(names, ".security-update-notify-restore.")
+	conflictNames := restoreNamesWithPrefix(names, ".security-update-notify-conflict.")
+	if len(temporaryNames) != 1 || len(conflictNames) != 1 {
+		t.Fatalf("recovery artifacts: temporary=%v conflicts=%v", temporaryNames, conflictNames)
+	}
+	assertPathContent(t, directory.host(temporaryNames[0]), "managed")
+	if _, err := restoreAPT(root); err == nil || !strings.Contains(err.Error(), "unfinished apt restore transaction") {
+		t.Fatalf("retry restoreAPT error = %v, want unfinished-transaction refusal", err)
+	}
+}
+
+func TestRestoreFileDoesNotDeleteReplacedTemporaryOnValidationFailure(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, aptPeriodicLogical, "managed")
+	writeFixture(t, root, aptStableLogical, "vendor baseline")
+	directory, err := openRestoreDirectory(root, filepath.Dir(aptPeriodicLogical))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directory.close()
+
+	sourceName := filepath.Base(aptStableLogical)
+	destinationName := filepath.Base(aptPeriodicLogical)
+	sourceSnapshot, err := directory.readRegular(sourceName, restoreConfigLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destinationSnapshot, err := directory.readRegular(destinationName, restoreConfigLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	temporaryPath := ""
+	heldPath := ""
+	directory.beforeTemporaryCommit = func(name string) error {
+		temporaryPath = directory.host(name)
+		heldPath = temporaryPath + ".held"
+		if err := os.Rename(temporaryPath, heldPath); err != nil {
+			return err
+		}
+		return os.WriteFile(temporaryPath, []byte("untrusted replacement"), 0o600)
+	}
+
+	if _, err := directory.restoreFile(sourceName, destinationName, sourceSnapshot, destinationSnapshot); err == nil ||
+		!strings.Contains(err.Error(), "temporary restore file changed before commit") ||
+		!strings.Contains(err.Error(), "temporary restore entry changed; retained at") {
+		t.Fatalf("restoreFile error = %v, want replaced-temporary refusal", err)
+	}
+	assertPathContent(t, temporaryPath, "untrusted replacement")
+	assertPathContent(t, heldPath, "vendor baseline")
+	assertContent(t, root, aptPeriodicLogical, "managed")
+}
+
+func TestRestoreFileRejectsUnsafeBackupSourceMetadata(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(*testing.T, *restoreDirectory, string)
+		reason  string
+	}{
+		{name: "wrong owner", prepare: func(_ *testing.T, directory *restoreDirectory, _ string) {
+			directory.ownerUID++
+		}, reason: "owner uid"},
+		{name: "group writable", prepare: func(t *testing.T, _ *restoreDirectory, source string) {
+			if err := os.Chmod(source, 0o664); err != nil {
+				t.Fatal(err)
+			}
+		}, reason: "forbidden permissions"},
+		{name: "hard linked", prepare: func(t *testing.T, _ *restoreDirectory, source string) {
+			if err := os.Link(source, source+".alias"); err != nil {
+				t.Fatal(err)
+			}
+		}, reason: "exactly one hard link"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			destination := writeFixture(t, root, aptPeriodicLogical, "managed")
+			source := writeFixture(t, root, aptStableLogical, "vendor baseline")
+			directory, err := openRestoreDirectory(root, filepath.Dir(aptPeriodicLogical))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer directory.close()
+			test.prepare(t, directory, source)
+			sourceSnapshot, err := directory.readRegular(filepath.Base(source), restoreConfigLimit)
+			if err != nil {
+				t.Fatal(err)
+			}
+			destinationSnapshot, err := directory.readRegular(filepath.Base(destination), restoreConfigLimit)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = directory.restoreFile(filepath.Base(source), filepath.Base(destination), sourceSnapshot, destinationSnapshot)
+			if err == nil || !strings.Contains(err.Error(), "unsafe backup source") || !strings.Contains(err.Error(), test.reason) {
+				t.Fatalf("unsafe backup error = %v, want %q", err, test.reason)
+			}
+			assertPathContent(t, destination, "managed")
+			names, readErr := directory.names()
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if temporary := restoreNamesWithPrefix(names, ".security-update-notify-restore."); len(temporary) != 0 {
+				t.Fatalf("restore temporary created before source validation: %v", temporary)
+			}
+		})
+	}
+}
+
+func TestRemoveValidatedReportsRetainedQuarantinePath(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, aptPeriodicLogical, "managed")
+	directory, err := openRestoreDirectory(root, filepath.Dir(aptPeriodicLogical))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directory.close()
+	destination := filepath.Base(aptPeriodicLogical)
+	snapshot, err := directory.readRegular(destination, restoreConfigLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forced := errors.New("forced quarantine removal failure")
+	directory.beforeRemove = func(name string) error {
+		if isRestoreTemporaryName(name, restorePurgePrefix) {
+			return forced
+		}
+		return nil
+	}
+
+	err = directory.removeValidated(destination, snapshot)
+	if err == nil || !errors.Is(err, forced) || !strings.Contains(err.Error(), "remove validated file retained at "+directory.host("."+restorePurgePrefix+".")) {
+		t.Fatalf("removeValidated error = %v, want retained quarantine path", err)
+	}
+}
+
+func TestFailedPlaceholderCleanupReportsPrimaryErrorAndRetainedPath(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, aptPeriodicLogical, "managed")
+	directory, err := openRestoreDirectory(root, filepath.Dir(aptPeriodicLogical))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directory.close()
+	placeholder, name, err := directory.newTemporary(restorePurgePrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := placeholder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	closeFailure := errors.New("forced placeholder close failure")
+	cleanupFailure := errors.New("forced placeholder cleanup failure")
+	directory.beforeRemove = func(candidate string) error {
+		if candidate == name {
+			return cleanupFailure
+		}
+		return nil
+	}
+
+	err = directory.cleanupUncommittedPlaceholder(name, closeFailure)
+	if !errors.Is(err, closeFailure) || !errors.Is(err, cleanupFailure) ||
+		!strings.Contains(err.Error(), "retained at "+directory.host(name)) {
+		t.Fatalf("placeholder cleanup error = %v, want both failures and retained path", err)
+	}
+	assertPathContent(t, directory.host(name), "")
 }
 
 func TestPurgeAPTDoesNotDeleteFixedBackupReplacedDuringCleanup(t *testing.T) {
@@ -1261,6 +1524,7 @@ func TestUninstallIgnoresOnlyExactMissingUnitDiagnostics(t *testing.T) {
 		{Code: 1, Stderr: "Failed to disable unit: Unit file other.timer does not exist.\n"},
 		{Code: 1, Stderr: "Failed to disable unit: Unit file " + timerUnit + " does not exist.\npermission denied\n"},
 		{Code: -1, Err: errors.New("systemctl unavailable"), Stderr: "Failed to disable unit: Unit file " + timerUnit + " does not exist.\n"},
+		{Code: 1, Stderr: "Failed to disable unit: Unit file " + timerUnit + " does not exist.\n", StderrTruncated: true},
 	} {
 		if !systemctlCleanupFailed(result, "disable", timerUnit) {
 			t.Fatalf("real/mismatched failure was suppressed: %+v", result)
@@ -1268,6 +1532,30 @@ func TestUninstallIgnoresOnlyExactMissingUnitDiagnostics(t *testing.T) {
 	}
 	if result := (sysexec.Result{Code: 1, Stderr: "Failed to stop " + serviceUnit + ": Unit " + serviceUnit + " not loaded.\n"}); !systemctlCleanupFailed(result, "stop", serviceUnit) {
 		t.Fatalf("stop failure with wrong exit code was suppressed: %+v", result)
+	}
+}
+
+func TestUninstallCountsTruncatedDaemonReloadAsSystemctlFailure(t *testing.T) {
+	for _, result := range []sysexec.Result{
+		{Code: 0, Stdout: "partial", StdoutTruncated: true},
+		{Code: 0, Stderr: "partial", StderrTruncated: true},
+	} {
+		root := t.TempDir()
+		report, err := uninstallAsRoot(Options{
+			RootDir: root,
+			RunCommand: func(_ string, args ...string) sysexec.Result {
+				if strings.Join(args, " ") == "daemon-reload" {
+					return result
+				}
+				return sysexec.Result{}
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if report.SystemctlFailureCount != 1 {
+			t.Fatalf("SystemctlFailureCount = %d, want 1 for %+v", report.SystemctlFailureCount, result)
+		}
 	}
 }
 
@@ -1384,6 +1672,29 @@ func TestUninstallLockOrderAndTemporaryFailures(t *testing.T) {
 		if len(events) < len(wantPrefix) || !reflect.DeepEqual(events[:len(wantPrefix)], wantPrefix) {
 			t.Fatalf("events=%v want prefix %v", events, wantPrefix)
 		}
+		wantSuffix := []string{
+			"unlock:security-update-notify.lock",
+			"unlock:security-update-notify.install.lock",
+		}
+		if len(events) < len(wantSuffix) || !reflect.DeepEqual(events[len(events)-len(wantSuffix):], wantSuffix) {
+			t.Fatalf("events=%v want suffix %v", events, wantSuffix)
+		}
+	})
+
+	t.Run("unlock failures are reported", func(t *testing.T) {
+		root := t.TempDir()
+		_, err := uninstallAsRoot(Options{
+			RootDir: root,
+			Lock: func(path string, _ time.Duration) (func() error, error) {
+				name := filepath.Base(path)
+				return func() error { return errors.New("forced " + name + " unlock failure") }, nil
+			},
+			RunCommand: successfulRunner,
+		})
+		if err == nil || !strings.Contains(err.Error(), "release runtime lock") ||
+			!strings.Contains(err.Error(), "release install lock") {
+			t.Fatalf("unlock errors were lost: %v", err)
+		}
 	})
 
 	for _, busyLock := range []string{"security-update-notify.install.lock", "security-update-notify.lock"} {
@@ -1476,6 +1787,257 @@ func TestRecursiveRemovalStaysBoundToOpenedParent(t *testing.T) {
 	if got, err := os.ReadFile(externalFile); err != nil || string(got) != "outside" {
 		t.Fatalf("replacement symlink target changed: %q err=%v", got, err)
 	}
+}
+
+func TestRemovalFailureReportsFullRetainedQuarantinePath(t *testing.T) {
+	root := t.TempDir()
+	logical := "/var/lib/security-update-notify/state"
+	target := writeFixture(t, root, logical, "managed")
+	parent, name, err := openLogicalParent(root, logical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	expected, err := readRemovalEntry(parent, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forced := errors.New("forced claimed-entry deletion failure")
+	quarantine := ""
+	err = removeValidatedEntryAtWithHook(parent, name, expected, removalLeaf, func(name string) error {
+		quarantine = name
+		return forced
+	})
+	retained := filepath.Join(filepath.Dir(target), quarantine)
+	if err == nil || !errors.Is(err, forced) || quarantine == "" || !strings.Contains(err.Error(), "retained at "+retained) {
+		t.Fatalf("removal error = %v, want retained path %s", err, retained)
+	}
+	assertPathMissing(t, target)
+	assertPathContent(t, retained, "managed")
+}
+
+func TestRemovalPlaceholderInitializationFailureReportsRetainedPath(t *testing.T) {
+	root := t.TempDir()
+	logical := "/var/lib/security-update-notify/state"
+	target := writeFixture(t, root, logical, "managed")
+	parent, _, err := openLogicalParent(root, logical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	forced := errors.New("forced quarantine close failure")
+	retained := ""
+	name, _, err := newRemovalPlaceholderWithClose(parent, false, func(file *os.File, name string) error {
+		if err := file.Close(); err != nil {
+			return err
+		}
+		retained = removalEntryPath(parent, name)
+		if err := os.Rename(retained, retained+".held"); err != nil {
+			return err
+		}
+		if err := os.WriteFile(retained, []byte("concurrent replacement"), 0o600); err != nil {
+			return err
+		}
+		return forced
+	})
+	if err == nil || !errors.Is(err, forced) || name == "" || retained == "" ||
+		!strings.Contains(err.Error(), "retained at "+retained) {
+		t.Fatalf("placeholder initialization error = %v, want retained path %s", err, retained)
+	}
+	assertPathContent(t, retained, "concurrent replacement")
+	assertPathContent(t, retained+".held", "")
+	assertPathContent(t, target, "managed")
+}
+
+func TestRemoveLogicalFileDoesNotDeleteConcurrentReplacement(t *testing.T) {
+	root := t.TempDir()
+	logical := "/etc/logrotate.d/security-update-notify"
+	target := writeFixture(t, root, logical, "managed")
+	held := target + ".held"
+	replaced := false
+
+	err := removeLogicalFileWithHook(root, logical, func() error {
+		if err := os.Rename(target, held); err != nil {
+			return err
+		}
+		if err := os.WriteFile(target, []byte("administrator replacement"), 0o640); err != nil {
+			return err
+		}
+		replaced = true
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "entry changed before removal") {
+		t.Fatalf("removeLogicalFileWithHook error = %v, want replacement refusal", err)
+	}
+	if !replaced {
+		t.Fatal("concurrent replacement hook was not called")
+	}
+	assertPathContent(t, held, "managed")
+	assertPathContent(t, target, "administrator replacement")
+}
+
+func TestRemoveLogicalTreeDoesNotDeleteConcurrentReplacement(t *testing.T) {
+	root := t.TempDir()
+	logical := "/etc/security-update-notify"
+	target := filepath.Dir(writeFixture(t, root, logical+"/managed", "managed"))
+	held := target + ".held"
+	replaced := false
+
+	err := removeLogicalTreeWithHook(root, logical, func() error {
+		if err := os.Rename(target, held); err != nil {
+			return err
+		}
+		if err := os.Mkdir(target, 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(target, "administrator.conf"), []byte("keep"), 0o640); err != nil {
+			return err
+		}
+		replaced = true
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "entry changed before removal") {
+		t.Fatalf("removeLogicalTreeWithHook error = %v, want replacement refusal", err)
+	}
+	if !replaced {
+		t.Fatal("concurrent replacement hook was not called")
+	}
+	assertPathContent(t, filepath.Join(held, "managed"), "managed")
+	assertPathContent(t, filepath.Join(target, "administrator.conf"), "keep")
+}
+
+func TestLogicalRemovalRecoversInterruptedQuarantines(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "etc")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prefix := "." + uninstallRemovalPrefix + "."
+	fileArtifact := prefix + strings.Repeat("a", 32)
+	directoryArtifact := prefix + strings.Repeat("b", 32)
+	nearMatch := prefix + "not-a-valid-artifact"
+	if err := os.WriteFile(filepath.Join(parent, fileArtifact), []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(parent, directoryArtifact), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, directoryArtifact, "credential"), []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, nearMatch), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := removeLogicalTree(root, "/etc/security-update-notify"); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{fileArtifact, directoryArtifact} {
+		if _, err := os.Lstat(filepath.Join(parent, name)); !os.IsNotExist(err) {
+			t.Fatalf("interrupted uninstall artifact %s survived retry: %v", name, err)
+		}
+	}
+	if got, err := os.ReadFile(filepath.Join(parent, nearMatch)); err != nil || string(got) != "keep" {
+		t.Fatalf("near-match file data=%q err=%v", got, err)
+	}
+}
+
+func TestRemoveClaimedTreeUsesHeldDirectoryDescriptor(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Dir(writeFixture(t, root, "/etc/security-update-notify/managed", "managed"))
+	parent, name, err := openLogicalParent(root, "/etc/security-update-notify")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	directory, err := openRemovalDirectory(parent, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directory.Close()
+
+	held := target + ".held"
+	if err := os.Rename(target, held); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	replacement := filepath.Join(target, "administrator.conf")
+	if err := os.WriteFile(replacement, []byte("keep"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := removeClaimedTree(directory); err != nil {
+		t.Fatal(err)
+	}
+	assertPathMissing(t, filepath.Join(held, "managed"))
+	assertPathContent(t, replacement, "keep")
+}
+
+func TestRemoveLogicalEmptyDirectoryDoesNotDeleteConcurrentReplacement(t *testing.T) {
+	root := t.TempDir()
+	logical := "/etc/systemd/system/security-update-notify.service.d"
+	target := hostPath(root, logical)
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	held := target + ".held"
+	replaced := false
+
+	err := removeLogicalEmptyDirectoryWithHook(root, logical, func() error {
+		if err := os.Rename(target, held); err != nil {
+			return err
+		}
+		if err := os.Mkdir(target, 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(target, "administrator.conf"), []byte("keep"), 0o640); err != nil {
+			return err
+		}
+		replaced = true
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "entry changed before removal") {
+		t.Fatalf("removeLogicalEmptyDirectoryWithHook error = %v, want replacement refusal", err)
+	}
+	if !replaced {
+		t.Fatal("concurrent replacement hook was not called")
+	}
+	if info, err := os.Stat(held); err != nil || !info.IsDir() {
+		t.Fatalf("validated empty directory was not preserved: info=%v err=%v", info, err)
+	}
+	assertPathContent(t, filepath.Join(target, "administrator.conf"), "keep")
+}
+
+func TestRotatedLogRemovalDoesNotDeleteConcurrentReplacement(t *testing.T) {
+	root := t.TempDir()
+	logical := "/var/log/security-update-notify.log.1"
+	target := writeFixture(t, root, logical, "managed log")
+	held := target + ".held"
+	replaced := false
+
+	err := removeLogicalFilesWithPrefix(root, "/var/log", "security-update-notify.log.", func(name string) error {
+		if name != filepath.Base(target) || replaced {
+			return nil
+		}
+		if err := os.Rename(target, held); err != nil {
+			return err
+		}
+		if err := os.WriteFile(target, []byte("new log"), 0o640); err != nil {
+			return err
+		}
+		replaced = true
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "entry changed before removal") {
+		t.Fatalf("removeLogicalFilesWithPrefix error = %v, want replacement refusal", err)
+	}
+	if !replaced {
+		t.Fatal("concurrent replacement hook was not called")
+	}
+	assertPathContent(t, held, "managed log")
+	assertPathContent(t, target, "new log")
 }
 
 func TestPurgeUnlinksLeafSymlinkWithoutFollowingIt(t *testing.T) {

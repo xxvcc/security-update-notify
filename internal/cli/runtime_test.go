@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/xxvcc/security-update-notify/internal/run"
+	"github.com/xxvcc/security-update-notify/internal/sysexec"
 )
 
 func TestRunModeDryRunExercisesRealCollectionWithoutStateMutation(t *testing.T) {
@@ -57,9 +60,6 @@ SELF_UPDATE_CHECK_DAYS=7
 }
 
 func TestDoctorModeUsesCommandFixturesWhenSystemdAvailable(t *testing.T) {
-	if info, err := os.Stat("/run/systemd/system"); err != nil || !info.IsDir() {
-		t.Skip("doctor's systemd success path requires /run/systemd/system")
-	}
 	envPath := writeRuntimeConfig(t, `
 CONFIG_VERSION=4
 NOTIFY_CHANNELS=telegram
@@ -85,8 +85,14 @@ CHECK_SELF_UPDATE=0
 	t.Setenv("SECURITY_UPDATE_NOTIFY_APT_PERIODIC_CONF", aptPeriodic)
 	t.Setenv("PATH", runtimeCommandPath(t))
 
+	query := &cliSystemdQuery{
+		enabled: map[string]bool{
+			"security-update-notify.timer": true,
+			"apt-daily-upgrade.timer":      true,
+		},
+	}
 	stdout, stderr, rc := captureCLIOutput(t, func() int {
-		return Main("3.0.1-test", []string{"doctor", "--skip-notify", "--lang", "en"})
+		return mainWithSystemd("3.0.1-test", []string{"doctor", "--skip-notify", "--lang", "en"}, query)
 	})
 	if rc != 0 {
 		t.Fatalf("doctor exit=%d stdout=%q stderr=%q", rc, stdout, stderr)
@@ -123,6 +129,18 @@ func TestRunModeParsingAndModePrecedence(t *testing.T) {
 		{name: "missing from", args: []string{"run", "--upgrade-from"}, want: 2},
 		{name: "missing to", args: []string{"run", "--upgrade-to"}, want: 2},
 		{name: "disabled upgrade notification", args: []string{"run", "--notify-upgrade-event", "--upgrade-from", "2.9.9", "--upgrade-to", "3.0.1"}, want: 0},
+		{name: "doctor cannot become upgrade", args: []string{"doctor", "--upgrade"}, want: 2},
+		{name: "check cannot become upgrade", args: []string{"check-upgrade", "--upgrade"}, want: 2},
+		{name: "internal event cannot become upgrade", args: []string{"run", "--notify-upgrade-event", "--upgrade"}, want: 2},
+		{name: "normal run rejects doctor skip", args: []string{"run", "--skip-notify"}, want: 2},
+		{name: "normal run rejects upgrade metadata", args: []string{"run", "--upgrade-from", "2.9.9"}, want: 2},
+		{name: "doctor rejects test fixture", args: []string{"doctor", "--test-reboot"}, want: 2},
+		{name: "check rejects dry run before network", args: []string{"check-upgrade", "--dry-run"}, want: 2},
+		{name: "upgrade rejects ignored lock wait", args: []string{"upgrade", "--wait-lock", "0"}, want: 2},
+		{name: "event rejects dry run instead of sending", args: []string{"run", "--notify-upgrade-event", "--dry-run"}, want: 2},
+		{name: "event rejects display language", args: []string{"run", "--notify-upgrade-event", "--lang", "en"}, want: 2},
+		{name: "test modes conflict", args: []string{"run", "--test-ok", "--test-reboot"}, want: 2},
+		{name: "version rejects trailing mode", args: []string{"run", "--version", "--upgrade"}, want: 2},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -153,8 +171,10 @@ func TestTrustHelperExitContracts(t *testing.T) {
 		{args: []string{"version-newer", "3.0.1", "3.0.1"}, want: 1},
 		{args: []string{"verify", "--bad-flag"}, want: 2},
 		{args: []string{"verify"}, want: 2},
+		{args: []string{"verify", "unexpected"}, want: 2},
 		{args: []string{"check-archive", "--bad-flag"}, want: 2},
 		{args: []string{"check-archive"}, want: 2},
+		{args: []string{"check-archive", "unexpected"}, want: 2},
 	} {
 		_, _, got := captureCLIOutput(t, func() int { return Main("3.0.1-test", test.args) })
 		if got != test.want {
@@ -171,6 +191,13 @@ func TestTrustHelperExitContracts(t *testing.T) {
 		t.Fatalf("valid check-archive exit=%d", rc)
 	}
 	if _, _, rc := captureCLIOutput(t, func() int {
+		return Main("3.0.1-test", []string{
+			"check-archive", "--tarball", archive, "--top-dir", "release-3.0.1", "unexpected",
+		})
+	}); rc != 2 {
+		t.Fatalf("check-archive with trailing argument exit=%d", rc)
+	}
+	if _, _, rc := captureCLIOutput(t, func() int {
 		return Main("3.0.1-test", []string{"check-archive", "--tarball", archive, "--top-dir", "wrong"})
 	}); rc != 1 {
 		t.Fatalf("mismatched check-archive exit=%d", rc)
@@ -183,29 +210,32 @@ func TestTrustHelperExitContracts(t *testing.T) {
 	}); rc != 1 {
 		t.Fatalf("invalid release verification exit=%d", rc)
 	}
+	if _, _, rc := captureCLIOutput(t, func() int {
+		return Main("3.0.1-test", []string{
+			"verify", "--tarball", archive, "--sha256", "missing.sha256", "--asc", "missing.asc",
+			"--pubkey", "missing.pub", "--fingerprint", strings.Repeat("A", 40), "unexpected",
+		})
+	}); rc != 2 {
+		t.Fatalf("release verification with trailing argument exit=%d", rc)
+	}
 }
 
 func runtimeCommandPath(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	writeCLICommand(t, dir, "systemctl", `
-case "$1" in
-  is-enabled) printf '%s\n' enabled ;;
-  show)
-    case "$4" in
-      Result) printf '%s\n' success ;;
-    esac
-    exit 0
-    ;;
-esac
-exit 0
-`)
 	writeCLICommand(t, dir, "dpkg", `
 [ "$1" = "-s" ] || exit 2
 printf '%s\n' "Package: $2" "Status: install ok installed"
 `)
 	writeCLICommand(t, dir, "apt-get", "exit 0\n")
-	writeCLICommand(t, dir, "needrestart", "exit 0\n")
+	writeCLICommand(t, dir, "needrestart", `
+[ "$1" = "-b" ] || exit 2
+printf '%s\n' \
+  'NEEDRESTART-VER: 3.6' \
+  'NEEDRESTART-KCUR: 6.12-fixture' \
+  'NEEDRESTART-KEXP: 6.12-fixture' \
+  'NEEDRESTART-KSTA: 1'
+`)
 	writeCLICommand(t, dir, "unattended-upgrade", "exit 0\n")
 	writeCLICommand(t, dir, "hostname", `
 if [ "${1:-}" = "-f" ]; then printf '%s\n' fixture.example.test; else printf '%s\n' fixture; fi
@@ -214,12 +244,26 @@ if [ "${1:-}" = "-f" ]; then printf '%s\n' fixture.example.test; else printf '%s
 	return dir
 }
 
+var _ run.SystemdQuery = (*cliSystemdQuery)(nil)
+
+type cliSystemdQuery struct {
+	enabled map[string]bool
+}
+
+func (*cliSystemdQuery) Available() bool { return true }
+
+func (q *cliSystemdQuery) IsEnabled(unit string) bool { return q.enabled[unit] }
+
+func (*cliSystemdQuery) ShowValue(string, string) (string, bool) { return "", true }
+
 func writeCLICommand(t *testing.T, dir, name, body string) {
 	t.Helper()
 	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	restore := sysexec.SetCommandPathForTest(dir)
+	t.Cleanup(restore)
 }
 
 func writeRuntimeConfig(t *testing.T, body string) string {

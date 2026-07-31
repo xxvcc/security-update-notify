@@ -1,26 +1,36 @@
 // Package config 复刻运行时对 /etc/security-update-notify/telegram.env 的严格行解析（load_config_file）
 // 与安装器的逐字节写出（config_quote + 固定写序）。刻意“不 source”配置文件：只做行级解析、键白名单、
-// 值去引号，且严格保持“文件不可读→继续(fail-open)，坏行/坏键/非白名单键→报错(fail-closed)”的分裂，
-// 以及写出的线格式（供已装机器升级后仍能被旧 Bash 读回）。
+// 值去引号。仅文件不存在时返回空配置以兼容未安装状态；其它读取错误、坏行、坏键和非白名单键
+// 均报错(fail-closed)，并保持写出的线格式（供已装机器升级后仍能被旧 Bash 读回）。
 //
 // Package config reproduces the runtime's strict line parser for /etc/security-update-notify/telegram.env
 // (load_config_file) and the installer's byte-exact writer (config_quote + fixed order). It deliberately
-// does NOT source the file: line parsing, key whitelist, value unquoting, keeping the exact split of
-// "unreadable file → proceed (fail-open); bad line / bad key / non-whitelisted key → error (fail-closed)"
-// and the on-disk wire format (so an upgraded host is still readable by the old Bash).
+// does NOT source the file: it parses lines, enforces a key whitelist, and unquotes values. Only a missing
+// file returns an empty configuration for compatibility with an uninstalled host; every other read error,
+// malformed line, bad key, or non-whitelisted key fails closed. The on-disk wire format remains readable
+// by the old Bash runtime after an upgrade.
 package config
 
 import (
 	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"regexp"
 	"strings"
+	"syscall"
+
+	"github.com/xxvcc/security-update-notify/internal/filetrust"
 )
 
 // cSpace 是 C locale 下 [[:space:]] 的字符集，用于值的首尾裁剪与行首空白判定。
 const cSpace = " \t\n\v\f\r"
+
+const maxConfigBytes = 4 << 20
+
+const maxConfigValueBytes = 64 << 10
 
 // whitelist 是运行时 load_config_file 接受的配置键（非此集合的合法键 → fail-closed）。
 var whitelist = map[string]bool{
@@ -65,15 +75,41 @@ func (c *Config) Map() map[string]string {
 }
 
 // Load 按运行时 load_config_file 语义解析 telegram.env：
-//   - 文件不可读 → 返回空配置且 nil（fail-open，对应 Bash `[[ -r ]] || return 0`）；
+//   - 文件不存在 → 返回空配置且 nil（保持未安装/旧调用路径的兼容语义）；
+//   - 其它不可读、非常规、符号链接或超大文件 → 返回错误（fail-closed）；
 //   - 行无 '='、键不匹配 ^[A-Za-z_][A-Za-z0-9_]*$、或键不在白名单 → 返回错误（fail-closed）。
 func Load(path string) (*Config, error) {
-	f, err := os.Open(path)
+	return load(path, os.Geteuid())
+}
+
+func load(path string, euid int) (*Config, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return &Config{m: map[string]string{}}, nil // fail-open
+		if errors.Is(err, os.ErrNotExist) {
+			return &Config{m: map[string]string{}}, nil
+		}
+		return nil, fmt.Errorf("open config: %w", err)
 	}
+	f := os.NewFile(uintptr(fd), path)
 	defer f.Close()
-	return parse(f)
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("inspect config: %w", err)
+	}
+	if err := filetrust.ValidateRegular(info, euid, 0o077, true); err != nil {
+		return nil, fmt.Errorf("config must be a protected regular file owned by the effective user: %w", err)
+	}
+	if info.Size() > maxConfigBytes {
+		return nil, fmt.Errorf("config exceeds %d bytes", maxConfigBytes)
+	}
+	contents, err := io.ReadAll(io.LimitReader(f, maxConfigBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+	if len(contents) > maxConfigBytes {
+		return nil, fmt.Errorf("config exceeds %d bytes", maxConfigBytes)
+	}
+	return parse(bytes.NewReader(contents))
 }
 
 func parse(r io.Reader) (*Config, error) {
@@ -153,7 +189,7 @@ func stripInlineComment(v string) string {
 }
 
 // quote 复刻 config_quote：值含单引号则用双引号包裹，否则用单引号包裹；不转义。
-// 上游 validate_config_value 已禁止值同时含单双引号或含换行。
+// Write 在调用此函数前会拒绝无法用该线格式无损表示的值。
 func quote(value string) string {
 	if strings.Contains(value, "'") {
 		return `"` + value + `"`
@@ -168,13 +204,10 @@ const header2 = "# 请保持此文件仅 root 可读；飞书 App Secret 使用�
 // Write 以安装器的逐字节格式写出 telegram.env：两行头注释 + 固定写序/config_quote 引用。
 // 强制 CONFIG_VERSION=4，并把 DEDUP_MODE 的旧值 always 迁移为 once（与安装器一致）。缺失键写空值。
 func Write(w io.Writer, values map[string]string) error {
-	bw := bufio.NewWriter(w)
-	if _, err := fmt.Fprintln(bw, header1); err != nil {
-		return err
+	type entry struct {
+		key, value string
 	}
-	if _, err := fmt.Fprintln(bw, header2); err != nil {
-		return err
-	}
+	entries := make([]entry, 0, len(writeOrder))
 	for _, k := range writeOrder {
 		v := values[k]
 		switch k {
@@ -189,9 +222,39 @@ func Write(w io.Writer, values map[string]string) error {
 				v = "once" // 迁移旧值
 			}
 		}
-		if _, err := fmt.Fprintf(bw, "%s=%s\n", k, quote(v)); err != nil {
+		if err := validateWriteValue(k, v); err != nil {
+			return err
+		}
+		entries = append(entries, entry{key: k, value: v})
+	}
+
+	bw := bufio.NewWriter(w)
+	if _, err := fmt.Fprintln(bw, header1); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(bw, header2); err != nil {
+		return err
+	}
+	for _, item := range entries {
+		if _, err := fmt.Fprintf(bw, "%s=%s\n", item.key, quote(item.value)); err != nil {
 			return err
 		}
 	}
 	return bw.Flush()
+}
+
+func validateWriteValue(key, value string) error {
+	if len(value) > maxConfigValueBytes {
+		return fmt.Errorf("config value %s exceeds 64 KiB", key)
+	}
+	if strings.ContainsAny(value, "\r\n") {
+		return fmt.Errorf("config value %s contains a line break", key)
+	}
+	if strings.ContainsRune(value, '\x00') {
+		return fmt.Errorf("config value %s contains a NUL byte", key)
+	}
+	if strings.Contains(value, "'") && strings.Contains(value, `"`) {
+		return fmt.Errorf("config value %s contains conflicting quote characters", key)
+	}
+	return nil
 }

@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/xxvcc/security-update-notify/internal/httpx"
+	"github.com/xxvcc/security-update-notify/internal/version"
 )
 
 const maxReleaseJSONBytes = 1 << 20
@@ -80,10 +81,10 @@ func latestFromGitHub(client *http.Client, repo string) (string, error) {
 	if err := json.Unmarshal(body, &v); err != nil {
 		return "", err
 	}
-	tag := strings.TrimPrefix(v.TagName, "v")
-	if tag == "" {
-		return "", fmt.Errorf("empty tag_name")
+	if !strings.HasPrefix(v.TagName, "v") {
+		return "", fmt.Errorf("tag_name must have exactly one v prefix")
 	}
+	tag := strings.TrimPrefix(v.TagName, "v")
 	if !validReleaseVersion(tag) {
 		return "", fmt.Errorf("invalid tag_name")
 	}
@@ -91,7 +92,9 @@ func latestFromGitHub(client *http.Client, repo string) (string, error) {
 }
 
 func validReleaseVersion(v string) bool {
-	if len(v) == 0 || len(v) > 128 || !isReleaseVersionAlphaNum(v[0]) {
+	// Published asset names and tags use one canonical shape: v<version> for
+	// the tag and an unprefixed, numeric release value everywhere else.
+	if len(v) == 0 || len(v) > 128 || v[0] < '0' || v[0] > '9' {
 		return false
 	}
 	for i := 1; i < len(v); i++ {
@@ -99,7 +102,8 @@ func validReleaseVersion(v string) bool {
 			return false
 		}
 	}
-	return true
+	_, err := version.Compare(v, v)
+	return err == nil
 }
 
 func isReleaseVersionAlphaNum(c byte) bool {
@@ -110,15 +114,19 @@ func getReleaseJSON(client *http.Client, url, accept string) ([]byte, error) {
 	if err := httpx.GuardHTTPS(url); err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	client, err := httpx.HTTPSRedirects(client)
 	if err != nil {
 		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create release metadata request failed")
 	}
 	req.Header.Set("Accept", accept)
 	req.Header.Set("User-Agent", "security-update-notify")
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("release metadata request failed")
 	}
 	if resp.Request != nil {
 		if err := httpx.GuardHTTPS(resp.Request.URL.String()); err != nil { // 最终 URL 复核
@@ -128,7 +136,7 @@ func getReleaseJSON(client *http.Client, url, accept string) ([]byte, error) {
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
+		return nil, fmt.Errorf("release metadata returned HTTP %d", resp.StatusCode)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxReleaseJSONBytes+1))

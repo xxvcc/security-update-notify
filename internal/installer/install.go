@@ -8,7 +8,10 @@ import (
 	"io/fs"
 	"os"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/xxvcc/security-update-notify/internal/filetrust"
 )
 
 // New constructs an installer. Zero dependencies select the real host
@@ -29,7 +32,7 @@ func New(dependencies Dependencies) (*Installer, error) {
 		dependencies.Runner = ExecRunner{}
 	}
 	if dependencies.Locker == nil {
-		dependencies.Locker = FileLocker{FS: dependencies.FS}
+		dependencies.Locker = FileLocker{FS: dependencies.FS, OwnerUID: dependencies.RootOwnerUID}
 	}
 	if dependencies.EffectiveUID == nil {
 		dependencies.EffectiveUID = os.Geteuid
@@ -70,8 +73,8 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 		return Result{}, failure("acquire installer lock", err)
 	}
 	defer func() {
-		if err := unlockInstall(); err != nil && returnErr == nil {
-			returnErr = failure("release installer lock", err)
+		if err := unlockInstall(); err != nil {
+			returnErr = errors.Join(returnErr, failure("release installer lock", err))
 		}
 	}()
 
@@ -96,6 +99,17 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 		return Result{}, err
 	}
 	var automaticUnits []unitSnapshot
+	unlockRuntime, err := i.acquireRuntimeLock(ctx, options.LockWait)
+	if err != nil {
+		return Result{}, err
+	}
+	// Register this before the rollback defer below so failures are restored
+	// while the transaction still excludes every normal runtime invocation.
+	defer func() {
+		if err := unlockRuntime(); err != nil {
+			returnErr = errors.Join(returnErr, failure("release runtime lock", err))
+		}
+	}()
 	previousVersion := i.currentInstalledVersion(ctx)
 	b, err := i.createBackup()
 	if err != nil {
@@ -108,16 +122,19 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 		if returnErr == nil || !transactionActive {
 			return
 		}
-		if rollbackErr := i.restoreBackup(b, private, timer, automaticUnits, options.LockWait); rollbackErr != nil {
+		if rollbackErr := i.restoreBackup(b, private, timer, automaticUnits); rollbackErr != nil {
 			returnErr = &ExitError{
 				Code: 1,
 				Op:   "installation failed and rollback was incomplete",
-				Err:  fmt.Errorf("original error: %v; rollback error: %w", returnErr, rollbackErr),
+				Err: errors.Join(
+					fmt.Errorf("original error: %w", returnErr),
+					fmt.Errorf("rollback error: %w", rollbackErr),
+				),
 			}
 		}
 	}()
 
-	if err := i.quiesceExisting(ctx, plan.upgrade, options.LockWait); err != nil {
+	if err := i.quiesceExisting(ctx, plan.upgrade); err != nil {
 		return Result{}, err
 	}
 	if plan.backend == "apt" {
@@ -295,7 +312,7 @@ func (i *Installer) activateAndVerify(ctx context.Context, plan installPlan, opt
 		}
 	}
 	enablement := i.runner.Run(ctx, Command{Name: "systemctl", Args: []string{"is-enabled", automaticTimer}, Timeout: 30 * time.Second})
-	if enablement.Err != nil || enablement.Code != 0 {
+	if commandResultIncomplete(enablement) || enablement.Err != nil || enablement.Code != 0 {
 		return nil, nil, failure("verify automatic-update timer", commandResultError(enablement))
 	}
 	state := strings.TrimSpace(string(enablement.Stdout))
@@ -320,6 +337,7 @@ func (i *Installer) activateAndVerify(ctx context.Context, plan installPlan, opt
 	if options.SendTest {
 		result := i.runner.Run(ctx, Command{
 			Name: BinaryPath, Args: []string{"--test-ok", "--no-dedupe", "--wait-lock", lockSeconds(options.LockWait)}, Timeout: options.LockWait + 30*time.Second,
+			Env: map[string]string{"SECURITY_UPDATE_NOTIFY_LOCK_FILE": InstallCheckLockPath},
 		})
 		postInstallTest = &result
 	}
@@ -333,9 +351,10 @@ func (i *Installer) activateAndVerify(ctx context.Context, plan installPlan, opt
 	if !options.SkipPostInstallCheck {
 		result := i.runner.Run(ctx, Command{
 			Name: BinaryPath, Args: []string{"--doctor", "--skip-notify", "--lang", plan.values["NOTIFY_LANG"]}, Timeout: 2 * time.Minute,
+			Env: map[string]string{"SECURITY_UPDATE_NOTIFY_LOCK_FILE": InstallCheckLockPath},
 		})
 		postInstallDoctor = &result
-		if plan.profile.Inferred && (result.Err != nil || result.Code != 0) {
+		if plan.profile.Inferred && (commandResultIncomplete(result) || result.Err != nil || result.Code != 0) {
 			return postInstallTest, postInstallDoctor, failure("verify inferred derivative with doctor", commandResultError(result))
 		}
 	}
@@ -349,6 +368,7 @@ func (i *Installer) activateAndVerify(ctx context.Context, plan installPlan, opt
 		_ = i.runner.Run(ctx, Command{
 			Name:    BinaryPath,
 			Args:    []string{"--notify-upgrade-event", "--upgrade-from", previousVersion, "--upgrade-to", newVersion},
+			Env:     map[string]string{"SECURITY_UPDATE_NOTIFY_LOCK_FILE": InstallCheckLockPath},
 			Timeout: 2 * time.Minute,
 		})
 	}
@@ -356,12 +376,27 @@ func (i *Installer) activateAndVerify(ctx context.Context, plan installPlan, opt
 }
 
 func (i *Installer) currentInstalledVersion(ctx context.Context) string {
-	info, err := i.fs.Lstat(BinaryPath)
-	if err != nil || info.Mode()&fs.ModeSymlink != 0 || !info.Mode().IsRegular() {
+	pathInfo, err := i.fs.Lstat(BinaryPath)
+	if err != nil || pathInfo.Mode()&fs.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() {
 		return "none"
 	}
-	result := i.runner.Run(ctx, Command{Name: BinaryPath, Args: []string{"--version"}, Timeout: 15 * time.Second})
-	if result.Err != nil || result.Code != 0 {
+	if err := i.validateInstalledBinaryParent(); err != nil {
+		return "unknown"
+	}
+	file, err := i.fs.OpenFileNoFollow(BinaryPath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return "unknown"
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || filetrust.ValidateRegular(info, int(i.rootOwnerUID), 0o022, true) != nil ||
+		info.Mode().Perm()&0o111 == 0 || info.Size() < 0 || info.Size() > 256<<20 {
+		return "unknown"
+	}
+	result := i.runner.Run(ctx, Command{
+		Name: "env", Args: []string{"/proc/self/fd/3", "--version"}, ExtraFiles: []*os.File{file}, Timeout: 15 * time.Second,
+	})
+	if commandResultIncomplete(result) || result.Err != nil || result.Code != 0 {
 		return "unknown"
 	}
 	fields := strings.Fields(string(result.Stdout))
@@ -369,6 +404,28 @@ func (i *Installer) currentInstalledVersion(ctx context.Context) string {
 		return "unknown"
 	}
 	return fields[1]
+}
+
+func (i *Installer) validateInstalledBinaryParent() error {
+	for _, directory := range []string{"/usr/local", "/usr/local/sbin"} {
+		info, err := i.fs.Lstat(directory)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&fs.ModeSymlink != 0 {
+			if directory == "/usr/local/sbin" {
+				return i.validateLocalSbinAlias(info)
+			}
+			return errors.New("privileged binary parent must be a real directory")
+		}
+		if !info.IsDir() {
+			return errors.New("privileged binary parent must be a real directory")
+		}
+		if err := i.validateTrustedDirectory(directory, info); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func lockSeconds(wait time.Duration) string {

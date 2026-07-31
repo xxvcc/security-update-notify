@@ -8,7 +8,7 @@ set -euo pipefail
   echo "build/rpm-best-effort-test.sh must run only in a disposable container" >&2
   exit 2
 }
-awk '$5 == "/src" && $6 ~ /(^|,)ro(,|$)/ { found = 1 } END { exit !found }' /proc/self/mountinfo || {
+awk '$5 == "/src" { found = 1; if ($6 !~ /(^|,)ro(,|$)/) unsafe = 1 } END { exit !(found && !unsafe) }' /proc/self/mountinfo || {
   echo "build/rpm-best-effort-test.sh requires /src to be mounted read-only" >&2
   exit 2
 }
@@ -156,6 +156,7 @@ if [[ -f /etc/dnf/automatic.conf ]]; then
   : >"$mock_state/vendor-recorded"
 fi
 fixture_path="$fake_bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export SUN_CONTAINER_TEST_COMMAND_PATH="$fake_bin"
 
 PATH="$fixture_path" "$SUN_INSTALL_BINARY" install \
   --allow-best-effort \

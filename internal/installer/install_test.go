@@ -22,10 +22,13 @@ import (
 )
 
 type fakeLocker struct {
-	mu       sync.Mutex
-	busyPath string
-	calls    []string
-	waits    []time.Duration
+	mu           sync.Mutex
+	busyPath     string
+	calls        []string
+	waits        []time.Duration
+	held         map[string]bool
+	unlocks      []string
+	unlockErrors map[string]error
 }
 
 type failMarkerBackupFS struct {
@@ -45,6 +48,24 @@ type failDependencyCaptureFS struct {
 	err    error
 }
 
+type failRemoveFS struct {
+	FileSystem
+	path string
+	err  error
+}
+
+type failBackupCleanupFS struct {
+	FileSystem
+	source    string
+	copyErr   error
+	removeErr error
+}
+
+type replaceLockPathFS struct {
+	FileSystem
+	afterOpen func() error
+}
+
 func (f *failAtomicWriteFS) WriteFileAtomic(name string, data []byte, perm fs.FileMode) error {
 	if name == f.path {
 		return f.err
@@ -52,29 +73,86 @@ func (f *failAtomicWriteFS) WriteFileAtomic(name string, data []byte, perm fs.Fi
 	return f.FileSystem.WriteFileAtomic(name, data, perm)
 }
 
-func (f *failDependencyCaptureFS) CopyRegularFileAtomic(source, destination string, maxBytes int64) error {
+func (f *failDependencyCaptureFS) CopyTrustedRegularFileAtomic(source, destination string, maxBytes int64, ownerUID uint32) error {
 	if source == f.source && strings.HasPrefix(destination, BackupRoot+"/") {
 		return f.err
 	}
-	return f.FileSystem.CopyRegularFileAtomic(source, destination, maxBytes)
+	return f.FileSystem.CopyTrustedRegularFileAtomic(source, destination, maxBytes, ownerUID)
 }
 
-func (f *failMarkerBackupFS) CopyRegularFileAtomic(source, destination string, maxBytes int64) error {
+func (f *failMarkerBackupFS) CopyTrustedRegularFileAtomic(source, destination string, maxBytes int64, ownerUID uint32) error {
 	if f.enabled && source == aptAbsentMarkerPath && strings.HasPrefix(destination, BackupRoot+"/") {
 		return errors.New("forced marker backup failure")
 	}
-	return f.FileSystem.CopyRegularFileAtomic(source, destination, maxBytes)
+	return f.FileSystem.CopyTrustedRegularFileAtomic(source, destination, maxBytes, ownerUID)
+}
+
+func (f *failRemoveFS) Remove(name string) error {
+	if name == f.path {
+		return f.err
+	}
+	return f.FileSystem.Remove(name)
+}
+
+func (f *failBackupCleanupFS) CopyTrustedRegularFileAtomic(source, destination string, maxBytes int64, ownerUID uint32) error {
+	if source == f.source && strings.HasPrefix(destination, BackupRoot+"/") {
+		return f.copyErr
+	}
+	return f.FileSystem.CopyTrustedRegularFileAtomic(source, destination, maxBytes, ownerUID)
+}
+
+func (f *failBackupCleanupFS) RemoveAll(name string) error {
+	if strings.HasPrefix(name, BackupRoot+"/") {
+		return f.removeErr
+	}
+	return f.FileSystem.RemoveAll(name)
+}
+
+func (f *replaceLockPathFS) OpenFileNoFollow(name string, flag int, mode fs.FileMode) (*os.File, error) {
+	file, err := f.FileSystem.OpenFileNoFollow(name, flag, mode)
+	if err != nil || f.afterOpen == nil {
+		return file, err
+	}
+	followErr := f.afterOpen()
+	f.afterOpen = nil
+	if followErr != nil {
+		_ = file.Close()
+		return nil, followErr
+	}
+	return file, nil
 }
 
 func (l *fakeLocker) Acquire(_ context.Context, lockPath string, wait time.Duration) (UnlockFunc, error) {
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.calls = append(l.calls, lockPath)
 	l.waits = append(l.waits, wait)
-	l.mu.Unlock()
 	if lockPath == l.busyPath {
 		return nil, ErrLockBusy
 	}
-	return func() error { return nil }, nil
+	if l.held == nil {
+		l.held = make(map[string]bool)
+	}
+	if l.held[lockPath] {
+		return nil, ErrLockBusy
+	}
+	l.held[lockPath] = true
+	return func() error {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		if !l.held[lockPath] {
+			return errors.New("fake lock released more than once")
+		}
+		delete(l.held, lockPath)
+		l.unlocks = append(l.unlocks, lockPath)
+		return l.unlockErrors[lockPath]
+	}, nil
+}
+
+func (l *fakeLocker) isHeld(lockPath string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.held[lockPath]
 }
 
 func TestExplicitZeroRuntimeLockWaitIsPreserved(t *testing.T) {
@@ -102,10 +180,14 @@ type fakeRunner struct {
 	fs                      *RootFS
 	mu                      sync.Mutex
 	commands                []string
+	invocations             []Command
+	runtimeLockHeld         []bool
+	locker                  *fakeLocker
 	missingPackages         map[string]bool
 	dpkgStatuses            map[string]string
 	missingCommands         map[string]bool
 	systemdCreds            bool
+	systemdDecryptHook      func(Command) CommandResult
 	timerActive             bool
 	enabledUnits            map[string]bool
 	unitEnablements         map[string]string
@@ -118,9 +200,13 @@ type fakeRunner struct {
 	doctorResult            CommandResult
 	testResult              CommandResult
 	failedCommands          map[string]CommandResult
+	lookPathHook            func(string) bool
 }
 
 func (r *fakeRunner) LookPath(name string) bool {
+	if r.lookPathHook != nil {
+		return r.lookPathHook(name)
+	}
 	if name == "systemd-creds" {
 		return r.systemdCreds
 	}
@@ -129,8 +215,15 @@ func (r *fakeRunner) LookPath(name string) bool {
 
 func (r *fakeRunner) Run(_ context.Context, command Command) CommandResult {
 	commandLine := command.Name + " " + strings.Join(command.Args, " ")
+	invocation := command
+	invocation.Args = append([]string(nil), command.Args...)
+	invocation.Stdin = append([]byte(nil), command.Stdin...)
+	invocation.Env = cloneConfig(command.Env)
+	runtimeHeld := r.locker != nil && r.locker.isHeld(RuntimeLockPath)
 	r.mu.Lock()
 	r.commands = append(r.commands, commandLine)
+	r.invocations = append(r.invocations, invocation)
+	r.runtimeLockHeld = append(r.runtimeLockHeld, runtimeHeld)
 	r.mu.Unlock()
 	if result, failed := r.failedCommands[commandLine]; failed {
 		delete(r.failedCommands, commandLine)
@@ -200,7 +293,24 @@ func (r *fakeRunner) Run(_ context.Context, command Command) CommandResult {
 			result.Stdout = append([]byte("encrypted:"), command.Stdin...)
 		}
 		if len(command.Args) > 0 && command.Args[0] == "decrypt" {
+			if r.systemdDecryptHook != nil {
+				return r.systemdDecryptHook(command)
+			}
 			result.Stdout = []byte("existing-secret")
+		}
+		return result
+	case "env":
+		if len(command.Args) == 2 && command.Args[0] == "/proc/self/fd/3" && command.Args[1] == "--version" {
+			if len(command.ExtraFiles) != 1 {
+				return CommandResult{Err: fmt.Errorf("version extra files = %d", len(command.ExtraFiles))}
+			}
+			data := make([]byte, len("old-runtime"))
+			n, _ := command.ExtraFiles[0].ReadAt(data, 0)
+			version := "3.0.0"
+			if bytes.Equal(data[:n], []byte("old-runtime")) {
+				version = "2.3.0"
+			}
+			return CommandResult{Stdout: []byte("security-update-notify " + version + "\n")}
 		}
 		return result
 	case BinaryPath:
@@ -407,6 +517,7 @@ func setupInstaller(t *testing.T, release string) (*Installer, *RootFS, *fakeRun
 		fs: root, missingPackages: map[string]bool{}, dpkgStatuses: map[string]string{}, missingCommands: map[string]bool{"dnf5": true}, enabledUnits: map[string]bool{}, unitEnablements: map[string]string{}, activeUnits: map[string]bool{}, failedCommands: map[string]CommandResult{},
 	}
 	locker := &fakeLocker{}
+	runner.locker = locker
 	installer, err := New(Dependencies{
 		FS: root, Runner: runner, Locker: locker, EffectiveUID: func() int { return 0 },
 		RootOwnerUID: uint32(os.Geteuid()),
@@ -455,8 +566,11 @@ func TestFreshAPTInstall(t *testing.T) {
 	if !existsNoErr(root, PersistentTimerLink) || !runner.timerActive {
 		t.Fatal("project timer was not enabled and started")
 	}
-	if len(locker.calls) != 1 || locker.calls[0] != InstallLockPath {
-		t.Fatalf("fresh install unexpectedly crossed runtime lock: %v", locker.calls)
+	if !reflect.DeepEqual(locker.calls, []string{InstallLockPath, RuntimeLockPath}) {
+		t.Fatalf("fresh install lock sequence = %v", locker.calls)
+	}
+	if locker.isHeld(InstallLockPath) || locker.isHeld(RuntimeLockPath) {
+		t.Fatal("successful install leaked a transaction lock")
 	}
 	if result.BackupDir == "" || !existsNoErr(root, result.BackupDir+"/manifest") {
 		t.Fatalf("backup was not created: %+v", result)
@@ -491,8 +605,119 @@ func TestInstallSupportsFedoraStandardLocalSbinAlias(t *testing.T) {
 	}
 }
 
+func TestManagedDirectoryMustBeRootOwnedBeforePermissionsChange(t *testing.T) {
+	installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	const directory = "/etc/security-update-notify"
+	if err := root.MkdirAll(directory, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Chmod(directory, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	installer.rootOwnerUID = uint32(os.Geteuid() + 1)
+
+	err := installer.ensureManagedDir(directory, 0o750)
+	if err == nil || !strings.Contains(err.Error(), "must be owned by root") {
+		t.Fatalf("non-root-owned managed directory error = %v", err)
+	}
+	info, statErr := root.Lstat(directory)
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	if got := info.Mode().Perm(); got != 0o777 {
+		t.Fatalf("mode changed before owner validation: %04o", got)
+	}
+}
+
+func TestNewManagedDirectoryOwnerIsVerified(t *testing.T) {
+	installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	installer.rootOwnerUID = uint32(os.Geteuid() + 1)
+
+	err := installer.ensureManagedDir("/var/lib/security-update-notify", 0o750)
+	if err == nil || !strings.Contains(err.Error(), "must be owned by root") {
+		t.Fatalf("new managed directory owner error = %v", err)
+	}
+	if _, statErr := root.Lstat("/var/lib/security-update-notify"); statErr != nil {
+		t.Fatalf("directory was not created before post-create validation: %v", statErr)
+	}
+}
+
+func TestPrivilegedDirectoriesRejectUnsafePermissionsBeforeChmod(t *testing.T) {
+	installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	for _, test := range []struct {
+		name      string
+		directory string
+		managed   bool
+	}{
+		{name: "managed service drop-in", directory: "/etc/systemd/system/security-update-notify.service.d", managed: true},
+		{name: "shared install parent", directory: "/var/log"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := root.MkdirAll(test.directory, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := root.Chmod(test.directory, 0o777); err != nil {
+				t.Fatal(err)
+			}
+			planted := path.Join(test.directory, "attacker.conf")
+			write(t, root, planted, "untrusted", 0o644)
+
+			var err error
+			if test.managed {
+				err = installer.ensureManagedDir(test.directory, 0o755)
+			} else {
+				err = installer.ensureDir(test.directory, 0o755)
+			}
+			if err == nil || !strings.Contains(err.Error(), "must not be writable by group or other users") {
+				t.Fatalf("unsafe directory error = %v", err)
+			}
+			info, statErr := root.Lstat(test.directory)
+			if statErr != nil {
+				t.Fatal(statErr)
+			}
+			if info.Mode().Perm() != 0o777 || readFile(t, root, planted) != "untrusted" {
+				t.Fatal("unsafe directory was modified before trust validation")
+			}
+		})
+	}
+}
+
+func TestSystemdRuntimeDirectoryMustBeTrusted(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*Installer, *RootFS) error
+	}{
+		{
+			name: "group-writable",
+			mutate: func(_ *Installer, root *RootFS) error {
+				return root.Chmod("/run/systemd/system", 0o777)
+			},
+		},
+		{
+			name: "wrong-owner",
+			mutate: func(installer *Installer, _ *RootFS) error {
+				installer.rootOwnerUID = uint32(os.Geteuid() + 1)
+				return nil
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+			if err := test.mutate(installer, root); err != nil {
+				t.Fatal(err)
+			}
+			if err := installer.requireSystemd(); err == nil {
+				t.Fatal("unsafe systemd runtime directory was accepted")
+			}
+			if _, err := root.Lstat(BackupRoot); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("systemd trust failure created installation state: %v", err)
+			}
+		})
+	}
+}
+
 func TestPostInstallDoctorFailureIsAdvisoryAndReturned(t *testing.T) {
-	installer, root, runner, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\nPRETTY_NAME=Debian 13\n")
+	installer, root, runner, locker := setupInstaller(t, "ID=debian\nVERSION_ID=13\nPRETTY_NAME=Debian 13\n")
 	runner.doctorResult = CommandResult{
 		Stdout: []byte("FAIL low disk\n"),
 		Stderr: []byte("doctor detail\n"),
@@ -518,10 +743,15 @@ func TestPostInstallDoctorFailureIsAdvisoryAndReturned(t *testing.T) {
 	if !existsNoErr(root, PersistentTimerLink) || !runner.timerActive {
 		t.Fatal("advisory doctor failure rolled back or disabled the project timer")
 	}
+	assertRuntimeInvocationLock(t, runner, "--doctor")
+	assertIndependentRuntimeLock(t, runner, "--doctor")
+	if locker.isHeld(RuntimeLockPath) {
+		t.Fatal("successful install leaked the runtime lock")
+	}
 }
 
 func TestInferredDerivativeDoctorFailureRollsBack(t *testing.T) {
-	installer, root, runner, _ := setupInstaller(t, "ID=custom-apt\nVERSION_ID=1\nID_LIKE=debian\nPRETTY_NAME='Custom apt derivative'\n")
+	installer, root, runner, locker := setupInstaller(t, "ID=custom-apt\nVERSION_ID=1\nID_LIKE=debian\nPRETTY_NAME='Custom apt derivative'\n")
 	runner.doctorResult = CommandResult{Code: 1, Stderr: []byte("repository gate failed\n")}
 	options := telegramOptions()
 	options.AllowBestEffort = true
@@ -532,6 +762,55 @@ func TestInferredDerivativeDoctorFailureRollsBack(t *testing.T) {
 	}
 	if existsNoErr(root, BinaryPath) || runner.timerActive {
 		t.Fatal("inferred derivative survived a failed mandatory doctor gate")
+	}
+	if !reflect.DeepEqual(locker.calls, []string{InstallLockPath, RuntimeLockPath}) {
+		t.Fatalf("rollback reacquired or skipped a transaction lock: %v", locker.calls)
+	}
+	assertRuntimeInvocationLock(t, runner, "--doctor")
+	assertRuntimeInvocationLock(t, runner, "disable")
+	if locker.isHeld(RuntimeLockPath) {
+		t.Fatal("failed install leaked the runtime lock")
+	}
+}
+
+func TestContendedRuntimeLockAbortsBeforeBackupOrMutation(t *testing.T) {
+	installer, root, runner, locker := setupInstaller(t, "ID=debian\nVERSION_ID=13\nPRETTY_NAME='Debian 13'\n")
+	locker.busyPath = RuntimeLockPath
+	options := telegramOptions()
+
+	_, err := installer.Install(context.Background(), options)
+	if ExitCode(err) != 75 || !strings.Contains(err.Error(), "timed out waiting") {
+		t.Fatalf("runtime contention exit=%d error=%v", ExitCode(err), err)
+	}
+	if existsNoErr(root, BackupRoot) || existsNoErr(root, BinaryPath) || runner.timerActive {
+		t.Fatal("runtime contention crossed the transaction mutation boundary")
+	}
+	if !reflect.DeepEqual(locker.calls, []string{InstallLockPath, RuntimeLockPath}) {
+		t.Fatalf("runtime contention lock sequence = %v", locker.calls)
+	}
+}
+
+func TestInstallJoinsPrimaryAndBothUnlockErrors(t *testing.T) {
+	installer, _, runner, locker := setupInstaller(t, "ID=debian\nVERSION_ID=13\nPRETTY_NAME='Debian 13'\n")
+	primaryErr := errors.New("forced daemon reload failure")
+	runtimeUnlockErr := errors.New("forced runtime unlock failure")
+	installUnlockErr := errors.New("forced installer unlock failure")
+	runner.failedCommands["systemctl daemon-reload"] = CommandResult{Err: primaryErr}
+	locker.unlockErrors = map[string]error{
+		RuntimeLockPath: runtimeUnlockErr,
+		InstallLockPath: installUnlockErr,
+	}
+	options := telegramOptions()
+	options.SkipPostInstallCheck = true
+
+	_, err := installer.Install(context.Background(), options)
+	for _, want := range []error{primaryErr, runtimeUnlockErr, installUnlockErr} {
+		if !errors.Is(err, want) {
+			t.Fatalf("Install() error %v does not include %v", err, want)
+		}
+	}
+	if !reflect.DeepEqual(locker.unlocks, []string{RuntimeLockPath, InstallLockPath}) {
+		t.Fatalf("unlock order = %v", locker.unlocks)
 	}
 }
 
@@ -560,6 +839,87 @@ func TestExplicitPostInstallTestFailureIsAdvisoryAndReturned(t *testing.T) {
 	}
 	if !existsNoErr(root, PersistentTimerLink) || !runner.timerActive {
 		t.Fatal("advisory test failure rolled back or disabled the project timer")
+	}
+	assertRuntimeInvocationLock(t, runner, "--test-ok")
+	assertIndependentRuntimeLock(t, runner, "--test-ok")
+}
+
+func TestUpgradeNotificationUsesIndependentLock(t *testing.T) {
+	installer, root, runner, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\nPRETTY_NAME=Debian 13\n")
+	values := cloneConfig(configDefaults)
+	values["NOTIFY_CHANNELS"] = "telegram"
+	values["TELEGRAM_BOT_TOKEN"] = "123456:old_token"
+	values["TELEGRAM_CHAT_ID"] = "-100"
+	values["NOTIFY_UPGRADE"] = "1"
+	values["BACKEND"] = "apt"
+	writeConfig(t, root, values)
+	write(t, root, BinaryPath, "old-runtime", 0o755)
+
+	result, err := installer.Install(context.Background(), telegramOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.PreviousVersion != "2.3.0" {
+		t.Fatalf("PreviousVersion = %q, want descriptor-bound old version", result.PreviousVersion)
+	}
+	versionCalls := 0
+	for index, invocation := range runner.invocations {
+		if invocation.Name != "env" || !reflect.DeepEqual(invocation.Args, []string{"/proc/self/fd/3", "--version"}) {
+			continue
+		}
+		versionCalls++
+		if len(invocation.ExtraFiles) != 1 || !runner.runtimeLockHeld[index] {
+			t.Fatalf("version invocation was not descriptor-bound under runtime lock: %+v", invocation)
+		}
+	}
+	if versionCalls != 2 {
+		t.Fatalf("version calls = %d, want old and new descriptor-bound probes", versionCalls)
+	}
+	assertRuntimeInvocationLock(t, runner, "--notify-upgrade-event")
+	assertIndependentRuntimeLock(t, runner, "--notify-upgrade-event")
+}
+
+func TestCurrentInstalledVersionRejectsUnsafeRuntimeMetadata(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(*testing.T, *RootFS)
+	}{
+		{name: "group writable", prepare: func(t *testing.T, root *RootFS) {
+			if err := root.Chmod(BinaryPath, 0o775); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "hard linked", prepare: func(t *testing.T, root *RootFS) {
+			if err := os.Link(filepath.Join(root.Root, strings.TrimPrefix(BinaryPath, "/")), filepath.Join(root.Root, "runtime-alias")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	if os.Geteuid() == 0 {
+		tests = append(tests, struct {
+			name    string
+			prepare func(*testing.T, *RootFS)
+		}{name: "wrong owner", prepare: func(t *testing.T, root *RootFS) {
+			if err := os.Chown(filepath.Join(root.Root, strings.TrimPrefix(BinaryPath, "/")), 1, 1); err != nil {
+				t.Fatal(err)
+			}
+		}})
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			installer, root, runner, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+			write(t, root, BinaryPath, "old-runtime", 0o755)
+			test.prepare(t, root)
+
+			if got := installer.currentInstalledVersion(context.Background()); got != "unknown" {
+				t.Fatalf("currentInstalledVersion = %q, want unknown", got)
+			}
+			for _, invocation := range runner.invocations {
+				if invocation.Name == "env" {
+					t.Fatalf("unsafe runtime was executed: %+v", invocation)
+				}
+			}
+		})
 	}
 }
 
@@ -904,6 +1264,14 @@ func TestSnapshotAutomaticUnitRejectsInconsistentSystemctlResults(t *testing.T) 
 		{
 			name: "activity exit mismatch", command: "systemctl is-active dnf5-automatic.timer",
 			result: CommandResult{Stdout: []byte("active\n"), Code: 3},
+		},
+		{
+			name: "enablement truncated", command: "systemctl is-enabled dnf5-automatic.timer",
+			result: CommandResult{Stdout: []byte("enabled\n"), StdoutTruncated: true},
+		},
+		{
+			name: "activity truncated", command: "systemctl is-active dnf5-automatic.timer",
+			result: CommandResult{Stdout: []byte("active\n"), StderrTruncated: true},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -1351,6 +1719,36 @@ func slicesContain(values []string, want string) bool {
 	return false
 }
 
+func assertRuntimeInvocationLock(t *testing.T, runner *fakeRunner, operation string) {
+	t.Helper()
+	found := false
+	for index, invocation := range runner.invocations {
+		if len(invocation.Args) == 0 || invocation.Args[0] != operation {
+			continue
+		}
+		found = true
+		if !runner.runtimeLockHeld[index] {
+			t.Fatalf("%s ran without the transaction runtime lock: %+v", operation, invocation)
+		}
+	}
+	if !found {
+		t.Fatalf("did not observe command operation %q", operation)
+	}
+}
+
+func assertIndependentRuntimeLock(t *testing.T, runner *fakeRunner, operation string) {
+	t.Helper()
+	for _, invocation := range runner.invocations {
+		if invocation.Name == BinaryPath && len(invocation.Args) > 0 && invocation.Args[0] == operation {
+			if got := invocation.Env["SECURITY_UPDATE_NOTIFY_LOCK_FILE"]; got != InstallCheckLockPath {
+				t.Fatalf("%s lock override = %q, want %q", operation, got, InstallCheckLockPath)
+			}
+			return
+		}
+	}
+	t.Fatalf("did not observe runtime operation %q", operation)
+}
+
 func TestDNFDependencyInstallFallsBackToMicrodnf(t *testing.T) {
 	installer, root, runner, _ := setupInstaller(t, "ID=rocky\nVERSION_ID=9.6\nPRETTY_NAME='Rocky Linux 9.6'\n")
 	write(t, root, dnfAutomaticPath, "[commands]\nupgrade_type = default\napply_updates = no\n", 0o644)
@@ -1462,13 +1860,179 @@ func TestUpgradeFailureRollsBackAfterDependencyMutation(t *testing.T) {
 	if !existsNoErr(root, PersistentTimerLink) || !runner.timerActive {
 		t.Fatal("old timer enablement/activity was not restored")
 	}
-	if len(locker.calls) < 3 || locker.calls[0] != InstallLockPath || locker.calls[1] != RuntimeLockPath || locker.calls[2] != RuntimeLockPath {
+	if !reflect.DeepEqual(locker.calls, []string{InstallLockPath, RuntimeLockPath}) {
 		t.Fatalf("unexpected transaction lock sequence: %v", locker.calls)
+	}
+	assertRuntimeInvocationLock(t, runner, "list-timers")
+	assertRuntimeInvocationLock(t, runner, "disable")
+	if locker.isHeld(RuntimeLockPath) {
+		t.Fatal("rollback leaked the runtime lock")
 	}
 	assertCommandOrder(t, runner.commands,
 		"systemctl disable --now security-update-notify.timer",
 		"dpkg -s apt-listchanges",
 		"apt-get update",
+	)
+}
+
+func TestRollbackContinuesAfterIndependentPathFailure(t *testing.T) {
+	installer, root, runner, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\nPRETTY_NAME='Debian 13'\n")
+	oldValues := cloneConfig(configDefaults)
+	oldValues["NOTIFY_CHANNELS"] = "telegram,feishu"
+	oldValues["TELEGRAM_BOT_TOKEN"] = "123456:old_token"
+	oldValues["TELEGRAM_CHAT_ID"] = "-100"
+	oldValues["FEISHU_APP_ID"] = "cli_old"
+	oldValues["FEISHU_RECEIVE_ID"] = "ou_old"
+	oldValues["BACKEND"] = "apt"
+	writeConfig(t, root, oldValues)
+	oldConfig := readFile(t, root, ConfigPath)
+	write(t, root, BinaryPath, "old-runtime", 0o755)
+	write(t, root, ServicePath, "old-service", 0o644)
+	write(t, root, TimerPath, renderTimer("08:30"), 0o644)
+	write(t, root, FeishuPlainCredentialPath, "old-secret", 0o600)
+	runner.timerActive = true
+
+	removeErr := errors.New("forced binary rollback removal failure")
+	installer.fs = &failRemoveFS{FileSystem: root, path: BinaryPath, err: removeErr}
+	runner.failListTimers = true
+	_, err := installer.Install(context.Background(), Options{
+		Config:       map[string]string{"HOST_LABEL": "changed"},
+		Payload:      Payload{Runtime: []byte("new-runtime")},
+		FeishuSecret: []byte("new-secret"),
+	})
+	if err == nil || !errors.Is(err, removeErr) || !strings.Contains(err.Error(), "rollback was incomplete") ||
+		!strings.Contains(err.Error(), "project timer was not reactivated") {
+		t.Fatalf("Install() error = %v, want joined incomplete rollback error", err)
+	}
+	if got := readFile(t, root, BinaryPath); got != "new-runtime" {
+		t.Fatalf("faulted binary rollback unexpectedly changed runtime: %q", got)
+	}
+	if got := readFile(t, root, ServicePath); got != "old-service" {
+		t.Fatalf("service restoration stopped after binary failure: %q", got)
+	}
+	if got := readFile(t, root, ConfigPath); got != oldConfig {
+		t.Fatalf("config restoration stopped after binary failure:\n%s", got)
+	}
+	if got := readFile(t, root, FeishuPlainCredentialPath); got != "old-secret" {
+		t.Fatalf("credential restoration stopped after binary failure: %q", got)
+	}
+	if runner.timerActive {
+		t.Fatal("project timer was reactivated after an incomplete file rollback")
+	}
+	for _, unit := range []string{"apt-daily.timer", "apt-daily-upgrade.timer", "unattended-upgrades.service"} {
+		if runner.unitEnablement(unit) != "disabled" || runner.activeUnits[unit] {
+			t.Fatalf("automatic unit %s was not contained after incomplete rollback: enablement=%q active=%t",
+				unit, runner.unitEnablement(unit), runner.activeUnits[unit])
+		}
+	}
+}
+
+func TestRollbackContinuesAcrossAutomaticUnitFailures(t *testing.T) {
+	installer, root, runner, _ := setupInstaller(t, "ID=rocky\nVERSION_ID=10.1\n")
+	first := unitSnapshot{name: "dnf-automatic-notifyonly.timer", enablement: "enabled", active: true}
+	second := unitSnapshot{name: "dnf-automatic-download.timer", enablement: "enabled-runtime", active: true}
+	runner.setUnitEnablement(first.name, "disabled")
+	runner.setUnitEnablement(second.name, "disabled")
+	firstErr := errors.New("forced first unit enable failure")
+	runner.failedCommands["systemctl enable "+first.name] = CommandResult{Err: firstErr}
+
+	err := installer.restoreAutomaticUnits([]unitSnapshot{first, second})
+	if !errors.Is(err, firstErr) {
+		t.Fatalf("restoreAutomaticUnits() error = %v, want first unit failure", err)
+	}
+	if got, active := runner.unitEnablement(second.name), runner.activeUnits[second.name]; got != second.enablement || !active {
+		t.Fatalf("second unit restoration stopped after first failure: enablement=%q active=%t", got, active)
+	}
+	assertCommandOrder(t, runner.commands,
+		"systemctl enable "+first.name,
+		"systemctl enable --runtime "+second.name,
+		"systemctl start "+second.name,
+	)
+
+	runner.commands = nil
+	runner.activeUnits[first.name] = true
+	runner.activeUnits[second.name] = true
+	stopErr := errors.New("forced first unit stop failure")
+	runner.failedCommands["systemctl stop "+first.name] = CommandResult{Err: stopErr}
+	err = installer.quiesceAutomaticUnits([]unitSnapshot{first, second})
+	if !errors.Is(err, stopErr) {
+		t.Fatalf("quiesceAutomaticUnits() error = %v, want first unit failure", err)
+	}
+	if !runner.activeUnits[first.name] || runner.activeUnits[second.name] {
+		t.Fatalf("quiesce continuation states: first=%t second=%t", runner.activeUnits[first.name], runner.activeUnits[second.name])
+	}
+	assertCommandOrder(t, runner.commands,
+		"systemctl stop "+first.name,
+		"systemctl stop "+second.name,
+	)
+
+	runner.commands = nil
+	write(t, root, ServicePath, "service", 0o644)
+	timerErr := errors.New("forced project timer disable failure")
+	runner.failedCommands["systemctl disable --now security-update-notify.timer"] = CommandResult{Err: timerErr}
+	err = installer.quiesceForRollback(timerSnapshot{active: true})
+	if !errors.Is(err, timerErr) {
+		t.Fatalf("quiesceForRollback() error = %v, want timer failure", err)
+	}
+	assertCommandOrder(t, runner.commands,
+		"systemctl disable --now security-update-notify.timer",
+		"systemctl stop security-update-notify.service",
+	)
+}
+
+func TestRollbackUsesOneSystemctlAvailabilityDecision(t *testing.T) {
+	installer, _, runner, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	lookups := 0
+	runner.lookPathHook = func(name string) bool {
+		if name != "systemctl" {
+			return true
+		}
+		lookups++
+		return lookups == 1
+	}
+	b := &backup{snapshots: map[string]nodeSnapshot{}}
+	private := map[string]privateSnapshot{
+		FeishuEncryptedCredPath:   {},
+		FeishuPlainCredentialPath: {},
+	}
+
+	if err := installer.restoreBackup(b, private, timerSnapshot{enablement: "not-found"}, nil); err != nil {
+		t.Fatalf("restoreBackup() unexpectedly followed a later LookPath result: %v", err)
+	}
+	if lookups != 1 {
+		t.Fatalf("systemctl availability was probed %d times during rollback, want one", lookups)
+	}
+}
+
+func TestRollbackContainsUnitsAfterPartialAutomaticRestore(t *testing.T) {
+	installer, _, runner, _ := setupInstaller(t, "ID=rocky\nVERSION_ID=10.1\n")
+	first := unitSnapshot{name: "dnf-automatic-notifyonly.timer", enablement: "enabled", active: true}
+	second := unitSnapshot{name: "dnf-automatic-download.timer", enablement: "enabled-runtime", active: true}
+	runner.setUnitEnablement(first.name, "disabled")
+	runner.setUnitEnablement(second.name, "disabled")
+	firstErr := errors.New("forced first unit enable failure")
+	runner.failedCommands["systemctl enable "+first.name] = CommandResult{Err: firstErr}
+	b := &backup{snapshots: map[string]nodeSnapshot{}}
+	private := map[string]privateSnapshot{
+		FeishuEncryptedCredPath:   {},
+		FeishuPlainCredentialPath: {},
+	}
+
+	err := installer.restoreBackup(b, private, timerSnapshot{enablement: "not-found"}, []unitSnapshot{first, second})
+	if !errors.Is(err, firstErr) || !strings.Contains(err.Error(), "project timer was not reactivated") {
+		t.Fatalf("restoreBackup() error = %v, want partial unit failure and containment", err)
+	}
+	for _, unit := range []string{first.name, second.name} {
+		if got, active := runner.unitEnablement(unit), runner.activeUnits[unit]; got != "disabled" || active {
+			t.Fatalf("unit %s escaped incomplete-rollback containment: enablement=%q active=%t", unit, got, active)
+		}
+	}
+	assertCommandOrder(t, runner.commands,
+		"systemctl enable --runtime "+second.name,
+		"systemctl start "+second.name,
+		"systemctl disable --now security-update-notify.timer",
+		"systemctl disable --now "+first.name,
+		"systemctl disable --now "+second.name,
 	)
 }
 
@@ -2146,6 +2710,47 @@ func TestCaptureDependencyDefaultsPreservesAnyManagedPathCreatedAfterSnapshot(t 
 	}
 	if got := readFile(t, root, snapshot.backupPath); got != "package-created default\n" {
 		t.Fatalf("captured managed path = %q", got)
+	}
+}
+
+func TestCreateBackupReportsPrimaryAndCleanupFailures(t *testing.T) {
+	installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	write(t, root, BinaryPath, "runtime", 0o755)
+	copyErr := errors.New("forced backup copy failure")
+	removeErr := errors.New("forced incomplete backup removal failure")
+	installer.fs = &failBackupCleanupFS{
+		FileSystem: root,
+		source:     BinaryPath,
+		copyErr:    copyErr,
+		removeErr:  removeErr,
+	}
+
+	if _, err := installer.createBackup(); err == nil || !errors.Is(err, copyErr) || !errors.Is(err, removeErr) ||
+		!strings.Contains(err.Error(), "remove incomplete backup") {
+		t.Fatalf("createBackup error = %v, want primary and cleanup failures", err)
+	}
+}
+
+func TestPruneBackupsRecoversInterruptedRemovalQuarantine(t *testing.T) {
+	installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	if err := root.MkdirAll(BackupRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	artifact := path.Join(BackupRoot, removalPrefix+strings.Repeat("c", 32))
+	if err := root.MkdirAll(artifact, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write(t, root, path.Join(artifact, "telegram.env"), "token", 0o600)
+	current := path.Join(BackupRoot, "20260731010101")
+	if err := root.Mkdir(current, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := installer.pruneBackups(current); err != nil {
+		t.Fatal(err)
+	}
+	if existsNoErr(root, artifact) {
+		t.Fatal("interrupted backup-removal quarantine survived pruning retry")
 	}
 }
 
@@ -2878,11 +3483,84 @@ func TestSafeSecretFileReaders(t *testing.T) {
 	if _, err := installer.ReadFeishuSecretFile("/wide-secret"); ExitCode(err) != 2 {
 		t.Fatalf("group-readable secret accepted: %v", err)
 	}
+	write(t, root, "/linked-secret", "app-secret", 0o600)
+	if err := os.Link(filepath.Join(root.Root, "linked-secret"), filepath.Join(root.Root, "linked-secret-alias")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := installer.ReadFeishuSecretFile("/linked-secret"); ExitCode(err) != 2 {
+		t.Fatalf("hard-linked secret accepted: %v", err)
+	}
 	if err := root.Symlink("token", "/token-link"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := installer.ReadTelegramTokenFile("/token-link"); ExitCode(err) != 2 {
 		t.Fatalf("symlink token accepted: %v", err)
+	}
+}
+
+func TestLoadFeishuSecretUsesVerifiedDescriptorAfterPathReplacement(t *testing.T) {
+	installer, root, runner, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	write(t, root, FeishuEncryptedCredPath, "encrypted-original", 0o600)
+	runner.systemdCreds = true
+	runner.systemdDecryptHook = func(command Command) CommandResult {
+		if !reflect.DeepEqual(command.Args, []string{"decrypt", "--name=feishu_app_secret", "/proc/self/fd/3", "-"}) {
+			return CommandResult{Err: fmt.Errorf("decrypt args = %v", command.Args)}
+		}
+		if len(command.ExtraFiles) != 1 {
+			return CommandResult{Err: fmt.Errorf("decrypt extra files = %d", len(command.ExtraFiles))}
+		}
+		if err := root.Remove(FeishuEncryptedCredPath); err != nil {
+			return CommandResult{Err: err}
+		}
+		if err := root.WriteFileAtomic(FeishuEncryptedCredPath, []byte("attacker-replacement"), 0o600); err != nil {
+			return CommandResult{Err: err}
+		}
+		buf := make([]byte, len("encrypted-original"))
+		n, err := command.ExtraFiles[0].ReadAt(buf, 0)
+		if err != nil || n != len(buf) || string(buf) != "encrypted-original" {
+			return CommandResult{Err: fmt.Errorf("descriptor content = %q (%d bytes): %v", buf[:n], n, err)}
+		}
+		return CommandResult{Stdout: []byte("descriptor-secret")}
+	}
+
+	secret, err := installer.loadFeishuSecret(context.Background())
+	if err != nil || string(secret) != "descriptor-secret" {
+		t.Fatalf("descriptor-bound secret = %q, err=%v", secret, err)
+	}
+	if got := readFile(t, root, FeishuEncryptedCredPath); got != "attacker-replacement" {
+		t.Fatalf("replacement fixture = %q", got)
+	}
+}
+
+func TestStoredFeishuCredentialRejectsUnsafeMetadata(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		mode  fs.FileMode
+		setup func(*testing.T, *Installer, *RootFS)
+	}{
+		{name: "group-readable", mode: 0o640},
+		{name: "wrong-owner", mode: 0o600, setup: func(_ *testing.T, installer *Installer, _ *RootFS) {
+			installer.rootOwnerUID = uint32(os.Geteuid() + 1)
+		}},
+		{name: "hard-linked", mode: 0o600, setup: func(t *testing.T, _ *Installer, root *RootFS) {
+			if err := os.Link(
+				filepath.Join(root.Root, strings.TrimPrefix(FeishuPlainCredentialPath, "/")),
+				filepath.Join(root.Root, "credential-alias"),
+			); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+			write(t, root, FeishuPlainCredentialPath, "stored-secret", test.mode)
+			if test.setup != nil {
+				test.setup(t, installer, root)
+			}
+			if _, err := installer.loadFeishuSecret(context.Background()); err == nil {
+				t.Fatal("unsafe stored credential was accepted")
+			}
+		})
 	}
 }
 
@@ -2896,6 +3574,31 @@ func TestSetINI(t *testing.T) {
 	}
 	if !strings.Contains(text, "[emitters]\nemit_via = stdio\n") {
 		t.Fatalf("missing section not appended:\n%s", text)
+	}
+}
+
+// setINI and parseStrictINI run as a pair over the same file, so they must agree on which header
+// names a section. A padded "[ commands ]" that only parseStrictINI matched used to make setINI
+// append a second "[commands]", and the managed config then failed its own duplicate-section
+// validation, aborting the install on any host with that vendor shape.
+func TestSetINIMatchesPaddedSectionHeader(t *testing.T) {
+	data := []byte("[ commands ]\nupgrade_type = default\napply_updates = no\n")
+	for _, setting := range [][3]string{
+		{"commands", "upgrade_type", "security"},
+		{"commands", "apply_updates", "yes"},
+	} {
+		data = setINI(data, setting[0], setting[1], setting[2])
+	}
+	text := string(data)
+	if strings.Contains(text, "[commands]") {
+		t.Fatalf("duplicate section appended instead of editing in place:\n%s", text)
+	}
+	values, err := parseStrictINI(data)
+	if err != nil {
+		t.Fatalf("managed config failed validation: %v\n%s", err, text)
+	}
+	if values["commands.upgrade_type"] != "security" || values["commands.apply_updates"] != "yes" {
+		t.Fatalf("policy not applied to the padded section: %v\n%s", values, text)
 	}
 }
 
@@ -3038,10 +3741,43 @@ func TestFileLockerRejectsSymlink(t *testing.T) {
 	if err := root.Symlink("../target", InstallLockPath); err != nil {
 		t.Fatal(err)
 	}
-	locker := FileLocker{FS: root}
+	locker := FileLocker{FS: root, OwnerUID: uint32(os.Geteuid())}
 	if unlock, err := locker.Acquire(context.Background(), InstallLockPath, 0); err == nil {
 		_ = unlock()
 		t.Fatal("symlink lock path was accepted")
+	}
+}
+
+func TestFileLockerRejectsPathReplacedAfterOpen(t *testing.T) {
+	root, err := NewRootFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := root.MkdirAll("/run", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(root.Root, strings.TrimPrefix(InstallLockPath, "/"))
+	heldPath := lockPath + ".held"
+	filesystem := &replaceLockPathFS{FileSystem: root}
+	filesystem.afterOpen = func() error {
+		if err := os.Rename(lockPath, heldPath); err != nil {
+			return err
+		}
+		return os.WriteFile(lockPath, nil, 0o600)
+	}
+	locker := FileLocker{FS: filesystem, OwnerUID: uint32(os.Geteuid())}
+	unlock, err := locker.Acquire(context.Background(), InstallLockPath, 0)
+	if err == nil || !strings.Contains(err.Error(), "lock path changed while acquiring") {
+		if unlock != nil {
+			_ = unlock()
+		}
+		t.Fatalf("replaced lock path was accepted: %v", err)
+	}
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Fatalf("replacement lock path disappeared: %v", err)
+	}
+	if _, err := os.Stat(heldPath); err != nil {
+		t.Fatalf("opened lock inode disappeared: %v", err)
 	}
 }
 

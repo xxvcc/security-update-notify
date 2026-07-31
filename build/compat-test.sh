@@ -7,7 +7,7 @@ set -euo pipefail
   echo "build/compat-test.sh must run only in a disposable container" >&2
   exit 2
 }
-awk '$5 == "/src" && $6 ~ /(^|,)ro(,|$)/ { found = 1 } END { exit !found }' /proc/self/mountinfo || {
+awk '$5 == "/src" { found = 1; if ($6 !~ /(^|,)ro(,|$)/) unsafe = 1 } END { exit !(found && !unsafe) }' /proc/self/mountinfo || {
   echo "build/compat-test.sh requires /src to be mounted read-only" >&2
   exit 2
 }
@@ -25,6 +25,7 @@ export DEBIAN_FRONTEND=noninteractive
 mkdir -p /run/systemd/system /etc/systemd/system /usr/local/sbin \
   /etc/security-update-notify /var/lib/security-update-notify /var/log /etc/logrotate.d \
   /etc/apt/apt.conf.d /tmp/mock-systemd /usr/local/bin
+export SUN_CONTAINER_TEST_COMMAND_PATH=/usr/local/bin
 
 cat >/usr/local/bin/systemctl <<'EOF'
 #!/usr/bin/env bash
@@ -99,7 +100,7 @@ case "${1:-}" in
   daemon-reload)
     ;;
   list-timers)
-    if [[ "${FAIL_LIST_TIMERS:-0}" == 1 ]]; then
+    if [[ "${SUN_FAIL_LIST_TIMERS:-0}" == 1 ]]; then
       echo "forced compatibility list-timers failure" >&2
       exit 1
     fi
@@ -181,7 +182,7 @@ echo "### Failed compatibility upgrade restores legacy APT metadata"
 set +e
 (
   cd "$package_dir"
-  FAIL_LIST_TIMERS=1 ./install.sh --skip-notify-test --non-interactive -y \
+  SUN_FAIL_LIST_TIMERS=1 ./install.sh --skip-notify-test --non-interactive -y \
     --skip-post-install-check --lang en "${best_effort_args[@]}"
 ) >/tmp/sun-compat-failure.out 2>&1
 failure_rc=$?

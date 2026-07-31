@@ -57,13 +57,13 @@ func TestRenderFeishuCardJSON2(t *testing.T) {
 }
 
 func TestRenderFeishuCardTreatsUntrustedInputAsPlainText(t *testing.T) {
-	host := "prod\"\\\r\n<at id=\"all\"></at>&😺\x00" + string([]byte{0xff})
+	host := "prod\"\\\r\n<at id=\"all\"></at>&😺\x00\u202e\u2028" + string([]byte{0xff})
 	b := RenderFeishuCard(Message{Alert: true, Lang: i18n.EN, Host: host})
 	var doc any
 	if err := json.Unmarshal(b, &doc); err != nil {
 		t.Fatal(err)
 	}
-	want := "prod\"\\\n<at id=\"all\"></at>&😺�"
+	want := "prod\"\\\n<at id=\"all\"></at>&😺   �"
 	found := false
 	var walk func(any)
 	walk = func(value any) {
@@ -88,8 +88,10 @@ func TestRenderFeishuCardTreatsUntrustedInputAsPlainText(t *testing.T) {
 	if !found {
 		t.Fatalf("sanitized hostile host %q not found in card", want)
 	}
-	if strings.Contains(string(b), `\u0000`) {
-		t.Fatal("control character was not removed")
+	for _, forbidden := range []string{`\u0000`, `\u202e`, `\u2028`} {
+		if strings.Contains(strings.ToLower(string(b)), forbidden) {
+			t.Fatalf("display control %s was not removed", forbidden)
+		}
 	}
 }
 
@@ -105,6 +107,9 @@ func TestRenderFeishuCardStatusColors(t *testing.T) {
 		{name: "health", message: Message{Alert: true, Lang: i18n.ZH, HealthAttention: true}, template: "red", title: "自动安全更新机制异常"},
 		{name: "patch", message: Message{Alert: true, Lang: i18n.ZH, PatchAttention: true}, template: "red", title: "补丁维护风险"},
 		{name: "release-only", message: Message{Alert: true, Lang: i18n.ZH, UpdateAvailable: true}, template: "blue", title: "SUN 新版本可用"},
+		// An informational self-update notice must not downgrade a restart requirement to a blue card.
+		{name: "reboot-outranks-release", message: Message{Alert: true, Lang: i18n.ZH, RebootRequired: true, UpdateAvailable: true}, template: "orange", title: "主机需要安全维护"},
+		{name: "restart-outranks-release", message: Message{Alert: true, Lang: i18n.ZH, RestartAttention: true, UpdateAvailable: true}, template: "orange", title: "主机需要安全维护"},
 		{name: "eol", message: Message{Alert: true, Lang: i18n.EN, EolAttention: true}, template: "red", title: "Distribution security support ended"},
 	}
 	for _, tt := range tests {

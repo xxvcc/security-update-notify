@@ -23,12 +23,11 @@ func TestCmpNumericStr(t *testing.T) {
 	}
 }
 
-// TestComparePrereleaseMatchesPythonReference 守护与 Bash 内嵌 python cmp_pre 的一致：数字段值相等
-// 即返回相等（0），不再比后续段；且大数不因溢出误判相等。
-func TestComparePrereleaseMatchesPythonReference(t *testing.T) {
-	// ("1","01") 值相等 -> python 立即 return 0（忽略后续 alpha/beta），Go 必须一致
-	if c, err := Compare("1.0.0-1.alpha", "1.0.0-01.beta"); err != nil || c != 0 {
-		t.Errorf("Compare(1.0.0-1.alpha,1.0.0-01.beta) = %d,%v; want 0,nil", c, err)
+// TestComparePrereleaseIsSemVerStrict rejects ambiguous numeric identifiers and still handles
+// arbitrarily large valid identifiers without integer overflow.
+func TestComparePrereleaseIsSemVerStrict(t *testing.T) {
+	if _, err := Compare("1.0.0-1.alpha", "1.0.0-01.beta"); err == nil {
+		t.Error("Compare accepted a numeric prerelease identifier with a leading zero")
 	}
 	// 20 位大数不同 -> 必须区分方向（不因溢出判等）
 	if c, err := Compare("1.0.0-99999999999999999999", "1.0.0-11111111111111111111"); err != nil || c <= 0 {

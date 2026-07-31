@@ -18,6 +18,39 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/i18n"
 )
 
+// http.Client.Timeout bounds the entire exchange including reading the response body, so the release
+// archive must not share the metadata client's ceiling: a ~16 MB archive under a 60 s limit would
+// demand ~2.2 Mbit/s sustained, making --upgrade impossible on a slow link rather than merely slow.
+func TestReleaseDownloadDeadlineFitsTheArchive(t *testing.T) {
+	if releaseDownloadTimeout <= releaseMetadataTimeout {
+		t.Fatalf("archive deadline %v must exceed the metadata deadline %v", releaseDownloadTimeout, releaseMetadataTimeout)
+	}
+	// A 16 MB archive over a modest 256 kbit/s link needs about 8.5 minutes.
+	const archiveBytes = 16 << 20
+	const floorBitsPerSecond = 256 << 10
+	need := time.Duration(archiveBytes*8/floorBitsPerSecond) * time.Second
+	if releaseDownloadTimeout < need {
+		t.Fatalf("archive deadline %v cannot fetch %d bytes at %d bit/s (needs %v)",
+			releaseDownloadTimeout, archiveBytes, floorBitsPerSecond, need)
+	}
+}
+
+func TestUpgradeRejectsMalformedLocalVersionIdentity(t *testing.T) {
+	for _, candidate := range []string{
+		"", "dev", "invalid", "3.1.1\n4.0.0", "3..1",
+		" 3.1.1", "3.1.1 ", "3.1.1\n", strings.Repeat("1", 129),
+	} {
+		if validUpgradeLocalVersion(candidate) {
+			t.Errorf("malformed local version %q was accepted", candidate)
+		}
+	}
+	for _, candidate := range []string{"3.1.1", "3.2.0-rc.1", "4.0.0+build.7"} {
+		if !validUpgradeLocalVersion(candidate) {
+			t.Errorf("valid local version %q was rejected", candidate)
+		}
+	}
+}
+
 func TestReadPackageVersionIsStrict(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "VERSION")
@@ -256,6 +289,45 @@ func TestUpgradeInstallCommandUsesGoInstallerEntrypoint(t *testing.T) {
 		if !found {
 			t.Errorf("expected environment entry missing: %q", item)
 		}
+	}
+}
+
+func TestTrustedPATHEnvironmentReplacesCallerPATH(t *testing.T) {
+	got := trustedPATHEnvironment([]string{
+		"PATH=/hostile/bin", "TERM=xterm", "PATH=/second/hostile",
+		"LD_PRELOAD=/tmp/attacker.so", "SUDO_ASKPASS=/tmp/attacker", "APT_CONFIG=/tmp/apt.conf",
+	})
+	if strings.Join(got, "\n") != "TERM=xterm\nLC_ALL=C\nPATH="+privilegedUpgradePath {
+		t.Fatalf("trusted environment=%q", got)
+	}
+}
+
+func TestSelfUpgradeSudoArgsPreserveWhetherLanguageWasExplicit(t *testing.T) {
+	tests := []struct {
+		name     string
+		disp     i18n.Lang
+		explicit bool
+		want     []string
+	}{
+		{
+			name: "implicit language is resolved again as root",
+			disp: i18n.ZH,
+			want: []string{"/usr/bin/sudo", "/usr/local/sbin/security-update-notify", "--upgrade"},
+		},
+		{
+			name:     "explicit language survives sudo",
+			disp:     i18n.EN,
+			explicit: true,
+			want:     []string{"/usr/bin/sudo", "/usr/local/sbin/security-update-notify", "--upgrade", "--lang", "en"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := selfUpgradeSudoArgs("/usr/bin/sudo", "/usr/local/sbin/security-update-notify", test.disp, test.explicit)
+			if strings.Join(got, "\x00") != strings.Join(test.want, "\x00") {
+				t.Fatalf("sudo args=%q want %q", got, test.want)
+			}
+		})
 	}
 }
 

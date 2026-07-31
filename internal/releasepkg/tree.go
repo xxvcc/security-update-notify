@@ -68,14 +68,11 @@ exec "$runtime" install "$@"
 `
 
 func validateRegularSource(path string) error {
-	info, err := os.Lstat(path)
+	file, _, err := openBoundedRegular(path, 0, true)
 	if err != nil {
 		return err
 	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("must be a regular file, got mode %s", info.Mode())
-	}
-	return nil
+	return file.Close()
 }
 
 func preparePackageTree(root, pkgDir, version string) error {
@@ -101,27 +98,18 @@ func preparePackageTree(root, pkgDir, version string) error {
 			return fmt.Errorf("copy release source %s: %w", spec.Source, err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(pkgDir, "install.sh"), []byte(compatibilityInstallShim), 0o755); err != nil {
+	if err := writeExclusiveRegular(filepath.Join(pkgDir, "install.sh"), []byte(compatibilityInstallShim), 0o755); err != nil {
 		return fmt.Errorf("write 2.x compatibility installer: %w", err)
 	}
-	if err := os.Chmod(filepath.Join(pkgDir, "install.sh"), 0o755); err != nil {
-		return fmt.Errorf("normalize 2.x compatibility installer mode: %w", err)
-	}
 	marker := []byte("VERSION=\"" + version + "\"\n")
-	if err := os.WriteFile(filepath.Join(pkgDir, "files", productName), marker, 0o644); err != nil {
+	if err := writeExclusiveRegular(filepath.Join(pkgDir, "files", productName), marker, 0o644); err != nil {
 		return fmt.Errorf("write 2.x compatibility version marker: %w", err)
-	}
-	if err := os.Chmod(filepath.Join(pkgDir, "files", productName), 0o644); err != nil {
-		return fmt.Errorf("normalize 2.x compatibility marker mode: %w", err)
 	}
 	return nil
 }
 
 func copyRegularFile(source, target string, mode fs.FileMode) error {
-	if err := validateRegularSource(source); err != nil {
-		return err
-	}
-	in, err := os.Open(source)
+	in, sourceInfo, err := openBoundedRegular(source, maxUncompressedSize, true)
 	if err != nil {
 		return err
 	}
@@ -137,13 +125,25 @@ func copyRegularFile(source, target string, mode fs.FileMode) error {
 			_ = os.Remove(target)
 		}
 	}()
-	if _, err := io.Copy(out, io.LimitReader(in, maxUncompressedSize+1)); err != nil {
+	if _, err := io.CopyN(out, in, sourceInfo.Size()); err != nil {
+		return err
+	}
+	var extra [1]byte
+	if count, err := in.Read(extra[:]); count != 0 || !errors.Is(err, io.EOF) {
+		return fmt.Errorf("source changed size while being copied")
+	}
+	after, err := in.Stat()
+	if err != nil || !sameRegularMetadata(sourceInfo, after) {
+		return fmt.Errorf("source changed while being copied")
+	}
+	current, err := os.Lstat(source)
+	if err != nil || !current.Mode().IsRegular() || !os.SameFile(sourceInfo, current) || !sameRegularMetadata(sourceInfo, current) {
+		return fmt.Errorf("source path changed while being copied")
+	}
+	if err := out.Chmod(mode); err != nil {
 		return err
 	}
 	if err := out.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(target, mode); err != nil {
 		return err
 	}
 	ok = true
@@ -220,21 +220,21 @@ func validatePackageTree(pkgDir, version string) error {
 			return fmt.Errorf("validate package tree: missing %q", filepath.ToSlash(path))
 		}
 	}
-	b, err := os.ReadFile(filepath.Join(pkgDir, "VERSION"))
+	b, err := readBoundedRegularPath(filepath.Join(pkgDir, "VERSION"), maxVersionFileSize, true)
 	if err != nil {
 		return fmt.Errorf("read package VERSION: %w", err)
 	}
 	if string(b) != "VERSION=\""+version+"\"\n" {
 		return fmt.Errorf("package VERSION does not match %s", version)
 	}
-	shim, err := os.ReadFile(filepath.Join(pkgDir, "install.sh"))
+	shim, err := readBoundedRegularPath(filepath.Join(pkgDir, "install.sh"), maxUncompressedSize, true)
 	if err != nil {
 		return fmt.Errorf("read 2.x compatibility installer: %w", err)
 	}
 	if string(shim) != compatibilityInstallShim {
 		return errors.New("2.x compatibility installer content mismatch")
 	}
-	marker, err := os.ReadFile(filepath.Join(pkgDir, "files", productName))
+	marker, err := readBoundedRegularPath(filepath.Join(pkgDir, "files", productName), maxVersionFileSize, true)
 	if err != nil {
 		return fmt.Errorf("read 2.x compatibility version marker: %w", err)
 	}

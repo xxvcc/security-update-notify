@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/xxvcc/security-update-notify/internal/assets"
+	"github.com/xxvcc/security-update-notify/internal/commandpath"
 	"github.com/xxvcc/security-update-notify/internal/dist"
 	"github.com/xxvcc/security-update-notify/internal/httpx"
 	"github.com/xxvcc/security-update-notify/internal/i18n"
@@ -28,8 +29,13 @@ var latestVersionRe = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$`)
 
 const (
 	maxUpgradeVersionOutputBytes = 4 << 10
-	privilegedUpgradePath        = "/usr/sbin:/usr/bin:/sbin:/bin"
+	privilegedUpgradePath        = commandpath.TrustedPATH
 	upgradeInstallerTimeout      = time.Hour
+	// http.Client.Timeout bounds the whole exchange including reading the body, so the metadata
+	// ceiling below would force the multi-megabyte release archive to arrive within a minute and
+	// make --upgrade impossible on a slow link. The archive gets its own generous deadline.
+	releaseMetadataTimeout = 60 * time.Second
+	releaseDownloadTimeout = 15 * time.Minute
 )
 
 type releaseELFIdentity struct {
@@ -50,9 +56,16 @@ var releaseELFIdentities = map[string]releaseELFIdentity{
 // 校验 sha256，用内置 pin 指纹强制校验 GPG 签名（解包前，fail-closed），安全解包并做版本/架构绑定，
 // 最后运行已验证包内当前架构的 Go 二进制完成安装。二进制替换发生在安装器子进程的备份/回滚事务里，
 // 本进程作为“存活父进程”等待并透传其退出码——不做 rename-then-exec 自替换，也不依赖 Bash runtime。
-func SelfUpgrade(ver string, disp i18n.Lang) int {
+func SelfUpgrade(ver string, disp i18n.Lang, langExplicit bool) int {
+	// Reject a malformed build identity before privilege escalation or any
+	// release-network access. A valid release version is part of the upgrade
+	// trust binding, not merely display text.
+	if !validUpgradeLocalVersion(ver) {
+		say(os.Stderr, disp, "本地版本数据无效，拒绝升级", "Invalid local version data; refusing to upgrade")
+		return 1
+	}
 	if os.Geteuid() != 0 {
-		sudo, err := exec.LookPath("sudo")
+		sudo, err := commandpath.Resolve("sudo")
 		if err != nil {
 			say(os.Stderr, disp, "升级需要 root 权限", "Root privileges are required to upgrade")
 			return 1
@@ -65,29 +78,30 @@ func SelfUpgrade(ver string, disp i18n.Lang) int {
 		if resolved, err := filepath.EvalSymlinks(self); err == nil {
 			self = resolved
 		}
-		argv := []string{sudo, self, "--upgrade", "--lang", string(disp)}
-		if err := syscall.Exec(sudo, argv, os.Environ()); err != nil {
+		argv := selfUpgradeSudoArgs(sudo, self, disp, langExplicit)
+		if err := syscall.Exec(sudo, argv, trustedPATHEnvironment(os.Environ())); err != nil {
 			say(os.Stderr, disp, "sudo 重新执行失败", "Failed to re-exec via sudo")
 			return 1
 		}
 		return 1 // exec 成功则不会到达
 	}
 
-	client := httpx.New(60 * time.Second)
+	client := httpx.New(releaseMetadataTimeout)
 	latest, err := dist.LatestRelease(client, Repo)
 	if err != nil {
 		say(os.Stderr, disp, "无法获取最新版本", "Failed to fetch latest version")
 		return 1
 	}
-	if !latestVersionRe.MatchString(latest) {
-		say(os.Stderr, disp, "无效的最新版本号: "+latest, "Invalid latest version: "+latest)
+	comparison, err := version.Compare(latest, ver)
+	if err != nil {
+		say(os.Stderr, disp, "版本数据无效，拒绝升级", "Invalid version data; refusing to upgrade")
 		return 1
 	}
-	if latest == ver {
+	if comparison == 0 {
 		say(os.Stdout, disp, "已经是最新版本 "+ver, "Already up to date: "+ver)
 		return 0
 	}
-	if !version.IsNewer(ver, latest) {
+	if comparison < 0 {
 		say(os.Stdout, disp, "本地版本 "+ver+" 高于或等于最新发布 "+latest+"，不自动升级。",
 			"Local version "+ver+" is at or above latest release "+latest+"; not upgrading.")
 		return 0
@@ -113,7 +127,7 @@ func SelfUpgrade(ver string, disp i18n.Lang) int {
 			"Missing gpg and not opted in; refusing to upgrade for safety.")
 		return 1
 	}
-	selectedBase, err := dist.DownloadReleaseSet(client, dist.ReleaseBases(Repo, latest), pkg, tmp, hasGPG)
+	selectedBase, err := dist.DownloadReleaseSet(httpx.New(releaseDownloadTimeout), dist.ReleaseBases(Repo, latest), pkg, tmp, hasGPG)
 	if err != nil {
 		say(os.Stderr, disp, "镜像和 GitHub 均无法提供完整发布包", "Neither the mirror nor GitHub provided a complete release set")
 		return 1
@@ -182,6 +196,30 @@ func SelfUpgrade(ver string, disp i18n.Lang) int {
 	}
 	cancelInstall()
 	return 0
+}
+
+func validUpgradeLocalVersion(ver string) bool {
+	// version.Compare deliberately trims surrounding whitespace for general
+	// comparisons. A compiled-in build identity is a stricter trust input: do
+	// not let terminal controls or an unbounded value survive into privileged
+	// upgrade output and release selection.
+	if ver == "" || len(ver) > 128 || ver != strings.TrimSpace(ver) {
+		return false
+	}
+	_, err := version.Compare(ver, ver)
+	return err == nil
+}
+
+func selfUpgradeSudoArgs(sudo, self string, disp i18n.Lang, langExplicit bool) []string {
+	argv := []string{sudo, self, "--upgrade"}
+	if langExplicit {
+		argv = append(argv, "--lang", string(disp))
+	}
+	return argv
+}
+
+func trustedPATHEnvironment(env []string) []string {
+	return commandpath.SanitizedEnvironmentFrom(env, commandpath.TrustedPATH, nil)
 }
 
 func validateUpgradeArchive(tarPath, pkgdir string) error {
@@ -281,21 +319,22 @@ func validateUpgradeBinaryVersionContext(ctx context.Context, binary, extractDir
 }
 
 func readPackageVersion(path string) (string, error) {
-	info, err := os.Lstat(path)
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return "", errors.New("release is missing root VERSION")
 		}
+		return "", fmt.Errorf("open root VERSION: %w", err)
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
 		return "", fmt.Errorf("inspect root VERSION: %w", err)
 	}
 	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > 256 {
 		return "", errors.New("root VERSION is empty, oversized, or not a regular file")
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return "", fmt.Errorf("open root VERSION: %w", err)
-	}
-	defer f.Close()
 	b, err := io.ReadAll(io.LimitReader(f, 257))
 	if err != nil {
 		return "", fmt.Errorf("read root VERSION: %w", err)
@@ -308,6 +347,9 @@ func readPackageVersion(path string) (string, error) {
 	}
 	value := string(b[len(prefix) : len(b)-len(suffix)])
 	if !latestVersionRe.MatchString(value) || string(b) != prefix+value+suffix {
+		return "", errors.New("root VERSION contains an invalid version")
+	}
+	if _, err := version.Compare(value, value); err != nil {
 		return "", errors.New("root VERSION contains an invalid version")
 	}
 	return value, nil

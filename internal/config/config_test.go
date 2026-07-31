@@ -2,8 +2,12 @@ package config
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // 镜像 ci.yml “Config parser regression check” 的用例（load_config_file 运行时语义）：
@@ -126,5 +130,122 @@ func TestWriteLoadRoundTrip(t *testing.T) {
 		if got := cfg.Get(k); got != w {
 			t.Errorf("round-trip %s=%q want %q", k, got, w)
 		}
+	}
+}
+
+func TestWriteRejectsUnrepresentableValuesBeforeWriting(t *testing.T) {
+	for _, test := range []struct {
+		name, value string
+	}{
+		{name: "newline", value: "trusted\nINCLUDE_PUBLIC_IP='1'"},
+		{name: "carriage return", value: "trusted\rforged"},
+		{name: "NUL", value: "trusted\x00forged"},
+		{name: "conflicting quotes", value: `both'and"`},
+		{name: "oversized", value: strings.Repeat("x", maxConfigValueBytes+1)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			if err := Write(&output, map[string]string{"HOST_LABEL": test.value}); err == nil {
+				t.Fatal("unsafe value was accepted")
+			}
+			if output.Len() != 0 {
+				t.Fatalf("validation failure left partial output: %q", output.Bytes())
+			}
+		})
+	}
+}
+
+func TestLoadRejectsUnsafeOrOversizedFilesWithoutBlocking(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing.env")
+	if cfg, err := Load(missing); err != nil || len(cfg.Map()) != 0 {
+		t.Fatalf("missing config = %#v, %v", cfg, err)
+	}
+
+	target := filepath.Join(dir, "target.env")
+	if err := os.WriteFile(target, []byte("NOTIFY_LANG=en\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.env")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(link); err == nil {
+		t.Fatal("symlinked config was accepted")
+	}
+
+	oversized := filepath.Join(dir, "oversized.env")
+	if err := os.WriteFile(oversized, bytes.Repeat([]byte{'x'}, maxConfigBytes+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(oversized); err == nil {
+		t.Fatal("oversized config was accepted")
+	}
+
+	fifo := filepath.Join(dir, "fifo.env")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := Load(fifo)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("FIFO config was accepted")
+		}
+	case <-time.After(time.Second):
+		writer, err := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if err == nil {
+			_ = writer.Close()
+		}
+		t.Fatal("loading a FIFO blocked")
+	}
+}
+
+func TestLoadRequiresEffectiveOwnerPrivateModeAndSingleLink(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		setup func(*testing.T, string)
+		load  func(string) (*Config, error)
+	}{
+		{
+			name: "group readable",
+			setup: func(t *testing.T, path string) {
+				if err := os.Chmod(path, 0o640); err != nil {
+					t.Fatal(err)
+				}
+			},
+			load: Load,
+		},
+		{
+			name: "hardlinked",
+			setup: func(t *testing.T, path string) {
+				if err := os.Link(path, path+".link"); err != nil {
+					t.Fatal(err)
+				}
+			},
+			load: Load,
+		},
+		{
+			name:  "owner mismatch",
+			setup: func(*testing.T, string) {},
+			load: func(path string) (*Config, error) {
+				return load(path, os.Geteuid()+1)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "telegram.env")
+			if err := os.WriteFile(path, []byte("NOTIFY_LANG=en\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			test.setup(t, path)
+			if _, err := test.load(path); err == nil {
+				t.Fatal("unsafe config metadata was accepted")
+			}
+		})
 	}
 }

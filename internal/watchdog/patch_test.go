@@ -36,6 +36,20 @@ func TestCheckPatchBelowThresholdIsInformational(t *testing.T) {
 	}
 }
 
+func TestCheckPatchSuppressesExactDuplicateIssues(t *testing.T) {
+	issue := Issue{Code: "dnf-blocked-query-failed", ZH: "无法检查阻塞项", EN: "Could not check blocked updates"}
+	p := CheckPatch(PatchInput{Issues: []Issue{issue, issue}})
+	if got := strings.Count(p.TxtZH, issue.ZH); got != 1 {
+		t.Fatalf("duplicate Chinese issue count=%d text=%q", got, p.TxtZH)
+	}
+	if got := strings.Count(p.TxtEN, issue.EN); got != 1 {
+		t.Fatalf("duplicate English issue count=%d text=%q", got, p.TxtEN)
+	}
+	if p.Sig != issue.Code+"," {
+		t.Fatalf("duplicate issue signal=%q", p.Sig)
+	}
+}
+
 func TestMergeSignals(t *testing.T) {
 	if got := MergeSignals("disk,disabled,", "pending-stale,disk,"); got != "disabled,disk,pending-stale," {
 		t.Fatalf("MergeSignals=%q", got)

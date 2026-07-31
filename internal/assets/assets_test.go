@@ -27,6 +27,52 @@ func TestEmbeddedAssetsNonEmpty(t *testing.T) {
 	}
 }
 
+func TestEmbeddedAssetAccessorsReturnIndependentCopies(t *testing.T) {
+	for name, get := range map[string]func() []byte{
+		"pubkey":      ReleaseSigningPublicKey,
+		"service":     SystemdServiceUnit,
+		"needrestart": NeedrestartConf,
+		"logrotate":   LogrotateConf,
+	} {
+		t.Run(name, func(t *testing.T) {
+			first := get()
+			original := bytes.Clone(first)
+			first[0] ^= 0xff
+			fresh := get()
+			isolated := bytes.Equal(fresh, original)
+			// Restore the backing bytes as well if a future regression returns the
+			// package-global slice, so one failure cannot contaminate other tests.
+			copy(first, original)
+			if !isolated {
+				t.Fatal("mutating returned bytes changed the embedded package asset")
+			}
+		})
+	}
+}
+
+func TestEmbeddedServiceDescribesAllRuntimeAlertsAndPinsPATH(t *testing.T) {
+	unit := string(SystemdServiceUnit())
+	for _, want := range []string{
+		"安全补丁维护风险", "重启需求", "SUN 新版本提醒",
+		"security patch maintenance risks", "restart needs", "new SUN releases",
+	} {
+		if !strings.Contains(unit, want) {
+			t.Errorf("embedded service description is missing %q", want)
+		}
+	}
+	const path = "Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin"
+	if strings.Count(unit, path) != 1 {
+		t.Fatalf("embedded service must contain exactly one trusted PATH declaration:\n%s", unit)
+	}
+	rootCopy, err := os.ReadFile("../../files/security-update-notify.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(rootCopy, SystemdServiceUnit()) {
+		t.Fatal("embedded service differs from files/security-update-notify.service")
+	}
+}
+
 func TestEmbeddedServiceHasBoundedStartTimeout(t *testing.T) {
 	const directive = "TimeoutStartSec=15min"
 	unit := string(SystemdServiceUnit())

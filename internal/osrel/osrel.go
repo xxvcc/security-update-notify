@@ -8,13 +8,22 @@ package osrel
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"io"
 	"io/fs"
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/xxvcc/security-update-notify/internal/filetrust"
+)
+
+const (
+	maxOSReleaseBytes        = 4 << 20
+	trustedOSReleaseOwnerUID = 0
 )
 
 // OSRelease 保存运行时/安装器关心的 os-release 字段。
@@ -26,15 +35,39 @@ type OSRelease struct {
 	SupportEnd string
 }
 
-// Read 解析 os-release 文件（缺失返回零值）。只取运行时需要的字段，剥离一层引号，保留 2.x
-// 的兼容解析语义（不做变量展开）。SUPPORT_END 保留原值；SupportEndDate 负责严格日期校验。
+// Read 解析 os-release 文件（缺失或不安全时返回零值）。发行版通常允许 /etc/os-release
+// 指向 /usr/lib/os-release，因此这里跟随最终 symlink，但最终对象必须是 root 所有、不可被
+// group/other 写入的有界普通文件；非阻塞打开避免损坏的 FIFO 或设备文件挂住 timer。硬链接不会
+// 绕过 inode 的所有权或写权限检查，因此不要求唯一链接，以兼容不可变/去重系统镜像。
+// 只取运行时需要的字段且不做变量展开。
 func Read(path string) OSRelease {
-	f, err := os.Open(path)
+	return readTrusted(path, trustedOSReleaseOwnerUID)
+}
+
+func readTrusted(path string, ownerUID int) OSRelease {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return OSRelease{}
 	}
+	f := os.NewFile(uintptr(fd), path)
+	if f == nil {
+		_ = syscall.Close(fd)
+		return OSRelease{}
+	}
 	defer f.Close()
-	o, _ := Parse(f)
+	info, err := f.Stat()
+	if err != nil || filetrust.ValidateRegular(info, ownerUID, 0o022, false) != nil ||
+		info.Size() < 0 || info.Size() > maxOSReleaseBytes {
+		return OSRelease{}
+	}
+	contents, err := io.ReadAll(io.LimitReader(f, maxOSReleaseBytes+1))
+	if err != nil || len(contents) > maxOSReleaseBytes {
+		return OSRelease{}
+	}
+	o, err := Parse(bytes.NewReader(contents))
+	if err != nil {
+		return OSRelease{}
+	}
 	return o
 }
 
@@ -42,16 +75,20 @@ func Read(path string) OSRelease {
 // path does not exist. Permission, I/O, and parse failures are not hidden by a
 // second file with different contents.
 func ReadFirst(primary, fallback string) OSRelease {
+	return readFirstTrusted(primary, fallback, trustedOSReleaseOwnerUID)
+}
+
+func readFirstTrusted(primary, fallback string, ownerUID int) OSRelease {
 	if _, err := os.Lstat(primary); errors.Is(err, fs.ErrNotExist) {
-		return Read(fallback)
+		return readTrusted(fallback, ownerUID)
 	} else if err != nil {
 		return OSRelease{}
 	}
-	return Read(primary)
+	return readTrusted(primary, ownerUID)
 }
 
-// Parse parses os-release data from r and reports scanner errors. Read keeps its historical zero-value/
-// best-effort behavior, while callers that already control file IO can use Parse without duplicating the parser.
+// Parse parses os-release data from r and reports scanner errors. Callers that already control file IO can
+// use Parse without duplicating the parser.
 func Parse(r io.Reader) (OSRelease, error) {
 	var o OSRelease
 	sc := bufio.NewScanner(r)

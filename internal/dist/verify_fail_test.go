@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 )
 
 // gpgHome 在临时 GNUPGHOME 里跑 gpg（loopback pinentry，无 passphrase），返回合并输出。
@@ -129,6 +132,54 @@ func TestVerifyReleaseFailClosed(t *testing.T) {
 	}
 }
 
+func TestVerifyReleaseRejectsExpiredSigningKey(t *testing.T) {
+	if !GPGAvailable() {
+		t.Skip("gpg not available")
+	}
+	dir := t.TempDir()
+	home := filepath.Join(dir, "gpg-home")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := gpgHome(t, home,
+		"--faked-system-time", "20200101T000000",
+		"--quick-generate-key", "expired-key <expired@example.invalid>", "ed25519", "sign", "1d"); err != nil {
+		t.Skipf("cannot generate expiring gpg key: %v: %s", err, out)
+	}
+	fingerprint := fprOf(t, home)
+
+	tarball := filepath.Join(dir, "pkg.tar.gz")
+	const payload = "release payload signed before key expiry"
+	if err := os.WriteFile(tarball, []byte(payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte(payload))
+	checksum := tarball + ".sha256"
+	if err := os.WriteFile(checksum, []byte(hex.EncodeToString(digest[:])+"  pkg.tar.gz\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	signature := tarball + ".asc"
+	if out, err := gpgHome(t, home,
+		"--faked-system-time", "20200101T010000",
+		"--armor", "--detach-sign", "-o", signature, tarball); err != nil {
+		t.Fatalf("sign with expiring key: %v: %s", err, out)
+	}
+	publicKeyBytes, err := gpgArmorExport(t, home, fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicKey := filepath.Join(dir, "public-key.asc")
+	if err := os.WriteFile(publicKey, publicKeyBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// GnuPG 2.2 emits EXPKEYSIG plus VALIDSIG and exits zero here. VALIDSIG
+	// alone is therefore insufficient for a fail-closed release verifier.
+	if err := VerifyRelease(tarball, checksum, signature, publicKey, fingerprint); err == nil {
+		t.Fatal("signature from an expired signing key was accepted")
+	}
+}
+
 func TestTrustedGPGExecutableIgnoresCallerPATH(t *testing.T) {
 	if !GPGAvailable() {
 		t.Skip("gpg not available")
@@ -145,6 +196,191 @@ func TestTrustedGPGExecutableIgnoresCallerPATH(t *testing.T) {
 	}
 	if got == fake || !filepath.IsAbs(got) {
 		t.Fatalf("trusted GPG resolved to %q", got)
+	}
+}
+
+func TestVerifyReleaseBindsHashAndGPGToOpenedTarball(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "verify-started")
+	release := filepath.Join(dir, "continue-verify")
+	captured := filepath.Join(dir, "gpg-artifact")
+	const fingerprint = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	fakeGPG := filepath.Join(dir, "gpg")
+	script := fmt.Sprintf(`#!/bin/sh
+set -eu
+case " $* " in
+  *" --list-keys "*)
+    printf 'pub:::::::::\nfpr:::::::::%s:\n'
+    ;;
+  *" --verify "*)
+    : > %q
+    while [ ! -e %q ]; do /bin/sleep 0.01; done
+    for artifact in "$@"; do :; done
+    /bin/cat "$artifact" > %q
+	printf '[GNUPG:] GOODSIG %s signer\n[GNUPG:] VALIDSIG %s 2026 0 0 0 0 0 0 0 %s\n'
+    ;;
+esac
+`, fingerprint, marker, release, captured, fingerprint, fingerprint, fingerprint)
+	if err := os.WriteFile(fakeGPG, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	previousPaths := trustedGPGPaths
+	trustedGPGPaths = [...]string{fakeGPG, fakeGPG}
+	defer func() { trustedGPGPaths = previousPaths }()
+
+	tarball := filepath.Join(dir, "pkg.tar.gz")
+	const original = "release payload bytes"
+	if err := os.WriteFile(tarball, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(original))
+	shaFile := tarball + ".sha256"
+	if err := os.WriteFile(shaFile, []byte(hex.EncodeToString(sum[:])+"  pkg.tar.gz\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	signature := tarball + ".asc"
+	publicKey := filepath.Join(dir, "release.pub")
+	for _, path := range []string{signature, publicKey} {
+		if err := os.WriteFile(path, []byte("fixture"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- VerifyRelease(tarball, shaFile, signature, publicKey, fingerprint)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fake GPG did not reach verification")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := os.Rename(tarball, tarball+".opened"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tarball, []byte("replacement payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := <-result
+	if err == nil || !strings.Contains(err.Error(), "tarball changed during release verification") {
+		t.Fatalf("path replacement error=%v", err)
+	}
+	got, readErr := os.ReadFile(captured)
+	if readErr != nil || string(got) != original {
+		t.Fatalf("GPG received %q err=%v, want bytes from the hashed inode", got, readErr)
+	}
+}
+
+func TestVerifyReleaseRejectsMultipleValidSignatures(t *testing.T) {
+	dir := t.TempDir()
+	const fingerprint = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	fakeGPG := filepath.Join(dir, "gpg")
+	script := fmt.Sprintf(`#!/bin/sh
+set -eu
+case " $* " in
+  *" --list-keys "*)
+    printf 'pub:::::::::\nfpr:::::::::%s:\n'
+    ;;
+  *" --verify "*)
+    printf '[GNUPG:] VALIDSIG %s 2026 0 0 0 0 0 0 0 %s\n'
+    printf '[GNUPG:] VALIDSIG %s 2026 0 0 0 0 0 0 0 %s\n'
+    ;;
+esac
+`, fingerprint, fingerprint, fingerprint, fingerprint, fingerprint)
+	if err := os.WriteFile(fakeGPG, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	previousPaths := trustedGPGPaths
+	trustedGPGPaths = [...]string{fakeGPG, fakeGPG}
+	defer func() { trustedGPGPaths = previousPaths }()
+
+	tarball := filepath.Join(dir, "pkg.tar.gz")
+	payload := []byte("release payload bytes")
+	if err := os.WriteFile(tarball, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(payload)
+	shaFile := tarball + ".sha256"
+	if err := os.WriteFile(shaFile, []byte(hex.EncodeToString(sum[:])+"  pkg.tar.gz\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	signature := tarball + ".asc"
+	publicKey := filepath.Join(dir, "release.pub")
+	for _, path := range []string{signature, publicKey} {
+		if err := os.WriteFile(path, []byte("fixture"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := VerifyRelease(tarball, shaFile, signature, publicKey, fingerprint); err == nil ||
+		!strings.Contains(err.Error(), "exactly one signature") {
+		t.Fatalf("multiple valid signatures error=%v", err)
+	}
+}
+
+func TestGPGStatusHasPinnedSignatureRequiresUniquePrimaryBinding(t *testing.T) {
+	const primary = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	const subkey = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+	const other = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+	status := func(signing, primaryField string) string {
+		return "[GNUPG:] GOODSIG " + signing + " signer\n" +
+			"[GNUPG:] VALIDSIG " + signing + " 2026 0 0 0 0 0 0 0 " + primaryField + "\n"
+	}
+	disqualified := func(outcome string) string {
+		return "[GNUPG:] " + outcome + " " + primary + " signer\n" +
+			"[GNUPG:] VALIDSIG " + primary + " 2026 0 0 0 0 0 0 0 " + primary + "\n"
+	}
+	for name, test := range map[string]struct {
+		status string
+		want   bool
+	}{
+		"primary-direct":    {status(primary, primary), true},
+		"signing-subkey":    {status(subkey, primary), true},
+		"wrong-key":         {status(other, other), false},
+		"missing":           {"[GNUPG:] GOODSIG ignored\n", false},
+		"multiple":          {status(primary, primary) + status(primary, primary), false},
+		"expired-signature": {disqualified("EXPSIG"), false},
+		"expired-key":       {disqualified("EXPKEYSIG"), false},
+		"revoked-key":       {disqualified("REVKEYSIG"), false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := gpgStatusHasPinnedSignature([]byte(test.status), primary); got != test.want {
+				t.Fatalf("gpgStatusHasPinnedSignature()=%v want %v for %q", got, test.want, test.status)
+			}
+		})
+	}
+}
+
+func TestVerifyReleaseRejectsInvalidPinnedFingerprintBeforeFileAccess(t *testing.T) {
+	for _, fingerprint := range []string{"", "DEADBEEF", strings.Repeat("Z", 40), "\x1b[31m" + strings.Repeat("A", 35)} {
+		if err := VerifyRelease("missing", "missing", "missing", "missing", fingerprint); err == nil ||
+			!strings.Contains(err.Error(), "invalid pinned") {
+			t.Fatalf("fingerprint %q error=%v", fingerprint, err)
+		}
+	}
+}
+
+func TestSummarizeGPGOutputIsTerminalSafeAndValidUTF8(t *testing.T) {
+	prefix := strings.Repeat("界", maxGPGErrorBytes/3)
+	got := summarizeGPGOutput([]byte(prefix + "\nforged\r\x1b[31mred\u202eevil\u2028tail\xff"))
+	if !utf8.ValidString(got) {
+		t.Fatalf("summary is invalid UTF-8: %q", got)
+	}
+	if len(got) > maxGPGErrorBytes {
+		t.Fatalf("summary length=%d want <= %d", len(got), maxGPGErrorBytes)
+	}
+	for _, forbidden := range []string{"\n", "\r", "\x1b", "\u202e", "\u2028"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("summary retained display control %q: %q", forbidden, got)
+		}
 	}
 }
 

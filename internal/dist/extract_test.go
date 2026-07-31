@@ -85,6 +85,75 @@ func TestExtractRejectsSpecialAndTraversal(t *testing.T) {
 	}
 }
 
+func TestExtractRejectsPreexistingSymlinkedDestinationPaths(t *testing.T) {
+	dir := t.TempDir()
+	tgz := filepath.Join(dir, "symlink-parent.tar.gz")
+	writeTarGz(t, tgz, []*tar.Header{
+		{Name: "top/files/payload", Typeflag: tar.TypeReg, Mode: 0o644},
+	}, map[string]string{"top/files/payload": "must stay inside destination"})
+
+	dest := filepath.Join(dir, "out")
+	if err := os.Mkdir(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	external := t.TempDir()
+	if err := os.Symlink(external, filepath.Join(dest, "top")); err != nil {
+		t.Fatal(err)
+	}
+	if err := Extract(tgz, dest); err == nil {
+		t.Fatal("pre-existing symlinked archive parent was followed")
+	}
+	if _, err := os.Lstat(filepath.Join(external, "files")); !os.IsNotExist(err) {
+		t.Fatalf("extraction changed a path outside the destination: %v", err)
+	}
+
+	destLink := filepath.Join(dir, "out-link")
+	if err := os.Symlink(dest, destLink); err != nil {
+		t.Fatal(err)
+	}
+	if err := Extract(tgz, destLink); err == nil {
+		t.Fatal("symlinked extraction destination was accepted")
+	}
+}
+
+func TestExtractRemainsBoundToOpenedDestinationDirectory(t *testing.T) {
+	root := t.TempDir()
+	tgz := filepath.Join(root, "bound.tar.gz")
+	writeTarGz(t, tgz, []*tar.Header{
+		{Name: "top/", Typeflag: tar.TypeDir, Mode: 0o755},
+		{Name: "top/payload", Typeflag: tar.TypeReg, Mode: 0o644},
+	}, map[string]string{"top/payload": "bound to opened directory"})
+	destination := filepath.Join(root, "destination")
+	moved := filepath.Join(root, "opened-destination")
+	external := filepath.Join(root, "external")
+	for _, path := range []string{destination, external} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	directory, err := openRealDirectory(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directory.Close()
+	if err := os.Rename(destination, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, destination); err != nil {
+		t.Fatal(err)
+	}
+	if err := extractIntoDirectory(tgz, directory); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(moved, "top", "payload"))
+	if err != nil || string(got) != "bound to opened directory" {
+		t.Fatalf("opened destination contains %q err=%v", got, err)
+	}
+	if _, err := os.Lstat(filepath.Join(external, "top")); !os.IsNotExist(err) {
+		t.Fatalf("replacement destination received extracted data: %v", err)
+	}
+}
+
 func TestExtractRejectsOutOfRangeModes(t *testing.T) {
 	dir := t.TempDir()
 	for name, mode := range map[string]int64{
@@ -139,6 +208,26 @@ func TestVerifySHA256(t *testing.T) {
 	}
 	if err := VerifySHA256(data, shaFile); err == nil {
 		t.Error("oversized checksum file was accepted")
+	}
+}
+
+func TestVerifySHA256RejectsSymlinkedInputs(t *testing.T) {
+	dir := t.TempDir()
+	realArchive := filepath.Join(dir, "real.tar.gz")
+	if err := os.WriteFile(realArchive, []byte("archive"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(dir, "pkg.tar.gz")
+	if err := os.Symlink(realArchive, archive); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte("archive"))
+	checksum := filepath.Join(dir, "pkg.tar.gz.sha256")
+	if err := os.WriteFile(checksum, []byte(hex.EncodeToString(sum[:])+"  pkg.tar.gz\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifySHA256(archive, checksum); err == nil {
+		t.Fatal("symlinked archive was accepted for checksum verification")
 	}
 }
 

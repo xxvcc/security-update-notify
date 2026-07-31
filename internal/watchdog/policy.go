@@ -20,21 +20,37 @@ func CheckAPTPolicy(dump string, aptDailyEnabled bool) []Issue {
 	if !aptBoolEnabled(lower, "apt::periodic::unattended-upgrade") {
 		issues = append(issues, Issue{"apt-unattended-disabled", "APT 自动安全更新策略未启用", "APT unattended security upgrades are not enabled"})
 	}
-	securityOrigin := false
-	for _, line := range strings.Split(lower, "\n") {
-		if (strings.Contains(line, "unattended-upgrade::origins-pattern") || strings.Contains(line, "unattended-upgrade::allowed-origins")) &&
-			(strings.Contains(line, "security") || strings.Contains(line, "esm")) {
-			securityOrigin = true
-			break
-		}
-	}
-	if !securityOrigin {
+	if !aptSecurityOriginEnabled(lower) {
 		issues = append(issues, Issue{"apt-security-origin-missing", "APT unattended-upgrades 未发现安全更新源策略", "No security origin policy was found for APT unattended-upgrades"})
 	}
 	if aptBoolEnabled(lower, "unattended-upgrade::automatic-reboot") {
 		issues = append(issues, Issue{"apt-auto-reboot-enabled", "APT 被配置为自动重启，偏离 SUN 的人工维护策略", "APT is configured to reboot automatically, contrary to SUN's manual-maintenance policy"})
 	}
 	return issues
+}
+
+func aptSecurityOriginEnabled(dump string) bool {
+	for _, line := range strings.Split(dump, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "unattended-upgrade::origins-pattern", "unattended-upgrade::origins-pattern::",
+			"unattended-upgrade::allowed-origins", "unattended-upgrade::allowed-origins::":
+		default:
+			continue
+		}
+		for _, token := range strings.FieldsFunc(value, func(r rune) bool {
+			return !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'))
+		}) {
+			if token == "security" || token == "esm" || token == "esmapps" || token == "esminfra" ||
+				strings.HasPrefix(token, "ubuntuesm") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func aptBoolEnabled(dump, key string) bool {

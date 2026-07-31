@@ -53,7 +53,7 @@ type privateSnapshot struct {
 	data   []byte
 }
 
-func (i *Installer) createBackup() (*backup, error) {
+func (i *Installer) createBackup() (_ *backup, returnErr error) {
 	if err := i.ensureManagedDir(BackupRoot, 0o700); err != nil {
 		return nil, failure("create backup root", err)
 	}
@@ -80,7 +80,9 @@ func (i *Installer) createBackup() (*backup, error) {
 	complete := false
 	defer func() {
 		if !complete {
-			_ = i.fs.RemoveAll(dir)
+			if err := i.fs.RemoveAll(dir); err != nil {
+				returnErr = errors.Join(returnErr, failure("remove incomplete backup "+dir, err))
+			}
 		}
 	}()
 	b := &backup{
@@ -223,6 +225,12 @@ func (i *Installer) pruneBackups(current string) error {
 	}
 	var directories []string
 	for _, entry := range entries {
+		if isRemovalArtifactName(entry.Name()) {
+			if err := i.fs.RemoveAll(path.Join(BackupRoot, entry.Name())); err != nil {
+				return failure("recover interrupted backup pruning", err)
+			}
+			continue
+		}
 		if entry.Name() == "" || entry.Name()[0] < '0' || entry.Name()[0] > '9' {
 			continue
 		}
@@ -264,6 +272,10 @@ func (i *Installer) copyNode(source, destination string) error {
 		if err != nil {
 			return err
 		}
+		finalInfo, err := i.fs.Lstat(source)
+		if err != nil || !sameRemovalEntry(info, finalInfo) {
+			return errors.Join(errors.New("managed symbolic link changed while copying: "+source), err)
+		}
 		if err := i.fs.Remove(destination); err != nil {
 			return err
 		}
@@ -275,18 +287,24 @@ func (i *Installer) copyNode(source, destination string) error {
 	if info.Size() < 0 || info.Size() > 256<<20 {
 		return fmt.Errorf("managed file exceeds 256 MiB: %s", source)
 	}
-	return i.fs.CopyRegularFileAtomic(source, destination, 256<<20)
+	return i.fs.CopyTrustedRegularFileAtomic(source, destination, 256<<20, i.rootOwnerUID)
 }
 
-func (i *Installer) restoreBackup(b *backup, private map[string]privateSnapshot, timer timerSnapshot, automaticUnits []unitSnapshot, lockWait time.Duration) error {
-	if !i.runner.LookPath("systemctl") {
-		return failure("rollback", errors.New("systemctl disappeared during the installation transaction"))
-	}
-	if err := i.quiesceForRollback(lockWait, timer); err != nil {
-		return err
-	}
-	if err := i.quiesceAutomaticUnits(automaticUnits); err != nil {
-		return err
+func (i *Installer) restoreBackup(b *backup, private map[string]privateSnapshot, timer timerSnapshot, automaticUnits []unitSnapshot) error {
+	var errs []error
+	systemctlAvailable := i.runner.LookPath("systemctl")
+	unitRestoreAllowed := systemctlAvailable
+	if !systemctlAvailable {
+		errs = append(errs, failure("rollback", errors.New("systemctl disappeared during the installation transaction")))
+	} else {
+		if err := i.quiesceForRollback(timer); err != nil {
+			errs = append(errs, err)
+			unitRestoreAllowed = false
+		}
+		if err := i.quiesceAutomaticUnits(automaticUnits); err != nil {
+			errs = append(errs, err)
+			unitRestoreAllowed = false
+		}
 	}
 	for _, destination := range b.paths {
 		snapshot := b.snapshots[destination]
@@ -294,7 +312,9 @@ func (i *Installer) restoreBackup(b *backup, private map[string]privateSnapshot,
 			continue
 		}
 		if err := i.fs.Remove(destination); err != nil {
-			return failure("remove changed path during rollback", err)
+			errs = append(errs, failure("remove changed path during rollback: "+destination, err))
+			unitRestoreAllowed = false
+			continue
 		}
 		if snapshot.exists {
 			parentMode := fs.FileMode(0o755)
@@ -302,70 +322,93 @@ func (i *Installer) restoreBackup(b *backup, private map[string]privateSnapshot,
 				parentMode = 0o750
 			}
 			if err := i.ensureDir(path.Dir(destination), parentMode); err != nil {
-				return failure("restore parent directory", err)
+				errs = append(errs, failure("restore parent directory for "+destination, err))
+				unitRestoreAllowed = false
+				continue
 			}
 			if err := i.copyNode(snapshot.backupPath, destination); err != nil {
-				return failure("restore "+destination, err)
+				errs = append(errs, failure("restore "+destination, err))
+				unitRestoreAllowed = false
 			}
 		}
 	}
-	for destination, snapshot := range private {
+	for _, destination := range []string{FeishuEncryptedCredPath, FeishuPlainCredentialPath} {
+		snapshot := private[destination]
 		if err := i.fs.Remove(destination); err != nil {
-			return failure("remove changed credential during rollback", err)
+			errs = append(errs, failure("remove changed credential during rollback: "+destination, err))
+			unitRestoreAllowed = false
+			continue
 		}
 		if snapshot.exists {
 			if err := i.fs.MkdirAll(path.Dir(destination), 0o700); err != nil {
-				return failure("restore credential directory", err)
+				errs = append(errs, failure("restore credential directory for "+destination, err))
+				unitRestoreAllowed = false
+				continue
 			}
 			if err := i.fs.WriteFileAtomic(destination, snapshot.data, snapshot.mode); err != nil {
-				return failure("restore credential", err)
+				errs = append(errs, failure("restore credential "+destination, err))
+				unitRestoreAllowed = false
 			}
 		}
 	}
-	if err := i.requiredCommand("reload systemd after rollback", Command{Name: "systemctl", Args: []string{"daemon-reload"}, Timeout: 30 * time.Second}); err != nil {
-		return err
+	if systemctlAvailable {
+		if err := i.requiredCommand("reload systemd after rollback", Command{Name: "systemctl", Args: []string{"daemon-reload"}, Timeout: 30 * time.Second}); err != nil {
+			errs = append(errs, err)
+			unitRestoreAllowed = false
+		}
+		if unitRestoreAllowed {
+			if err := i.restoreAutomaticUnits(automaticUnits); err != nil {
+				errs = append(errs, err)
+				unitRestoreAllowed = false
+			}
+		}
+		if !unitRestoreAllowed {
+			if err := i.containIncompleteRollback(automaticUnits); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if unitRestoreAllowed {
+			if err := i.restoreProjectTimer(timer); err != nil {
+				errs = append(errs, err)
+			}
+			after, err := i.snapshotTimer(context.Background())
+			if err != nil {
+				errs = append(errs, failure("verify project timer after rollback", err))
+			} else if after != timer {
+				errs = append(errs, failure("verify project timer after rollback", fmt.Errorf(
+					"got enablement=%q active=%t, want enablement=%q active=%t",
+					after.enablement, after.active, timer.enablement, timer.active)))
+			}
+		} else if timer.active || len(automaticUnits) > 0 {
+			errs = append(errs, failure("restore systemd units after rollback", errors.New(
+				"dependent restoration was stopped because an earlier rollback step was incomplete; the project timer was not reactivated")))
+		}
 	}
-	if err := i.restoreAutomaticUnits(automaticUnits); err != nil {
-		return err
-	}
-	if err := i.restoreProjectTimer(timer); err != nil {
-		return err
-	}
-	after, err := i.snapshotTimer(context.Background())
-	if err != nil {
-		return failure("verify project timer after rollback", err)
-	}
-	if after != timer {
-		return failure("verify project timer after rollback", fmt.Errorf(
-			"got enablement=%q active=%t, want enablement=%q active=%t",
-			after.enablement, after.active, timer.enablement, timer.active))
-	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (i *Installer) snapshotPrivateCredentials() (map[string]privateSnapshot, error) {
 	result := make(map[string]privateSnapshot, 2)
 	for _, credentialPath := range []string{FeishuEncryptedCredPath, FeishuPlainCredentialPath} {
-		info, err := i.fs.Lstat(credentialPath)
-		if errors.Is(err, fs.ErrNotExist) {
-			result[credentialPath] = privateSnapshot{}
-			continue
+		limit := int64(64 << 10)
+		if credentialPath == FeishuEncryptedCredPath {
+			limit = 128 << 10
 		}
+		file, _, exists, err := i.openFeishuCredential(credentialPath, limit)
 		if err != nil {
 			return nil, failure("inspect Feishu credential", err)
 		}
-		if info.Mode()&fs.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			return nil, failure("inspect Feishu credential", errors.New("credential must be a regular file, not a symlink"))
+		if !exists {
+			result[credentialPath] = privateSnapshot{}
+			continue
 		}
-		if info.Size() < 0 || info.Size() > 128<<10 {
-			return nil, failure("read Feishu credential", errors.New("credential exceeds 128 KiB"))
-		}
-		data, openedInfo, err := i.fs.ReadRegularFile(credentialPath, 128<<10)
+		data, openedInfo, err := readOpenedRegularFile(file, limit)
+		closeErr := file.Close()
 		if err != nil {
 			return nil, failure("read Feishu credential", err)
 		}
-		if len(data) > 128<<10 {
-			return nil, failure("read Feishu credential", errors.New("credential exceeds 128 KiB"))
+		if closeErr != nil {
+			return nil, failure("read Feishu credential", closeErr)
 		}
 		result[credentialPath] = privateSnapshot{exists: true, mode: openedInfo.Mode().Perm(), data: data}
 	}

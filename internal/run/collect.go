@@ -2,10 +2,12 @@ package run
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"math/bits"
 	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -26,6 +28,8 @@ const (
 	osReleasePath              = "/etc/os-release"
 	osReleaseFallbackPath      = "/usr/lib/os-release"
 	maxRebootPkgsBytes         = 1 << 20
+	maxHostnameBytes           = 253
+	maxKernelReleaseBytes      = 256
 	restartProbeCommandTimeout = 30 * time.Second
 	identityCommandTimeout     = 5 * time.Second
 	ubuntu2004ESMSupportEnd    = "2030-04-30"
@@ -39,6 +43,32 @@ type Flags struct {
 	Lang          string // --lang（UI_LANG），空表示未指定
 	Version       string // 编译期注入的 SUN 版本，仅用于通知展示
 	NoStateWrites bool   // dry-run/diagnostic paths must not create patch-age state
+}
+
+// SystemdQuery is the narrow systemd query surface used by runtime collection.
+// Production callers leave it unset and use the trusted-path implementation;
+// tests can inject deterministic results without making PATH part of the trust boundary.
+type SystemdQuery interface {
+	Available() bool
+	IsEnabled(unit string) bool
+	ShowValue(unit, prop string) (string, bool)
+}
+
+type trustedSystemdQuery struct{}
+
+func (trustedSystemdQuery) Available() bool {
+	return fileExists("/run/systemd/system") && systemd.Available()
+}
+func (trustedSystemdQuery) IsEnabled(unit string) bool { return systemd.IsEnabled(unit) }
+func (trustedSystemdQuery) ShowValue(unit, prop string) (string, bool) {
+	return systemd.ShowValue(unit, prop)
+}
+
+func systemdQueryOrDefault(query SystemdQuery) SystemdQuery {
+	if query != nil {
+		return query
+	}
+	return trustedSystemdQuery{}
 }
 
 // --test-reboot 的固定摘要（与 check_apt/check_dnf 的测试分支一致）。
@@ -96,9 +126,14 @@ func Collect(cfg *config.Config, f Flags) Input {
 
 // collectWatchdog 采集看门狗三项（健康/待装/EOL），受各自的配置开关门控。Collect 与 Doctor 共用。
 func collectWatchdog(cfg *config.Config, be string, o osrel.OSRelease, restart backend.RestartState, currentVersion string, persistPatchState, forceSelfUpdate, skipSelfUpdate bool) (watchdog.Health, watchdog.Pending, watchdog.Patch, watchdog.EOL) {
+	return collectWatchdogWithSystemd(cfg, be, o, restart, currentVersion, persistPatchState, forceSelfUpdate, skipSelfUpdate, nil)
+}
+
+func collectWatchdogWithSystemd(cfg *config.Config, be string, o osrel.OSRelease, restart backend.RestartState, currentVersion string, persistPatchState, forceSelfUpdate, skipSelfUpdate bool, systemdQuery SystemdQuery) (watchdog.Health, watchdog.Pending, watchdog.Patch, watchdog.EOL) {
 	var h watchdog.Health
-	if truthyLooseDefault(cfg.Get("CHECK_UPDATE_HEALTH"), true) && systemd.Available() {
-		h = collectHealth(be, staleDays(cfg))
+	query := systemdQueryOrDefault(systemdQuery)
+	if truthyLooseDefault(cfg.Get("CHECK_UPDATE_HEALTH"), true) {
+		h = collectHealthWithSystemd(be, staleDays(cfg), query)
 	}
 	patch, p := collectPatchWatchdog(cfg, be, restart, currentVersion, patchCollectOptions{PersistState: persistPatchState, ForceSelfUpdate: forceSelfUpdate, SkipSelfUpdate: skipSelfUpdate})
 	var e watchdog.EOL
@@ -137,7 +172,8 @@ func ubuntuESMInfraEnabled(timeout time.Duration) bool {
 		return false
 	}
 	result := sysexec.RunTimeout(timeout, command, "api", "u.pro.status.enabled_services.v1")
-	return result.Err == nil && result.Code == 0 && parseUbuntuESMInfraStatus(result.Stdout)
+	return result.Err == nil && result.Code == 0 && !result.StdoutTruncated && !result.StderrTruncated &&
+		strings.TrimSpace(result.Stderr) == "" && parseUbuntuESMInfraStatus(result.Stdout)
 }
 
 func parseUbuntuESMInfraStatus(output string) bool {
@@ -194,28 +230,110 @@ func collectAPTWithTimeout(timeout time.Duration) backend.RestartState {
 	pkgs := readFilePrefix("/var/run/reboot-required.pkgs", maxRebootPkgsBytes)
 	hasNR := sysexec.Look("needrestart")
 	nrb := ""
+	probeIssue := ""
 	if hasNR {
-		nrb = sysexec.RunTimeout(timeout, "needrestart", "-b").Stdout
+		result := sysexec.RunTimeout(timeout, "needrestart", "-b")
+		nrb = result.Stdout
+		if result.Err != nil || result.Code != 0 || result.StdoutTruncated || result.StderrTruncated ||
+			strings.TrimSpace(result.Stderr) != "" || !validNeedrestartBatch(result.Stdout) {
+			probeIssue = "apt-restart-probe-failed"
+			nrb = ""
+		}
+	} else {
+		probeIssue = "apt-restart-probe-failed"
 	}
-	return backend.ParseAPT(backend.APTInput{
+	state := backend.ParseAPT(backend.APTInput{
 		RebootRequiredExists: fileExists("/var/run/reboot-required"),
 		RebootRequiredPkgs:   pkgs,
 		HasNeedrestart:       hasNR,
 		NeedrestartB:         nrb,
 	})
+	state.ProbeIssue = probeIssue
+	return state
+}
+
+func validNeedrestartBatch(output string) bool {
+	seenVersion := false
+	seenKernelCurrent := false
+	seenKernelExpected := false
+	seenKernelStatus := false
+	for _, line := range strings.Split(strings.TrimRight(output, "\n"), "\n") {
+		key, value, ok := strings.Cut(line, ": ")
+		if !ok || !strings.HasPrefix(key, "NEEDRESTART-") || value == "" ||
+			strings.ContainsAny(value, "\r\x00") {
+			return false
+		}
+		switch key {
+		case "NEEDRESTART-VER":
+			if seenVersion || len(value) > 128 || len(strings.Fields(value)) != 1 {
+				return false
+			}
+			seenVersion = true
+		case "NEEDRESTART-KCUR":
+			if seenKernelCurrent {
+				return false
+			}
+			seenKernelCurrent = true
+		case "NEEDRESTART-KEXP":
+			if seenKernelExpected {
+				return false
+			}
+			seenKernelExpected = true
+		case "NEEDRESTART-KSTA":
+			if seenKernelStatus || value != "0" && value != "1" && value != "2" && value != "3" {
+				return false
+			}
+			seenKernelStatus = true
+		}
+	}
+	kernelFieldsPresent := seenKernelCurrent || seenKernelExpected || seenKernelStatus
+	return seenVersion && (!kernelFieldsPresent || seenKernelCurrent && seenKernelStatus)
 }
 
 func readFilePrefix(path string, limit int64) string {
-	f, err := os.Open(path)
+	b, _, err := readRegularFileBounded(path, limit, false)
 	if err != nil {
 		return ""
 	}
+	return b
+}
+
+func readFilePrefixChecked(path string, limit int64) (string, os.FileInfo, error) {
+	return readRegularFileBounded(path, limit, true)
+}
+
+func readRegularFileBounded(path string, limit int64, rejectTruncation bool) (string, os.FileInfo, error) {
+	if limit < 0 {
+		return "", nil, fmt.Errorf("invalid file size limit")
+	}
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return "", nil, err
+	}
+	f := os.NewFile(uintptr(fd), path)
 	defer f.Close()
-	b, err := io.ReadAll(io.LimitReader(f, limit))
-	if err != nil {
-		return ""
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		if err == nil {
+			err = fmt.Errorf("not a regular file: %s", path)
+		}
+		return "", nil, err
 	}
-	return string(b)
+	if rejectTruncation && info.Size() > limit {
+		return "", nil, fmt.Errorf("file exceeds %d bytes: %s", limit, path)
+	}
+	readLimit := limit
+	if rejectTruncation && limit < math.MaxInt64 {
+		readLimit++
+	}
+	b, err := io.ReadAll(io.LimitReader(f, readLimit))
+	if err != nil {
+		return "", nil, err
+	}
+	if rejectTruncation && int64(len(b)) > limit {
+		return "", nil, fmt.Errorf("file exceeds %d bytes: %s", limit, path)
+	}
+	return string(b), info, nil
 }
 
 func collectDNF() backend.RestartState {
@@ -244,12 +362,12 @@ func collectDNFWithTimeout(timeout time.Duration) backend.RestartState {
 		nrR = r.Stdout
 		rcR = r.Code
 		_, rebootValid = backend.DNFRebootDecision(nrR, rcR)
-		rebootValid = rebootValid && r.Err == nil && strings.TrimSpace(r.Stderr) == ""
+		rebootValid = rebootValid && r.Err == nil && !r.StdoutTruncated && !r.StderrTruncated && strings.TrimSpace(r.Stderr) == ""
 		if !rebootValid {
 			probeIssue = "dnf-restart-probe-failed"
 		}
 		help := sysexec.RunTimeout(timeout, "needs-restarting", "--help")
-		if help.Code != 0 {
+		if help.Err != nil || help.Code != 0 || help.StdoutTruncated || help.StderrTruncated {
 			probeIssue = "dnf-restart-probe-failed"
 		} else {
 			hasS = strings.Contains(help.Stdout+help.Stderr, "-s")
@@ -258,7 +376,7 @@ func collectDNFWithTimeout(timeout time.Duration) backend.RestartState {
 			services := sysexec.RunTimeout(timeout, "needs-restarting", "-s")
 			var valid bool
 			nrS, valid = backend.NormalizeDNFServiceList(services.Stdout)
-			if services.Err != nil || services.Code != 0 || strings.TrimSpace(services.Stderr) != "" || !valid {
+			if services.Err != nil || services.Code != 0 || services.StdoutTruncated || services.StderrTruncated || strings.TrimSpace(services.Stderr) != "" || !valid {
 				probeIssue = "dnf-restart-probe-failed"
 				nrS = ""
 			}
@@ -284,7 +402,7 @@ func collectDNFWithTimeout(timeout time.Duration) backend.RestartState {
 
 func collectDNF5WithRuntime(timeout time.Duration, runtime dnfRuntime) backend.RestartState {
 	help := sysexec.RunTimeout(timeout, runtime.Command, "needs-restarting", "--help")
-	hasNR := help.Code == 0
+	hasNR := help.Err == nil && help.Code == 0 && !help.StdoutTruncated && !help.StderrTruncated
 	var nrR, nrS string
 	var rcR int
 	hasS := false
@@ -295,7 +413,7 @@ func collectDNF5WithRuntime(timeout time.Duration, runtime dnfRuntime) backend.R
 		nrR = r.Stdout
 		rcR = r.Code
 		_, rebootValid = backend.DNFRebootDecision(nrR, rcR)
-		rebootValid = rebootValid && r.Err == nil && strings.TrimSpace(r.Stderr) == ""
+		rebootValid = rebootValid && r.Err == nil && !r.StdoutTruncated && !r.StderrTruncated && strings.TrimSpace(r.Stderr) == ""
 		if !rebootValid {
 			probeIssue = "dnf-restart-probe-failed"
 		}
@@ -308,7 +426,7 @@ func collectDNF5WithRuntime(timeout time.Duration, runtime dnfRuntime) backend.R
 			if nrS != "" {
 				wantCode = 1
 			}
-			if services.Err != nil || services.Code != wantCode || strings.TrimSpace(services.Stderr) != "" || !valid {
+			if services.Err != nil || services.Code != wantCode || services.StdoutTruncated || services.StderrTruncated || strings.TrimSpace(services.Stderr) != "" || !valid {
 				probeIssue = "dnf-restart-probe-failed"
 				nrS = ""
 			}
@@ -334,36 +452,48 @@ func collectDNF5WithRuntime(timeout time.Duration, runtime dnfRuntime) backend.R
 }
 
 func collectHealth(be string, stale int) watchdog.Health {
+	return collectHealthWithSystemd(be, stale, nil)
+}
+
+func collectHealthWithSystemd(be string, stale int, systemdQuery SystemdQuery) watchdog.Health {
+	query := systemdQueryOrDefault(systemdQuery)
+	if !query.Available() {
+		return watchdog.CheckHealth(watchdog.HealthInput{
+			Backend: be, TimerEnabled: true, SystemdQueryFailed: true, Disks: collectDisks(),
+		})
+	}
 	var timer, svc string
 	timerEnabled := false
 	var dnfUnit dnfAutomaticUnit
 	switch be {
 	case "apt":
 		timer, svc = "apt-daily-upgrade.timer", "apt-daily-upgrade.service"
-		timerEnabled = systemd.IsEnabled(timer)
+		timerEnabled = query.IsEnabled(timer)
 	case "dnf":
 		runtime := detectDNFRuntime(restartProbeCommandTimeout)
 		if !runtime.GenerationKnown {
 			return watchdog.Health{}
 		}
-		dnfUnit = selectDNFAutomaticUnit(runtime.Generation, systemd.IsEnabled)
+		dnfUnit = selectDNFAutomaticUnit(runtime.Generation, query.IsEnabled)
 		timer, svc, timerEnabled = dnfUnit.Timer, dnfUnit.Service, dnfUnit.Enabled
 	default:
 		return watchdog.Health{}
 	}
-	lastTs := systemd.ShowValue(svc, "ExecMainExitTimestamp")
-	timerTrig := systemd.ShowValue(timer, "LastTriggerUSec")
+	lastTs, lastTsOK := query.ShowValue(svc, "ExecMainExitTimestamp")
+	timerTrig, timerTrigOK := query.ShowValue(timer, "LastTriggerUSec")
+	svcResult, svcResultOK := query.ShowValue(svc, "Result")
 	health := watchdog.CheckHealth(watchdog.HealthInput{
-		Backend:           be,
-		TimerEnabled:      timerEnabled,
-		SvcResult:         systemd.ShowValue(svc, "Result"),
-		HaveSvcExit:       lastTs != "",
-		SvcExitEpoch:      parseSystemdTime(lastTs),
-		HaveTimerTrigger:  timerTrig != "" && timerTrig != "n/a",
-		TimerTriggerEpoch: parseSystemdTime(timerTrig),
-		Now:               time.Now().Unix(),
-		StaleDays:         stale,
-		Disks:             collectDisks(),
+		Backend:            be,
+		TimerEnabled:       timerEnabled,
+		SystemdQueryFailed: !lastTsOK || !timerTrigOK || !svcResultOK,
+		SvcResult:          svcResult,
+		HaveSvcExit:        lastTs != "",
+		SvcExitEpoch:       parseSystemdTime(lastTs),
+		HaveTimerTrigger:   timerTrig != "" && timerTrig != "n/a",
+		TimerTriggerEpoch:  parseSystemdTime(timerTrig),
+		Now:                time.Now().Unix(),
+		StaleDays:          stale,
+		Disks:              collectDisks(),
 	})
 	if be == "dnf" {
 		health.TxtZH = rewriteDNFHealthUnitNames(health.TxtZH, dnfUnit)
@@ -424,7 +554,7 @@ func parseSystemdTimeWithTimeout(ts string, timeout time.Duration) int64 {
 		return 0
 	}
 	r := sysexec.RunTimeout(timeout, "date", "-d", ts, "+%s")
-	if r.Code != 0 {
+	if r.Code != 0 || commandOutputIncomplete(r) || strings.TrimSpace(r.Stderr) != "" {
 		return 0
 	}
 	n, err := strconv.ParseInt(strings.TrimSpace(r.Stdout), 10, 64)
@@ -442,13 +572,13 @@ func hostLabelWithTimeout(cfg *config.Config, timeout time.Duration) string {
 	if v := cfg.Get("HOST_LABEL"); v != "" {
 		return v
 	}
-	if r := sysexec.RunTimeout(timeout, "hostname", "-f"); r.Code == 0 {
-		if h := strings.TrimSpace(r.Stdout); h != "" {
+	if r := sysexec.RunTimeout(timeout, "hostname", "-f"); r.Code == 0 && !commandOutputIncomplete(r) && strings.TrimSpace(r.Stderr) == "" {
+		if h := strings.TrimSpace(r.Stdout); h != "" && len(h) <= maxHostnameBytes {
 			return h
 		}
 	}
-	if r := sysexec.RunTimeout(timeout, "hostname"); r.Code == 0 {
-		if h := strings.TrimSpace(r.Stdout); h != "" {
+	if r := sysexec.RunTimeout(timeout, "hostname"); r.Code == 0 && !commandOutputIncomplete(r) && strings.TrimSpace(r.Stderr) == "" {
+		if h := strings.TrimSpace(r.Stdout); h != "" && len(h) <= maxHostnameBytes {
 			return h
 		}
 	}
@@ -460,8 +590,8 @@ func kernelRelease() string {
 }
 
 func kernelReleaseWithTimeout(timeout time.Duration) string {
-	if r := sysexec.RunTimeout(timeout, "uname", "-r"); r.Code == 0 {
-		if k := strings.TrimSpace(r.Stdout); k != "" {
+	if r := sysexec.RunTimeout(timeout, "uname", "-r"); r.Code == 0 && !commandOutputIncomplete(r) && strings.TrimSpace(r.Stderr) == "" {
+		if k := strings.TrimSpace(r.Stdout); k != "" && len(k) <= maxKernelReleaseBytes {
 			return k
 		}
 	}
@@ -470,17 +600,23 @@ func kernelReleaseWithTimeout(timeout time.Duration) string {
 
 // fetchPublicIP 复刻 get_public_ip：依次尝试 ipify / ifconfig.me，校验是合法 IP，失败返回 unknown。
 func fetchPublicIP() string {
-	client := httpx.New(5 * time.Second)
-	for _, url := range []string{"https://api.ipify.org", "https://ifconfig.me/ip"} {
+	return fetchPublicIPFrom(httpx.New(5*time.Second), []string{"https://api.ipify.org", "https://ifconfig.me/ip"})
+}
+
+func fetchPublicIPFrom(client *http.Client, urls []string) string {
+	for _, url := range urls {
 		resp, err := client.Get(url)
 		if err != nil {
 			continue
 		}
 		// 读到 EOF（上限 128 字节），而非单次 Read：分片响应下单次 Read 可能只拿到半个 IP。
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 128))
+		b, readErr := io.ReadAll(io.LimitReader(resp.Body, 129))
 		resp.Body.Close()
+		if readErr != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 || len(b) > 128 {
+			continue
+		}
 		ip := strings.Fields(strings.TrimSpace(string(b)))
-		if len(ip) == 0 {
+		if len(ip) != 1 {
 			continue
 		}
 		if net.ParseIP(ip[0]) != nil {

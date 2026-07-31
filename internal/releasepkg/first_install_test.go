@@ -52,9 +52,12 @@ func TestMirrorWorkflowBindsVersionedBootstrapTrustSet(t *testing.T) {
 		`cmp files/release-signing.pub.asc "deploy/$TAG/release-signing.pub.asc"`,
 		`assets+=("$BOOTSTRAP_SIGNATURE_ASSET" release-signing.pub.asc)`,
 		`--verify "public-check/$BOOTSTRAP_SIGNATURE_ASSET" public-check/sun.sh`,
-		`- name: Confirm GitHub Latest before stable update`,
-		`- name: Publish stable bootstrap`,
-		`- name: Publish latest manifest last`,
+		`- name: Publish stable files under one remote lock`,
+		`latest_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"`,
+		`printf '%s\n' PUBLISH_SUN`,
+		`"$MIRROR_BASE_URL/sun.sh?run=$GITHUB_RUN_ID&attempt=$GITHUB_RUN_ATTEMPT"`,
+		`printf '%s\n' PUBLISH_LATEST`,
+		`"$MIRROR_BASE_URL/latest.json?run=$GITHUB_RUN_ID&attempt=$GITHUB_RUN_ATTEMPT"`,
 	}
 	previous := -1
 	for _, item := range requiredInOrder {
@@ -67,11 +70,20 @@ func TestMirrorWorkflowBindsVersionedBootstrapTrustSet(t *testing.T) {
 		}
 		previous = position
 	}
-	stableStart := strings.Index(workflow, `- name: Publish stable bootstrap`)
-	latestStart := strings.Index(workflow, `- name: Publish latest manifest last`)
-	stableStep := workflow[stableStart:latestStart]
-	if strings.Contains(stableStep, `BOOTSTRAP_SIGNATURE_ASSET`) || strings.Contains(stableStep, `release-signing.pub.asc`) {
-		t.Fatal("stable bootstrap step must not pretend to atomically publish the versioned trust set")
+	stableStart := strings.Index(workflow, `- name: Publish stable files under one remote lock`)
+	stableEnd := strings.Index(workflow[stableStart:], `- name: Remove SSH identity`)
+	stableStep := workflow[stableStart : stableStart+stableEnd]
+	for _, item := range []string{
+		`if [[ "$BOOTSTRAP_PRESENT" == "1" ]]; then`,
+		`install -m 0600 "deploy/$TAG/sun.sh" "$local_stage/"`,
+		`[[ -f "$stage/sun.sh" && ! -L "$stage/sun.sh" ]] || exit 64`,
+	} {
+		if !strings.Contains(stableStep, item) {
+			t.Fatalf("stable publication legacy-bootstrap guard missing: %s", item)
+		}
+	}
+	if strings.Contains(stableStep, `release-signing.pub.asc`) {
+		t.Fatal("stable publication must not pretend to atomically publish the versioned trust set")
 	}
 }
 
@@ -151,7 +163,7 @@ func TestLiveCanaryIsolatesRunnerHealthAndSkipsFakeNotificationCredentialProbe(t
 	}
 	requiredInOrder := []string{
 		`apt_check_before_rc="$(capture_bounded_rc "$work/apt-check.before" 330s "${apt_check[@]}")"`,
-		`bash "$work/stable-sun.sh"`,
+		`/bin/bash -p "$work/stable-sun.sh"`,
 		`grep -qxF "$expected" /etc/security-update-notify/telegram.env ||`,
 		`systemctl is-enabled --quiet security-update-notify.timer || die`,
 		`systemctl is-active --quiet security-update-notify.timer || die`,
@@ -208,6 +220,27 @@ func TestWorkflowImmutableReleaseChecksUseContentsReadAPI(t *testing.T) {
 	}
 }
 
+func TestBootstrapRuntimeVersionProbeIsBounded(t *testing.T) {
+	root := repositoryRoot(t)
+	script, err := os.ReadFile(filepath.Join(root, "sun.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range [][]byte{
+		[]byte(`REQUIRED_COMMANDS=(curl tar sha256sum mktemp python3 env uname timeout wc)`),
+		[]byte(`timeout --signal=TERM --kill-after=5s "$duration"`),
+		[]byte(`capture_limited 4096 "$runtime_version_file" 15s "$GO_RUNTIME" --version`),
+		[]byte(`command output exceeds size limit`),
+	} {
+		if !bytes.Contains(script, required) {
+			t.Fatalf("bootstrap runtime-probe boundary missing %q", required)
+		}
+	}
+	if bytes.Contains(script, []byte(`runtime_version="$($GO_RUNTIME --version`)) {
+		t.Fatal("bootstrap runtime probe reverted to unbounded command substitution")
+	}
+}
+
 func TestDocumentedHighAssuranceBlocksAreShellSyntaxValid(t *testing.T) {
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash unavailable")
@@ -225,6 +258,7 @@ func TestDocumentedHighAssuranceBlocksAreShellSyntaxValid(t *testing.T) {
 			}
 			for _, required := range [][]byte{
 				[]byte(`SUN_VERSION='X.Y.Z'`),
+				[]byte(`PATH=/usr/sbin:/usr/bin:/sbin:/bin`),
 				[]byte(assets.ReleaseSigningFingerprint),
 				[]byte(`release-version@xxv.cc`),
 				[]byte(`--known-notation`),
@@ -232,7 +266,14 @@ func TestDocumentedHighAssuranceBlocksAreShellSyntaxValid(t *testing.T) {
 				[]byte(`NOTATION_NAME`),
 				[]byte(`NOTATION_FLAGS`),
 				[]byte(`NOTATION_DATA`),
+				[]byte(`part="${output}.part"`),
+				[]byte(`remaining + 1`),
+				[]byte(`open(path, "xb")`),
+				[]byte(`rm -f -- "$part"`),
+				[]byte(`mv -f -- "$part" "$output"`),
+				[]byte(`--max-time 180`),
 				[]byte(`--verify "$SUN_WORK/sun.sh.asc" "$SUN_WORK/sun.sh"`),
+				[]byte(`/bin/bash -p "$SUN_WORK/sun.sh"`),
 				[]byte(`--version "$SUN_VERSION" --base-url "$SUN_BASE"`),
 			} {
 				if !bytes.Contains(block, required) {
@@ -297,6 +338,21 @@ func TestDocumentedHighAssuranceBlocksExecuteOnlyAfterRealGPGVerification(t *tes
 			}
 		})
 	}
+	for name, block := range blocks {
+		t.Run(name+"/oversized-chunked-download", func(t *testing.T) {
+			marker := filepath.Join(t.TempDir(), "must-not-execute")
+			output, err := runDocumentedHighAssuranceBlock(
+				block, version, goodFingerprint, goodAssets, fakeBin, marker,
+				"SUN_TEST_OVERSIZED_ASSET=sun.sh",
+			)
+			if err == nil {
+				t.Fatalf("oversized bootstrap download was accepted: %s", output)
+			}
+			if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+				t.Fatalf("oversized bootstrap executed before download validation failed: %v", statErr)
+			}
+		})
+	}
 
 	wrongVersion := "0.0.0"
 	if version == wrongVersion {
@@ -319,15 +375,19 @@ func TestDocumentedHighAssuranceBlocksExecuteOnlyAfterRealGPGVerification(t *tes
 			assetsDir := writeBootstrapTestAssets(
 				t, ctx, gpg, signerHome, publicKey, tc.signer, tc.notationValues, tc.tamper,
 			)
-			marker := filepath.Join(t.TempDir(), "must-not-execute")
-			output, err := runDocumentedHighAssuranceBlock(
-				blocks["docs/installation.md"], version, goodFingerprint, assetsDir, fakeBin, marker,
-			)
-			if err == nil {
-				t.Fatalf("invalid bootstrap trust set was accepted: %s", output)
-			}
-			if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
-				t.Fatalf("bootstrap executed before verification failed: %v", statErr)
+			for name, block := range blocks {
+				t.Run(name, func(t *testing.T) {
+					marker := filepath.Join(t.TempDir(), "must-not-execute")
+					output, err := runDocumentedHighAssuranceBlock(
+						block, version, goodFingerprint, assetsDir, fakeBin, marker,
+					)
+					if err == nil {
+						t.Fatalf("invalid bootstrap trust set was accepted: %s", output)
+					}
+					if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+						t.Fatalf("bootstrap executed before verification failed: %v", statErr)
+					}
+				})
 			}
 		})
 	}
@@ -406,9 +466,15 @@ while (($#)); do
       ;;
   esac
 done
-[[ -n "$output" && -n "$url" ]]
+[[ -n "$url" ]]
 asset="${url##*/}"
-cp -- "$SUN_TEST_ASSET_DIR/$asset" "$output"
+if [[ "${SUN_TEST_OVERSIZED_ASSET:-}" == "$asset" ]]; then
+  python3 -c 'import sys; sys.stdout.buffer.write(b"x" * 1048577)'
+elif [[ -n "$output" ]]; then
+  cp -- "$SUN_TEST_ASSET_DIR/$asset" "$output"
+else
+  cat -- "$SUN_TEST_ASSET_DIR/$asset"
+fi
 `
 	if err := os.WriteFile(filepath.Join(dir, "curl"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -417,12 +483,19 @@ cp -- "$SUN_TEST_ASSET_DIR/$asset" "$output"
 }
 
 func runDocumentedHighAssuranceBlock(
-	block []byte,
-	version, fingerprint, assetsDir, fakeBin, marker string,
+	block []byte, version, fingerprint, assetsDir, fakeBin, marker string, extraEnv ...string,
 ) ([]byte, error) {
-	script := strings.Replace(string(block), "sudo bash <<'SUN_ROOT'", "bash <<'SUN_ROOT'", 1)
+	script := strings.Replace(string(block), "sudo /bin/bash -p <<'SUN_ROOT'", "/bin/bash -p <<'SUN_ROOT'", 1)
 	script = strings.Replace(script, "SUN_VERSION='X.Y.Z'", "SUN_VERSION='"+version+"'", 1)
 	script = strings.Replace(script, assets.ReleaseSigningFingerprint, fingerprint, 1)
+	// The published block deliberately fixes a privileged PATH. Only the test
+	// copy prepends the fixture directory so its fake curl can supply local
+	// signed assets without weakening the documented command.
+	script = strings.Replace(script,
+		"PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+		"PATH="+fakeBin+":/usr/sbin:/usr/bin:/sbin:/bin",
+		1,
+	)
 	cmd := exec.Command("bash")
 	cmd.Stdin = strings.NewReader(script)
 	cmd.Env = append(os.Environ(),
@@ -431,11 +504,12 @@ func runDocumentedHighAssuranceBlock(
 		"SUN_EXEC_MARKER="+marker,
 		"SUN_EXPECTED_VERSION="+version,
 	)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	return cmd.CombinedOutput()
 }
 
 func highAssuranceCommandBlock(readme []byte) ([]byte, bool) {
-	startMarker := []byte("sudo bash <<'SUN_ROOT'\n")
+	startMarker := []byte("sudo /bin/bash -p <<'SUN_ROOT'\n")
 	start := bytes.Index(readme, startMarker)
 	if start < 0 {
 		return nil, false

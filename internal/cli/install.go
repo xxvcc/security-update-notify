@@ -17,6 +17,7 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/httpx"
 	"github.com/xxvcc/security-update-notify/internal/installer"
 	"github.com/xxvcc/security-update-notify/internal/telegram"
+	"github.com/xxvcc/security-update-notify/internal/textsafe"
 )
 
 type installerAPI interface {
@@ -117,7 +118,7 @@ func configureMode(_ string, args []string) int {
 func (c *installCommand) run(rawArgs []string, configure bool) int {
 	parsed, err := c.parse(rawArgs)
 	if err != nil {
-		fmt.Fprintln(c.console.errOut, err)
+		fmt.Fprintln(c.console.errOut, safeCLIText(err.Error()))
 		return 2
 	}
 	if parsed.help {
@@ -134,13 +135,13 @@ func (c *installCommand) run(rawArgs []string, configure bool) int {
 	defer func() { zeroCLIBytes(parsed.feishuSecret) }()
 	parsed.lang, err = c.chooseLanguage(parsed.lang, parsed.nonInteractive)
 	if err != nil {
-		fmt.Fprintln(c.console.errOut, err)
+		fmt.Fprintln(c.console.errOut, safeCLIText(err.Error()))
 		return 2
 	}
 
 	current, err := c.loadConfig(defaultEnvFile)
 	if err != nil {
-		fmt.Fprintln(c.console.errOut, err)
+		fmt.Fprintln(c.console.errOut, safeCLIText(err.Error()))
 		return 2
 	}
 	existing := current.Has("CONFIG_VERSION") || current.Has("NOTIFY_CHANNELS")
@@ -155,13 +156,13 @@ func (c *installCommand) run(rawArgs []string, configure bool) int {
 
 	api, err := c.newInstaller()
 	if err != nil {
-		fmt.Fprintln(c.console.errOut, err)
+		fmt.Fprintln(c.console.errOut, safeCLIText(err.Error()))
 		return 1
 	}
 	if parsed.telegramTokenFile != "" {
 		token, readErr := api.ReadTelegramTokenFile(parsed.telegramTokenFile)
 		if readErr != nil {
-			fmt.Fprintln(c.console.errOut, readErr)
+			fmt.Fprintln(c.console.errOut, safeCLIText(readErr.Error()))
 			return installer.ExitCode(readErr)
 		}
 		parsed.config["TELEGRAM_BOT_TOKEN"] = token
@@ -169,7 +170,7 @@ func (c *installCommand) run(rawArgs []string, configure bool) int {
 	if parsed.feishuSecretFile != "" {
 		secret, readErr := api.ReadFeishuSecretFile(parsed.feishuSecretFile)
 		if readErr != nil {
-			fmt.Fprintln(c.console.errOut, readErr)
+			fmt.Fprintln(c.console.errOut, safeCLIText(readErr.Error()))
 			return installer.ExitCode(readErr)
 		}
 		parsed.feishuSecret = secret
@@ -184,7 +185,7 @@ func (c *installCommand) run(rawArgs []string, configure bool) int {
 	if configure && !parsed.nonInteractive {
 		changed, wizardErr := c.configureWizard(&parsed, effective)
 		if wizardErr != nil {
-			fmt.Fprintln(c.console.errOut, wizardErr)
+			fmt.Fprintln(c.console.errOut, safeCLIText(wizardErr.Error()))
 			return 2
 		}
 		if !changed && !changedBeforeWizard {
@@ -196,17 +197,17 @@ func (c *installCommand) run(rawArgs []string, configure bool) int {
 		}
 	}
 	if err := c.completeRequiredInputs(&parsed, effective, original, existing); err != nil {
-		fmt.Fprintln(c.console.errOut, err)
+		fmt.Fprintln(c.console.errOut, safeCLIText(err.Error()))
 		return installer.ExitCode(err)
 	}
 	if err := c.completeInstallPreferences(&parsed, effective, original, existing); err != nil {
-		fmt.Fprintln(c.console.errOut, err)
+		fmt.Fprintln(c.console.errOut, safeCLIText(err.Error()))
 		return installer.ExitCode(err)
 	}
 
 	runtime, err := c.readRuntime()
 	if err != nil {
-		fmt.Fprintln(c.console.errOut, "read runtime:", err)
+		fmt.Fprintln(c.console.errOut, "read runtime:", safeCLIText(err.Error()))
 		return 1
 	}
 	preflight := c.makePreflight(&parsed, effective, original, existing)
@@ -218,7 +219,7 @@ func (c *installCommand) run(rawArgs []string, configure bool) int {
 		LockWait: parsed.lockWait, LockWaitSet: parsed.lockWaitSet,
 	})
 	if err != nil {
-		fmt.Fprintln(c.console.errOut, err)
+		fmt.Fprintln(c.console.errOut, safeCLIText(err.Error()))
 		return installer.ExitCode(err)
 	}
 	actionZH, actionEN := "已安装 security-update-notify。", "Installed security-update-notify."
@@ -241,12 +242,17 @@ func (c *installCommand) reportPostInstallTest(lang string, result *installer.Co
 	}
 	writeCommandOutput(c.console.out, result.Stdout)
 	writeCommandOutput(c.console.errOut, result.Stderr)
-	if result.Err == nil && result.Code == 0 {
+	if result.Err == nil && result.Code == 0 && !commandOutputTruncated(result) {
 		return
 	}
+	if commandOutputTruncated(result) {
+		c.say(c.console.errOut, lang,
+			"额外测试消息的命令输出超过捕获上限，结果不完整。",
+			"Additional test message command output exceeded the capture limit; the result is incomplete.")
+	}
 	if result.Err != nil {
-		fmt.Fprintf(c.console.errOut, "%s: %v\n",
-			c.pick(lang, "额外测试消息无法完成", "Additional test message could not complete"), result.Err)
+		fmt.Fprintf(c.console.errOut, "%s: %s\n",
+			c.pick(lang, "额外测试消息无法完成", "Additional test message could not complete"), safeCLIText(result.Err.Error()))
 	}
 	c.say(c.console.errOut, lang,
 		"警告：安装已完成，但额外测试消息发送失败；核心安装和定时任务未回滚，请检查接收平台配置与网络后重试测试。",
@@ -259,24 +265,34 @@ func (c *installCommand) reportPostInstallDoctor(lang string, result *installer.
 	}
 	writeCommandOutput(c.console.out, result.Stdout)
 	writeCommandOutput(c.console.errOut, result.Stderr)
-	if result.Err == nil && result.Code == 0 {
+	if result.Err == nil && result.Code == 0 && !commandOutputTruncated(result) {
 		return
 	}
+	if commandOutputTruncated(result) {
+		c.say(c.console.errOut, lang,
+			"装后自检的命令输出超过捕获上限，结果不完整。",
+			"Post-install self-check command output exceeded the capture limit; the result is incomplete.")
+	}
 	if result.Err != nil {
-		fmt.Fprintf(c.console.errOut, "%s: %v\n",
-			c.pick(lang, "装后自检无法完成", "Post-install self-check could not complete"), result.Err)
+		fmt.Fprintf(c.console.errOut, "%s: %s\n",
+			c.pick(lang, "装后自检无法完成", "Post-install self-check could not complete"), safeCLIText(result.Err.Error()))
 	}
 	c.say(c.console.errOut, lang,
 		"警告：安装已完成，但装后自检未完全通过；安装本身完好，请查看上方诊断输出并处理报告的问题。",
 		"Warning: installation completed, but the post-install self-check did not fully pass; the installation itself is intact. Review the diagnostics above and address the reported issue.")
 }
 
+func commandOutputTruncated(result *installer.CommandResult) bool {
+	return result.StdoutTruncated || result.StderrTruncated
+}
+
 func writeCommandOutput(out io.Writer, value []byte) {
 	if len(value) == 0 {
 		return
 	}
-	_, _ = out.Write(value)
-	if value[len(value)-1] != '\n' {
+	safe := textsafe.Multiline(string(value))
+	_, _ = io.WriteString(out, safe)
+	if safe == "" || safe[len(safe)-1] != '\n' {
 		_, _ = io.WriteString(out, "\n")
 	}
 }
@@ -747,7 +763,7 @@ func (c *installCommand) telegramPreflight(parent context.Context, parsed *insta
 			c.say(c.console.out, parsed.lang, "Telegram 测试消息已发送。", "Telegram test message sent.")
 			return nil
 		}
-		fmt.Fprintln(c.console.errOut, "Telegram preflight:", err)
+		fmt.Fprintln(c.console.errOut, "Telegram preflight:", safeCLIText(err.Error()))
 		if telegram.IsTemporary(err) {
 			if parsed.nonInteractive {
 				return &installer.ExitError{Code: 75, Op: "Telegram preflight", Err: err}
@@ -811,7 +827,7 @@ func (c *installCommand) feishuPreflight(parent context.Context, parsed *install
 			if err == nil {
 				err = errors.New("no visible active Feishu users")
 			}
-			fmt.Fprintln(c.console.errOut, "Feishu directory scan:", err)
+			fmt.Fprintln(c.console.errOut, "Feishu directory scan:", safeCLIText(err.Error()))
 			if parsed.nonInteractive {
 				code := 2
 				if feishu.IsTemporary(err) {
@@ -857,7 +873,7 @@ func (c *installCommand) feishuPreflight(parent context.Context, parsed *install
 			err := c.feishu.Probe(ctx, appID, secret)
 			cancel()
 			if err != nil {
-				fmt.Fprintln(c.console.errOut, "Feishu preflight:", err)
+				fmt.Fprintln(c.console.errOut, "Feishu preflight:", safeCLIText(err.Error()))
 				if feishu.IsTemporary(err) {
 					if parsed.nonInteractive {
 						return &installer.ExitError{Code: 75, Op: "Feishu preflight", Err: err}
@@ -1033,7 +1049,7 @@ func (c *installCommand) promptRequired(lang, label string) (string, error) {
 }
 
 func (c *installCommand) promptDefault(lang, zhLabel, enLabel, defaultValue string) (string, error) {
-	fmt.Fprintf(c.console.out, "%s [%s]: ", c.pick(lang, zhLabel, enLabel), defaultValue)
+	fmt.Fprintf(c.console.out, "%s [%s]: ", c.pick(lang, zhLabel, enLabel), safeCLIText(defaultValue))
 	line, err := c.readPromptLine(lang)
 	if err != nil {
 		return "", err
@@ -1170,7 +1186,7 @@ func (c *installCommand) readLine() (string, error) {
 }
 
 func (c *installCommand) say(out io.Writer, lang, zh, en string) {
-	fmt.Fprintln(out, c.pick(lang, zh, en))
+	fmt.Fprintln(out, safeCLIText(c.pick(lang, zh, en)))
 }
 
 func (c *installCommand) pick(lang, zh, en string) string {
@@ -1208,6 +1224,9 @@ func (c *installCommand) printUsage(configure bool, lang string) {
 
 func normalizeCLIChannels(raw string) (string, error) {
 	raw = strings.ToLower(strings.Join(strings.Fields(raw), ""))
+	if raw == "" {
+		return "", errors.New("receiving platforms cannot be empty")
+	}
 	hasTelegram, hasFeishu := false, false
 	for _, item := range strings.Split(raw, ",") {
 		switch item {
@@ -1216,7 +1235,7 @@ func normalizeCLIChannels(raw string) (string, error) {
 		case "feishu":
 			hasFeishu = true
 		default:
-			return "", fmt.Errorf("invalid receiving platform: %s", item)
+			return "", fmt.Errorf("invalid receiving platform: %q", item)
 		}
 	}
 	if hasTelegram && hasFeishu {
@@ -1228,7 +1247,7 @@ func normalizeCLIChannels(raw string) (string, error) {
 	if hasFeishu {
 		return "feishu", nil
 	}
-	return "", errors.New("receiving platforms cannot be empty")
+	return "", errors.New("receiving platform normalization produced no supported platform")
 }
 
 func selectedCLIChannel(channels, channel string) bool {

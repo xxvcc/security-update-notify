@@ -14,10 +14,23 @@ import termios
 import time
 
 
+MAX_OUTPUT_BYTES = 8 << 20
+
+
+def positive_timeout(value):
+    try:
+        timeout = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("timeout must be a number") from exc
+    if not 0 < timeout <= 3600 or not timeout < float("inf"):
+        raise argparse.ArgumentTypeError("timeout must be finite and in (0, 3600]")
+    return timeout
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True)
-    parser.add_argument("--timeout", type=float, default=180.0)
+    parser.add_argument("--timeout", type=positive_timeout, default=180.0)
     parser.add_argument(
         "--step",
         action="append",
@@ -43,20 +56,40 @@ def child_setup(slave_fd):
     fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
 
 
+def process_group_exists(group_id):
+    try:
+        os.killpg(group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def terminate(proc):
-    if proc.poll() is not None:
-        return
+    # The session leader may have exited while a descendant still holds the PTY.
+    # Signal and observe the process group itself instead of using leader state as
+    # a proxy for group lifetime.
     try:
         os.killpg(proc.pid, signal.SIGTERM)
     except ProcessLookupError:
+        proc.wait()
         return
-    try:
-        proc.wait(timeout=2)
-    except subprocess.TimeoutExpired:
+
+    grace_deadline = time.monotonic() + 2
+    while process_group_exists(proc.pid) and time.monotonic() < grace_deadline:
+        proc.poll()
+        time.sleep(0.01)
+    if process_group_exists(proc.pid):
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
 
 
 def main():
@@ -90,6 +123,10 @@ def main():
             raise
         if not chunk:
             return False
+        if len(output) + len(chunk) > MAX_OUTPUT_BYTES:
+            remaining = MAX_OUTPUT_BYTES - len(output)
+            output.extend(chunk[:remaining])
+            raise RuntimeError(f"PTY output exceeded {MAX_OUTPUT_BYTES} bytes")
         output.extend(chunk)
         return True
 

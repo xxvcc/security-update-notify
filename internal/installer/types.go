@@ -26,6 +26,7 @@ const (
 	BackupRoot                = "/var/backups/security-update-notify"
 	InstallLockPath           = "/run/security-update-notify.install.lock"
 	RuntimeLockPath           = "/run/security-update-notify.lock"
+	InstallCheckLockPath      = "/run/security-update-notify.install-check.lock"
 	FeishuPlainCredentialPath = "/etc/security-update-notify/credentials/feishu-app-secret"
 	FeishuEncryptedCredPath   = "/etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred"
 	FeishuCredentialDropIn    = "/etc/systemd/system/security-update-notify.service.d/credentials.conf"
@@ -87,6 +88,7 @@ type FileSystem interface {
 	OpenFileNoFollow(path string, flag int, perm fs.FileMode) (*os.File, error)
 	WriteFileAtomic(path string, data []byte, perm fs.FileMode) error
 	CopyRegularFileAtomic(source, destination string, maxBytes int64) error
+	CopyTrustedRegularFileAtomic(source, destination string, maxBytes int64, ownerUID uint32) error
 	Mkdir(path string, perm fs.FileMode) error
 	MkdirAll(path string, perm fs.FileMode) error
 	ReadDir(path string) ([]fs.DirEntry, error)
@@ -99,20 +101,23 @@ type FileSystem interface {
 
 // Command is one shell-free external command invocation.
 type Command struct {
-	Name    string
-	Args    []string
-	Env     map[string]string
-	Stdin   []byte
-	Timeout time.Duration
+	Name       string
+	Args       []string
+	Env        map[string]string
+	Stdin      []byte
+	ExtraFiles []*os.File
+	Timeout    time.Duration
 }
 
 // CommandResult treats a non-zero exit as data. Err is reserved for failures
 // to start, cancellation, and timeout.
 type CommandResult struct {
-	Stdout []byte
-	Stderr []byte
-	Code   int
-	Err    error
+	Stdout          []byte
+	Stderr          []byte
+	StdoutTruncated bool
+	StderrTruncated bool
+	Code            int
+	Err             error
 }
 
 type Runner interface {
