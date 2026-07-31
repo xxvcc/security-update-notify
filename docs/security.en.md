@@ -19,6 +19,7 @@ SUN is intentionally narrow:
 - no public HTTP endpoint;
 - no automatic reboot;
 - root-only normal notification config; the Feishu App Secret uses a separate systemd/root credential and never enters normal config, command lines, logs, or upgrade backups;
+- the fixed shared `/var/log` parent is the only privileged-directory exception that may be root-owned and group-writable, and it assumes that the directory group contains only trusted system principals. The log leaf is still opened no-follow and must be root-owned, non-group/other-writable, and single-linked. Those checks constrain symlink, special-file, ordinary non-root file, and hard-link injection, but cannot stop directory group members from renaming or unlinking entries, so they do not guarantee log-name integrity or availability. Custom log parents and every configuration, state, and binary directory still reject group/other write permission;
 - explicit opt-in for best-effort distro support.
 
 The release `.sha256` file protects against accidental corruption or version mismatch. If your threat model includes a compromised download source, keep the default signature verification enabled and do not use `--verify-signature off` or the unsigned-upgrade escape hatch.

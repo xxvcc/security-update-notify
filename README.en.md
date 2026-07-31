@@ -96,7 +96,7 @@ These systems require an explicit `--allow-best-effort`:
 - CloudLinux 8 / 9 / 10
 - Amazon Linux 2023
 
-Best-effort means the SUN code path is compatible; administrators must still confirm that subscriptions and security sources are valid. Ubuntu 20.04 checks local `esm-infra` state automatically. Amazon Linux 2023 still requires the administrator to track and advance release snapshots. Some Oracle Linux 8 vendor images set `/etc/dnf` to `root:root 0775`; SUN rejects a group-writable privileged directory, so first confirm that it is root-owned and not a symlink, then run `sudo chmod 0755 /etc/dnf`. Unlisted `ID_LIKE` derivatives are never promoted to official support automatically; see [Operations and recovery](docs/operations.en.md) for detection and rollback rules.
+Best-effort means the SUN code path is compatible; administrators must still confirm that subscriptions and security sources are valid. Ubuntu 20.04 checks local `esm-infra` state automatically. Amazon Linux 2023 still requires the administrator to track and advance release snapshots. Some Oracle Linux 8 vendor images set `/etc/dnf` to `root:root 0775`; except for the fixed shared `/var/log` parent, SUN still rejects group-writable privileged configuration directories such as `/etc/dnf`, so first confirm that it is root-owned and not a symlink, then run `sudo chmod 0755 /etc/dnf`. Unlisted `ID_LIKE` derivatives are never promoted to official support automatically; see [Operations and recovery](docs/operations.en.md) for detection and rollback rules.
 
 ### Not supported
 

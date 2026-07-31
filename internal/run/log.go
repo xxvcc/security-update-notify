@@ -24,7 +24,11 @@ func logEvent(line string) {
 
 func logEventForOwner(line string, euid int) {
 	path := logFilePath()
-	directory, err := filetrust.OpenOrCreateDirectory(filepath.Dir(path), euid)
+	logEventAtPath(line, path, euid, isSharedLogPath(path))
+}
+
+func logEventAtPath(line, path string, euid int, allowGroupWrite bool) {
+	directory, err := openLogDirectory(path, euid, allowGroupWrite)
 	if err != nil {
 		return
 	}
@@ -48,6 +52,19 @@ func logEventForOwner(line string, euid int) {
 		return
 	}
 	fmt.Fprintf(f, "%s %s\n", time.Now().Format("2006-01-02 15:04:05 -0700"), singleLineLogText(line))
+}
+
+func openLogDirectory(path string, euid int, allowGroupWrite bool) (*os.File, error) {
+	if allowGroupWrite {
+		// Some supported hosts make the shared system log namespace group-writable.
+		// The leaf remains root-owned, non-group/other-writable, and single-linked.
+		return filetrust.OpenOrCreateDirectoryAllowGroupWrite(filepath.Dir(path), euid)
+	}
+	return filetrust.OpenOrCreateDirectory(filepath.Dir(path), euid)
+}
+
+func isSharedLogPath(path string) bool {
+	return path == defaultLogFile
 }
 
 func singleLineLogText(value string) string {

@@ -186,6 +186,15 @@ apt-config dump >/tmp/sun-apt-config.out 2>&1
 ok "! grep -Fq \"Ignoring file '20auto-upgrades.security-update-notify\" /tmp/sun-apt-config.out" \
   "SUN APT metadata names are silently ignored"
 
+echo "### Install with the hosted Ubuntu shared log-parent mode"
+# Dependency packages can normalize /var/log, so reproduce the canary mode only after that transaction.
+rm -f /var/log/security-update-notify.log
+chmod 0775 /var/log
+"$runtime" "${install_args[@]}"
+ok "[[ \"$(stat -c %a /var/log)\" == 775 ]]" "shared log parent mode preserved"
+ok "[[ \"$(stat -c %U:%G:%a:%h /var/log/security-update-notify.log)\" == root:root:640:1 ]]" \
+  "protected log leaf created inside shared parent"
+
 binary_sha="$(sha256sum /usr/local/sbin/security-update-notify | awk '{print $1}')"
 config_sha="$(sha256sum /etc/security-update-notify/telegram.env | awk '{print $1}')"
 service_sha="$(sha256sum /etc/systemd/system/security-update-notify.service | awk '{print $1}')"

@@ -96,7 +96,7 @@ SUN 不会自动执行 `reboot`，也不会自动重启服务。维护窗口和�
 - CloudLinux 8 / 9 / 10
 - Amazon Linux 2023
 
-尽力支持只表示 SUN 的代码路径兼容，管理员仍须确认订阅和安全源有效。Ubuntu 20.04 会自动核对本机 `esm-infra`；Amazon Linux 2023 仍需管理员跟踪并前移发行快照。部分 Oracle Linux 8 厂商镜像将 `/etc/dnf` 设为 `root:root 0775`；SUN 会拒绝组可写特权目录，管理员须先确认它由 root 所有且不是符号链接，再执行 `sudo chmod 0755 /etc/dnf`。未列出的 `ID_LIKE` 衍生版不会自动升级为正式支持，详细探测和回滚规则见[运维文档](docs/operations.md)。
+尽力支持只表示 SUN 的代码路径兼容，管理员仍须确认订阅和安全源有效。Ubuntu 20.04 会自动核对本机 `esm-infra`；Amazon Linux 2023 仍需管理员跟踪并前移发行快照。部分 Oracle Linux 8 厂商镜像将 `/etc/dnf` 设为 `root:root 0775`；除固定共享日志父目录 `/var/log` 外，SUN 仍会拒绝组可写的 `/etc/dnf` 等特权配置目录，管理员须先确认它由 root 所有且不是符号链接，再执行 `sudo chmod 0755 /etc/dnf`。未列出的 `ID_LIKE` 衍生版不会自动升级为正式支持，详细探测和回滚规则见[运维文档](docs/operations.md)。
 
 ### 暂不支持
 

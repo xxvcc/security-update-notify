@@ -1,5 +1,10 @@
 # 变更记录
 
+## 3.1.4
+
+- 修复 v3.1.3 公网 canary 暴露的 Ubuntu 安装兼容性回归：本次 canary 使用的 GitHub 托管 Ubuntu 22.04/24.04 runner 映像中，`/var/log` 由 root 所有但允许组写，v3.1.2 引入的通用特权目录检查因此在安装日志文件前错误拒绝系统。安装器和运行时现在只对固定 `/var/log` 共享父目录允许组写，仍拒绝非 root、符号链接、非目录和任何 other-write；日志叶文件继续以 no-follow 打开，并强制 root 所有、不可组/其他写且只有一个硬链接。其他特权目录仍拒绝全部组/其他写权限。
+  Fixes an Ubuntu installation compatibility regression exposed by the v3.1.3 public canary: on the GitHub-hosted Ubuntu 22.04/24.04 runner images used by that canary, `/var/log` is root-owned but group-writable, so the generic privileged-directory check introduced in v3.1.2 incorrectly rejected it before creating the log. The installer and runtime now allow group write only for the fixed shared `/var/log` parent while still rejecting non-root ownership, symlinks, non-directories, and any other-write permission. The log leaf remains opened no-follow and must be root-owned, non-group/other-writable, and single-linked. Every other privileged directory retains the strict no-group/other-write policy.
+
 ## 3.1.3
 
 - 修复 v3.1.2 发布后发现的镜像部署兼容性问题：生产 SSH 身份由 forced-command `rrsync` 限制，不能执行该版本新工作流尝试启动的远端 Bash 锁协议。部署恢复为仅使用 `rrsync` 的单文件延迟替换，由仓库级全局 concurrency 串行写入；稳定 `sun.sh` 公网回读成功后才最后更新 `latest.json`。文档不再承诺两个稳定文件构成远端事务，并明确后半段失败时须从 `main` 幂等重跑。

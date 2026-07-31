@@ -70,6 +70,58 @@ func TestExistingDirectoryFailsClosedWithoutChangingUnsafePaths(t *testing.T) {
 	}
 }
 
+func TestDirectoryForbiddenPermissionPolicy(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "shared-log-parent")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(directory, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	if opened, _, err := OpenExistingDirectory(directory, os.Geteuid()); err == nil {
+		if opened != nil {
+			_ = opened.Close()
+		}
+		t.Fatal("strict directory policy accepted group write permission")
+	}
+	opened, err := OpenOrCreateDirectoryAllowGroupWrite(directory, os.Geteuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opened == nil {
+		t.Fatal("group-writable directory was not opened by the explicit policy")
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if opened, err := OpenOrCreateDirectoryAllowGroupWrite(directory, os.Geteuid()+1); err == nil {
+		if opened != nil {
+			_ = opened.Close()
+		}
+		t.Fatal("explicit shared-directory policy accepted the wrong owner")
+	}
+	link := directory + "-link"
+	if err := os.Symlink(directory, link); err != nil {
+		t.Fatal(err)
+	}
+	if opened, err := OpenOrCreateDirectoryAllowGroupWrite(link, os.Geteuid()); err == nil {
+		if opened != nil {
+			_ = opened.Close()
+		}
+		t.Fatal("explicit shared-directory policy accepted a symlink")
+	}
+
+	if err := os.Chmod(directory, 0o772); err != nil {
+		t.Fatal(err)
+	}
+	if opened, err := OpenOrCreateDirectoryAllowGroupWrite(directory, os.Geteuid()); err == nil {
+		if opened != nil {
+			_ = opened.Close()
+		}
+		t.Fatal("explicit shared-directory policy accepted other write permission")
+	}
+}
+
 func TestValidateRegularMetadata(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state")
 	if err := os.WriteFile(path, []byte("state"), 0o600); err != nil {

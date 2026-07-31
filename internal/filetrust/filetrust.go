@@ -64,14 +64,25 @@ func EnsureDirectory(path string, euid int) error {
 // OpenExistingDirectory opens and validates the final directory object without
 // following a symlink. A missing path is reported as (nil, false, nil).
 func OpenExistingDirectory(path string, euid int) (*os.File, bool, error) {
-	return openDirectory(path, euid, false)
+	return openDirectory(path, euid, false, 0o022)
 }
 
 // OpenOrCreateDirectory creates a missing directory with mode 0750, then opens
 // and validates the final directory object. Callers can safely use *at syscalls
 // relative to the returned descriptor even if the pathname is later replaced.
 func OpenOrCreateDirectory(path string, euid int) (*os.File, error) {
-	directory, exists, err := openDirectory(path, euid, true)
+	return openOrCreateDirectory(path, euid, 0o022)
+}
+
+// OpenOrCreateDirectoryAllowGroupWrite is limited to shared system namespaces
+// whose group writers are trusted privileged principals. It still rejects any
+// other-write permission and retains the owner, directory-type, and no-follow checks.
+func OpenOrCreateDirectoryAllowGroupWrite(path string, euid int) (*os.File, error) {
+	return openOrCreateDirectory(path, euid, 0o002)
+}
+
+func openOrCreateDirectory(path string, euid int, forbiddenPerm fs.FileMode) (*os.File, error) {
+	directory, exists, err := openDirectory(path, euid, true, forbiddenPerm)
 	if err != nil {
 		return nil, err
 	}
@@ -81,7 +92,7 @@ func OpenOrCreateDirectory(path string, euid int) (*os.File, error) {
 	return directory, nil
 }
 
-func openDirectory(path string, euid int, create bool) (*os.File, bool, error) {
+func openDirectory(path string, euid int, create bool, forbiddenPerm fs.FileMode) (*os.File, bool, error) {
 	if path == "" {
 		return nil, false, fmt.Errorf("directory path is required")
 	}
@@ -111,7 +122,7 @@ func openDirectory(path string, euid int, create bool) (*os.File, bool, error) {
 		_ = directory.Close()
 		return nil, false, err
 	}
-	if err := ValidateDirectory(info, euid, 0o022); err != nil {
+	if err := ValidateDirectory(info, euid, forbiddenPerm); err != nil {
 		_ = directory.Close()
 		return nil, false, fmt.Errorf("unsafe directory %s: %w", path, err)
 	}

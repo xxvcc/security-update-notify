@@ -121,6 +121,19 @@ group-writable privileged directory; an administrator must first confirm that th
 symlink, then tighten it with `sudo chmod 0755 /etc/dnf`. The lifecycle fixture models that step only for the exact
 vendor metadata and does not weaken the product check.
 
+本次 v3.1.3 公网 canary 使用的 GitHub 托管 Ubuntu 22.04/24.04 runner 映像中，共享日志父目录
+`/var/log` 由 root 所有并允许组写。
+该固定路径是唯一的组可写特权目录例外：仍禁止任何 other-write，日志文件每次都通过 no-follow 描述符打开并
+复验 root owner、不可组/其他写和单硬链接。这个例外假定目录所属组仅包含受信的系统特权主体，因为组成员仍能
+在目录层执行 rename/unlink。`/etc`、`/usr/local`、systemd、APT/DNF 及 SUN 自有状态目录继续拒绝所有组/其他写。
+
+On the GitHub-hosted Ubuntu 22.04/24.04 runner images used by the v3.1.3 public canary, the shared `/var/log` parent
+is root-owned and group-writable. That fixed path is the only group-writable privileged-directory exception: any
+other-write bit is still rejected, and every log leaf is opened through a no-follow descriptor and revalidated as root-owned,
+non-group/other-writable, and single-linked. This exception assumes that the directory's group contains only trusted
+system principals because its members can still rename or unlink directory entries. `/etc`, `/usr/local`, systemd,
+APT/DNF, and SUN-owned state directories retain the strict policy.
+
 ## 安装事务 / Installation transaction
 
 Go 安装器保留并收紧了既有运维契约：
