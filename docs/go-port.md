@@ -107,12 +107,19 @@ internal/assets/             systemd、logrotate、needrestart、公钥与指纹
 
 Fedora 43/44 使用 DNF5 JSON advisory 与实际可执行事务的交集；RHEL-compatible 与尽力支持的 EL 衍生版使用 DNF4。Ubuntu 20.04 只有在 Ubuntu Pro 结构化状态明确显示 `esm-infra` 已启用时，才采用 ESM 支持终止日；不需要因此关闭全部 EOL 检查。
 
+部分 Oracle Linux 8 厂商镜像将 `/etc/dnf` 设为 `root:root 0775`。生产安装器不会把组可写特权目录纳入信任边界；管理员必须先确认该路径由 root 所有且不是符号链接，再用 `sudo chmod 0755 /etc/dnf` 收紧权限。生命周期测试只在精确匹配该厂商默认元数据时模拟这一步，不会放宽产品检查。
+
 `BACKEND` remains the stable user-facing value (`apt` or `dnf`), while the internal profile distinguishes
 APT, DNF4, and DNF5 and owns their packages, probes, automatic-update configuration, units, and restart
 capabilities. Best-effort systems require explicit opt-in. Unlisted `ID_LIKE` derivatives additionally require
 an unambiguous ancestry or pre-side-effect DNF generation probe and a mandatory post-install doctor; ambiguity
 or a failed doctor rolls the transaction back. Ubuntu 20.04 extends its EOL date only when the structured Ubuntu
 Pro status confirms `esm-infra` locally.
+
+Some Oracle Linux 8 vendor images set `/etc/dnf` to `root:root 0775`. The production installer does not trust a
+group-writable privileged directory; an administrator must first confirm that the path is root-owned and not a
+symlink, then tighten it with `sudo chmod 0755 /etc/dnf`. The lifecycle fixture models that step only for the exact
+vendor metadata and does not weaken the product check.
 
 ## 安装事务 / Installation transaction
 

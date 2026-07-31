@@ -35,6 +35,26 @@ case "$distro_id:$distro_major" in
     ;;
 esac
 
+# Oracle Linux 8 images ship /etc/dnf as root:root 0775. Production keeps
+# rejecting that group-writable trust boundary; this disposable fixture models
+# the documented administrator remediation only for the exact vendor state.
+if [[ "$distro_id:$distro_major" == ol:8 ]]; then
+  [[ -d /etc/dnf && ! -L /etc/dnf ]] || {
+    echo 'Oracle Linux 8 fixture has an unexpected /etc/dnf object' >&2
+    exit 2
+  }
+  dnf_directory_metadata="$(stat -c '%u:%g:%a' -- /etc/dnf)"
+  case "$dnf_directory_metadata" in
+    0:0:775) chmod 0755 /etc/dnf ;;
+    0:0:755) ;;
+    *)
+      printf 'Oracle Linux 8 fixture has unexpected /etc/dnf metadata: %s\n' "$dnf_directory_metadata" >&2
+      exit 2
+      ;;
+  esac
+  [[ "$(stat -c '%u:%g:%a' -- /etc/dnf)" == 0:0:755 ]]
+fi
+
 assert_same_file() {
   local left="$1"
   local right="$2"

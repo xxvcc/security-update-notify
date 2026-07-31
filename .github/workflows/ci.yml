@@ -784,6 +784,7 @@ jobs:
           STALE_UPDATE_DAYS=0
           CHECK_SELF_UPDATE=0
           EOF
+          chmod 0600 "$config"
           want="$(python3 -I -c "import json; print({x['name']: x['hash'] for x in json.load(open('internal/golden/testdata/scenarios.json'))}['apt-test-reboot-zh'])")"
           run_arch() {
             local arch="$1"
