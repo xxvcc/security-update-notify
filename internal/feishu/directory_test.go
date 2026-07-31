@@ -172,6 +172,28 @@ func TestScanDirectoryRetriesNonJSONServerFailure(t *testing.T) {
 	}
 }
 
+func TestScanDirectoryRetriesHTTP408(t *testing.T) {
+	var calls int32
+	c, srv, slept := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "tenant_access_token") {
+			io.WriteString(w, `{"code":0,"tenant_access_token":"token"}`)
+			return
+		}
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.WriteHeader(http.StatusRequestTimeout)
+			return
+		}
+		io.WriteString(w, directoryPageJSON(false, "", ""))
+	})
+	defer srv.Close()
+	if _, err := c.ScanDirectory(context.Background(), "cli_test", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 || *slept != 1 {
+		t.Fatalf("calls=%d sleeps=%d want 2,1", calls, *slept)
+	}
+}
+
 func TestScanDirectoryRetriesInterruptedResponseBody(t *testing.T) {
 	var directoryRequests int32
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {

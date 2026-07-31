@@ -12,6 +12,7 @@ package dedup
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -109,17 +110,21 @@ type Store struct {
 	Dir                string
 	HashFile           string
 	TimeFile           string
+	TargetFile         string
+	TargetPendingFile  string
 	afterDirectoryOpen func()
 	fileSync           func(*os.File) error
 	directorySync      func(*os.File) error
 }
 
-// NewStore 按运行时的路径约定构造：<dir>/last-alert.sha256 与 <dir>/last-alert.sent_at。
+// NewStore 按运行时的 Telegram 路径约定构造去重与目标状态。
 func NewStore(dir string) *Store {
 	return &Store{
-		Dir:      dir,
-		HashFile: filepath.Join(dir, "last-alert.sha256"),
-		TimeFile: filepath.Join(dir, "last-alert.sent_at"),
+		Dir:               dir,
+		HashFile:          filepath.Join(dir, "last-alert.sha256"),
+		TimeFile:          filepath.Join(dir, "last-alert.sent_at"),
+		TargetFile:        filepath.Join(dir, "last-alert.telegram.target.sha256"),
+		TargetPendingFile: filepath.Join(dir, "last-alert.telegram.target.pending"),
 	}
 }
 
@@ -127,10 +132,138 @@ func NewStore(dir string) *Store {
 // keeps using NewStore so an upgrade does not forget its existing delivery state and resend alerts.
 func NewChannelStore(dir, channel string) *Store {
 	return &Store{
-		Dir:      dir,
-		HashFile: filepath.Join(dir, "last-alert."+channel+".sha256"),
-		TimeFile: filepath.Join(dir, "last-alert."+channel+".sent_at"),
+		Dir:               dir,
+		HashFile:          filepath.Join(dir, "last-alert."+channel+".sha256"),
+		TimeFile:          filepath.Join(dir, "last-alert."+channel+".sent_at"),
+		TargetFile:        filepath.Join(dir, "last-alert."+channel+".target.sha256"),
+		TargetPendingFile: filepath.Join(dir, "last-alert."+channel+".target.pending"),
 	}
+}
+
+// TargetFingerprint creates a domain-separated, unambiguous fingerprint for a
+// channel's stable delivery identity. Callers must pass only stable identifiers
+// (for example Telegram bot ID plus chat ID), never a bearer token or secret.
+func TargetFingerprint(channel string, identities ...string) string {
+	h := sha256.New()
+	writePart := func(value string) {
+		_, _ = io.WriteString(h, strconv.Itoa(len(value)))
+		_, _ = io.WriteString(h, ":")
+		_, _ = io.WriteString(h, value)
+	}
+	writePart("security-update-notify-target-v1")
+	writePart(channel)
+	for _, identity := range identities {
+		writePart(identity)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// TargetStatus describes how the current target relates to persisted delivery
+// state. A missing fingerprint is Legacy so upgrading old state does not resend
+// every unchanged alert. Pending and malformed state are Changed and therefore
+// bias toward delivery.
+type TargetStatus uint8
+
+const (
+	TargetLegacy TargetStatus = iota
+	TargetCurrent
+	TargetChanged
+)
+
+// ReadTargetStatus compares current with the last successfully delivered
+// target. The pending marker is deliberately identity-free and forces another
+// attempt after an installer change or interrupted state commit.
+func (s *Store) ReadTargetStatus(current string) TargetStatus {
+	if !validFingerprint(current) {
+		return TargetChanged
+	}
+	targetName, err := s.entryName(s.TargetFile)
+	if err != nil {
+		return TargetChanged
+	}
+	pendingName, err := s.entryName(s.TargetPendingFile)
+	if err != nil {
+		return TargetChanged
+	}
+	directory, exists, err := s.openDirectory()
+	if err != nil || !exists {
+		return TargetChanged
+	}
+	defer directory.Close()
+	if _, err := readStateFileAt(directory, pendingName, 64, os.Geteuid()); err == nil {
+		return TargetChanged
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return TargetChanged
+	}
+	b, err := readStateFileAt(directory, targetName, 256, os.Geteuid())
+	if errors.Is(err, os.ErrNotExist) {
+		return TargetLegacy
+	}
+	if err != nil {
+		return TargetChanged
+	}
+	stored := strings.TrimRight(string(b), "\n")
+	if !validFingerprint(stored) || stored != current {
+		return TargetChanged
+	}
+	return TargetCurrent
+}
+
+// AdoptLegacyTarget binds target-less legacy state to the current stable
+// identity without recording a delivery. Callers use this only after the
+// existing hash/time policy has suppressed an alert, preserving upgrade
+// compatibility while closing the migration window for later target changes.
+func (s *Store) AdoptLegacyTarget(current string) error {
+	if !validFingerprint(current) {
+		return fmt.Errorf("invalid delivery target fingerprint")
+	}
+	targetName, err := s.entryName(s.TargetFile)
+	if err != nil {
+		return err
+	}
+	pendingName, err := s.entryName(s.TargetPendingFile)
+	if err != nil {
+		return err
+	}
+	directory, exists, err := s.openDirectory()
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("state directory does not exist: %s", s.Dir)
+	}
+	defer directory.Close()
+	if _, err := readStateFileAt(directory, pendingName, 64, os.Geteuid()); err == nil {
+		return fmt.Errorf("delivery target has a pending change")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read delivery target pending marker: %w", err)
+	}
+	stored, err := readStateFileAt(directory, targetName, 256, os.Geteuid())
+	if err == nil {
+		if strings.TrimRight(string(stored), "\n") == current {
+			return nil
+		}
+		return fmt.Errorf("delivery target is no longer legacy")
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read delivery target fingerprint: %w", err)
+	}
+	if err := s.atomicAt(directory, targetName, current+"\n"); err != nil {
+		return fmt.Errorf("adopt legacy delivery target: %w", err)
+	}
+	return nil
+}
+
+func validFingerprint(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	for _, char := range value {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // ReadLast 读回上次 hash 与发送时间戳；缺失或非法时分别返回 ""、0。回读会裁掉所有尾部换行
@@ -215,6 +348,60 @@ func (s *Store) Write(hash string, now int64) error {
 		return fmt.Errorf("state directory does not exist: %s", s.Dir)
 	}
 	defer directory.Close()
+	return s.writeAlertAt(directory, hashName, timeName, hash, now)
+}
+
+// WriteDelivery records a successful channel delivery. The identity-free
+// pending marker is committed first and removed last. Thus every error or crash
+// between the target, timestamp, and hash commits leaves evidence that forces a
+// retry instead of silently suppressing a message to a newly selected target.
+func (s *Store) WriteDelivery(hash string, now int64, targetFingerprint string) error {
+	if !validFingerprint(targetFingerprint) {
+		return fmt.Errorf("invalid delivery target fingerprint")
+	}
+	hashName, err := s.entryName(s.HashFile)
+	if err != nil {
+		return err
+	}
+	timeName, err := s.entryName(s.TimeFile)
+	if err != nil {
+		return err
+	}
+	targetName, err := s.entryName(s.TargetFile)
+	if err != nil {
+		return err
+	}
+	pendingName, err := s.entryName(s.TargetPendingFile)
+	if err != nil {
+		return err
+	}
+	directory, exists, err := s.openDirectory()
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("state directory does not exist: %s", s.Dir)
+	}
+	defer directory.Close()
+	if err := s.atomicAt(directory, pendingName, "pending\n"); err != nil {
+		return fmt.Errorf("commit delivery target pending marker: %w", err)
+	}
+	if err := s.atomicAt(directory, targetName, targetFingerprint+"\n"); err != nil {
+		return fmt.Errorf("commit delivery target fingerprint: %w", err)
+	}
+	if err := s.writeAlertAt(directory, hashName, timeName, hash, now); err != nil {
+		return err
+	}
+	if err := syscall.Unlinkat(int(directory.Fd()), pendingName); err != nil {
+		return fmt.Errorf("clear delivery target pending marker: %w", err)
+	}
+	if err := s.syncDirectory(directory); err != nil {
+		return fmt.Errorf("sync state directory after clearing delivery target pending marker: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) writeAlertAt(directory *os.File, hashName, timeName, hash string, now int64) error {
 	if err := s.atomicAt(directory, timeName, strconv.FormatInt(now, 10)+"\n"); err != nil {
 		return err
 	}

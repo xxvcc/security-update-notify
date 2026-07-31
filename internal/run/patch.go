@@ -1,6 +1,7 @@
 package run
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -45,22 +46,22 @@ func collectPatchWatchdog(cfg *config.Config, be string, restart backend.Restart
 	if opts.LatestRelease == nil {
 		opts.LatestRelease = dist.LatestRelease
 	}
-	pending, blocked, issues := collectPackageFacts(cfg, be, opts.Now)
+	pending, pendingObservation, blocked, issues := collectPackageFacts(cfg, be, opts.Now)
 	if restart.ProbeIssue != "" {
 		issues = append(issues, restartProbeIssue(restart.ProbeIssue))
 	}
 	store := statefile.Store{Dir: stateDirPath()}
 	now := opts.Now.Unix()
 
-	pendingAge, err := trackedAgeDays(store, "pending-security.first_seen", pending.Count > 0, now, opts.PersistState)
+	pendingAge, err := trackedAgeDays(store, "pending-security.first_seen", pendingObservation, now, opts.PersistState)
 	if err != nil {
 		issues = append(issues, stateIssue())
 	}
-	rebootAge, err := trackedAgeDays(store, "reboot-required.first_seen", restart.RebootRequired, now, opts.PersistState)
+	rebootAge, err := trackedAgeDays(store, "reboot-required.first_seen", observationFor(restart.RebootRequired, restart.ProbeIssue == ""), now, opts.PersistState)
 	if err != nil {
 		issues = append(issues, stateIssue())
 	}
-	serviceAge, err := trackedAgeDays(store, "service-restart.first_seen", restart.RestartAttention, now, opts.PersistState)
+	serviceAge, err := trackedAgeDays(store, "service-restart.first_seen", observationFor(restart.RestartAttention, restart.ProbeIssue == ""), now, opts.PersistState)
 	if err != nil {
 		issues = append(issues, stateIssue())
 	}
@@ -77,38 +78,50 @@ func collectPatchWatchdog(cfg *config.Config, be string, restart backend.Restart
 	}), pending
 }
 
-func collectPackageFacts(cfg *config.Config, be string, now time.Time) (watchdog.Pending, []string, []watchdog.Issue) {
+func collectPackageFacts(cfg *config.Config, be string, now time.Time) (watchdog.Pending, statefile.Observation, []string, []watchdog.Issue) {
 	healthEnabled := truthyLooseDefault(cfg.Get("CHECK_UPDATE_HEALTH"), true)
 	switch be {
 	case "apt":
-		return collectAPTPackageFacts(healthEnabled, now, staleDays(cfg))
+		return collectAPTPackageFactsObserved(healthEnabled, now, staleDays(cfg))
 	case "dnf":
-		return collectDNFPackageFacts(healthEnabled)
+		return collectDNFPackageFactsObserved(healthEnabled)
 	default:
-		return watchdog.Pending{}, nil, nil
+		return watchdog.Pending{}, statefile.ObservationUnknown, nil, nil
 	}
 }
 
 func collectAPTPackageFacts(healthEnabled bool, now time.Time, stale int) (watchdog.Pending, []string, []watchdog.Issue) {
+	pending, _, blocked, issues := collectAPTPackageFactsObserved(healthEnabled, now, stale)
+	return pending, blocked, issues
+}
+
+func collectAPTPackageFactsObserved(healthEnabled bool, now time.Time, stale int) (watchdog.Pending, statefile.Observation, []string, []watchdog.Issue) {
 	regular := sysexec.RunTimeout(patchCommandTimeout, "apt-get", "-s", "upgrade")
 	regularUsable := regular.Code == 0 && !commandOutputIncomplete(regular)
 	pending := watchdog.Pending{}
+	regularParsed := false
 	if regularUsable {
-		pending = watchdog.CollectPending("apt", regular.Stdout)
+		pending, regularParsed = watchdog.CollectAPTPending(regular.Stdout)
 	}
+	pendingObservation := observationFor(pending.Count > 0, regularUsable && regularParsed)
 	var blocked []string
 	var issues []watchdog.Issue
 	if !healthEnabled {
-		return pending, nil, nil
+		return pending, pendingObservation, nil, nil
 	}
 	if !regularUsable {
 		issues = append(issues, watchdog.Issue{Code: "apt-simulation-failed", ZH: "APT 无法计算待安装安全更新", EN: "APT could not calculate pending security updates"})
+	} else if !regularParsed {
+		issues = append(issues, watchdog.Issue{Code: "apt-simulation-output-invalid", ZH: "APT 返回了无法完整解析的更新模拟结果", EN: "APT returned update-simulation output that could not be fully parsed"})
 	}
 	held := sysexec.RunTimeout(patchCommandTimeout, "apt-mark", "showhold")
 	ignoreHold := sysexec.RunTimeout(patchCommandTimeout, "apt-get", "-s", "--ignore-hold", "upgrade")
 	if held.Code == 0 && ignoreHold.Code == 0 && !commandOutputIncomplete(held) && !commandOutputIncomplete(ignoreHold) {
-		if regularUsable {
-			blocked = watchdog.BlockedAPT(pending, watchdog.CollectPending("apt", ignoreHold.Stdout), held.Stdout)
+		ignorePending, ignoreParsed := watchdog.CollectAPTPending(ignoreHold.Stdout)
+		if regularUsable && regularParsed && ignoreParsed {
+			blocked = watchdog.BlockedAPT(pending, ignorePending, held.Stdout)
+		} else if !ignoreParsed {
+			issues = append(issues, watchdog.Issue{Code: "apt-blocked-query-failed", ZH: "APT 无法检查被 hold 阻塞的安全更新", EN: "APT could not check security updates blocked by package holds"})
 		}
 	} else {
 		issues = append(issues, watchdog.Issue{Code: "apt-blocked-query-failed", ZH: "APT 无法检查被 hold 阻塞的安全更新", EN: "APT could not check security updates blocked by package holds"})
@@ -130,23 +143,28 @@ func collectAPTPackageFacts(healthEnabled bool, now time.Time, stale int) (watch
 		issues = append(issues, watchdog.Issue{Code: "apt-check", ZH: "APT 依赖一致性检查失败，请运行 apt-get check", EN: "APT dependency consistency check failed; run apt-get check"})
 	}
 	issues = append(issues, checkAPTRepository(now, stale)...)
-	return pending, blocked, issues
+	return pending, pendingObservation, blocked, issues
 }
 
 func collectDNFPackageFacts(healthEnabled bool) (watchdog.Pending, []string, []watchdog.Issue) {
+	pending, _, blocked, issues := collectDNFPackageFactsObserved(healthEnabled)
+	return pending, blocked, issues
+}
+
+func collectDNFPackageFactsObserved(healthEnabled bool) (watchdog.Pending, statefile.Observation, []string, []watchdog.Issue) {
 	runtime := detectDNFRuntime(patchCommandTimeout)
 	if !runtime.GenerationKnown {
 		if !healthEnabled {
-			return watchdog.Pending{}, nil, nil
+			return watchdog.Pending{}, statefile.ObservationUnknown, nil, nil
 		}
-		return watchdog.Pending{}, nil, []watchdog.Issue{{
+		return watchdog.Pending{}, statefile.ObservationUnknown, nil, []watchdog.Issue{{
 			Code: "dnf-generation-probe-failed",
 			ZH:   "无法可靠识别已安装的 DNF 代际，已跳过安全更新查询",
 			EN:   "Could not reliably identify the installed DNF generation; security-update queries were skipped",
 		}}
 	}
 	if runtime.isDNF5() {
-		return collectDNF5PackageFacts(healthEnabled, runtime)
+		return collectDNF5PackageFactsObserved(healthEnabled, runtime)
 	}
 	regular := sysexec.RunTimeout(patchCommandTimeout, runtime.Command, runtime.advisoryArgs(false)...)
 	regularIssue, regularFailed := dnfRepositoryIssue(regular, regular.Code == 0)
@@ -154,10 +172,11 @@ func collectDNFPackageFacts(healthEnabled bool) (watchdog.Pending, []string, []w
 	if !regularFailed {
 		pending = watchdog.CollectPending("dnf", regular.Stdout)
 	}
+	pendingObservation := observationFor(pending.Count > 0, !regularFailed)
 	var blocked []string
 	var issues []watchdog.Issue
 	if !healthEnabled {
-		return pending, nil, nil
+		return pending, pendingObservation, nil, nil
 	}
 	if regularFailed {
 		issues = append(issues, regularIssue)
@@ -178,14 +197,14 @@ func collectDNFPackageFacts(healthEnabled bool) (watchdog.Pending, []string, []w
 	if dnfCheck.Code != 0 || commandOutputIncomplete(dnfCheck) {
 		issues = append(issues, watchdog.Issue{Code: "dnf-check", ZH: "DNF 软件包一致性检查失败，请运行 dnf check", EN: "DNF package consistency check failed; run dnf check"})
 	}
-	return pending, blocked, issues
+	return pending, pendingObservation, blocked, issues
 }
 
-func collectDNF5PackageFacts(healthEnabled bool, runtime dnfRuntime) (watchdog.Pending, []string, []watchdog.Issue) {
+func collectDNF5PackageFactsObserved(healthEnabled bool, runtime dnfRuntime) (watchdog.Pending, statefile.Observation, []string, []watchdog.Issue) {
 	regular := sysexec.RunTimeout(patchCommandTimeout, runtime.Command, runtime.advisoryArgs(false)...)
 	transaction := sysexec.RunTimeout(patchCommandTimeout, runtime.Command, runtime.checkUpgradeArgs(false)...)
 	transactionStatusOK := transaction.Code == 0 || transaction.Code == 100
-	regularIssue, regularFailed := dnfRepositoryIssue(regular, regular.Code == 0)
+	regularIssue, regularFailed := dnfStructuredRepositoryIssue(regular, regular.Code == 0)
 	transactionIssue, transactionFailed := dnfRepositoryIssue(transaction, transactionStatusOK)
 	transactionUpgrades, transactionParseErr := backend.ParseDNF5CheckUpgrades(transaction.Stdout)
 	transactionUsable := !transactionFailed && transactionParseErr == nil && ((transaction.Code == 0 && len(transactionUpgrades) == 0) ||
@@ -200,15 +219,16 @@ func collectDNF5PackageFacts(healthEnabled bool, runtime dnfRuntime) (watchdog.P
 				// A valid advisory response is stronger evidence than a failed
 				// advisory/transaction join. Conservatively over-report the
 				// advisories instead of turning parser drift into a false green.
-				normalized, _ = backend.NormalizeDNF5Advisories(regular.Stdout)
+				normalized, parseErr = backend.NormalizeDNF5Advisories(regular.Stdout)
 			}
 		} else {
 			normalized, parseErr = backend.NormalizeDNF5Advisories(regular.Stdout)
 		}
 	}
 	pending := watchdog.CollectPending("dnf", normalized)
+	pendingObservation := observationFor(pending.Count > 0, !regularFailed && parseErr == nil)
 	if !healthEnabled {
-		return pending, nil, nil
+		return pending, pendingObservation, nil, nil
 	}
 
 	var blocked []string
@@ -236,7 +256,7 @@ func collectDNF5PackageFacts(healthEnabled bool, runtime dnfRuntime) (watchdog.P
 			((unrestrictedTransaction.Code == 0 && len(unrestrictedUpgrades) == 0) ||
 				(unrestrictedTransaction.Code == 100 && len(unrestrictedUpgrades) > 0))
 		unrestrictedFailed := false
-		if issue, failed := dnfRepositoryIssue(unrestricted, unrestricted.Code == 0); failed {
+		if issue, failed := dnfStructuredRepositoryIssue(unrestricted, unrestricted.Code == 0); failed {
 			issues = append(issues, issue, dnfBlockedQueryIssue())
 			unrestrictedFailed = true
 		}
@@ -265,7 +285,7 @@ func collectDNF5PackageFacts(healthEnabled bool, runtime dnfRuntime) (watchdog.P
 	if dnfCheck.Code != 0 || commandOutputIncomplete(dnfCheck) {
 		issues = append(issues, watchdog.Issue{Code: "dnf-check", ZH: "DNF 软件包一致性检查失败，请运行 dnf check", EN: "DNF package consistency check failed; run dnf check"})
 	}
-	return pending, blocked, issues
+	return pending, pendingObservation, blocked, issues
 }
 
 func checkAPTRepository(now time.Time, stale int) []watchdog.Issue {
@@ -279,7 +299,7 @@ func checkAPTRepository(now time.Time, stale int) []watchdog.Issue {
 	}
 	if result != "success" {
 		journal := sysexec.RunTimeout(patchCommandTimeout, "journalctl", "-u", "apt-daily.service", "-n", "100", "--no-pager", "-o", "cat")
-		if journal.Code == 0 && !commandOutputIncomplete(journal) && repositorySignatureError(journal.Stdout+journal.Stderr) {
+		if journal.Code == 0 && !commandOutputIncomplete(journal) && aptRepositorySignatureError(journal.Stdout+journal.Stderr) {
 			issues = append(issues, watchdog.Issue{Code: "apt-repository-signature", ZH: "APT 软件源元数据签名、有效期或 TLS 校验失败", EN: "APT repository metadata signature, expiry, or TLS verification failed"})
 		} else {
 			issues = append(issues, watchdog.Issue{Code: "apt-daily-failed", ZH: "上次 APT 软件源刷新失败（apt-daily.service）", EN: "The last APT metadata refresh failed (apt-daily.service)"})
@@ -399,8 +419,18 @@ func collectSelfUpdate(cfg *config.Config, current string, store statefile.Store
 	return latest, comparison > 0, nil, stateErr
 }
 
-func trackedAgeDays(store statefile.Store, name string, active bool, now int64, persist bool) (int, error) {
-	first, err := store.Track(name, active, now, persist)
+func observationFor(active, known bool) statefile.Observation {
+	if active {
+		return statefile.ObservationPresent
+	}
+	if known {
+		return statefile.ObservationAbsent
+	}
+	return statefile.ObservationUnknown
+}
+
+func trackedAgeDays(store statefile.Store, name string, observation statefile.Observation, now int64, persist bool) (int, error) {
+	first, err := store.Observe(name, observation, now, persist)
 	if err != nil || first <= 0 || first > now {
 		return 0, err
 	}
@@ -429,7 +459,7 @@ func dedupeIssues(in []watchdog.Issue) []watchdog.Issue {
 	return out
 }
 
-func repositorySignatureError(text string) bool {
+func aptRepositorySignatureError(text string) bool {
 	lower := strings.ToLower(text)
 	for _, marker := range []string{"no_pubkey", "expkeysig", "badsig", "not signed", "signature", "valid-until", "release file expired", "certificate verification", "tls"} {
 		if strings.Contains(lower, marker) {
@@ -454,8 +484,21 @@ func repositoryOperationalError(text string) bool {
 }
 
 func dnfRepositoryIssue(result sysexec.Result, statusOK bool) (watchdog.Issue, bool) {
-	output := result.Stdout + result.Stderr
-	if repositorySignatureError(output) {
+	return classifyDNFRepositoryIssue(result, statusOK, false)
+}
+
+func dnfStructuredRepositoryIssue(result sysexec.Result, statusOK bool) (watchdog.Issue, bool) {
+	return classifyDNFRepositoryIssue(result, statusOK, true)
+}
+
+func classifyDNFRepositoryIssue(result sysexec.Result, statusOK, structuredStdout bool) (watchdog.Issue, bool) {
+	output := result.Stderr
+	// A syntactically valid JSON response is application data. Package and
+	// advisory names inside it must never be interpreted as repository errors.
+	if !structuredStdout || !json.Valid([]byte(strings.TrimSpace(result.Stdout))) {
+		output = result.Stdout + result.Stderr
+	}
+	if dnfRepositorySignatureError(output) {
 		return watchdog.Issue{
 			Code: "dnf-repository-signature",
 			ZH:   "DNF 软件源元数据签名或 TLS 校验失败",
@@ -470,6 +513,23 @@ func dnfRepositoryIssue(result sysexec.Result, statusOK bool) (watchdog.Issue, b
 		}, true
 	}
 	return watchdog.Issue{}, false
+}
+
+func dnfRepositorySignatureError(text string) bool {
+	lower := strings.ToLower(text)
+	for _, marker := range []string{
+		"no_pubkey", "expkeysig", "badsig", "not signed", "gpg check failed",
+		"gpg signature verification failed", "signature verification failed",
+		"signature could not be verified", "failed to verify signature",
+		"certificate verification failed", "certificate verify failed",
+		"ssl certificate problem", "certificate issuer has been marked as not trusted",
+		"curl error (60)", "tls certificate verification failed", "tls handshake failed",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func commandOutputIncomplete(result sysexec.Result) bool {

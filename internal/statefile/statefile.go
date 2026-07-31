@@ -17,6 +17,17 @@ import (
 
 const maxStateFileBytes = 4 << 10
 
+// Observation is the result of probing a condition whose lifetime is tracked.
+// Unknown deliberately differs from Absent: a failed probe must not erase the
+// last confirmed observation.
+type Observation uint8
+
+const (
+	ObservationUnknown Observation = iota
+	ObservationAbsent
+	ObservationPresent
+)
+
 type Store struct {
 	Dir                string
 	afterDirectoryOpen func()
@@ -201,14 +212,27 @@ func createTempAt(directory *os.File, pattern string) (*os.File, string, error) 
 	return temporary, filepath.Base(temporary.Name()), nil
 }
 
-// Track returns the first time an active condition was observed. When mutate is false it is read-only;
-// a missing timestamp is treated as newly observed. Clock rollback resets a future timestamp.
-func (s Store) Track(name string, active bool, now int64, mutate bool) (int64, error) {
-	if !active {
+// Observe returns the first time a condition was confirmed present. Unknown
+// observations neither read nor mutate the timestamp, so callers cannot turn a
+// transient probe failure into a false recovery or a stale-condition alert.
+// When mutate is false the operation is read-only; a missing timestamp is
+// treated as newly observed. Clock rollback resets a future timestamp.
+func (s Store) Observe(name string, observation Observation, now int64, mutate bool) (int64, error) {
+	if _, err := s.path(name); err != nil {
+		return 0, err
+	}
+	switch observation {
+	case ObservationUnknown:
+		return 0, nil
+	case ObservationAbsent:
 		if mutate {
 			return 0, s.Remove(name)
 		}
 		return 0, nil
+	case ObservationPresent:
+		// Continue below.
+	default:
+		return 0, fmt.Errorf("invalid condition observation %d", observation)
 	}
 	first, err := s.ReadInt(name)
 	if err != nil {
@@ -223,4 +247,14 @@ func (s Store) Track(name string, active bool, now int64, mutate bool) (int64, e
 		}
 	}
 	return now, nil
+}
+
+// Track is the two-state compatibility wrapper for callers that have a
+// definitive result. New probe-backed code should use Observe.
+func (s Store) Track(name string, active bool, now int64, mutate bool) (int64, error) {
+	observation := ObservationAbsent
+	if active {
+		observation = ObservationPresent
+	}
+	return s.Observe(name, observation, now, mutate)
 }

@@ -9,10 +9,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/xxvcc/security-update-notify/internal/config"
+	"github.com/xxvcc/security-update-notify/internal/dedup"
 	"github.com/xxvcc/security-update-notify/internal/delivery"
 	"github.com/xxvcc/security-update-notify/internal/feishu"
 	"github.com/xxvcc/security-update-notify/internal/telegram"
@@ -71,7 +73,14 @@ func TestDeliverChannelsPartialFailureDoesNotRepeatSuccess(t *testing.T) {
 			state := t.TempDir()
 			t.Setenv("SECURITY_UPDATE_NOTIFY_STATE_DIR", state)
 			t.Setenv("SECURITY_UPDATE_NOTIFY_LOG_FILE", filepath.Join(t.TempDir(), "notify.log"))
-			cfg := loadDeliveryConfig(t, "NOTIFY_CHANNELS=telegram,feishu\nDEDUP_MODE=once\n")
+			cfg := loadDeliveryConfig(t, strings.Join([]string{
+				"NOTIFY_CHANNELS=telegram,feishu",
+				"TELEGRAM_BOT_TOKEN=123456:test_token",
+				"TELEGRAM_CHAT_ID=-100123",
+				"FEISHU_APP_ID=cli_test",
+				"FEISHU_RECEIVE_ID=ou_test",
+				"DEDUP_MODE=once",
+			}, "\n")+"\n")
 			counts := map[string]*int{"telegram": new(int), "feishu": new(int)}
 			factory := func(_ *config.Config, name string) (delivery.Sender, error) {
 				var err error
@@ -121,7 +130,12 @@ func TestDeliverChannelsReportsStatePersistenceFailure(t *testing.T) {
 	}
 	t.Setenv("SECURITY_UPDATE_NOTIFY_STATE_DIR", statePath)
 	t.Setenv("SECURITY_UPDATE_NOTIFY_LOG_FILE", filepath.Join(t.TempDir(), "notify.log"))
-	cfg := loadDeliveryConfig(t, "NOTIFY_CHANNELS=telegram\nDEDUP_MODE=once\n")
+	cfg := loadDeliveryConfig(t, strings.Join([]string{
+		"NOTIFY_CHANNELS=telegram",
+		"TELEGRAM_BOT_TOKEN=123456:test_token",
+		"TELEGRAM_CHAT_ID=-100123",
+		"DEDUP_MODE=once",
+	}, "\n")+"\n")
 	sends := 0
 	factory := func(_ *config.Config, name string) (delivery.Sender, error) {
 		return &fakeSender{name: name, sends: &sends}, nil
@@ -134,6 +148,116 @@ func TestDeliverChannelsReportsStatePersistenceFailure(t *testing.T) {
 	contents, err := os.ReadFile(statePath)
 	if err != nil || string(contents) != "marker\n" {
 		t.Fatalf("state path changed: contents=%q err=%v", contents, err)
+	}
+}
+
+func TestDeliverChannelsAdoptsUnchangedLegacyTargetWithoutResending(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv("SECURITY_UPDATE_NOTIFY_STATE_DIR", state)
+	t.Setenv("SECURITY_UPDATE_NOTIFY_LOG_FILE", filepath.Join(t.TempDir(), "notify.log"))
+	if err := os.WriteFile(filepath.Join(state, "last-alert.sha256"), []byte("same-hash\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(state, "last-alert.sent_at"), []byte("100\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := loadDeliveryConfig(t, "NOTIFY_CHANNELS=telegram\nTELEGRAM_BOT_TOKEN=123456:legacy_token\nTELEGRAM_CHAT_ID=-100123\nDEDUP_MODE=once\n")
+	sends := 0
+	factory := func(_ *config.Config, name string) (delivery.Sender, error) {
+		return &fakeSender{name: name, sends: &sends}, nil
+	}
+	if rc := deliverChannels(cfg, []string{"telegram"}, delivery.Message{Text: "message"}, "same-hash", "apt", "host", true, true, false, 200, factory); rc != 0 || sends != 0 {
+		t.Fatalf("legacy delivery rc=%d sends=%d want 0,0", rc, sends)
+	}
+	targetPath := filepath.Join(state, "last-alert.telegram.target.sha256")
+	b, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("suppressed legacy state did not adopt its target: %v", err)
+	}
+	if got, want := string(bytes.TrimSpace(b)), dedup.TargetFingerprint("telegram", "123456", "-100123"); got != want {
+		t.Fatalf("adopted target=%q want %q", got, want)
+	}
+
+	changed := loadDeliveryConfig(t, "NOTIFY_CHANNELS=telegram\nTELEGRAM_BOT_TOKEN=123456:legacy_token\nTELEGRAM_CHAT_ID=-100999\nDEDUP_MODE=once\n")
+	if rc := deliverChannels(changed, []string{"telegram"}, delivery.Message{Text: "message"}, "same-hash", "apt", "host", true, true, false, 300, factory); rc != 0 || sends != 1 {
+		t.Fatalf("post-migration changed target rc=%d sends=%d want 0,1", rc, sends)
+	}
+}
+
+func TestDeliverChannelsTracksStableTelegramBotAndChangedChat(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv("SECURITY_UPDATE_NOTIFY_STATE_DIR", state)
+	t.Setenv("SECURITY_UPDATE_NOTIFY_LOG_FILE", filepath.Join(t.TempDir(), "notify.log"))
+	configFor := func(token, chat string) *config.Config {
+		return loadDeliveryConfig(t, "NOTIFY_CHANNELS=telegram\nTELEGRAM_BOT_TOKEN="+token+"\nTELEGRAM_CHAT_ID="+chat+"\nDEDUP_MODE=once\n")
+	}
+	sends := 0
+	factory := func(_ *config.Config, name string) (delivery.Sender, error) {
+		return &fakeSender{name: name, sends: &sends}, nil
+	}
+	message := delivery.Message{Text: "message"}
+	if rc := deliverChannels(configFor("123456:first_token", "-100123"), []string{"telegram"}, message, "same-hash", "apt", "host", true, true, false, 100, factory); rc != 0 {
+		t.Fatalf("initial delivery rc=%d", rc)
+	}
+	if rc := deliverChannels(configFor("123456:rotated_token", "-100123"), []string{"telegram"}, message, "same-hash", "apt", "host", true, true, false, 200, factory); rc != 0 || sends != 1 {
+		t.Fatalf("same-bot token rotation rc=%d sends=%d want 0,1", rc, sends)
+	}
+	if rc := deliverChannels(configFor("123456:rotated_token", "-100999"), []string{"telegram"}, message, "same-hash", "apt", "host", true, true, false, 300, factory); rc != 0 || sends != 2 {
+		t.Fatalf("changed chat delivery rc=%d sends=%d want 0,2", rc, sends)
+	}
+	b, err := os.ReadFile(filepath.Join(state, "last-alert.telegram.target.sha256"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(b, []byte("rotated_token")) || string(bytes.TrimSpace(b)) != dedup.TargetFingerprint("telegram", "123456", "-100999") {
+		t.Fatalf("persisted Telegram target fingerprint=%q", b)
+	}
+}
+
+func TestDeliverChannelsKeepsOldTargetAfterFailedChangedTargetSend(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv("SECURITY_UPDATE_NOTIFY_STATE_DIR", state)
+	t.Setenv("SECURITY_UPDATE_NOTIFY_LOG_FILE", filepath.Join(t.TempDir(), "notify.log"))
+	oldTarget := dedup.TargetFingerprint("feishu", "cli_old", "ou_old")
+	store := dedup.NewChannelStore(state, "feishu")
+	if err := store.WriteDelivery("same-hash", 100, oldTarget); err != nil {
+		t.Fatal(err)
+	}
+	cfg := loadDeliveryConfig(t, "NOTIFY_CHANNELS=feishu\nFEISHU_APP_ID=cli_new\nFEISHU_RECEIVE_ID=ou_new\nDEDUP_MODE=once\n")
+	sends := 0
+	factory := func(_ *config.Config, name string) (delivery.Sender, error) {
+		return &fakeSender{name: name, sends: &sends, err: errors.New("temporary failure")}, nil
+	}
+	if rc := deliverChannels(cfg, []string{"feishu"}, delivery.Message{Text: "message"}, "same-hash", "apt", "host", true, true, false, 200, factory); rc != 1 || sends != 1 {
+		t.Fatalf("failed changed-target delivery rc=%d sends=%d want 1,1", rc, sends)
+	}
+	b, err := os.ReadFile(store.TargetFile)
+	if err != nil || string(bytes.TrimSpace(b)) != oldTarget {
+		t.Fatalf("failed send changed target state=%q err=%v", b, err)
+	}
+}
+
+func TestDeliverChannelsInstallerPendingMarkerForcesAndClearsDelivery(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv("SECURITY_UPDATE_NOTIFY_STATE_DIR", state)
+	t.Setenv("SECURITY_UPDATE_NOTIFY_LOG_FILE", filepath.Join(t.TempDir(), "notify.log"))
+	store := dedup.NewStore(state)
+	if err := store.Write("same-hash", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.TargetPendingFile, []byte("pending\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := loadDeliveryConfig(t, "NOTIFY_CHANNELS=telegram\nTELEGRAM_BOT_TOKEN=123456:new_token\nTELEGRAM_CHAT_ID=-100999\nDEDUP_MODE=once\n")
+	sends := 0
+	factory := func(_ *config.Config, name string) (delivery.Sender, error) {
+		return &fakeSender{name: name, sends: &sends}, nil
+	}
+	if rc := deliverChannels(cfg, []string{"telegram"}, delivery.Message{Text: "message"}, "same-hash", "apt", "host", true, true, false, 200, factory); rc != 0 || sends != 1 {
+		t.Fatalf("pending target delivery rc=%d sends=%d want 0,1", rc, sends)
+	}
+	if _, err := os.Stat(store.TargetPendingFile); !os.IsNotExist(err) {
+		t.Fatalf("successful pending target delivery did not clear marker: %v", err)
 	}
 }
 

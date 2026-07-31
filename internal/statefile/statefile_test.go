@@ -32,6 +32,39 @@ func TestTrackLifecycleAndClockRollback(t *testing.T) {
 	}
 }
 
+func TestObservePreservesConfirmedStateAcrossUnknown(t *testing.T) {
+	s := Store{Dir: t.TempDir()}
+	first, err := s.Observe("pending.first_seen", ObservationPresent, 100, true)
+	if err != nil || first != 100 {
+		t.Fatalf("present observation=(%d, %v), want (100, nil)", first, err)
+	}
+	first, err = s.Observe("pending.first_seen", ObservationUnknown, 200, true)
+	if err != nil || first != 0 {
+		t.Fatalf("unknown observation=(%d, %v), want (0, nil)", first, err)
+	}
+	first, err = s.Observe("pending.first_seen", ObservationPresent, 300, true)
+	if err != nil || first != 100 {
+		t.Fatalf("present after unknown=(%d, %v), want original first_seen", first, err)
+	}
+	if _, err := s.Observe("pending.first_seen", ObservationAbsent, 400, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(s.Dir, "pending.first_seen")); !os.IsNotExist(err) {
+		t.Fatalf("confirmed absence did not remove state: %v", err)
+	}
+	first, err = s.Observe("pending.first_seen", ObservationPresent, 500, true)
+	if err != nil || first != 500 {
+		t.Fatalf("present after absence=(%d, %v), want new first_seen", first, err)
+	}
+}
+
+func TestObserveRejectsInvalidState(t *testing.T) {
+	s := Store{Dir: t.TempDir()}
+	if _, err := s.Observe("pending.first_seen", Observation(99), 100, true); err == nil {
+		t.Fatal("Observe accepted an invalid observation")
+	}
+}
+
 func TestReadOnlyTrackDoesNotCreateState(t *testing.T) {
 	s := Store{Dir: t.TempDir()}
 	first, err := s.Track("reboot.first_seen", true, 123, false)

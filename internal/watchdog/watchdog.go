@@ -175,10 +175,14 @@ func hasArchTail(s string) bool {
 	return false
 }
 
-// CollectPending 复刻 collect_security_updates：
+// CollectPending 解析包管理器已经筛选或模拟出的更新：
 //   - dnf：`dnf -q updateinfo list security` 中 $NF 形如包名.架构 的行计数，另计含 critical 的行；
-//   - apt：`apt-get -s upgrade` 中以 "Inst " 起始且（小写）含 "security" 的行计数。
+//   - apt：只采信 `Inst` 候选版本来源中明确的 Debian/Ubuntu security 或 ESM pocket。
 func CollectPending(backend, out string) Pending {
+	if backend == "apt" {
+		pending, _ := CollectAPTPending(out)
+		return pending
+	}
 	var p Pending
 	var packages []string
 	switch backend {
@@ -198,18 +202,103 @@ func CollectPending(backend, out string) Pending {
 				}
 			}
 		}
-	case "apt":
-		for _, ln := range strings.Split(out, "\n") {
-			if strings.HasPrefix(ln, "Inst ") && strings.Contains(strings.ToLower(ln), "security") {
-				p.Count++
-				if fields := strings.Fields(ln); len(fields) > 1 {
-					packages = append(packages, strings.SplitN(fields[1], ":", 2)[0])
-				}
-			}
-		}
 	default:
 		return p
 	}
+	return finishPending(p, packages)
+}
+
+// CollectAPTPending also reports whether every apt `Inst` record was
+// structurally parseable. A successful command with an unparseable record is
+// not proof that security updates are absent.
+func CollectAPTPending(out string) (Pending, bool) {
+	var p Pending
+	var packages []string
+	complete := true
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(line, "Inst ") {
+			continue
+		}
+		name, sources, ok := parseAPTInstall(line)
+		if !ok {
+			complete = false
+			continue
+		}
+		if aptSecuritySource(sources) {
+			p.Count++
+			packages = append(packages, strings.SplitN(name, ":", 2)[0])
+		}
+	}
+	return finishPending(p, packages), complete
+}
+
+func parseAPTInstall(line string) (string, []string, bool) {
+	rest := strings.TrimPrefix(line, "Inst ")
+	nameEnd := strings.IndexByte(rest, ' ')
+	if nameEnd <= 0 {
+		return "", nil, false
+	}
+	name := rest[:nameEnd]
+	open := strings.Index(rest[nameEnd:], "(")
+	if open < 0 {
+		return "", nil, false
+	}
+	open += nameEnd
+	close := strings.LastIndex(rest[open+1:], ")")
+	if close < 0 {
+		return "", nil, false
+	}
+	close += open + 1
+	fields := strings.Fields(rest[open+1 : close])
+	if len(fields) < 2 { // candidate version followed by one or more source fields
+		return "", nil, false
+	}
+	sources := fields[1:]
+	hasDescriptor := false
+	for _, source := range sources {
+		if !strings.HasPrefix(source, "[") {
+			hasDescriptor = true
+			break
+		}
+	}
+	if !hasDescriptor {
+		return "", nil, false
+	}
+	return name, sources, true
+}
+
+func aptSecuritySource(fields []string) bool {
+	for _, field := range fields {
+		descriptor := strings.Trim(strings.ToLower(field), ",")
+		if descriptor == "" || strings.HasPrefix(descriptor, "[") {
+			continue
+		}
+		origin, release, hasRelease := strings.Cut(descriptor, ":")
+		compactOrigin := strings.NewReplacer("-", "", "_", "").Replace(origin)
+		allowedOrigin := compactOrigin == "debian" || compactOrigin == "debiansecurity" ||
+			compactOrigin == "ubuntu" || compactOrigin == "ubuntuesmapps" || compactOrigin == "ubuntuesminfra"
+		if !allowedOrigin {
+			continue
+		}
+		// Debian-Security is itself a security-only label in older apt output.
+		if !hasRelease {
+			if compactOrigin == "debiansecurity" {
+				return true
+			}
+			continue
+		}
+		pocket := release
+		if slash := strings.LastIndexByte(pocket, '/'); slash >= 0 {
+			pocket = pocket[slash+1:]
+		}
+		if pocket == "security" || strings.HasSuffix(pocket, "-security") {
+			return true
+		}
+	}
+	return false
+}
+
+func finishPending(p Pending, packages []string) Pending {
 	p.Packages = sortUniqStrings(packages)
 	if p.Count > 0 {
 		if p.Crit > 0 {

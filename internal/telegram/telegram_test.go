@@ -139,14 +139,19 @@ func TestSendOKFalseNoRetry(t *testing.T) {
 
 func TestSendRetryOn429ThenSuccess(t *testing.T) {
 	var n int32
+	var delay time.Duration
 	c, srv, slept := newTestClient(func(w http.ResponseWriter, r *http.Request) {
 		if atomic.AddInt32(&n, 1) == 1 {
 			w.WriteHeader(429)
-			io.WriteString(w, `{"ok":false}`)
+			io.WriteString(w, `{"ok":false,"parameters":{"retry_after":2}}`)
 			return
 		}
 		io.WriteString(w, `{"ok":true}`)
 	})
+	c.Sleep = func(d time.Duration) {
+		delay = d
+		atomic.AddInt32(slept, 1)
+	}
 	defer srv.Close()
 	if err := c.SendMessage(context.Background(), "123:abc", "-100", "hi"); err != nil {
 		t.Fatal(err)
@@ -156,6 +161,30 @@ func TestSendRetryOn429ThenSuccess(t *testing.T) {
 	}
 	if *slept != 1 {
 		t.Errorf("slept=%d want 1", *slept)
+	}
+	if delay != 2*time.Second {
+		t.Errorf("retry delay=%v want 2s", delay)
+	}
+}
+
+func TestTelegramRetryAfterIsBoundedAndFallsBackToHeader(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		body   string
+		header string
+		want   time.Duration
+	}{
+		{name: "body", body: `{"parameters":{"retry_after":7}}`, want: 7 * time.Second},
+		{name: "body capped", body: `{"parameters":{"retry_after":18446744073709551615}}`, want: 30 * time.Second},
+		{name: "header fallback", body: `{"ok":false}`, header: "4", want: 4 * time.Second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resp := &http.Response{Header: make(http.Header)}
+			resp.Header.Set("Retry-After", test.header)
+			if got := telegramRetryAfter(resp, []byte(test.body)); got != test.want {
+				t.Fatalf("retry delay=%v want %v", got, test.want)
+			}
+		})
 	}
 }
 
@@ -176,6 +205,23 @@ func TestSend5xxIsTemporaryButNotRetried(t *testing.T) {
 	}
 	if *slept != 0 {
 		t.Errorf("slept=%d want 0", *slept)
+	}
+}
+
+func TestSend408IsTemporaryButNotRetried(t *testing.T) {
+	var requests int32
+	c, srv, slept := newTestClient(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.WriteHeader(http.StatusRequestTimeout)
+		_, _ = io.WriteString(w, `{"ok":false}`)
+	})
+	defer srv.Close()
+	err := c.SendMessage(context.Background(), "123:abc", "-100", "hi")
+	if err == nil || !IsTemporary(err) {
+		t.Fatalf("error=%v, want temporary HTTP 408", err)
+	}
+	if requests != 1 || *slept != 0 {
+		t.Fatalf("requests=%d sleeps=%d want 1,0", requests, *slept)
 	}
 }
 
@@ -356,6 +402,22 @@ func TestGetMe(t *testing.T) {
 }
 
 func TestGetMeTemporaryClassification(t *testing.T) {
+	t.Run("request timeout", func(t *testing.T) {
+		var requests int32
+		c, srv, slept := newTestClient(func(w http.ResponseWriter, _ *http.Request) {
+			atomic.AddInt32(&requests, 1)
+			w.WriteHeader(http.StatusRequestTimeout)
+		})
+		defer srv.Close()
+		err := c.GetMe(context.Background(), "123:abc")
+		if err == nil || !IsTemporary(err) {
+			t.Fatalf("error=%v, want temporary", err)
+		}
+		if requests != 3 || *slept != 2 {
+			t.Fatalf("requests=%d sleeps=%d want 3,2", requests, *slept)
+		}
+	})
+
 	t.Run("server failure", func(t *testing.T) {
 		var requests int32
 		c, srv, _ := newTestClient(func(w http.ResponseWriter, _ *http.Request) {

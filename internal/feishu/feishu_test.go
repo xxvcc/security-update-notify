@@ -211,6 +211,22 @@ func TestRetryOn429(t *testing.T) {
 	}
 }
 
+func TestTokenRequestRetriesHTTP408AsTemporary(t *testing.T) {
+	var requests int32
+	c, srv, slept := newTestClient(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.WriteHeader(http.StatusRequestTimeout)
+	})
+	defer srv.Close()
+	err := c.Probe(context.Background(), "cli_app", "secret")
+	if err == nil || !IsTemporary(err) {
+		t.Fatalf("error=%v, want temporary HTTP 408", err)
+	}
+	if requests != 3 || *slept != 2 {
+		t.Fatalf("requests=%d sleeps=%d want 3,2", requests, *slept)
+	}
+}
+
 func TestMessageRetryOnExplicitHTTP429(t *testing.T) {
 	var messages int32
 	c, srv, slept := newTestClient(func(w http.ResponseWriter, r *http.Request) {
@@ -328,6 +344,26 @@ func TestMessageTransportAndServerFailuresAreNotRetried(t *testing.T) {
 		err := c.SendText(context.Background(), "cli_app", "secret", "ou_lanny", "hello")
 		if err == nil || !IsTemporary(err) {
 			t.Fatalf("error=%v, want temporary server failure", err)
+		}
+		if messages != 1 || *slept != 0 {
+			t.Fatalf("messages=%d sleeps=%d want 1,0", messages, *slept)
+		}
+	})
+
+	t.Run("request timeout", func(t *testing.T) {
+		var messages int32
+		c, srv, slept := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "tenant_access_token") {
+				_, _ = io.WriteString(w, `{"code":0,"tenant_access_token":"token"}`)
+				return
+			}
+			atomic.AddInt32(&messages, 1)
+			w.WriteHeader(http.StatusRequestTimeout)
+		})
+		defer srv.Close()
+		err := c.SendText(context.Background(), "cli_app", "secret", "ou_lanny", "hello")
+		if err == nil || !IsTemporary(err) {
+			t.Fatalf("error=%v, want temporary request timeout", err)
 		}
 		if messages != 1 || *slept != 0 {
 			t.Fatalf("messages=%d sleeps=%d want 1,0", messages, *slept)

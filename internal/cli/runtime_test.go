@@ -102,7 +102,10 @@ CHECK_SELF_UPDATE=0
 		"OK timer enabled",
 		"OK package unattended-upgrades fully installed",
 		"SKIP Telegram connectivity check",
-		"OK automatic security-update mechanism healthy",
+		"SKIP automatic security-update mechanism health check disabled",
+		"SKIP patch policy, package consistency, and repository health checks disabled",
+		"SKIP pending security-update status was not confirmed",
+		"SKIP release security-support check disabled",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("doctor output missing %q: %q", want, stdout)

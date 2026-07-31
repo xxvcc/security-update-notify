@@ -35,7 +35,9 @@ const (
 	apiRateLimitCode    = 99991400
 )
 
-func retryableStatus(status int) bool { return status == 429 || (status >= 500 && status < 600) }
+func retryableStatus(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || (status >= 500 && status < 600)
+}
 
 var openIDPattern = regexp.MustCompile(`^ou_[A-Za-z0-9_-]+$`)
 
@@ -317,7 +319,7 @@ func (c *Client) doJSON(ctx context.Context, endpoint, token string, body []byte
 		if resp.StatusCode == http.StatusTooManyRequests {
 			return true, retryAfter(resp), fmt.Errorf("Feishu message HTTP %d", resp.StatusCode)
 		}
-		if resp.StatusCode >= 500 && resp.StatusCode < 600 {
+		if resp.StatusCode == http.StatusRequestTimeout || (resp.StatusCode >= 500 && resp.StatusCode < 600) {
 			return false, 0, temporary(fmt.Errorf("Feishu message HTTP %d", resp.StatusCode))
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {

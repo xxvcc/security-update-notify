@@ -43,6 +43,11 @@ type failAtomicWriteFS struct {
 	err  error
 }
 
+type interruptAfterAtomicWriteFS struct {
+	FileSystem
+	path string
+}
+
 type failDependencyCaptureFS struct {
 	FileSystem
 	source string
@@ -72,6 +77,16 @@ func (f *failAtomicWriteFS) WriteFileAtomic(name string, data []byte, perm fs.Fi
 		return f.err
 	}
 	return f.FileSystem.WriteFileAtomic(name, data, perm)
+}
+
+func (f *interruptAfterAtomicWriteFS) WriteFileAtomic(name string, data []byte, perm fs.FileMode) error {
+	if err := f.FileSystem.WriteFileAtomic(name, data, perm); err != nil {
+		return err
+	}
+	if name == f.path {
+		panic("simulated abrupt interruption")
+	}
+	return nil
 }
 
 func (f *failDependencyCaptureFS) CopyTrustedRegularFileAtomic(source, destination string, maxBytes int64, ownerUID uint32) error {
@@ -538,6 +553,193 @@ func telegramOptions() Options {
 		},
 		Payload: Payload{Runtime: []byte("new-runtime")},
 	}
+}
+
+func TestChangedDeliveryTargetChannelsUseStableIdentities(t *testing.T) {
+	base := installPlan{
+		existingConfig: true,
+		originalTargets: notificationTargets{
+			telegramEnabled: true, telegramBotID: "123456", telegramChatID: "-100123",
+			feishuEnabled: true, feishuAppID: "cli_old", feishuReceiveID: "ou_old",
+		},
+	}
+	for _, test := range []struct {
+		name string
+		set  func(map[string]string)
+		want string
+	}{
+		{name: "Telegram token rotation", set: func(map[string]string) {}, want: ""},
+		{name: "Telegram chat", set: func(values map[string]string) { values["TELEGRAM_CHAT_ID"] = "-100999" }, want: "telegram"},
+		{name: "Telegram bot", set: func(values map[string]string) { values["TELEGRAM_BOT_TOKEN"] = "654321:new_secret" }, want: "telegram"},
+		{name: "Feishu recipient", set: func(values map[string]string) { values["FEISHU_RECEIVE_ID"] = "ou_new" }, want: "feishu"},
+		{name: "both", set: func(values map[string]string) {
+			values["TELEGRAM_CHAT_ID"] = "-100999"
+			values["FEISHU_APP_ID"] = "cli_new"
+		}, want: "telegram,feishu"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			plan := base
+			plan.values = cloneConfig(configDefaults)
+			plan.values["NOTIFY_CHANNELS"] = "telegram,feishu"
+			plan.values["TELEGRAM_BOT_TOKEN"] = "123456:rotated_secret"
+			plan.values["TELEGRAM_CHAT_ID"] = "-100123"
+			plan.values["FEISHU_APP_ID"] = "cli_old"
+			plan.values["FEISHU_RECEIVE_ID"] = "ou_old"
+			test.set(plan.values)
+			if got := strings.Join(changedDeliveryTargetChannels(plan), ","); got != test.want {
+				t.Fatalf("changed channels=%q want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestInstallerMarksOnlyExplicitlyChangedDeliveryTarget(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		newChat string
+		marked  bool
+	}{
+		{name: "token rotation for same bot", newChat: "-100123", marked: false},
+		{name: "changed recipient", newChat: "-100999", marked: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+			oldValues := cloneConfig(configDefaults)
+			oldValues["NOTIFY_CHANNELS"] = "telegram"
+			oldValues["TELEGRAM_BOT_TOKEN"] = "123456:old_secret"
+			oldValues["TELEGRAM_CHAT_ID"] = "-100123"
+			oldValues["BACKEND"] = "apt"
+			writeConfig(t, root, oldValues)
+			write(t, root, TelegramAlertHashPath, "old-hash\n", 0o600)
+			write(t, root, TelegramAlertTimePath, "100\n", 0o600)
+
+			options := telegramOptions()
+			options.Config["TELEGRAM_BOT_TOKEN"] = "123456:rotated_secret"
+			options.Config["TELEGRAM_CHAT_ID"] = test.newChat
+			options.SkipPostInstallCheck = true
+			if _, err := installer.Install(context.Background(), options); err != nil {
+				t.Fatal(err)
+			}
+			_, err := root.Lstat(TelegramTargetPendingPath)
+			if test.marked && err != nil {
+				t.Fatalf("changed target was not invalidated: %v", err)
+			}
+			if !test.marked && !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("same stable target was invalidated: %v", err)
+			}
+			if got := readFile(t, root, TelegramAlertHashPath); got != "old-hash\n" {
+				t.Fatalf("installer changed alert hash state: %q", got)
+			}
+			if existsNoErr(root, TelegramTargetPath) {
+				t.Fatal("installer persisted a target identity before successful delivery")
+			}
+		})
+	}
+}
+
+func TestChangedDeliveryTargetIsMarkedBeforeNewConfigCanBecomeVisible(t *testing.T) {
+	installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	oldValues := cloneConfig(configDefaults)
+	oldValues["NOTIFY_CHANNELS"] = "telegram"
+	oldValues["TELEGRAM_BOT_TOKEN"] = "123456:old_secret"
+	oldValues["TELEGRAM_CHAT_ID"] = "-100123"
+	oldValues["BACKEND"] = "apt"
+	writeConfig(t, root, oldValues)
+	write(t, root, TelegramAlertHashPath, "old-hash\n", 0o600)
+	write(t, root, TelegramAlertTimePath, "100\n", 0o600)
+
+	installer.fs = &interruptAfterAtomicWriteFS{FileSystem: root, path: ConfigPath}
+	options := telegramOptions()
+	options.Config["TELEGRAM_CHAT_ID"] = "-100999"
+	options.SkipPostInstallCheck = true
+
+	var interrupted any
+	func() {
+		defer func() { interrupted = recover() }()
+		_, _ = installer.Install(context.Background(), options)
+	}()
+	if interrupted == nil {
+		t.Fatal("installation was not interrupted after committing the new config")
+	}
+	if !strings.Contains(readFile(t, root, ConfigPath), "TELEGRAM_CHAT_ID='-100999'") {
+		t.Fatal("interruption model did not persist the new delivery target")
+	}
+	if got := readFile(t, root, TelegramTargetPendingPath); got != "pending\n" {
+		t.Fatalf("visible target change lacked a durable resend marker: %q", got)
+	}
+}
+
+func TestChangedDeliveryTargetMarkersRollBackWhenSecondChannelFails(t *testing.T) {
+	installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	oldValues := cloneConfig(configDefaults)
+	oldValues["NOTIFY_CHANNELS"] = "telegram,feishu"
+	oldValues["TELEGRAM_BOT_TOKEN"] = "123456:old_secret"
+	oldValues["TELEGRAM_CHAT_ID"] = "-100123"
+	oldValues["FEISHU_APP_ID"] = "cli_old"
+	oldValues["FEISHU_RECEIVE_ID"] = "ou_old"
+	oldValues["BACKEND"] = "apt"
+	writeConfig(t, root, oldValues)
+	oldConfig := readFile(t, root, ConfigPath)
+
+	markerErr := errors.New("forced second target marker failure")
+	installer.fs = &failAtomicWriteFS{FileSystem: root, path: FeishuTargetPendingPath, err: markerErr}
+	options := Options{
+		Config: map[string]string{
+			"NOTIFY_CHANNELS":    "telegram,feishu",
+			"TELEGRAM_BOT_TOKEN": "123456:new_secret",
+			"TELEGRAM_CHAT_ID":   "-100999",
+			"FEISHU_APP_ID":      "cli_new",
+			"FEISHU_RECEIVE_ID":  "ou_new",
+		},
+		Payload:              Payload{Runtime: []byte("new-runtime")},
+		FeishuSecret:         []byte("new-feishu-secret"),
+		SkipPostInstallCheck: true,
+	}
+	if _, err := installer.Install(context.Background(), options); !errors.Is(err, markerErr) {
+		t.Fatalf("installation error=%v want second marker failure", err)
+	}
+	if got := readFile(t, root, ConfigPath); got != oldConfig {
+		t.Fatalf("marker failure changed config:\n%s", got)
+	}
+	for _, marker := range []string{TelegramTargetPendingPath, FeishuTargetPendingPath} {
+		if _, err := root.Lstat(marker); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("marker rollback left %s: %v", marker, err)
+		}
+	}
+}
+
+func TestChangedDeliveryTargetStateRollsBackWithFailedInstall(t *testing.T) {
+	installer, root, runner, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	oldValues := cloneConfig(configDefaults)
+	oldValues["NOTIFY_CHANNELS"] = "telegram"
+	oldValues["TELEGRAM_BOT_TOKEN"] = "123456:old_secret"
+	oldValues["TELEGRAM_CHAT_ID"] = "-100123"
+	oldValues["BACKEND"] = "apt"
+	writeConfig(t, root, oldValues)
+	write(t, root, TelegramAlertHashPath, "old-hash\n", 0o600)
+	write(t, root, TelegramAlertTimePath, "100\n", 0o600)
+	write(t, root, TelegramTargetPath, strings.Repeat("a", 64)+"\n", 0o600)
+	write(t, root, TelegramTargetPendingPath, "pending\n", 0o400)
+	runner.failListTimers = true
+	options := telegramOptions()
+	options.Config["TELEGRAM_CHAT_ID"] = "-100999"
+	options.SkipPostInstallCheck = true
+	if _, err := installer.Install(context.Background(), options); err == nil || !strings.Contains(err.Error(), "forced list-timers failure") {
+		t.Fatalf("late installation failure=%v", err)
+	}
+	if got := readFile(t, root, TelegramAlertHashPath); got != "old-hash\n" {
+		t.Fatalf("rollback alert hash=%q", got)
+	}
+	if got := readFile(t, root, TelegramAlertTimePath); got != "100\n" {
+		t.Fatalf("rollback alert timestamp=%q", got)
+	}
+	if got := readFile(t, root, TelegramTargetPath); got != strings.Repeat("a", 64)+"\n" {
+		t.Fatalf("rollback target fingerprint=%q", got)
+	}
+	if got := readFile(t, root, TelegramTargetPendingPath); got != "pending\n" {
+		t.Fatalf("rollback pending marker=%q", got)
+	}
+	assertMode(t, root, TelegramTargetPendingPath, 0o400)
 }
 
 func TestFreshAPTInstall(t *testing.T) {

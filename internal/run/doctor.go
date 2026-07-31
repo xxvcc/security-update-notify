@@ -31,6 +31,26 @@ type DoctorOpts struct {
 	Systemd      SystemdQuery
 }
 
+type doctorCheckState uint8
+
+const (
+	doctorCheckUnknown doctorCheckState = iota
+	doctorCheckSkipped
+	doctorCheckChecked
+)
+
+type doctorWatchdogResult struct {
+	health           watchdog.Health
+	pending          watchdog.Pending
+	patch            watchdog.Patch
+	eol              watchdog.EOL
+	healthState      doctorCheckState
+	patchHealthState doctorCheckState
+	pendingState     doctorCheckState
+	eolState         doctorCheckState
+	supportEnd       string
+}
+
 // Doctor 复刻 run_doctor：打印环境/后端/systemd/依赖命令/Telegram/看门狗自检；有失败项返回 1，否则 0。
 // 这是人类可读的诊断输出（非线格式/去重字段），无需字节级对齐。
 func Doctor(cfg *config.Config, opts DoctorOpts) int {
@@ -215,49 +235,163 @@ func Doctor(cfg *config.Config, opts DoctorOpts) int {
 	case "dnf":
 		restart = collectDNF()
 	}
-	health, pending, patch, eol := collectWatchdogWithSystemd(cfg, be, o, restart, opts.Version, false, true, false, systemdQuery)
-	if health.Attention || !backendReady {
-		say(out, lang, "失败：自动安全更新机制异常", "FAIL automatic security-update mechanism issue")
-		if health.Attention && (health.TxtZH != "" || health.TxtEN != "") {
-			say(out, lang, health.TxtZH, health.TxtEN)
+	checks := collectDoctorWatchdog(cfg, be, o, restart, opts.Version, backendReady, systemdQuery)
+	switch checks.healthState {
+	case doctorCheckSkipped:
+		say(out, lang, "跳过：自动安全更新机制健康检查已禁用", "SKIP automatic security-update mechanism health check disabled")
+	case doctorCheckUnknown:
+		say(out, lang, "未知：无法可靠检查自动安全更新机制", "UNKNOWN automatic security-update mechanism health could not be determined")
+		ok = false
+	case doctorCheckChecked:
+		if checks.health.Attention {
+			say(out, lang, "失败：自动安全更新机制异常", "FAIL automatic security-update mechanism issue")
+			if checks.health.TxtZH != "" || checks.health.TxtEN != "" {
+				say(out, lang, checks.health.TxtZH, checks.health.TxtEN)
+			}
+			ok = false
+		} else {
+			say(out, lang, "正常：自动安全更新机制健康", "OK automatic security-update mechanism healthy")
 		}
-		ok = false
-	} else {
-		say(out, lang, "正常：自动安全更新机制健康", "OK automatic security-update mechanism healthy")
 	}
-	if patch.RiskAttention {
+
+	switch checks.patchHealthState {
+	case doctorCheckSkipped:
+		say(out, lang, "跳过：补丁策略、软件包一致性和仓库健康检查已禁用", "SKIP patch policy, package consistency, and repository health checks disabled")
+	case doctorCheckUnknown:
+		say(out, lang, "未知：补丁策略、软件包一致性和仓库健康检查未完成", "UNKNOWN patch policy, package consistency, and repository health checks incomplete")
+		ok = false
+	case doctorCheckChecked:
+		if !checks.patch.RiskAttention {
+			say(out, lang, "正常：补丁策略、软件包和仓库检查通过", "OK patch policy, package, and repository checks passed")
+		}
+	}
+	if checks.patch.RiskAttention {
 		say(out, lang, "失败：补丁维护检查发现风险", "FAIL patch-maintenance checks found risks")
-		say(out, lang, patch.TxtZH, patch.TxtEN)
+		say(out, lang, checks.patch.TxtZH, checks.patch.TxtEN)
 		ok = false
-	} else {
-		say(out, lang, "正常：补丁策略、软件包和仓库检查通过", "OK patch policy, package, and repository checks passed")
 	}
-	if patch.SelfUpdateCheckErr {
+	if checks.patch.SelfUpdateCheckErr {
 		say(out, lang, "失败：无法检查 SUN 最新版本", "FAIL could not check the latest SUN version")
 		ok = false
-	} else if patch.UpdateAvailable {
-		say(out, lang, patch.UpdateTxtZH, patch.UpdateTxtEN)
-	} else if patch.LatestVersion != "" {
+	} else if checks.patch.UpdateAvailable {
+		say(out, lang, checks.patch.UpdateTxtZH, checks.patch.UpdateTxtEN)
+	} else if checks.patch.LatestVersion != "" {
 		say(out, lang, "正常：SUN 已是最新版本（"+opts.Version+"）", "OK SUN is up to date ("+opts.Version+")")
 	}
-	if pending.Count > 0 {
-		say(out, lang, pending.TxtZH, pending.TxtEN)
-	} else {
-		say(out, lang, "正常：当前无待安装的安全更新", "OK no pending security updates")
+	if checks.pending.Count > 0 {
+		say(out, lang, checks.pending.TxtZH, checks.pending.TxtEN)
 	}
-	if eol.TxtZH != "" {
-		if eol.Attention {
-			ok = false
+	switch checks.pendingState {
+	case doctorCheckChecked:
+		if checks.pending.Count > 0 {
+			break
 		}
-		say(out, lang, eol.TxtZH, eol.TxtEN)
-	} else {
-		say(out, lang, "正常：发行版仍在安全支持期内（或不在 EOL 表中）", "OK release within security support (or not in the EOL table)")
+		say(out, lang, "正常：当前无待安装的安全更新", "OK no pending security updates")
+	case doctorCheckSkipped:
+		say(out, lang, "跳过：未确认当前是否存在待安装安全更新", "SKIP pending security-update status was not confirmed")
+	case doctorCheckUnknown:
+		say(out, lang, "未知：无法可靠确定当前待安装安全更新状态", "UNKNOWN pending security-update status could not be determined")
+		ok = false
+	}
+	switch checks.eolState {
+	case doctorCheckSkipped:
+		say(out, lang, "跳过：发行版安全支持期检查已禁用", "SKIP release security-support check disabled")
+	case doctorCheckUnknown:
+		say(out, lang, "未知：无法确定此发行版的安全支持终止日期", "UNKNOWN release security-support end date could not be determined")
+		ok = false
+	case doctorCheckChecked:
+		if checks.eol.TxtZH != "" {
+			if checks.eol.Attention {
+				ok = false
+			}
+			say(out, lang, checks.eol.TxtZH, checks.eol.TxtEN)
+		} else {
+			say(out, lang, "正常：发行版安全支持有效期至 "+checks.supportEnd, "OK release security support active until "+checks.supportEnd)
+		}
 	}
 
 	if ok {
 		return 0
 	}
 	return 1
+}
+
+func collectDoctorWatchdog(cfg *config.Config, be string, o osrel.OSRelease, restart backend.RestartState, currentVersion string, backendReady bool, systemdQuery SystemdQuery) doctorWatchdogResult {
+	var result doctorWatchdogResult
+	healthEnabled := truthyLooseDefault(cfg.Get("CHECK_UPDATE_HEALTH"), true)
+	if !healthEnabled {
+		result.healthState = doctorCheckSkipped
+		result.patchHealthState = doctorCheckSkipped
+	} else if !backendReady {
+		result.healthState = doctorCheckUnknown
+		result.patchHealthState = doctorCheckUnknown
+	} else {
+		result.healthState = doctorCheckChecked
+		result.patchHealthState = doctorCheckChecked
+		result.health = collectHealthWithSystemd(be, staleDays(cfg), systemdQueryOrDefault(systemdQuery))
+	}
+
+	result.patch, result.pending = collectPatchWatchdog(cfg, be, restart, currentVersion, patchCollectOptions{
+		ForceSelfUpdate: true,
+	})
+	result.pendingState = doctorPendingState(be, backendReady, healthEnabled, result.pending, result.patch)
+
+	if !truthyLooseDefault(cfg.Get("CHECK_EOL"), true) {
+		result.eolState = doctorCheckSkipped
+		return result
+	}
+	result.supportEnd = effectiveSupportEnd(o)
+	if result.supportEnd == "" {
+		result.eolState = doctorCheckUnknown
+		return result
+	}
+	result.eolState = doctorCheckChecked
+	result.eol = watchdog.CheckEOLDate(result.supportEnd, time.Now().Unix())
+	return result
+}
+
+func doctorPendingState(be string, backendReady, healthEnabled bool, pending watchdog.Pending, patch watchdog.Patch) doctorCheckState {
+	if !backendReady {
+		return doctorCheckUnknown
+	}
+	var unknownReasons []string
+	if healthEnabled {
+		switch be {
+		case "apt":
+			unknownReasons = []string{"apt-simulation-failed", "apt-simulation-output-invalid"}
+		case "dnf":
+			unknownReasons = []string{
+				"dnf-generation-probe-failed", "dnf-repository-signature", "dnf-repository-failed",
+				"dnf-advisory-output-invalid", "dnf-security-transaction-failed", "dnf-security-transaction-invalid",
+			}
+		default:
+			return doctorCheckUnknown
+		}
+		for _, reason := range unknownReasons {
+			if hasPatchReason(patch.Sig, reason) {
+				return doctorCheckUnknown
+			}
+		}
+	}
+	if pending.Count > 0 {
+		return doctorCheckChecked
+	}
+	if !healthEnabled {
+		// The runtime still asks for pending updates when extended health checks are disabled,
+		// but it intentionally suppresses the query-failure reason. A zero result is therefore
+		// not enough evidence for doctor to report a verified green state.
+		return doctorCheckSkipped
+	}
+	return doctorCheckChecked
+}
+
+func hasPatchReason(signal, reason string) bool {
+	for _, current := range strings.Split(signal, ",") {
+		if current == reason {
+			return true
+		}
+	}
+	return false
 }
 
 func doctorAPTDependencies(out io.Writer, lang i18n.Lang, look func(string) bool, run func(string, ...string) sysexec.Result) bool {

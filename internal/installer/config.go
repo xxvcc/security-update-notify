@@ -67,14 +67,24 @@ var configDefaults = map[string]string{
 }
 
 type installPlan struct {
-	values         map[string]string
-	checkTime      string
-	osRelease      osrel.OSRelease
-	backend        string
-	supportTier    string
-	profile        osrel.Profile
-	existingConfig bool
-	upgrade        bool
+	values          map[string]string
+	checkTime       string
+	osRelease       osrel.OSRelease
+	backend         string
+	supportTier     string
+	profile         osrel.Profile
+	existingConfig  bool
+	upgrade         bool
+	originalTargets notificationTargets
+}
+
+type notificationTargets struct {
+	telegramEnabled bool
+	telegramBotID   string
+	telegramChatID  string
+	feishuEnabled   bool
+	feishuAppID     string
+	feishuReceiveID string
 }
 
 func (i *Installer) prepare(ctx context.Context, options Options) (installPlan, error) {
@@ -97,6 +107,7 @@ func (i *Installer) prepare(ctx context.Context, options Options) (installPlan, 
 	for key, value := range existing {
 		values[key] = value
 	}
+	originalTargets := notificationTargetsFor(values)
 	oldFeishuAppID := values["FEISHU_APP_ID"]
 	for key, value := range options.Config {
 		if !configKeys[key] {
@@ -189,7 +200,52 @@ func (i *Installer) prepare(ctx context.Context, options Options) (installPlan, 
 	return installPlan{
 		values: values, checkTime: checkTime, osRelease: osRelease,
 		backend: backend, supportTier: tier, profile: profile, existingConfig: exists, upgrade: upgrade,
+		originalTargets: originalTargets,
 	}, nil
+}
+
+func notificationTargetsFor(values map[string]string) notificationTargets {
+	channels := values["NOTIFY_CHANNELS"]
+	return notificationTargets{
+		telegramEnabled: channelSelectedUnnormalized(channels, "telegram"),
+		telegramBotID:   stableTelegramBotID(values["TELEGRAM_BOT_TOKEN"]),
+		telegramChatID:  values["TELEGRAM_CHAT_ID"],
+		feishuEnabled:   channelSelectedUnnormalized(channels, "feishu"),
+		feishuAppID:     values["FEISHU_APP_ID"],
+		feishuReceiveID: values["FEISHU_RECEIVE_ID"],
+	}
+}
+
+func stableTelegramBotID(token string) string {
+	botID, secret, ok := strings.Cut(token, ":")
+	if !ok || botID == "" || secret == "" {
+		return ""
+	}
+	for _, char := range botID {
+		if char < '0' || char > '9' {
+			return ""
+		}
+	}
+	return botID
+}
+
+func changedDeliveryTargetChannels(plan installPlan) []string {
+	if !plan.existingConfig {
+		return nil
+	}
+	current := notificationTargetsFor(plan.values)
+	var changed []string
+	if current.telegramEnabled && (!plan.originalTargets.telegramEnabled ||
+		current.telegramBotID != plan.originalTargets.telegramBotID ||
+		current.telegramChatID != plan.originalTargets.telegramChatID) {
+		changed = append(changed, "telegram")
+	}
+	if current.feishuEnabled && (!plan.originalTargets.feishuEnabled ||
+		current.feishuAppID != plan.originalTargets.feishuAppID ||
+		current.feishuReceiveID != plan.originalTargets.feishuReceiveID) {
+		changed = append(changed, "feishu")
+	}
+	return changed
 }
 
 func (i *Installer) probeInferredDNFProfile(ctx context.Context, release osrel.OSRelease) (osrel.Profile, error) {
