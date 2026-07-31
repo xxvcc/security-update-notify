@@ -16,6 +16,8 @@ This guide covers reminder policy, patch-maintenance checks, managed files, APT/
 
 With dual delivery, each channel has independent state. If Telegram succeeds and Feishu fails, the next run retries only Feishu instead of repeating Telegram.
 
+Channel state is also bound to a stable target identity: Telegram uses the numeric bot identity plus Chat ID, while Feishu uses App ID plus the app-scoped `open_id`; only a one-way fingerprint is stored. When `configure notifications` changes a target, the installer marks that channel within the same rollback transaction before the new configuration becomes visible, so the next real alert cannot be suppressed by the old target's `once` or interval state. A failed send does not advance the target; only successful delivery commits its fingerprint. Existing target-less state is silently bound to the current target the first time deduplication suppresses it, without sending a message. Later runtime checks can therefore detect manual target changes in the protected config file.
+
 ## Security-update watchdog
 
 In addition to reboot/service-restart and distro-EOL detection, SUN runs seven patch-maintenance checks by default:
@@ -38,7 +40,9 @@ In addition to reboot/service-restart and distro-EOL detection, SUN runs seven p
 | `SELF_UPDATE_CHECK_DAYS` | `7` | SUN release-check interval. Successful results are cached; `security-update-notify doctor` forces a read-only refresh. |
 | `CHECK_EOL` | `1` | Distro end-of-life (EOL) warning: a past-EOL release triggers an alert, an approaching one (within 90 days) is informational. Ubuntu 20.04 automatically checks the local `esm-infra` state. Consider `0` only for an external extended-support arrangement that SUN cannot recognize, accepting that it disables every EOL check. |
 
-The pending count remains informational until it reaches `PENDING_ALERT_DAYS`. DNF's high-severity subtotal includes both `critical` and `important`. Run `security-update-notify doctor` anytime to inspect all seven checks, pending counts, and the SUN release result; diagnostics never mutate age or release-cache state. Simulated `security-update-notify test` modes and `security-update-notify run --dry-run` neither write this state nor make the periodic release request.
+The pending count remains informational until it reaches `PENDING_ALERT_DAYS`. DNF's high-severity subtotal includes both `critical` and `important`. Patch-backlog, full-reboot, and service-restart age tracking uses three-state observations: confirmed presence accumulates age, confirmed absence clears it, and a command failure, truncated output, or incomplete parse is unknown. An unknown run neither evaluates a stale alert nor loses the earlier `first_seen` value.
+
+Run `security-update-notify doctor` anytime to inspect all seven checks, pending counts, and the SUN release result. Each item is explicitly reported as `OK`, `SKIP`, or `UNKNOWN`; unknown results return a nonzero status, while a check explicitly disabled by configuration does not fail merely because it is skipped. Diagnostics never mutate age or release-cache state. Simulated `security-update-notify test` modes and `security-update-notify run --dry-run` neither write this state nor make the periodic release request.
 
 ## Installed files
 
