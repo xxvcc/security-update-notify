@@ -28,8 +28,39 @@ func TestPackageSubcommandUsesRootVersionByDefault(t *testing.T) {
 	if got.Root != "/repo" || got.Version != "" {
 		t.Fatalf("package options root=%q version=%q", got.Root, got.Version)
 	}
+	if got.Release || got.Sign != releasepkg.SignAuto {
+		t.Fatalf("development package release=%v sign=%q", got.Release, got.Sign)
+	}
 	if !strings.Contains(stdout.String(), "security-update-notify-3.0.0.tar.gz") {
 		t.Fatalf("stdout=%q", stdout.String())
+	}
+}
+
+func TestPackageReleaseRequiresSigningAtCLIBoundary(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		args       []string
+		releaseEnv string
+	}{
+		{name: "release flag", args: []string{"package", "--release"}},
+		{name: "documented command", args: []string{"package", "--release", "--sign", "required"}},
+		{name: "release environment", args: []string{"package"}, releaseEnv: "1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clearReleaseEnv(t)
+			t.Setenv("RELEASE", test.releaseEnv)
+			var got releasepkg.Options
+			build := func(_ context.Context, opts releasepkg.Options) (releasepkg.Result, error) {
+				got = opts
+				return releasepkg.Result{}, nil
+			}
+			if code := run(test.args, &bytes.Buffer{}, &bytes.Buffer{}, build); code != 0 {
+				t.Fatalf("run code=%d", code)
+			}
+			if !got.Release || got.Sign != releasepkg.SignRequired {
+				t.Fatalf("release package release=%v sign=%q", got.Release, got.Sign)
+			}
+		})
 	}
 }
 

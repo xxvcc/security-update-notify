@@ -141,11 +141,12 @@ func TestCollectHealthUsesSystemdCommandResults(t *testing.T) {
 			"apt-daily-upgrade.service\x00ExecMainExitTimestamp": "fixture timestamp",
 			"apt-daily-upgrade.timer\x00LastTriggerUSec":         "fixture timestamp",
 			"apt-daily-upgrade.service\x00Result":                "success",
+			"apt-daily-upgrade.timer\x00ActiveState":             "active",
 		},
 	}
 
 	health := collectHealthWithSystemd("apt", 7, query)
-	for _, unexpected := range []string{"disabled", "failed", "stale", "never-success"} {
+	for _, unexpected := range []string{"disabled", "failed", "inactive", "never-success", "stale"} {
 		if strings.Contains(health.Sig, unexpected) {
 			t.Fatalf("health signal %q contains %q", health.Sig, unexpected)
 		}
@@ -155,6 +156,7 @@ func TestCollectHealthUsesSystemdCommandResults(t *testing.T) {
 		"show apt-daily-upgrade.timer LastTriggerUSec",
 		"is-enabled apt-daily-upgrade.timer",
 		"show apt-daily-upgrade.service Result",
+		"show apt-daily-upgrade.timer ActiveState",
 	} {
 		if countString(query.calls, want) != 1 {
 			t.Fatalf("systemd calls missing or repeated %q: %v", want, query.calls)
@@ -162,6 +164,21 @@ func TestCollectHealthUsesSystemdCommandResults(t *testing.T) {
 	}
 	if got := collectHealthWithSystemd("unsupported", 7, query); got.Attention || got.Sig != "" {
 		t.Fatalf("unsupported backend health=%+v", got)
+	}
+}
+
+func TestCollectHealthReportsEnabledInactiveTimer(t *testing.T) {
+	query := &recordingSystemdQuery{
+		available: true,
+		enabled:   map[string]bool{"apt-daily-upgrade.timer": true},
+		values: map[string]string{
+			"apt-daily-upgrade.service\x00Result":    "success",
+			"apt-daily-upgrade.timer\x00ActiveState": "inactive",
+		},
+	}
+	health := collectHealthWithSystemd("apt", 7, query)
+	if !health.Attention || health.Sig != "inactive," {
+		t.Fatalf("enabled inactive timer health=%+v", health)
 	}
 }
 
@@ -191,7 +208,8 @@ func TestCollectHealthReportsSystemdShowFailure(t *testing.T) {
 		available: true,
 		enabled:   map[string]bool{"apt-daily-upgrade.timer": true},
 		values: map[string]string{
-			"apt-daily-upgrade.service\x00Result": "success",
+			"apt-daily-upgrade.service\x00Result":    "success",
+			"apt-daily-upgrade.timer\x00ActiveState": "active",
 		},
 		showFailures: map[string]bool{
 			"apt-daily-upgrade.service\x00ExecMainExitTimestamp": true,

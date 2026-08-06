@@ -7,10 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"time"
 
 	"github.com/xxvcc/security-update-notify/internal/commandpath"
+	"github.com/xxvcc/security-update-notify/internal/filetrust"
 
 	runlock "github.com/xxvcc/security-update-notify/internal/lock"
 	"github.com/xxvcc/security-update-notify/internal/sysexec"
@@ -177,6 +179,9 @@ func Uninstall(opts Options) (report Report, returnErr error) {
 			returnErr = errors.Join(returnErr, fmt.Errorf("release runtime lock: %w", unlockErr))
 		}
 	}()
+	if err := rejectInterruptedInstallState(root); err != nil {
+		return Report{}, &ExitError{Code: 1, Op: "refuse uninstall during interrupted installation", Err: err}
+	}
 
 	if result := run("systemctl", "disable", "--now", timerUnit); systemctlCleanupFailed(result, "disable", timerUnit) {
 		report.SystemctlFailureCount++
@@ -211,6 +216,166 @@ func Uninstall(opts Options) (report Report, returnErr error) {
 		errs = append(errs, purgeErrs...)
 	}
 	return report, errors.Join(errs...)
+}
+
+func rejectInterruptedInstallState(root string) error {
+	const (
+		backupRoot = "/var/backups/security-update-notify"
+		journal    = "transaction.json"
+		maxJournal = 1 << 20
+	)
+	for _, candidate := range []struct {
+		logical     string
+		managedRoot string
+	}{
+		{
+			logical:     "/etc/security-update-notify/credentials/.feishu-app-secret.install-recovery",
+			managedRoot: "/etc/security-update-notify",
+		},
+		{logical: "/etc/credstore.encrypted/.security-update-notify-feishu-app-secret.cred.install-recovery"},
+	} {
+		logical := candidate.logical
+		if candidate.managedRoot != "" {
+			info, err := logicalEntryInfo(root, candidate.managedRoot)
+			if err != nil {
+				return fmt.Errorf("inspect managed recovery root %s: %w", candidate.managedRoot, err)
+			}
+			// The whole managed tree is removed as one no-follow leaf during
+			// purge. A non-directory root cannot contain installer-created
+			// recovery state and must not make that safe unlink impossible.
+			if info == nil || !info.IsDir() {
+				continue
+			}
+			if err := filetrust.ValidateDirectory(info, os.Geteuid(), 0o022); err != nil {
+				return fmt.Errorf("unsafe managed recovery root %s: %w", candidate.managedRoot, err)
+			}
+		}
+		exists, err := trustedLogicalEntryExists(root, logical)
+		if err != nil {
+			return fmt.Errorf("inspect private install recovery %s: %w", logical, err)
+		}
+		if exists {
+			return fmt.Errorf("private install recovery exists at %s; run install again to recover first", logical)
+		}
+	}
+
+	directory, err := openRestoreDirectory(root, backupRoot)
+	if err != nil {
+		return fmt.Errorf("inspect install backup root: %w", err)
+	}
+	if directory == nil {
+		return nil
+	}
+	defer directory.close()
+	info, err := directory.file.Stat()
+	if err != nil {
+		return fmt.Errorf("inspect install backup root: %w", err)
+	}
+	if err := filetrust.ValidateDirectory(info, directory.ownerUID, 0o022); err != nil {
+		return fmt.Errorf("unsafe install backup root: %w", err)
+	}
+	names, err := directory.names()
+	if err != nil {
+		return fmt.Errorf("list install backups: %w", err)
+	}
+	for _, name := range names {
+		entry, err := readRemovalEntry(directory.file, name)
+		if err != nil {
+			return fmt.Errorf("inspect install backup %s: %w", name, err)
+		}
+		if !entry.IsDir() || entry.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		backup, err := openRestoreChildDirectory(directory, name)
+		if err != nil {
+			return fmt.Errorf("open install backup %s: %w", name, err)
+		}
+		backupInfo, statErr := backup.file.Stat()
+		if statErr != nil {
+			_ = backup.close()
+			return fmt.Errorf("inspect install backup %s: %w", name, statErr)
+		}
+		if err := filetrust.ValidateDirectory(backupInfo, backup.ownerUID, 0o022); err != nil {
+			_ = backup.close()
+			return fmt.Errorf("unsafe install backup %s: %w", name, err)
+		}
+		snapshot, readErr := backup.readTrustedRegular(journal, maxJournal)
+		closeErr := backup.close()
+		if readErr != nil {
+			return fmt.Errorf("inspect installation transaction in %s: %w", name, readErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close install backup %s: %w", name, closeErr)
+		}
+		if snapshot.exists {
+			return fmt.Errorf("installation transaction journal exists in %s; run install again to recover first", name)
+		}
+	}
+	return nil
+}
+
+func trustedLogicalEntryExists(root, logical string) (bool, error) {
+	parent, name, err := openLogicalParent(root, logical)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer parent.Close()
+	info, err := parent.Stat()
+	if err != nil {
+		return false, err
+	}
+	if err := filetrust.ValidateDirectory(info, os.Geteuid(), 0o022); err != nil {
+		return false, fmt.Errorf("unsafe recovery parent %s: %w", filepath.Dir(logical), err)
+	}
+	_, err = readRemovalEntry(parent, name)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func openRestoreChildDirectory(parent *restoreDirectory, name string) (*restoreDirectory, error) {
+	if parent == nil || parent.file == nil {
+		return nil, errors.New("restore parent directory is unavailable")
+	}
+	if err := validRestoreEntry(name); err != nil {
+		return nil, err
+	}
+	fd, err := syscall.Openat(
+		int(parent.file.Fd()), name,
+		syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC,
+		0,
+	)
+	if err != nil {
+		return nil, err
+	}
+	directory := os.NewFile(uintptr(fd), parent.host(name))
+	if directory == nil {
+		_ = syscall.Close(fd)
+		return nil, errors.New("could not create child restore directory handle")
+	}
+	return &restoreDirectory{
+		file: directory, hostPath: parent.host(name), ownerUID: parent.ownerUID,
+	}, nil
+}
+
+func logicalEntryInfo(root, logical string) (os.FileInfo, error) {
+	parent, name, err := openLogicalParent(root, logical)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer parent.Close()
+	info, err := readRemovalEntry(parent, name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	return info, err
 }
 
 func systemctlCleanupFailed(result sysexec.Result, operation, unit string) bool {

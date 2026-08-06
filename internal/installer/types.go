@@ -35,7 +35,6 @@ const (
 	BackupRoot                = "/var/backups/security-update-notify"
 	InstallLockPath           = "/run/security-update-notify.install.lock"
 	RuntimeLockPath           = "/run/security-update-notify.lock"
-	InstallCheckLockPath      = "/run/security-update-notify.install-check.lock"
 	FeishuPlainCredentialPath = "/etc/security-update-notify/credentials/feishu-app-secret"
 	FeishuEncryptedCredPath   = "/etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred"
 	FeishuCredentialDropIn    = "/etc/systemd/system/security-update-notify.service.d/credentials.conf"
@@ -98,8 +97,10 @@ type FileSystem interface {
 	WriteFileAtomic(path string, data []byte, perm fs.FileMode) error
 	CopyRegularFileAtomic(source, destination string, maxBytes int64) error
 	CopyTrustedRegularFileAtomic(source, destination string, maxBytes int64, ownerUID uint32) error
+	ValidateTrustedRegularFile(source string, maxBytes int64, ownerUID uint32) error
 	Mkdir(path string, perm fs.FileMode) error
 	MkdirAll(path string, perm fs.FileMode) error
+	SyncDir(path string) error
 	ReadDir(path string) ([]fs.DirEntry, error)
 	Readlink(path string) (string, error)
 	Symlink(target, path string) error
@@ -136,10 +137,26 @@ type Runner interface {
 
 type UnlockFunc func() error
 
+// HeldLock keeps the exact descriptor that owns the advisory lock available to
+// trusted child checks. Unlock must be called exactly once.
+type HeldLock struct {
+	File   *os.File
+	unlock UnlockFunc
+}
+
+func (l *HeldLock) Unlock() error {
+	if l == nil || l.unlock == nil {
+		return errors.New("lock is not held")
+	}
+	unlock := l.unlock
+	l.unlock = nil
+	return unlock()
+}
+
 // Locker provides advisory process locks for install serialization and the
 // runtime quiescence barrier.
 type Locker interface {
-	Acquire(ctx context.Context, path string, wait time.Duration) (UnlockFunc, error)
+	Acquire(ctx context.Context, path string, wait time.Duration) (*HeldLock, error)
 }
 
 var ErrLockBusy = errors.New("lock is busy")

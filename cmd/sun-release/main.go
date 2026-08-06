@@ -88,6 +88,9 @@ func runPackage(args []string, stdout, stderr io.Writer, build buildFunc) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
+	if *release && mode == releasepkg.SignAuto {
+		mode = releasepkg.SignRequired
+	}
 	var epoch *int64
 	if *epochText != "" {
 		value, err := strconv.ParseInt(*epochText, 10, 64)

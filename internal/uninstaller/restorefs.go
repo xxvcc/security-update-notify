@@ -184,7 +184,7 @@ func isRestoreTemporaryName(name, prefix string) bool {
 func (d *restoreDirectory) readSnapshots(names []string, maxBytes int64) (map[string]regularSnapshot, error) {
 	snapshots := make(map[string]regularSnapshot, len(names))
 	for _, name := range names {
-		snapshot, err := d.readRegular(name, maxBytes)
+		snapshot, err := d.readTrustedRegular(name, maxBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -284,6 +284,20 @@ func (d *restoreDirectory) readRegular(name string, maxBytes int64) (regularSnap
 		xattrs:          xattrs,
 		xattrsSupported: xattrsSupported,
 	}, nil
+}
+
+// readTrustedRegular is for baselines, provenance records, and current
+// privileged configuration that can influence a restore decision. Temporary
+// transaction files use readRegular and are instead bound to their opened fd.
+func (d *restoreDirectory) readTrustedRegular(name string, maxBytes int64) (regularSnapshot, error) {
+	snapshot, err := d.readRegular(name, maxBytes)
+	if err != nil || !snapshot.exists {
+		return snapshot, err
+	}
+	if err := filetrust.ValidateRegular(snapshot.info, d.ownerUID, 0o022, true); err != nil {
+		return regularSnapshot{}, fmt.Errorf("unsafe restore decision file %s: %w", d.host(name), err)
+	}
+	return snapshot, nil
 }
 
 func sameRestoreFileInfo(left, right fs.FileInfo) bool {

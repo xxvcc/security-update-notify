@@ -44,7 +44,7 @@ Distributions can usually install security patches automatically, but updates ma
 
 - a new kernel is installed while the host still runs the old kernel;
 - services continue using old shared libraries;
-- the automatic-update timer, repositories, or package-manager state becomes unhealthy;
+- the automatic-update timer is disabled or inactive, or repository/package-manager state becomes unhealthy;
 - hold, versionlock, or exclude policy blocks a security update;
 - restart requirements or patch backlogs remain unresolved.
 
@@ -55,7 +55,7 @@ SUN automates security updates and turns the states that genuinely need an admin
 - Installs security updates through the distribution's official mechanism, but never reboots automatically.
 - Sends through Telegram, Feishu, or both, with independent deduplication and retry state.
 - Detects full-reboot, service-restart, patch-backlog, and distro-EOL conditions.
-- Checks automatic-update policy, timers, repository metadata, and package-manager consistency.
+- Checks automatic-update policy, timer activation, repository metadata, and package-manager consistency.
 - Provides a single-language Chinese or English interface and notifications.
 - Supports interactive setup, config reuse, non-interactive deployment, and signed self-upgrade.
 - Defaults to at most one repeated alert per day; once-only and every-N-days modes are available.

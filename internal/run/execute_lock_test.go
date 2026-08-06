@@ -4,9 +4,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -30,6 +32,82 @@ func TestAcquireExecutionLockSuccessAndFilesystemError(t *testing.T) {
 	t.Setenv("SECURITY_UPDATE_NOTIFY_LOCK_FILE", filepath.Join(parentFile, "notify.lock"))
 	if release, acquired, exitCode := AcquireExecutionLock(false, 0); release != nil || acquired || exitCode != 1 {
 		t.Fatalf("failed lock: acquired=%v exit=%d releaseNil=%v", acquired, exitCode, release == nil)
+	}
+}
+
+func TestAcquireExecutionLockAdoptsValidatedInheritedDescriptor(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "notify.lock")
+	parent, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	if err := syscall.Flock(int(parent.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Flock(int(parent.Fd()), syscall.LOCK_UN)
+	inheritedFD, err := syscall.Dup(int(parent.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SECURITY_UPDATE_NOTIFY_LOCK_FILE", lockPath)
+	t.Setenv(inheritedLockFDEnv, strconv.Itoa(inheritedFD))
+
+	release, acquired, exitCode := AcquireExecutionLock(true, 0)
+	if !acquired || exitCode != 0 || release == nil {
+		t.Fatalf("inherited lock: acquired=%v exit=%d releaseNil=%v", acquired, exitCode, release == nil)
+	}
+	release()
+	if otherRelease, otherAcquired, err := runlock.Acquire(lockPath); err != nil || otherAcquired || otherRelease != nil {
+		t.Fatalf("parent lock was released by child: release=%v acquired=%v err=%v", otherRelease != nil, otherAcquired, err)
+	}
+}
+
+func TestAcquireExecutionLockAdoptsDescriptorAcrossExec(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "notify.lock")
+	parent, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	if err := syscall.Flock(int(parent.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Flock(int(parent.Fd()), syscall.LOCK_UN)
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestAcquireExecutionLockExecHelper$")
+	env := envWithOverride(os.Environ(), "SUN_INHERITED_LOCK_EXEC_HELPER", "1")
+	env = envWithOverride(env, "SECURITY_UPDATE_NOTIFY_LOCK_FILE", lockPath)
+	env = envWithOverride(env, inheritedLockFDEnv, "3")
+	cmd.Env = env
+	cmd.ExtraFiles = []*os.File{parent}
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("inherited-lock helper: %v\n%s", err, output)
+	}
+	if release, acquired, err := runlock.Acquire(lockPath); err != nil || acquired || release != nil {
+		t.Fatalf("child close released parent lock: release=%v acquired=%v err=%v", release != nil, acquired, err)
+	}
+}
+
+func TestAcquireExecutionLockExecHelper(t *testing.T) {
+	if os.Getenv("SUN_INHERITED_LOCK_EXEC_HELPER") != "1" {
+		return
+	}
+	release, acquired, exitCode := AcquireExecutionLock(true, 0)
+	if !acquired || exitCode != 0 || release == nil {
+		t.Fatalf("exec-inherited lock: acquired=%v exit=%d releaseNil=%v", acquired, exitCode, release == nil)
+	}
+	release()
+}
+
+func TestAcquireExecutionLockRejectsMalformedInheritedDescriptor(t *testing.T) {
+	for _, value := range []string{"", "2", "+3", "03", "1025", "invalid"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv(inheritedLockFDEnv, value)
+			if release, acquired, exitCode := AcquireExecutionLock(false, 0); release != nil || acquired || exitCode != 1 {
+				t.Fatalf("descriptor %q: release=%v acquired=%v exit=%d", value, release != nil, acquired, exitCode)
+			}
+		})
 	}
 }
 

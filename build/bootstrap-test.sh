@@ -258,6 +258,83 @@ grep -Fxq 'readonly SYSTEM_PATH=/usr/sbin:/usr/bin:/sbin:/bin' "$ROOT/sun.sh"
 grep -Fxq 'curl_https() { curl --disable --proto '\''=https'\'' --proto-redir '\''=https'\'' "$@"; }' "$ROOT/sun.sh"
 grep -Fq 'gpg --no-options --batch --no-tty --homedir' "$ROOT/sun.sh"
 
+# The privileged bootstrap must create its workspace under a fixed system base.
+# Validate each opened component before using mkdirat through the checked base FD.
+python3 -I - "$ROOT/sun.sh" "$TMP/trusted-temp-function.sh" <<'PY'
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+start = source.index("create_trusted_temp_dir() {")
+end = source.index("\n\nappend_bootstrap_package()", start)
+Path(sys.argv[2]).write_text(source[start:end] + "\n", encoding="utf-8")
+PY
+# shellcheck source=/dev/null
+source "$TMP/trusted-temp-function.sh"
+trusted_temp_base="$TMP/trusted-temp-base"
+attacker_temp_base="$TMP/attacker-temp-base"
+mkdir -m 0700 "$trusted_temp_base" "$attacker_temp_base"
+SYSTEM_TEMP_BASE="$trusted_temp_base"
+export TMPDIR="$attacker_temp_base"
+trusted_temp="$(create_trusted_temp_dir)"
+[[ "$(dirname "$trusted_temp")" == "$trusted_temp_base" ]]
+[[ "$(stat -c '%u:%a' "$trusted_temp")" == '0:700' ]]
+[[ -z "$(find "$attacker_temp_base" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+rm -rf -- "$trusted_temp"
+
+unsafe_ancestor="$TMP/unsafe-temp-ancestor"
+mkdir -m 0700 "$unsafe_ancestor"
+mkdir -m 0700 "$unsafe_ancestor/base"
+chmod 0777 "$unsafe_ancestor"
+SYSTEM_TEMP_BASE="$unsafe_ancestor/base"
+if create_trusted_temp_dir >"$TMP/unsafe-temp.out" 2>&1; then
+  echo 'sun.sh accepted a group/other-writable non-sticky temporary ancestor' >&2
+  exit 1
+fi
+grep -Fq 'group/other-writable without the sticky bit' "$TMP/unsafe-temp.out"
+
+sticky_ancestor="$TMP/sticky-temp-ancestor"
+mkdir -m 0700 "$sticky_ancestor"
+mkdir -m 0700 "$sticky_ancestor/base"
+chmod 1777 "$sticky_ancestor"
+SYSTEM_TEMP_BASE="$sticky_ancestor/base"
+sticky_temp="$(create_trusted_temp_dir)"
+[[ "$(dirname "$sticky_temp")" == "$sticky_ancestor/base" ]]
+rm -rf -- "$sticky_temp"
+
+real_temp_base="$TMP/real-temp-base"
+mkdir -m 0700 "$real_temp_base"
+ln -s "$real_temp_base" "$TMP/symlink-temp-base"
+SYSTEM_TEMP_BASE="$TMP/symlink-temp-base"
+if create_trusted_temp_dir >"$TMP/symlink-temp.out" 2>&1; then
+  echo 'sun.sh followed a symlink temporary-path component' >&2
+  exit 1
+fi
+
+if (( EUID == 0 )); then
+  untrusted_temp_base="$TMP/untrusted-owner-temp-base"
+  mkdir -m 0700 "$untrusted_temp_base"
+  chown 65534:65534 "$untrusted_temp_base"
+  # shellcheck disable=SC2034 # Consumed by the dynamically sourced helper.
+  SYSTEM_TEMP_BASE="$untrusted_temp_base"
+  if create_trusted_temp_dir >"$TMP/untrusted-owner-temp.out" 2>&1; then
+    echo 'sun.sh accepted a temporary base not owned by root' >&2
+    exit 1
+  fi
+  grep -Fq 'is not owned by root' "$TMP/untrusted-owner-temp.out"
+fi
+
+grep -Fxq 'readonly SYSTEM_TEMP_BASE=/var/tmp' "$ROOT/sun.sh"
+grep -Fq 'os.open(component, flags, dir_fd=current_fd)' "$ROOT/sun.sh"
+grep -Fq 'os.mkdir(name, 0o700, dir_fd=current_fd)' "$ROOT/sun.sh"
+# shellcheck disable=SC2016 # Match the literal command substitution in sun.sh.
+grep -Fq 'TMP="$(create_trusted_temp_dir)"' "$ROOT/sun.sh"
+# shellcheck disable=SC2016 # Reject the old literal mktemp command substitution.
+if grep -Fq 'TMP="$(mktemp -d)"' "$ROOT/sun.sh"; then
+  echo 'sun.sh still creates its privileged workspace with path-resolved mktemp' >&2
+  exit 1
+fi
+
 # Privileged mode must suppress Bash startup hooks before sun.sh executes. The
 # remaining environment is then reduced before any package or download helper
 # runs, while the explicit UI language and proxy remain available.

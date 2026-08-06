@@ -39,7 +39,7 @@ func restoreDNFWithRemove(root string, beforeRemove func(string) error) (string,
 		return "", false, fmt.Errorf("inspect dnf timestamp backups: %w", err)
 	}
 
-	fixedSnapshot, err := directory.readRegular(fixed, restoreConfigLimit)
+	fixedSnapshot, err := directory.readTrustedRegular(fixed, restoreConfigLimit)
 	if err != nil {
 		return "", false, fmt.Errorf("inspect dnf fixed backup: %w", err)
 	}
@@ -47,7 +47,7 @@ func restoreDNFWithRemove(root string, beforeRemove func(string) error) (string,
 	if err != nil {
 		return "", false, fmt.Errorf("inspect dnf absence marker: %w", err)
 	}
-	proofSnapshot, err := directory.readRegular(proof, 256)
+	proofSnapshot, err := directory.readTrustedRegular(proof, 256)
 	if err != nil {
 		return "", false, fmt.Errorf("inspect dnf dependency proof: %w", err)
 	}
@@ -80,7 +80,7 @@ func restoreDNFWithRemove(root string, beforeRemove func(string) error) (string,
 	preserveDependencyDefault := false
 	var configSnapshot regularSnapshot
 	if source != "" || markerExists {
-		configSnapshot, err = directory.readRegular(destination, restoreConfigLimit)
+		configSnapshot, err = directory.readTrustedRegular(destination, restoreConfigLimit)
 		if err != nil {
 			return "", false, fmt.Errorf("inspect dnf configuration: %w", err)
 		}
@@ -181,7 +181,7 @@ func restoreDNFWithRemove(root string, beforeRemove func(string) error) (string,
 }
 
 func readDNFMarkerSnapshot(directory *restoreDirectory, name string) (string, regularSnapshot, error) {
-	snapshot, err := directory.readRegular(name, 256)
+	snapshot, err := directory.readTrustedRegular(name, 256)
 	if err != nil || !snapshot.exists {
 		return "", snapshot, err
 	}

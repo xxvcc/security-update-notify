@@ -186,11 +186,13 @@ func (i *Installer) persistDNF4DependencyBaseline(plan installPlan, b *backup, c
 		{path: dnfAbsentMarkerPath, op: "replace dnf absence marker with vendor baseline"},
 		{path: dnfDependencyProofPath, op: "remove promoted dnf dependency proof"},
 	} {
-		if err := i.fs.Remove(metadata.path); err != nil {
-			return failure(metadata.op, err)
-		}
+		// Persist the logical absence first so an abrupt stop cannot recover the
+		// superseded marker beside the retained vendor baseline.
 		if err := i.keepPathAbsentOnRollback(b, metadata.path); err != nil {
 			return err
+		}
+		if err := i.fs.Remove(metadata.path); err != nil {
+			return failure(metadata.op, err)
 		}
 	}
 	return nil

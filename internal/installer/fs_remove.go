@@ -21,7 +21,7 @@ func (f *RootFS) Remove(logicalPath string) error {
 	return f.remove(logicalPath, nil)
 }
 
-func (f *RootFS) remove(logicalPath string, beforeClaim func() error) error {
+func (f *RootFS) remove(logicalPath string, beforeClaim func() error) (returnErr error) {
 	directory, name, err := f.openParent(logicalPath)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
@@ -29,7 +29,9 @@ func (f *RootFS) remove(logicalPath string, beforeClaim func() error) error {
 	if err != nil {
 		return err
 	}
-	defer directory.Close()
+	defer func() {
+		returnErr = errors.Join(returnErr, f.syncRemovalDirectory(directory), directory.Close())
+	}()
 	if err := cleanupRemovalArtifactsAt(directory); err != nil {
 		return fmt.Errorf("recover interrupted removal: %w", err)
 	}
@@ -50,7 +52,7 @@ func (f *RootFS) RemoveAll(logicalPath string) error {
 	return f.removeAll(logicalPath, nil)
 }
 
-func (f *RootFS) removeAll(logicalPath string, beforeClaim func() error) error {
+func (f *RootFS) removeAll(logicalPath string, beforeClaim func() error) (returnErr error) {
 	directory, name, err := f.openParent(logicalPath)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
@@ -58,7 +60,9 @@ func (f *RootFS) removeAll(logicalPath string, beforeClaim func() error) error {
 	if err != nil {
 		return err
 	}
-	defer directory.Close()
+	defer func() {
+		returnErr = errors.Join(returnErr, f.syncRemovalDirectory(directory), directory.Close())
+	}()
 	if err := cleanupRemovalArtifactsAt(directory); err != nil {
 		return fmt.Errorf("recover interrupted recursive removal: %w", err)
 	}
@@ -70,6 +74,15 @@ func (f *RootFS) removeAll(logicalPath string, beforeClaim func() error) error {
 		return err
 	}
 	return removeValidatedEntryAt(directory, name, expected, true, beforeClaim)
+}
+
+func (f *RootFS) syncRemovalDirectory(directory *os.File) error {
+	if f.beforeRemovalDirectorySync != nil {
+		if err := f.beforeRemovalDirectorySync(directory); err != nil {
+			return err
+		}
+	}
+	return directory.Sync()
 }
 
 func removeAllAt(parent *os.File, name string) error {

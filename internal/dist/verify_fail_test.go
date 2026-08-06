@@ -84,6 +84,11 @@ func TestVerifyReleaseFailClosed(t *testing.T) {
 	if b, err := gpgArmorExport(t, h2, fpr2); err == nil {
 		os.WriteFile(pub2, b, 0o644)
 	}
+	attackerTemp := filepath.Join(dir, "attacker-tmp")
+	if err := os.Mkdir(attackerTemp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", attackerTemp)
 
 	// a) 正确：key1 签、pin=fpr1、sha 正确 -> 接受
 	if err := VerifyRelease(tarball, shaFile, asc1, pub1, fpr1); err != nil {
@@ -129,6 +134,76 @@ func TestVerifyReleaseFailClosed(t *testing.T) {
 		if err := VerifyRelease(tarball, shaFile, asc2, multiPub, fpr1); err == nil {
 			t.Error("multi-key pubkey file with attacker signature accepted (fingerprint-pin bypass)")
 		}
+	}
+	entries, err := os.ReadDir(attackerTemp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("verification used caller-controlled TMPDIR: %v", entries)
+	}
+}
+
+func TestCreateVerificationTempDirIgnoresTMPDIRAndRejectsUnsafeBase(t *testing.T) {
+	root := t.TempDir()
+	trusted := filepath.Join(root, "trusted")
+	sticky := filepath.Join(root, "sticky")
+	unsafe := filepath.Join(root, "unsafe")
+	attacker := filepath.Join(root, "attacker")
+	for path, mode := range map[string]os.FileMode{
+		trusted:  0o700,
+		sticky:   os.ModeSticky | 0o777,
+		unsafe:   0o0777,
+		attacker: 0o700,
+	} {
+		if err := os.Mkdir(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("TMPDIR", attacker)
+	tmp, err := createVerificationTempDir(trusted, "verify-test-", os.Geteuid())
+	if err != nil {
+		t.Fatalf("createVerificationTempDir(): %v", err)
+	}
+	defer os.RemoveAll(tmp)
+	if filepath.Dir(tmp) != trusted {
+		t.Fatalf("verification directory=%q, want child of %q", tmp, trusted)
+	}
+	entries, err := os.ReadDir(attacker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("caller-controlled TMPDIR was used: %v", entries)
+	}
+	stickyTmp, err := createVerificationTempDir(sticky, "verify-test-", os.Geteuid())
+	if err != nil {
+		t.Fatalf("sticky shared verification base was rejected: %v", err)
+	}
+	if err := os.RemoveAll(stickyTmp); err != nil {
+		t.Fatal(err)
+	}
+	if tmp, err := createVerificationTempDir(unsafe, "verify-test-", os.Geteuid()); err == nil {
+		_ = os.RemoveAll(tmp)
+		t.Fatal("group/other-writable non-sticky verification base was accepted")
+	}
+}
+
+func TestSystemVerificationTempBaseContract(t *testing.T) {
+	tmp, err := createVerificationTempDir(verificationTempBase, "verify-contract-", 0)
+	if err != nil {
+		t.Fatalf("system verification temporary base is unavailable or unsafe: %v", err)
+	}
+	defer os.RemoveAll(tmp)
+	info, err := os.Lstat(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("verification temporary directory mode=%v, want drwx------", info.Mode())
 	}
 }
 

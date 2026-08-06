@@ -16,7 +16,7 @@
 先完成[开发与本地验证](development.md)中的门禁，然后运行：
 
 ```bash
-go run ./cmd/sun-release package
+go run ./cmd/sun-release package --release --sign required
 cd dist && sha256sum -c security-update-notify-*.tar.gz.sha256
 ```
 

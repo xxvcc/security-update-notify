@@ -63,6 +63,69 @@ func (f *RootFS) CopyTrustedRegularFileAtomic(source, destination string, maxByt
 	}, nil)
 }
 
+// ValidateTrustedRegularFile performs every source-side operation required by
+// CopyTrustedRegularFileAtomic: it reads the complete contents and xattrs and
+// verifies that both the opened inode and its path remain stable throughout.
+// Recovery uses this before changing any managed host path so a corrupt later
+// snapshot cannot be discovered only after earlier paths were restored.
+func (f *RootFS) ValidateTrustedRegularFile(source string, maxBytes int64, ownerUID uint32) error {
+	return f.validateTrustedRegularFile(source, maxBytes, ownerUID, nil)
+}
+
+func (f *RootFS) validateTrustedRegularFile(source string, maxBytes int64, ownerUID uint32, checkpoint func(copyRegularFileCheckpoint)) error {
+	if maxBytes < 0 {
+		return errors.New("invalid negative file limit")
+	}
+	file, err := f.OpenFileNoFollow(source, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	state, err := regularFileStateFromInfo(info)
+	if err != nil {
+		return err
+	}
+	if err := filetrust.ValidateRegular(info, int(ownerUID), 0o022, true); err != nil {
+		return fmt.Errorf("unsafe source file: %w", err)
+	}
+	if state.size < 0 || state.size > maxBytes {
+		return fmt.Errorf("file exceeds %d bytes", maxBytes)
+	}
+	written, err := io.Copy(io.Discard, io.LimitReader(file, limitWithOverflowByte(maxBytes)))
+	if err != nil {
+		return err
+	}
+	if written > maxBytes {
+		return fmt.Errorf("file exceeds %d bytes", maxBytes)
+	}
+	if written != state.size {
+		return errors.New("source file changed while validating copy")
+	}
+	if checkpoint != nil {
+		checkpoint(copyRegularFileContentsCopied)
+	}
+	if err := f.revalidateRegularFileState(source, file, state); err != nil {
+		return err
+	}
+	if _, _, err := readFileXattrs(file); err != nil {
+		return err
+	}
+	if checkpoint != nil {
+		checkpoint(copyRegularFileXattrsCaptured)
+	}
+	if err := f.revalidateRegularFileState(source, file, state); err != nil {
+		return err
+	}
+	if checkpoint != nil {
+		checkpoint(copyRegularFileReadyToPublish)
+	}
+	return f.revalidateRegularFileState(source, file, state)
+}
+
 // The checkpoint is nil in production and lets tests deterministically modify
 // the source at consistency boundaries.
 func (f *RootFS) copyRegularFileAtomic(source, destination string, maxBytes int64, checkpoint func(copyRegularFileCheckpoint)) (returnErr error) {

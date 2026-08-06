@@ -15,7 +15,7 @@ import (
 // attempted. A non-zero package-manager result may still leave installed packages
 // and their configuration behind, so callers must snapshot those side effects
 // before rolling back SUN-owned files.
-func (i *Installer) installDependencies(ctx context.Context, plan installPlan, confirm ConfirmDependenciesFunc) (bool, error) {
+func (i *Installer) installDependencies(ctx context.Context, plan installPlan, confirm ConfirmDependenciesFunc, beforeMutation func() error) (bool, error) {
 	profile := plan.profile
 	if profile.Backend != plan.backend || profile.PackageProbe.Name == "" || len(profile.PackageManagers) == 0 {
 		return false, failure("install dependencies", errors.New("distribution profile is incomplete"))
@@ -56,8 +56,26 @@ func (i *Installer) installDependencies(ctx context.Context, plan installPlan, c
 	if !approved {
 		return false, failure("confirm dependency installation", errors.New("required package installation was declined"))
 	}
+	manager := profile.PackageManagers[0]
+	if plan.backend == "dnf" {
+		manager = ""
+		for _, candidate := range profile.PackageManagers {
+			if i.runner.LookPath(candidate) {
+				manager = candidate
+				break
+			}
+		}
+		if manager == "" {
+			return false, failure("install dependencies", errors.New("dnf, microdnf, or yum is required"))
+		}
+	}
+	if beforeMutation == nil {
+		return false, failure("prepare dependency installation", errors.New("transaction phase callback is required"))
+	}
+	if err := beforeMutation(); err != nil {
+		return false, err
+	}
 	if plan.backend == "apt" {
-		manager := profile.PackageManagers[0]
 		if err := i.requiredCommandContext(ctx, "update apt package lists", Command{Name: manager, Args: []string{"update"}, Timeout: 15 * time.Minute}); err != nil {
 			return false, err
 		}
@@ -65,16 +83,6 @@ func (i *Installer) installDependencies(ctx context.Context, plan installPlan, c
 			Name: manager, Args: append([]string{"install", "-y"}, missing...),
 			Env: map[string]string{"DEBIAN_FRONTEND": "noninteractive"}, Timeout: 30 * time.Minute,
 		})
-	}
-	manager := ""
-	for _, candidate := range profile.PackageManagers {
-		if i.runner.LookPath(candidate) {
-			manager = candidate
-			break
-		}
-	}
-	if manager == "" {
-		return false, failure("install dependencies", errors.New("dnf, microdnf, or yum is required"))
 	}
 	return true, i.requiredCommandContext(ctx, "install dnf dependencies", Command{Name: manager, Args: append([]string{"install", "-y"}, missing...), Timeout: 30 * time.Minute})
 }

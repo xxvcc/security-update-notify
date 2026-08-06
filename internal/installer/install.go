@@ -65,7 +65,7 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 	if err := i.ensureDir("/run", 0o755); err != nil {
 		return Result{}, failure("prepare installer lock", err)
 	}
-	unlockInstall, err := i.locker.Acquire(ctx, InstallLockPath, 0)
+	installLock, err := i.locker.Acquire(ctx, InstallLockPath, 0)
 	if err != nil {
 		if errors.Is(err, ErrLockBusy) {
 			return Result{}, temporary("acquire installer lock", errors.New("another install or upgrade transaction is running"))
@@ -73,10 +73,19 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 		return Result{}, failure("acquire installer lock", err)
 	}
 	defer func() {
-		if err := unlockInstall(); err != nil {
+		if err := installLock.Unlock(); err != nil {
 			returnErr = errors.Join(returnErr, failure("release installer lock", err))
 		}
 	}()
+	// An earlier process may have stopped after changing the host but before its
+	// in-memory defers ran. Finish that transaction under the install lock before
+	// parsing a new request or making any new installation change.
+	if err := i.recoverInterruptedTransaction(ctx, options.LockWait); err != nil {
+		return Result{}, err
+	}
+	if err := installContextError(ctx); err != nil {
+		return Result{}, err
+	}
 
 	plan, err := i.prepare(ctx, options)
 	if err != nil {
@@ -99,30 +108,47 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 		return Result{}, err
 	}
 	var automaticUnits []unitSnapshot
-	unlockRuntime, err := i.acquireRuntimeLock(ctx, options.LockWait)
+	runtimeLock, err := i.acquireRuntimeLock(ctx, options.LockWait)
 	if err != nil {
 		return Result{}, err
 	}
 	// Register this before the rollback defer below so failures are restored
 	// while the transaction still excludes every normal runtime invocation.
 	defer func() {
-		if err := unlockRuntime(); err != nil {
+		if err := runtimeLock.Unlock(); err != nil {
 			returnErr = errors.Join(returnErr, failure("release runtime lock", err))
 		}
 	}()
-	previousVersion := i.currentInstalledVersion(ctx)
+	previousVersion := i.currentInstalledVersion(ctx, runtimeLock)
 	b, err := i.createBackup()
 	if err != nil {
 		return Result{}, err
 	}
 	aptConfigOriginallyAbsent := plan.backend == "apt" && !b.snapshots[aptPeriodicPath].exists
 	dnfConfigOriginallyAbsent := plan.backend == "dnf" && !b.snapshots[dnfAutomaticPath].exists
+	tx, err := i.beginTransaction(b, private, timer)
+	if err != nil {
+		return Result{}, err
+	}
 	transactionActive := true
 	defer func() {
 		if returnErr == nil || !transactionActive {
 			return
 		}
-		if rollbackErr := i.restoreBackup(b, private, timer, automaticUnits); rollbackErr != nil {
+		if !tx.journal.RecoverySafe {
+			returnErr = &ExitError{
+				Code: 1,
+				Op:   "installation failed during an unsafe dependency phase; automatic rollback was skipped",
+				Err: errors.Join(returnErr, errors.New(
+					"the package-manager state requires manual inspection; the transaction journal and private recovery material were retained")),
+			}
+			return
+		}
+		rollbackErr := i.restoreBackup(b, private, timer, automaticUnits)
+		if rollbackErr == nil {
+			_, rollbackErr = tx.finish(transactionStateRevert)
+		}
+		if rollbackErr != nil {
 			returnErr = &ExitError{
 				Code: 1,
 				Op:   "installation failed and rollback was incomplete",
@@ -134,7 +160,13 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 		}
 	}()
 
+	if err := installContextError(ctx); err != nil {
+		return Result{}, err
+	}
 	if err := i.quiesceExisting(ctx, plan.upgrade); err != nil {
+		return Result{}, err
+	}
+	if err := installContextError(ctx); err != nil {
 		return Result{}, err
 	}
 	if plan.backend == "apt" {
@@ -155,7 +187,9 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 	packageInstallAttempted := false
 	var dependencyErr error
 	if !options.SkipDependencies {
-		packageInstallAttempted, dependencyErr = i.installDependencies(ctx, plan, options.ConfirmDependencies)
+		packageInstallAttempted, dependencyErr = i.installDependencies(ctx, plan, options.ConfirmDependencies, func() error {
+			return tx.markDependencyMutation(b, plan)
+		})
 	}
 	var dependencyProofErr error
 	if packageInstallAttempted {
@@ -227,6 +261,9 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 	if err != nil {
 		return Result{}, err
 	}
+	if err := tx.captureAutomaticUnits(automaticUnits); err != nil {
+		return Result{}, err
+	}
 	credentialSecret := bytes.Clone(options.FeishuSecret)
 	defer func() { zeroBytes(credentialSecret) }()
 
@@ -273,7 +310,7 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 	if err := i.snapshotChangedDeliveryTargets(b, plan); err != nil {
 		return Result{}, err
 	}
-	if err := i.markChangedDeliveryTargets(plan); err != nil {
+	if err := i.markChangedDeliveryTargets(ctx, plan); err != nil {
 		return Result{}, err
 	}
 
@@ -284,16 +321,32 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 	if err := i.verifyBackendPolicyFile(plan); err != nil {
 		return Result{}, err
 	}
-	postInstallTest, postInstallDoctor, err := i.activateAndVerify(ctx, plan, options, previousVersion, automaticUnits)
+	postInstallTest, postInstallDoctor, err := i.activateAndVerify(ctx, plan, options, previousVersion, automaticUnits, runtimeLock)
 	if err != nil {
 		return Result{}, err
 	}
-	transactionActive = false
+	if err := installContextError(ctx); err != nil {
+		return Result{}, err
+	}
+	finalized, err := tx.finish(transactionStateCommit)
+	if finalized {
+		transactionActive = false
+	}
+	if err != nil {
+		return Result{}, err
+	}
 	return Result{
 		Upgrade: plan.upgrade, Backend: plan.backend, SupportTier: plan.supportTier,
 		PreviousVersion: previousVersion, BackupDir: b.dir, CredentialStorage: storage,
 		PostInstallTest: postInstallTest, PostInstallDoctor: postInstallDoctor,
 	}, nil
+}
+
+func installContextError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return failure("installation canceled", err)
+	}
+	return nil
 }
 
 func deliveryStatePaths(channel string) []string {
@@ -327,7 +380,7 @@ func (i *Installer) snapshotChangedDeliveryTargets(b *backup, plan installPlan) 
 	return nil
 }
 
-func (i *Installer) markChangedDeliveryTargets(plan installPlan) error {
+func (i *Installer) markChangedDeliveryTargets(ctx context.Context, plan installPlan) error {
 	channels := changedDeliveryTargetChannels(plan)
 	if len(channels) == 0 {
 		return nil
@@ -336,6 +389,9 @@ func (i *Installer) markChangedDeliveryTargets(plan installPlan) error {
 		return failure("prepare delivery target state", err)
 	}
 	for _, channel := range channels {
+		if err := installContextError(ctx); err != nil {
+			return err
+		}
 		if err := i.fs.WriteFileAtomic(targetPendingPath(channel), []byte("pending\n"), 0o600); err != nil {
 			return failure("invalidate changed "+channel+" delivery target", err)
 		}
@@ -343,7 +399,7 @@ func (i *Installer) markChangedDeliveryTargets(plan installPlan) error {
 	return nil
 }
 
-func (i *Installer) activateAndVerify(ctx context.Context, plan installPlan, options Options, previousVersion string, automaticUnits []unitSnapshot) (*CommandResult, *CommandResult, error) {
+func (i *Installer) activateAndVerify(ctx context.Context, plan installPlan, options Options, previousVersion string, automaticUnits []unitSnapshot, runtimeLock *HeldLock) (*CommandResult, *CommandResult, error) {
 	if err := i.requiredCommandContext(ctx, "reload systemd", Command{Name: "systemctl", Args: []string{"daemon-reload"}, Timeout: 30 * time.Second}); err != nil {
 		return nil, nil, err
 	}
@@ -374,7 +430,11 @@ func (i *Installer) activateAndVerify(ctx context.Context, plan installPlan, opt
 			"%s has enablement state %q; want enabled or enabled-runtime", automaticTimer, state))
 	}
 	if !options.SkipPostInstallCheck {
-		if err := i.requiredCommandContext(ctx, "verify installed runtime", Command{Name: BinaryPath, Args: []string{"--version"}, Timeout: 30 * time.Second}); err != nil {
+		command, err := commandWithRuntimeLock(Command{Name: BinaryPath, Args: []string{"--version"}, Timeout: 30 * time.Second}, runtimeLock)
+		if err != nil {
+			return nil, nil, failure("verify installed runtime", err)
+		}
+		if err := i.requiredCommandContext(ctx, "verify installed runtime", command); err != nil {
 			return nil, nil, err
 		}
 		if !i.runner.LookPath("systemd-analyze") {
@@ -388,10 +448,13 @@ func (i *Installer) activateAndVerify(ctx context.Context, plan installPlan, opt
 	}
 	var postInstallTest *CommandResult
 	if options.SendTest {
-		result := i.runner.Run(ctx, Command{
+		command, lockErr := commandWithRuntimeLock(Command{
 			Name: BinaryPath, Args: []string{"--test-ok", "--no-dedupe", "--wait-lock", lockSeconds(options.LockWait)}, Timeout: options.LockWait + 30*time.Second,
-			Env: map[string]string{"SECURITY_UPDATE_NOTIFY_LOCK_FILE": InstallCheckLockPath},
-		})
+		}, runtimeLock)
+		if lockErr != nil {
+			return nil, nil, failure("prepare post-install notification test", lockErr)
+		}
+		result := i.runner.Run(ctx, command)
 		postInstallTest = &result
 	}
 	if err := i.fs.Remove(RuntimeTimerLink); err != nil {
@@ -402,10 +465,13 @@ func (i *Installer) activateAndVerify(ctx context.Context, plan installPlan, opt
 	}
 	var postInstallDoctor *CommandResult
 	if !options.SkipPostInstallCheck {
-		result := i.runner.Run(ctx, Command{
+		command, lockErr := commandWithRuntimeLock(Command{
 			Name: BinaryPath, Args: []string{"--doctor", "--skip-notify", "--lang", plan.values["NOTIFY_LANG"]}, Timeout: 2 * time.Minute,
-			Env: map[string]string{"SECURITY_UPDATE_NOTIFY_LOCK_FILE": InstallCheckLockPath},
-		})
+		}, runtimeLock)
+		if lockErr != nil {
+			return postInstallTest, nil, failure("prepare post-install doctor", lockErr)
+		}
+		result := i.runner.Run(ctx, command)
 		postInstallDoctor = &result
 		if plan.profile.Inferred && (commandResultIncomplete(result) || result.Err != nil || result.Code != 0) {
 			return postInstallTest, postInstallDoctor, failure("verify inferred derivative with doctor", commandResultError(result))
@@ -417,18 +483,20 @@ func (i *Installer) activateAndVerify(ctx context.Context, plan installPlan, opt
 		return postInstallTest, postInstallDoctor, err
 	}
 	if plan.upgrade && plan.values["NOTIFY_UPGRADE"] == "1" {
-		newVersion := i.currentInstalledVersion(ctx)
-		_ = i.runner.Run(ctx, Command{
+		newVersion := i.currentInstalledVersion(ctx, runtimeLock)
+		command, lockErr := commandWithRuntimeLock(Command{
 			Name:    BinaryPath,
 			Args:    []string{"--notify-upgrade-event", "--upgrade-from", previousVersion, "--upgrade-to", newVersion},
-			Env:     map[string]string{"SECURITY_UPDATE_NOTIFY_LOCK_FILE": InstallCheckLockPath},
 			Timeout: 2 * time.Minute,
-		})
+		}, runtimeLock)
+		if lockErr == nil {
+			_ = i.runner.Run(ctx, command)
+		}
 	}
 	return postInstallTest, postInstallDoctor, nil
 }
 
-func (i *Installer) currentInstalledVersion(ctx context.Context) string {
+func (i *Installer) currentInstalledVersion(ctx context.Context, runtimeLock *HeldLock) string {
 	pathInfo, err := i.fs.Lstat(BinaryPath)
 	if err != nil || pathInfo.Mode()&fs.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() {
 		return "none"
@@ -446,9 +514,13 @@ func (i *Installer) currentInstalledVersion(ctx context.Context) string {
 		info.Mode().Perm()&0o111 == 0 || info.Size() < 0 || info.Size() > 256<<20 {
 		return "unknown"
 	}
-	result := i.runner.Run(ctx, Command{
+	command, err := commandWithRuntimeLock(Command{
 		Name: "env", Args: []string{"/proc/self/fd/3", "--version"}, ExtraFiles: []*os.File{file}, Timeout: 15 * time.Second,
-	})
+	}, runtimeLock)
+	if err != nil {
+		return "unknown"
+	}
+	result := i.runner.Run(ctx, command)
 	if commandResultIncomplete(result) || result.Err != nil || result.Code != 0 {
 		return "unknown"
 	}
@@ -457,6 +529,17 @@ func (i *Installer) currentInstalledVersion(ctx context.Context) string {
 		return "unknown"
 	}
 	return fields[1]
+}
+
+func commandWithRuntimeLock(command Command, runtimeLock *HeldLock) (Command, error) {
+	if runtimeLock == nil || runtimeLock.File == nil {
+		return Command{}, errors.New("runtime lock descriptor is unavailable")
+	}
+	command.Args = append([]string(nil), command.Args...)
+	command.ExtraFiles = append(append([]*os.File(nil), command.ExtraFiles...), runtimeLock.File)
+	command.Env = cloneConfig(command.Env)
+	command.Env["SECURITY_UPDATE_NOTIFY_LOCK_FD"] = fmt.Sprintf("%d", 2+len(command.ExtraFiles))
+	return command, nil
 }
 
 func (i *Installer) validateInstalledBinaryParent() error {

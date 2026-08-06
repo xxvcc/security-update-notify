@@ -3,6 +3,8 @@ package lock
 import (
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -136,4 +138,87 @@ func TestAcquireRejectsWrongOwner(t *testing.T) {
 	if release, acquired, err := Acquire(path); err == nil || acquired || release != nil {
 		t.Fatalf("wrong-owner acquire: release=%v acquired=%v err=%v", release != nil, acquired, err)
 	}
+}
+
+func TestAcquireInheritedUsesParentOpenFileDescription(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "notify.lock")
+	parentLock, parentDir, _, err := openLockFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := parentDir.Close(); err != nil {
+		t.Fatal(err)
+	}
+	defer parentLock.Close()
+	if err := parentLock.Chmod(0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(int(parentLock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Flock(int(parentLock.Fd()), syscall.LOCK_UN)
+
+	inheritedFD, err := syscall.Dup(int(parentLock.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := AcquireInherited(path, inheritedFD)
+	if err != nil {
+		t.Fatalf("adopt inherited lock: %v", err)
+	}
+	release()
+
+	// Closing the child descriptor must not issue LOCK_UN against the shared
+	// open file description while the installer parent is still active.
+	if releaseOther, acquired, err := Acquire(path); err != nil || acquired || releaseOther != nil {
+		t.Fatalf("parent lock after child release: release=%v acquired=%v err=%v", releaseOther != nil, acquired, err)
+	}
+}
+
+func TestAcquireInheritedRejectsForgedDescriptor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "notify.lock")
+	parentLock, parentDir, _, err := openLockFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := parentDir.Close(); err != nil {
+		t.Fatal(err)
+	}
+	defer parentLock.Close()
+	if err := parentLock.Chmod(0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(int(parentLock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Flock(int(parentLock.Fd()), syscall.LOCK_UN)
+
+	t.Run("different inode", func(t *testing.T) {
+		other, err := os.OpenFile(filepath.Join(t.TempDir(), "other.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer other.Close()
+		descriptor, err := syscall.Dup(int(other.Fd()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if release, err := AcquireInherited(path, descriptor); err == nil || release != nil ||
+			!strings.Contains(err.Error(), "path") {
+			t.Fatalf("different-inode inherited lock: release=%v err=%v", release != nil, err)
+		}
+	})
+
+	t.Run("different open file description", func(t *testing.T) {
+		other, err := os.OpenFile(path, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		descriptor := int(other.Fd())
+		// AcquireInherited owns and closes descriptor on every return path.
+		if release, err := AcquireInherited(path, descriptor); err == nil || release != nil ||
+			!strings.Contains(err.Error(), "ownership") {
+			t.Fatalf("separate-open inherited lock: release=%v err=%v", release != nil, err)
+		}
+	})
 }

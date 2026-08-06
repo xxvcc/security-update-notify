@@ -97,6 +97,10 @@ esac
 			"security-update-notify.timer": true,
 			"dnf-automatic.timer":          true,
 		},
+		values: map[string]string{
+			"dnf-automatic.service\x00Result":    "success",
+			"dnf-automatic.timer\x00ActiveState": "active",
+		},
 	}
 
 	output, got := captureDoctorOutput(t, func() int {
@@ -143,6 +147,15 @@ esac
 			t.Fatalf("Doctor output missing checked result %q:\n%s", want, output)
 		}
 	}
+
+	systemdQuery.values["dnf-automatic.timer\x00ActiveState"] = "inactive"
+	output, got = captureDoctorOutput(t, func() int {
+		return Doctor(checkedCfg, DoctorOpts{Version: "2.7.3", Lang: i18n.EN, EnvPath: checkedPath, SkipNotify: true, Systemd: systemdQuery})
+	})
+	if got != 1 || !strings.Contains(output, "enabled but not active") {
+		t.Fatalf("Doctor() did not reject enabled inactive timer: rc=%d\n%s", got, output)
+	}
+	systemdQuery.values["dnf-automatic.timer\x00ActiveState"] = "active"
 
 	if err := os.WriteFile(dnfConfig, []byte("[commands]\nupgrade_type = default\napply_updates = no\nreboot = when-needed\n"), 0o600); err != nil {
 		t.Fatal(err)

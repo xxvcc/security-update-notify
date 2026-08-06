@@ -16,6 +16,11 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/textsafe"
 )
 
+const (
+	inheritedLockFDEnv = "SECURITY_UPDATE_NOTIFY_LOCK_FD"
+	maxInheritedLockFD = 1024
+)
+
 // DryRunFlags 扩展 Flags：仅计算并打印 hash 与将发送的正文，不加锁、不发送、不写状态、不记日志。
 // 用于人工观察与 bash↔Go 差分测试。
 type DryRunFlags struct {
@@ -29,6 +34,13 @@ type DryRunFlags struct {
 // AcquireExecutionLock applies the runtime's public lock contract. Default contention is a quiet success;
 // an explicit wait timeout returns 75; lock filesystem or flock failures return 1.
 func AcquireExecutionLock(require bool, wait time.Duration) (release func(), acquired bool, exitCode int) {
+	if inheritedRelease, present, err := inheritedExecutionLock(); present {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "lock error: "+err.Error())
+			return nil, false, 1
+		}
+		return inheritedRelease, true, 0
+	}
 	var err error
 	if require {
 		release, acquired, err = lock.AcquireWait(lockFilePath(), wait)
@@ -47,6 +59,26 @@ func AcquireExecutionLock(require bool, wait time.Duration) (release func(), acq
 		return nil, false, 0
 	}
 	return release, true, 0
+}
+
+// inheritedExecutionLock adopts the installer's lock capability. The
+// descriptor number is not itself trusted: lock.AcquireInherited binds it to
+// the canonical runtime-lock inode and proves that its open file description
+// can hold the flock. A malformed or forged capability fails closed.
+func inheritedExecutionLock() (release func(), present bool, err error) {
+	value, present := os.LookupEnv(inheritedLockFDEnv)
+	if !present {
+		return nil, false, nil
+	}
+	if value == "" || strings.TrimLeft(value, "0123456789") != "" {
+		return nil, true, fmt.Errorf("invalid inherited runtime lock descriptor %q", value)
+	}
+	descriptor, parseErr := strconv.Atoi(value)
+	if parseErr != nil || descriptor < 3 || descriptor > maxInheritedLockFD || strconv.Itoa(descriptor) != value {
+		return nil, true, fmt.Errorf("invalid inherited runtime lock descriptor %q", value)
+	}
+	release, err = lock.AcquireInherited(lockFilePath(), descriptor)
+	return release, true, err
 }
 
 // Execute 跑完整的 检查→通知→去重→落盘 流程，返回进程退出码。复刻运行时末尾的决策、日志事件与退出码：

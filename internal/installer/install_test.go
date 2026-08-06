@@ -48,10 +48,23 @@ type interruptAfterAtomicWriteFS struct {
 	path string
 }
 
+type cancelAfterAtomicWriteFS struct {
+	FileSystem
+	path   string
+	cancel context.CancelFunc
+}
+
 type failDependencyCaptureFS struct {
 	FileSystem
 	source string
 	err    error
+}
+
+type failSnapshotValidationFS struct {
+	FileSystem
+	source    string
+	err       error
+	validated []string
 }
 
 type failRemoveFS struct {
@@ -89,11 +102,30 @@ func (f *interruptAfterAtomicWriteFS) WriteFileAtomic(name string, data []byte, 
 	return nil
 }
 
+func (f *cancelAfterAtomicWriteFS) WriteFileAtomic(name string, data []byte, perm fs.FileMode) error {
+	if err := f.FileSystem.WriteFileAtomic(name, data, perm); err != nil {
+		return err
+	}
+	if name == f.path && f.cancel != nil {
+		f.cancel()
+		f.cancel = nil
+	}
+	return nil
+}
+
 func (f *failDependencyCaptureFS) CopyTrustedRegularFileAtomic(source, destination string, maxBytes int64, ownerUID uint32) error {
 	if source == f.source && strings.HasPrefix(destination, BackupRoot+"/") {
 		return f.err
 	}
 	return f.FileSystem.CopyTrustedRegularFileAtomic(source, destination, maxBytes, ownerUID)
+}
+
+func (f *failSnapshotValidationFS) ValidateTrustedRegularFile(source string, maxBytes int64, ownerUID uint32) error {
+	f.validated = append(f.validated, source)
+	if source == f.source {
+		return f.err
+	}
+	return f.FileSystem.ValidateTrustedRegularFile(source, maxBytes, ownerUID)
 }
 
 func (f *failMarkerBackupFS) CopyTrustedRegularFileAtomic(source, destination string, maxBytes int64, ownerUID uint32) error {
@@ -138,7 +170,7 @@ func (f *replaceLockPathFS) OpenFileNoFollow(name string, flag int, mode fs.File
 	return file, nil
 }
 
-func (l *fakeLocker) Acquire(_ context.Context, lockPath string, wait time.Duration) (UnlockFunc, error) {
+func (l *fakeLocker) Acquire(_ context.Context, lockPath string, wait time.Duration) (*HeldLock, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.calls = append(l.calls, lockPath)
@@ -152,17 +184,22 @@ func (l *fakeLocker) Acquire(_ context.Context, lockPath string, wait time.Durat
 	if l.held[lockPath] {
 		return nil, ErrLockBusy
 	}
+	file, err := os.Open(os.DevNull)
+	if err != nil {
+		return nil, err
+	}
 	l.held[lockPath] = true
-	return func() error {
+	return &HeldLock{File: file, unlock: func() error {
 		l.mu.Lock()
 		defer l.mu.Unlock()
 		if !l.held[lockPath] {
+			_ = file.Close()
 			return errors.New("fake lock released more than once")
 		}
 		delete(l.held, lockPath)
 		l.unlocks = append(l.unlocks, lockPath)
-		return l.unlockErrors[lockPath]
-	}, nil
+		return errors.Join(l.unlockErrors[lockPath], file.Close())
+	}}, nil
 }
 
 func (l *fakeLocker) isHeld(lockPath string) bool {
@@ -250,6 +287,9 @@ func (r *fakeRunner) Run(_ context.Context, command Command) CommandResult {
 	case "systemctl":
 		return r.systemctl(command.Args)
 	case "dpkg":
+		if len(command.Args) == 1 && command.Args[0] == "--audit" {
+			return result
+		}
 		if len(command.Args) < 2 {
 			return CommandResult{Code: 2, Stderr: []byte("missing package argument")}
 		}
@@ -317,7 +357,7 @@ func (r *fakeRunner) Run(_ context.Context, command Command) CommandResult {
 		return result
 	case "env":
 		if len(command.Args) == 2 && command.Args[0] == "/proc/self/fd/3" && command.Args[1] == "--version" {
-			if len(command.ExtraFiles) != 1 {
+			if len(command.ExtraFiles) != 2 {
 				return CommandResult{Err: fmt.Errorf("version extra files = %d", len(command.ExtraFiles))}
 			}
 			data := make([]byte, len("old-runtime"))
@@ -512,6 +552,59 @@ func existsNoErr(filesystem FileSystem, name string) bool {
 	return err == nil
 }
 
+func assertUnsafeTransactionRetained(t *testing.T, installer *Installer) {
+	t.Helper()
+	tx, _, err := installer.loadTransaction()
+	if err != nil {
+		t.Fatalf("load retained transaction: %v", err)
+	}
+	if tx == nil || tx.journal.RecoverySafe || tx.journal.Dependency == nil || tx.journal.Dependency.State != "mutating" {
+		t.Fatalf("retained transaction is not unsafe mutating state: %+v", tx)
+	}
+}
+
+func assertPreserveCurrentTransactionPath(t *testing.T, installer *Installer, name string) {
+	t.Helper()
+	tx, b, err := installer.loadTransaction()
+	if err != nil || tx == nil {
+		t.Fatalf("load preserve-current transaction: tx=%v err=%v", tx, err)
+	}
+	snapshot, ok := b.snapshots[name]
+	if !ok || snapshot.exists || !snapshot.preserveCurrent || snapshot.backupPath != "" {
+		t.Fatalf("preserve-current snapshot for %s = %+v, tracked=%t", name, snapshot, ok)
+	}
+}
+
+func assertRetryFailsClosed(t *testing.T, installer *Installer, runner *fakeRunner, options Options) {
+	t.Helper()
+	commandsBefore := len(runner.commands)
+	if _, err := installer.Install(context.Background(), options); err == nil || !strings.Contains(err.Error(), "not automatically recoverable") {
+		t.Fatalf("unsafe transaction retry error = %v", err)
+	}
+	if len(runner.commands) != commandsBefore {
+		t.Fatalf("unsafe transaction retry ran host commands: %v", runner.commands[commandsBefore:])
+	}
+	assertUnsafeTransactionRetained(t, installer)
+}
+
+func assertPurgeFailsClosed(t *testing.T, root *RootFS) {
+	t.Helper()
+	commandCalled := false
+	_, err := uninstaller.Uninstall(uninstaller.Options{
+		RootDir: root.Root, PurgeConfig: true, EffectiveUID: func() int { return 0 },
+		RunCommand: func(string, ...string) sysexec.Result {
+			commandCalled = true
+			return sysexec.Result{}
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "transaction journal exists") {
+		t.Fatalf("unsafe transaction purge error = %v", err)
+	}
+	if commandCalled {
+		t.Fatal("unsafe transaction purge ran a host command")
+	}
+}
+
 func setupInstaller(t *testing.T, release string) (*Installer, *RootFS, *fakeRunner, *fakeLocker) {
 	t.Helper()
 	root, err := NewRootFS(t.TempDir())
@@ -543,6 +636,19 @@ func setupInstaller(t *testing.T, release string) (*Installer, *RootFS, *fakeRun
 		t.Fatal(err)
 	}
 	return installer, root, runner, locker
+}
+
+func freshTestInstaller(t *testing.T, root *RootFS, runner *fakeRunner, locker *fakeLocker) *Installer {
+	t.Helper()
+	installer, err := New(Dependencies{
+		FS: root, Runner: runner, Locker: locker, EffectiveUID: func() int { return 0 },
+		RootOwnerUID: uint32(os.Geteuid()),
+		Now:          func() time.Time { return time.Date(2026, 7, 26, 12, 0, 1, 0, time.UTC) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return installer
 }
 
 func telegramOptions() Options {
@@ -638,7 +744,7 @@ func TestInstallerMarksOnlyExplicitlyChangedDeliveryTarget(t *testing.T) {
 }
 
 func TestChangedDeliveryTargetIsMarkedBeforeNewConfigCanBecomeVisible(t *testing.T) {
-	installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	installer, root, runner, locker := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
 	oldValues := cloneConfig(configDefaults)
 	oldValues["NOTIFY_CHANNELS"] = "telegram"
 	oldValues["TELEGRAM_BOT_TOKEN"] = "123456:old_secret"
@@ -647,6 +753,14 @@ func TestChangedDeliveryTargetIsMarkedBeforeNewConfigCanBecomeVisible(t *testing
 	writeConfig(t, root, oldValues)
 	write(t, root, TelegramAlertHashPath, "old-hash\n", 0o600)
 	write(t, root, TelegramAlertTimePath, "100\n", 0o600)
+	write(t, root, TimerPath, "old timer\n", 0o644)
+	if err := root.MkdirAll(path.Dir(PersistentTimerLink), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Symlink("../security-update-notify.timer", PersistentTimerLink); err != nil {
+		t.Fatal(err)
+	}
+	runner.timerActive = true
 
 	installer.fs = &interruptAfterAtomicWriteFS{FileSystem: root, path: ConfigPath}
 	options := telegramOptions()
@@ -666,6 +780,262 @@ func TestChangedDeliveryTargetIsMarkedBeforeNewConfigCanBecomeVisible(t *testing
 	}
 	if got := readFile(t, root, TelegramTargetPendingPath); got != "pending\n" {
 		t.Fatalf("visible target change lacked a durable resend marker: %q", got)
+	}
+
+	recovery := freshTestInstaller(t, root, runner, locker)
+	invalidOptions := telegramOptions()
+	invalidOptions.Config["NOT_A_CONFIG_KEY"] = "recovery must run first"
+	invalidOptions.SkipPostInstallCheck = true
+	if _, err := recovery.Install(context.Background(), invalidOptions); err == nil {
+		t.Fatal("invalid follow-up request unexpectedly installed")
+	}
+	if got := readFile(t, root, ConfigPath); !strings.Contains(got, "TELEGRAM_CHAT_ID='-100123'") {
+		t.Fatalf("interrupted config was not recovered before prepare failed: %q", got)
+	}
+	if got := readFile(t, root, TimerPath); got != "old timer\n" {
+		t.Fatalf("interrupted timer file was not recovered: %q", got)
+	}
+	if !existsNoErr(root, PersistentTimerLink) || !runner.timerActive {
+		t.Fatal("interrupted timer enablement/activity was not recovered")
+	}
+	if existsNoErr(root, TelegramTargetPendingPath) {
+		t.Fatal("interrupted delivery marker was not rolled back")
+	}
+	if _, _, err := recovery.loadTransaction(); err != nil {
+		t.Fatalf("completed recovery left an invalid transaction state: %v", err)
+	} else if existsNoErr(root, plainCredentialRecoveryPath) || existsNoErr(root, encryptedCredentialRecoveryPath) {
+		t.Fatal("completed recovery left a private recovery file")
+	}
+}
+
+func TestContextCancellationAfterConfigWriteCompletesRollback(t *testing.T) {
+	installer, root, runner, locker := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	oldValues := cloneConfig(configDefaults)
+	oldValues["NOTIFY_CHANNELS"] = "telegram"
+	oldValues["TELEGRAM_BOT_TOKEN"] = "123456:old_secret"
+	oldValues["TELEGRAM_CHAT_ID"] = "-100123"
+	oldValues["BACKEND"] = "apt"
+	writeConfig(t, root, oldValues)
+	oldConfig := readFile(t, root, ConfigPath)
+	write(t, root, BinaryPath, "old-runtime", 0o755)
+	write(t, root, ServicePath, "old service\n", 0o644)
+	write(t, root, TimerPath, "old timer\n", 0o644)
+	if err := root.MkdirAll(path.Dir(PersistentTimerLink), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Symlink("../security-update-notify.timer", PersistentTimerLink); err != nil {
+		t.Fatal(err)
+	}
+	runner.timerActive = true
+	ctx, cancel := context.WithCancel(context.Background())
+	installer.fs = &cancelAfterAtomicWriteFS{FileSystem: root, path: ConfigPath, cancel: cancel}
+	options := telegramOptions()
+	options.Config["HOST_LABEL"] = "canceled-change"
+	options.SkipDependencies = true
+	options.SkipPostInstallCheck = true
+
+	_, err := installer.Install(ctx, options)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled install error = %v", err)
+	}
+	if got := readFile(t, root, ConfigPath); got != oldConfig {
+		t.Fatalf("canceled install did not restore config:\n%s", got)
+	}
+	if got := readFile(t, root, BinaryPath); got != "old-runtime" {
+		t.Fatalf("canceled install did not restore runtime: %q", got)
+	}
+	if got := readFile(t, root, ServicePath); got != "old service\n" {
+		t.Fatalf("canceled install did not restore service: %q", got)
+	}
+	if got := readFile(t, root, TimerPath); got != "old timer\n" {
+		t.Fatalf("canceled install did not restore timer: %q", got)
+	}
+	if !existsNoErr(root, PersistentTimerLink) || !runner.timerActive {
+		t.Fatal("canceled install did not restore project timer state")
+	}
+	recovery := freshTestInstaller(t, root, runner, locker)
+	if tx, _, err := recovery.loadTransaction(); err != nil || tx != nil {
+		t.Fatalf("canceled install left transaction state: tx=%v err=%v", tx, err)
+	}
+}
+
+func TestPrivateRecoveryPreservesExistingParentModeAndKeepsSecretOutOfBackup(t *testing.T) {
+	installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	const secret = "private-transaction-secret"
+	write(t, root, FeishuPlainCredentialPath, secret, 0o600)
+	credentialDir := path.Dir(FeishuPlainCredentialPath)
+	if err := root.Chmod(credentialDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	private, err := installer.snapshotPrivateCredentials()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		for _, snapshot := range private {
+			zeroBytes(snapshot.data)
+		}
+	}()
+	b, err := installer.createBackup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := installer.beginTransaction(b, private, timerSnapshot{enablement: "not-found"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertMode(t, root, credentialDir, 0o750)
+	if got := readFile(t, root, plainCredentialRecoveryPath); got != secret {
+		t.Fatalf("private recovery bytes = %q", got)
+	}
+
+	hostBackup := filepath.Join(root.Root, strings.TrimPrefix(b.dir, "/"))
+	err = filepath.WalkDir(hostBackup, func(name string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil || entry.IsDir() {
+			return walkErr
+		}
+		data, readErr := os.ReadFile(name)
+		if readErr != nil {
+			return readErr
+		}
+		if bytes.Contains(data, []byte(secret)) {
+			return fmt.Errorf("private secret leaked into backup file %s", name)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.finish(transactionStateCommit); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPrivateRecoveryConflictIsRejectedWithoutDeletingReservedFile(t *testing.T) {
+	installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	b, err := installer.createBackup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, root, plainCredentialRecoveryPath, "administrator-reserved", 0o600)
+	if _, err := installer.beginTransaction(b, nil, timerSnapshot{enablement: "not-found"}); err == nil ||
+		!strings.Contains(err.Error(), "reserved recovery path already exists") {
+		t.Fatalf("private recovery conflict error = %v", err)
+	}
+	if got := readFile(t, root, plainCredentialRecoveryPath); got != "administrator-reserved" {
+		t.Fatalf("private recovery conflict was modified or deleted: %q", got)
+	}
+	if existsNoErr(root, path.Join(b.dir, transactionJournalName)) {
+		t.Fatal("private recovery conflict published a transaction journal")
+	}
+}
+
+func TestInterruptedTransactionRejectsRecoveryForCredentialDeclaredAbsent(t *testing.T) {
+	installer, root, runner, locker := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	b, err := installer.createBackup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := installer.beginTransaction(b, nil, timerSnapshot{enablement: "not-found"}); err != nil {
+		t.Fatal(err)
+	}
+	write(t, root, plainCredentialRecoveryPath, "unexpected-recovery", 0o600)
+	commandsBefore := len(runner.commands)
+	recovery := freshTestInstaller(t, root, runner, locker)
+	err = recovery.recoverInterruptedTransaction(context.Background(), 0)
+	if err == nil || !strings.Contains(err.Error(), "absent credential has an unexpected reserved recovery file") {
+		t.Fatalf("absent credential recovery error = %v", err)
+	}
+	if got := readFile(t, root, plainCredentialRecoveryPath); got != "unexpected-recovery" {
+		t.Fatalf("unexpected recovery sibling was modified or deleted: %q", got)
+	}
+	if !existsNoErr(root, path.Join(b.dir, transactionJournalName)) {
+		t.Fatal("absent credential conflict lost the transaction locator")
+	}
+	if len(runner.commands) != commandsBefore {
+		t.Fatalf("absent credential conflict ran host commands: %v", runner.commands[commandsBefore:])
+	}
+}
+
+func TestInterruptedTransactionPreflightsEverySnapshotBeforeHostMutation(t *testing.T) {
+	installer, root, runner, locker := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	write(t, root, ConfigPath, "old config\n", 0o600)
+	write(t, root, TimerPath, "old timer\n", 0o644)
+	b, err := installer.createBackup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := installer.beginTransaction(b, nil, timerSnapshot{enablement: "not-found"}); err != nil {
+		t.Fatal(err)
+	}
+	write(t, root, ConfigPath, "interrupted config\n", 0o600)
+	write(t, root, TimerPath, "interrupted timer\n", 0o644)
+	validationErr := errors.New("forced later snapshot validation failure")
+	faults := &failSnapshotValidationFS{
+		FileSystem: root,
+		source:     b.snapshots[TimerPath].backupPath,
+		err:        validationErr,
+	}
+	recovery, err := New(Dependencies{
+		FS: faults, Runner: runner, Locker: locker, EffectiveUID: func() int { return 0 },
+		RootOwnerUID: uint32(os.Geteuid()),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	commandsBefore := len(runner.commands)
+	err = recovery.recoverInterruptedTransaction(context.Background(), 0)
+	if !errors.Is(err, validationErr) {
+		t.Fatalf("snapshot preflight error = %v", err)
+	}
+	if got := readFile(t, root, ConfigPath); got != "interrupted config\n" {
+		t.Fatalf("earlier path was restored before later snapshot failed validation: %q", got)
+	}
+	if got := readFile(t, root, TimerPath); got != "interrupted timer\n" {
+		t.Fatalf("failed snapshot path was changed: %q", got)
+	}
+	if len(runner.commands) != commandsBefore {
+		t.Fatalf("snapshot preflight failure ran host commands: %v", runner.commands[commandsBefore:])
+	}
+	if len(faults.validated) != 2 || faults.validated[0] != b.snapshots[ConfigPath].backupPath ||
+		faults.validated[1] != b.snapshots[TimerPath].backupPath {
+		t.Fatalf("validated snapshots = %v", faults.validated)
+	}
+}
+
+func TestInProcessRollbackPreflightsEverySnapshotBeforeHostMutation(t *testing.T) {
+	installer, root, runner, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	write(t, root, ConfigPath, "old config\n", 0o600)
+	write(t, root, TimerPath, "old timer\n", 0o644)
+	b, err := installer.createBackup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, root, ConfigPath, "failed install config\n", 0o600)
+	write(t, root, TimerPath, "failed install timer\n", 0o644)
+	validationErr := errors.New("forced in-process snapshot validation failure")
+	faults := &failSnapshotValidationFS{
+		FileSystem: root,
+		source:     b.snapshots[TimerPath].backupPath,
+		err:        validationErr,
+	}
+	installer.fs = faults
+	commandsBefore := len(runner.commands)
+	err = installer.restoreBackup(b, map[string]privateSnapshot{
+		FeishuEncryptedCredPath:   {},
+		FeishuPlainCredentialPath: {},
+	}, timerSnapshot{enablement: "not-found"}, nil)
+	if !errors.Is(err, validationErr) {
+		t.Fatalf("in-process rollback preflight error = %v", err)
+	}
+	if got := readFile(t, root, ConfigPath); got != "failed install config\n" {
+		t.Fatalf("earlier path was restored before later snapshot failed validation: %q", got)
+	}
+	if got := readFile(t, root, TimerPath); got != "failed install timer\n" {
+		t.Fatalf("failed snapshot path was changed: %q", got)
+	}
+	if len(runner.commands) != commandsBefore {
+		t.Fatalf("in-process preflight failure ran host commands: %v", runner.commands[commandsBefore:])
 	}
 }
 
@@ -1156,7 +1526,7 @@ func TestUpgradeNotificationUsesIndependentLock(t *testing.T) {
 			continue
 		}
 		versionCalls++
-		if len(invocation.ExtraFiles) != 1 || !runner.runtimeLockHeld[index] {
+		if len(invocation.ExtraFiles) != 2 || invocation.Env["SECURITY_UPDATE_NOTIFY_LOCK_FD"] != "4" || !runner.runtimeLockHeld[index] {
 			t.Fatalf("version invocation was not descriptor-bound under runtime lock: %+v", invocation)
 		}
 	}
@@ -1198,8 +1568,13 @@ func TestCurrentInstalledVersionRejectsUnsafeRuntimeMetadata(t *testing.T) {
 			installer, root, runner, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
 			write(t, root, BinaryPath, "old-runtime", 0o755)
 			test.prepare(t, root)
+			runtimeLock, err := runner.locker.Acquire(context.Background(), RuntimeLockPath, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer runtimeLock.Unlock()
 
-			if got := installer.currentInstalledVersion(context.Background()); got != "unknown" {
+			if got := installer.currentInstalledVersion(context.Background(), runtimeLock); got != "unknown" {
 				t.Fatalf("currentInstalledVersion = %q, want unknown", got)
 			}
 			for _, invocation := range runner.invocations {
@@ -2028,8 +2403,9 @@ func assertIndependentRuntimeLock(t *testing.T, runner *fakeRunner, operation st
 	t.Helper()
 	for _, invocation := range runner.invocations {
 		if invocation.Name == BinaryPath && len(invocation.Args) > 0 && invocation.Args[0] == operation {
-			if got := invocation.Env["SECURITY_UPDATE_NOTIFY_LOCK_FILE"]; got != InstallCheckLockPath {
-				t.Fatalf("%s lock override = %q, want %q", operation, got, InstallCheckLockPath)
+			wantFD := fmt.Sprintf("%d", 2+len(invocation.ExtraFiles))
+			if got := invocation.Env["SECURITY_UPDATE_NOTIFY_LOCK_FD"]; got != wantFD || len(invocation.ExtraFiles) == 0 {
+				t.Fatalf("%s inherited lock fd = %q files=%d, want %q", operation, got, len(invocation.ExtraFiles), wantFD)
 			}
 			return
 		}
@@ -2078,6 +2454,9 @@ func TestDNFDependencyInstallReportsAllSupportedManagers(t *testing.T) {
 	_, err := installer.Install(context.Background(), options)
 	if err == nil || !strings.Contains(err.Error(), "dnf, microdnf, or yum is required") {
 		t.Fatalf("error = %v, want supported-manager diagnostic", err)
+	}
+	if tx, _, loadErr := installer.loadTransaction(); loadErr != nil || tx != nil {
+		t.Fatalf("pre-mutation manager failure retained transaction: tx=%v err=%v", tx, loadErr)
 	}
 }
 
@@ -2350,7 +2729,7 @@ func TestDependencyInstallRequiresApprovalBeforePackageManagerWrites(t *testing.
 	}
 }
 
-func TestFailedDependencyInstallPreservesPackageDefaultsAndAutomaticUnits(t *testing.T) {
+func TestFailedDependencyInstallRetainsUnsafeTransactionAndFailsClosed(t *testing.T) {
 	installer, root, runner, _ := setupInstaller(t, "ID=rocky\nVERSION_ID=9.6\nPRETTY_NAME='Rocky Linux 9.6'\n")
 	runner.missingPackages["dnf-automatic"] = true
 	const vendorConfig = "[commands]\nupgrade_type = default\napply_updates = no\n"
@@ -2400,28 +2779,16 @@ func TestFailedDependencyInstallPreservesPackageDefaultsAndAutomaticUnits(t *tes
 		t.Fatalf("SUN tried to roll back an automatic unit it had not changed:\n%s", strings.Join(runner.commands, "\n"))
 	}
 
+	assertUnsafeTransactionRetained(t, installer)
 	runner.dependencyInstallHook = nil
 	options.SkipPostInstallCheck = true
-	if _, err := installer.Install(context.Background(), options); err != nil {
-		t.Fatalf("retry after partial dependency transaction: %v", err)
-	}
-	if got := readFile(t, root, dnfStableBackupPath); got != vendorConfig {
-		t.Fatalf("retry DNF baseline = %q, want package-created vendor config", got)
-	}
-	if existsNoErr(root, dnfAbsentMarkerPath) || existsNoErr(root, dnfDependencyProofPath) {
-		t.Fatal("retry retained superseded DNF dependency metadata")
-	}
-	if _, err := uninstaller.Uninstall(uninstaller.Options{
-		RootDir: root.Root, PurgeConfig: true, EffectiveUID: func() int { return 0 },
-		RunCommand: func(string, ...string) sysexec.Result { return sysexec.Result{} },
-	}); err != nil {
-		t.Fatal(err)
-	}
+	assertRetryFailsClosed(t, installer, runner, options)
+	assertPurgeFailsClosed(t, root)
 	if got := readFile(t, root, dnfAutomaticPath); got != vendorConfig {
-		t.Fatalf("purge after dependency retry restored %q, want vendor config", got)
+		t.Fatalf("fail-closed retry or purge changed the dependency default to %q", got)
 	}
-	if existsNoErr(root, dnfStableBackupPath) || existsNoErr(root, dnfAbsentMarkerPath) || existsNoErr(root, dnfDependencyProofPath) {
-		t.Fatal("purge after dependency retry left DNF baseline metadata")
+	if existsNoErr(root, dnfStableBackupPath) || !existsNoErr(root, dnfAbsentMarkerPath) || !existsNoErr(root, dnfDependencyProofPath) {
+		t.Fatal("fail-closed retry or purge changed retained DNF evidence")
 	}
 }
 
@@ -2461,9 +2828,11 @@ func TestDNFDependencyDefaultCaptureFailurePreservesPackageConfigurationAndTimer
 	if existsNoErr(root, BinaryPath) {
 		t.Fatal("dependency capture failure left the SUN runtime installed")
 	}
+	assertUnsafeTransactionRetained(t, installer)
+	assertPreserveCurrentTransactionPath(t, installer, dnfAutomaticPath)
 }
 
-func TestDNF4DependencyProofWriteFailurePromotesSafeBaselineBeforeAbort(t *testing.T) {
+func TestDNF4DependencyProofWriteFailureRetainsUnsafeJournalBeforeAbort(t *testing.T) {
 	installer, root, runner, _ := setupInstaller(t, "ID=rocky\nVERSION_ID=9.6\nPRETTY_NAME='Rocky Linux 9.6'\n")
 	installer.fs = &failAtomicWriteFS{
 		FileSystem: root,
@@ -2503,24 +2872,21 @@ func TestDNF4DependencyProofWriteFailurePromotesSafeBaselineBeforeAbort(t *testi
 	if existsNoErr(root, dnfAbsentMarkerPath) || existsNoErr(root, dnfDependencyProofPath) || existsNoErr(root, BinaryPath) {
 		t.Fatal("proof failure retained transient DNF metadata or installed the runtime")
 	}
-	if _, err := uninstaller.Uninstall(uninstaller.Options{
-		RootDir: root.Root, PurgeConfig: true, EffectiveUID: func() int { return 0 },
-		RunCommand: func(string, ...string) sysexec.Result { return sysexec.Result{} },
-	}); err != nil {
-		t.Fatal(err)
-	}
+	assertUnsafeTransactionRetained(t, installer)
+	assertRetryFailsClosed(t, installer, runner, options)
+	assertPurgeFailsClosed(t, root)
 	if got := readFile(t, root, dnfAutomaticPath); got != vendorConfig {
-		t.Fatalf("purge after proof failure restored %q, want vendor config", got)
+		t.Fatalf("fail-closed retry or purge changed vendor config to %q", got)
 	}
-	if existsNoErr(root, dnfStableBackupPath) || existsNoErr(root, dnfAbsentMarkerPath) || existsNoErr(root, dnfDependencyProofPath) {
-		t.Fatal("purge after proof failure retained DNF metadata")
+	if !existsNoErr(root, dnfStableBackupPath) || existsNoErr(root, dnfAbsentMarkerPath) || existsNoErr(root, dnfDependencyProofPath) {
+		t.Fatal("fail-closed retry or purge changed promoted DNF metadata")
 	}
 	if runner.unitEnablement("dnf-automatic.timer") != "enabled" || !runner.activeUnits["dnf-automatic.timer"] {
-		t.Fatal("purge after proof failure changed the retained dependency package timer")
+		t.Fatal("fail-closed retry or purge changed the retained dependency package timer")
 	}
 }
 
-func TestFailedDNF4DependencyInstallCanBePurgedImmediately(t *testing.T) {
+func TestFailedDNF4DependencyInstallCannotBeRetriedOrPurged(t *testing.T) {
 	installer, root, runner, _ := setupInstaller(t, "ID=rocky\nVERSION_ID=9.6\nPRETTY_NAME='Rocky Linux 9.6'\n")
 	runner.missingPackages["dnf-automatic"] = true
 	const vendorConfig = "[commands]\nupgrade_type = default\napply_updates = no\n"
@@ -2545,24 +2911,21 @@ func TestFailedDNF4DependencyInstallCanBePurgedImmediately(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "forced partial package transaction failure") {
 		t.Fatalf("dependency install error = %v", err)
 	}
-	if _, err := uninstaller.Uninstall(uninstaller.Options{
-		RootDir: root.Root, PurgeConfig: true, EffectiveUID: func() int { return 0 },
-		RunCommand: func(string, ...string) sysexec.Result { return sysexec.Result{} },
-	}); err != nil {
-		t.Fatal(err)
-	}
+	assertUnsafeTransactionRetained(t, installer)
+	assertRetryFailsClosed(t, installer, runner, options)
+	assertPurgeFailsClosed(t, root)
 	if got := readFile(t, root, dnfAutomaticPath); got != vendorConfig {
-		t.Fatalf("immediate purge changed dependency default to %q", got)
+		t.Fatalf("fail-closed retry or purge changed dependency default to %q", got)
 	}
-	if existsNoErr(root, dnfAbsentMarkerPath) || existsNoErr(root, dnfDependencyProofPath) || existsNoErr(root, dnfStableBackupPath) {
-		t.Fatal("immediate purge retained DNF dependency metadata")
+	if !existsNoErr(root, dnfAbsentMarkerPath) || !existsNoErr(root, dnfDependencyProofPath) || existsNoErr(root, dnfStableBackupPath) {
+		t.Fatal("fail-closed retry or purge changed retained DNF evidence")
 	}
 	if runner.unitEnablement("dnf-automatic.timer") != "enabled" || !runner.activeUnits["dnf-automatic.timer"] {
-		t.Fatal("immediate purge changed the retained dependency package timer")
+		t.Fatal("fail-closed retry or purge changed the retained dependency package timer")
 	}
 }
 
-func TestFailedAPTDependencyInstallPreservesProofAcrossRetryAndPurge(t *testing.T) {
+func TestFailedAPTDependencyInstallRetainsProofAndFailsClosed(t *testing.T) {
 	installer, root, runner, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\nPRETTY_NAME='Debian 13'\n")
 	runner.missingPackages["unattended-upgrades"] = true
 	const vendorConfig = "APT::Periodic::Update-Package-Lists \"1\";\nAPT::Periodic::Unattended-Upgrade \"1\";\n"
@@ -2603,28 +2966,16 @@ func TestFailedAPTDependencyInstallPreservesProofAcrossRetryAndPurge(t *testing.
 		t.Fatal("rollback changed the retained APT package timer")
 	}
 
+	assertUnsafeTransactionRetained(t, installer)
 	runner.dependencyInstallHook = nil
 	options.SkipPostInstallCheck = true
-	if _, err := installer.Install(context.Background(), options); err != nil {
-		t.Fatalf("retry after partial APT dependency transaction: %v", err)
-	}
-	if got := readFile(t, root, aptStableBackupPath); got != vendorConfig {
-		t.Fatalf("retry APT baseline = %q, want package-created vendor config", got)
-	}
-	if existsNoErr(root, aptAbsentMarkerPath) || existsNoErr(root, aptDependencyProofPath) {
-		t.Fatal("retry retained superseded APT dependency metadata")
-	}
-	if _, err := uninstaller.Uninstall(uninstaller.Options{
-		RootDir: root.Root, PurgeConfig: true, EffectiveUID: func() int { return 0 },
-		RunCommand: func(string, ...string) sysexec.Result { return sysexec.Result{} },
-	}); err != nil {
-		t.Fatal(err)
-	}
+	assertRetryFailsClosed(t, installer, runner, options)
+	assertPurgeFailsClosed(t, root)
 	if got := readFile(t, root, aptPeriodicPath); got != vendorConfig {
-		t.Fatalf("purge after APT dependency retry restored %q, want vendor config", got)
+		t.Fatalf("fail-closed retry or purge changed vendor config to %q", got)
 	}
-	if existsNoErr(root, aptStableBackupPath) || existsNoErr(root, aptAbsentMarkerPath) || existsNoErr(root, aptDependencyProofPath) {
-		t.Fatal("purge after APT dependency retry left baseline metadata")
+	if existsNoErr(root, aptStableBackupPath) || !existsNoErr(root, aptAbsentMarkerPath) || !existsNoErr(root, aptDependencyProofPath) {
+		t.Fatal("fail-closed retry or purge changed retained APT evidence")
 	}
 }
 
@@ -2661,6 +3012,8 @@ func TestAPTDependencyDefaultCaptureFailurePreservesPackageConfigurationAndTimer
 	if existsNoErr(root, BinaryPath) {
 		t.Fatal("dependency capture failure left the SUN runtime installed")
 	}
+	assertUnsafeTransactionRetained(t, installer)
+	assertPreserveCurrentTransactionPath(t, installer, aptPeriodicPath)
 }
 
 func TestAPTDependencyProofWriteFailurePromotesSafeBaselineBeforeAbort(t *testing.T) {
@@ -2712,7 +3065,7 @@ func TestMissingDependencyWithoutConfirmationDoesNotWrite(t *testing.T) {
 	}
 }
 
-func TestAPTUpdateFailureDoesNotRetainDependencyBaselineMetadata(t *testing.T) {
+func TestAPTUpdateFailureRetainsUnsafeTransactionEvidence(t *testing.T) {
 	installer, root, runner, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
 	runner.missingPackages["unattended-upgrades"] = true
 	runner.failedCommands["apt-get update"] = CommandResult{Code: 1, Stderr: []byte("forced apt update failure")}
@@ -2723,9 +3076,12 @@ func TestAPTUpdateFailureDoesNotRetainDependencyBaselineMetadata(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "forced apt update failure") {
 		t.Fatalf("apt update error = %v", err)
 	}
-	if existsNoErr(root, aptAbsentMarkerPath) || existsNoErr(root, aptPeriodicPath) {
-		t.Fatal("package-list update failure retained dependency baseline metadata")
+	if !existsNoErr(root, aptAbsentMarkerPath) || existsNoErr(root, aptPeriodicPath) {
+		t.Fatal("package-list update failure did not retain the exact pre-install APT evidence")
 	}
+	assertUnsafeTransactionRetained(t, installer)
+	assertRetryFailsClosed(t, installer, runner, options)
+	assertPurgeFailsClosed(t, root)
 }
 
 func TestAPTConfigFilesPackageStateIsReinstalled(t *testing.T) {
@@ -3084,7 +3440,7 @@ func TestFreshAPTDependencyBaselineSurvivesFailedInstallRetryAndPurge(t *testing
 	}
 }
 
-func TestAPTAbsentBaselineSurvivesMarkerCaptureFailureRetryAndPurge(t *testing.T) {
+func TestAPTMarkerCaptureFailureRetainsUnsafeTransactionEvidence(t *testing.T) {
 	installer, root, runner, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
 	faults := &failMarkerBackupFS{FileSystem: root, enabled: true}
 	installer.fs = faults
@@ -3102,28 +3458,18 @@ func TestAPTAbsentBaselineSurvivesMarkerCaptureFailureRetryAndPurge(t *testing.T
 	if got := readFile(t, root, aptPeriodicPath); got != "dependency-default\n" {
 		t.Fatalf("failed marker capture lost the retained dependency default: %q", got)
 	}
-	if existsNoErr(root, aptAbsentMarkerPath) || existsNoErr(root, aptDependencyProofPath) || existsNoErr(root, aptStableBackupPath) {
-		t.Fatal("failed marker capture retained incomplete APT metadata")
+	if !existsNoErr(root, aptAbsentMarkerPath) || !existsNoErr(root, aptDependencyProofPath) || existsNoErr(root, aptStableBackupPath) {
+		t.Fatal("failed marker capture did not retain its incomplete APT evidence")
 	}
-
+	assertUnsafeTransactionRetained(t, installer)
 	faults.enabled = false
-	if _, err := installer.Install(context.Background(), options); err != nil {
-		t.Fatalf("retry install: %v", err)
-	}
-	if got := readFile(t, root, aptStableBackupPath); got != "dependency-default\n" {
-		t.Fatalf("retry APT baseline = %q, want dependency default", got)
-	}
-	if _, err := uninstaller.Uninstall(uninstaller.Options{
-		RootDir: root.Root, PurgeConfig: true, EffectiveUID: func() int { return 0 },
-		RunCommand: func(string, ...string) sysexec.Result { return sysexec.Result{} },
-	}); err != nil {
-		t.Fatal(err)
-	}
+	assertRetryFailsClosed(t, installer, runner, options)
+	assertPurgeFailsClosed(t, root)
 	if got := readFile(t, root, aptPeriodicPath); got != "dependency-default\n" {
-		t.Fatalf("purge after marker capture failure restored %q", got)
+		t.Fatalf("fail-closed retry or purge changed dependency default to %q", got)
 	}
-	if existsNoErr(root, aptStableBackupPath) || existsNoErr(root, aptAbsentMarkerPath) || existsNoErr(root, aptDependencyProofPath) {
-		t.Fatal("purge after marker capture failure retained APT metadata")
+	if existsNoErr(root, aptStableBackupPath) || !existsNoErr(root, aptAbsentMarkerPath) || !existsNoErr(root, aptDependencyProofPath) {
+		t.Fatal("fail-closed retry or purge changed retained APT evidence")
 	}
 }
 
@@ -4031,7 +4377,7 @@ func TestFileLockerRejectsSymlink(t *testing.T) {
 	}
 	locker := FileLocker{FS: root, OwnerUID: uint32(os.Geteuid())}
 	if unlock, err := locker.Acquire(context.Background(), InstallLockPath, 0); err == nil {
-		_ = unlock()
+		_ = unlock.Unlock()
 		t.Fatal("symlink lock path was accepted")
 	}
 }
@@ -4057,7 +4403,7 @@ func TestFileLockerRejectsPathReplacedAfterOpen(t *testing.T) {
 	unlock, err := locker.Acquire(context.Background(), InstallLockPath, 0)
 	if err == nil || !strings.Contains(err.Error(), "lock path changed while acquiring") {
 		if unlock != nil {
-			_ = unlock()
+			_ = unlock.Unlock()
 		}
 		t.Fatalf("replaced lock path was accepted: %v", err)
 	}

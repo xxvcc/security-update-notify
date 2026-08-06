@@ -95,6 +95,7 @@ INSTALL_ARGS=()
 CURL_RETRY_OPTIONS=()
 readonly MAX_METADATA_BYTES=1048576
 readonly MAX_ARCHIVE_BYTES=268435456
+readonly SYSTEM_TEMP_BASE=/var/tmp
 
 # 双语输出助手：sun.sh 运行在“选择语言”之前，自身输出默认 zh；
 # 仅当显式指定 --lang/UI_LANG/SUN_LANG 时才把语言传给目标脚本（否则菜单会提示选择）。
@@ -248,6 +249,88 @@ except Exception:
   return 1
 }
 tar_clean_env() { env -u TAR_OPTIONS -u GZIP -u BZIP2 -u XZ_OPT tar "$@"; }
+
+create_trusted_temp_dir() {
+  python3 -I - "$SYSTEM_TEMP_BASE" <<'PY'
+import os
+import secrets
+import stat
+import sys
+
+
+def validate_directory(fd, path):
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError("{} is not a directory".format(path))
+    if info.st_uid != 0:
+        raise RuntimeError("{} is not owned by root".format(path))
+    if (stat.S_IMODE(info.st_mode) & 0o022) and not (info.st_mode & stat.S_ISVTX):
+        raise RuntimeError("{} is group/other-writable without the sticky bit".format(path))
+
+
+def create(base):
+    if os.geteuid() != 0:
+        raise RuntimeError("trusted temporary directory creation requires root")
+    if not base.startswith("/") or os.path.normpath(base) != base:
+        raise RuntimeError("temporary base must be a clean absolute path")
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    current_fd = os.open("/", flags)
+    display_path = "/"
+    try:
+        validate_directory(current_fd, display_path)
+        components = [] if base == "/" else base[1:].split("/")
+        for component in components:
+            next_fd = os.open(component, flags, dir_fd=current_fd)
+            display_path = os.path.join(display_path, component)
+            try:
+                validate_directory(next_fd, display_path)
+            except Exception:
+                os.close(next_fd)
+                raise
+            os.close(current_fd)
+            current_fd = next_fd
+
+        old_umask = os.umask(0o077)
+        try:
+            for _ in range(100):
+                name = "security-update-notify." + secrets.token_hex(16)
+                try:
+                    os.mkdir(name, 0o700, dir_fd=current_fd)
+                except FileExistsError:
+                    continue
+                child_fd = -1
+                try:
+                    child_fd = os.open(name, flags, dir_fd=current_fd)
+                    os.fchmod(child_fd, 0o700)
+                    child = os.fstat(child_fd)
+                    if (not stat.S_ISDIR(child.st_mode) or child.st_uid != 0 or
+                            stat.S_IMODE(child.st_mode) != 0o700):
+                        raise RuntimeError("created temporary directory failed validation")
+                except Exception:
+                    if child_fd >= 0:
+                        os.close(child_fd)
+                    try:
+                        os.rmdir(name, dir_fd=current_fd)
+                    except OSError:
+                        pass
+                    raise
+                os.close(child_fd)
+                print(base + "/" + name)
+                return
+            raise RuntimeError("could not allocate a unique temporary directory")
+        finally:
+            os.umask(old_umask)
+    finally:
+        os.close(current_fd)
+
+
+try:
+    create(sys.argv[1])
+except (OSError, RuntimeError) as error:
+    raise SystemExit("cannot create trusted temporary directory: {}".format(error))
+PY
+}
 
 append_bootstrap_package() {
   local package="$1" existing
@@ -620,7 +703,7 @@ else
   DOWNLOAD_BASES+=("https://github.com/${REPO}/releases/download/v${VERSION}")
 fi
 
-TMP="$(mktemp -d)"
+TMP="$(create_trusted_temp_dir)"
 trap 'rm -rf "$TMP"' EXIT
 cd "$TMP"
 

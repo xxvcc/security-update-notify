@@ -8,7 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path"
-
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,6 +17,31 @@ import (
 
 func (i *Installer) ensureDir(directory string, mode fs.FileMode) error {
 	return i.ensureDirWithForbiddenPerm(directory, mode, 0o022)
+}
+
+// syncDirectoryChain confirms every directory entry from the selected root to
+// logicalPath before a transaction relies on that path for durable recovery.
+// It intentionally includes existing directories so a retry repairs an earlier
+// mkdir whose parent sync reported failure after the entry became visible.
+func (i *Installer) syncDirectoryChain(logicalPath string) error {
+	clean, err := cleanLogicalPath(logicalPath)
+	if err != nil {
+		return err
+	}
+	current := "/"
+	if err := i.fs.SyncDir(current); err != nil {
+		return fmt.Errorf("sync directory chain at %s: %w", current, err)
+	}
+	for _, component := range strings.Split(strings.TrimPrefix(clean, "/"), "/") {
+		if component == "" {
+			continue
+		}
+		current = path.Join(current, component)
+		if err := i.fs.SyncDir(current); err != nil {
+			return fmt.Errorf("sync directory chain at %s: %w", current, err)
+		}
+	}
+	return nil
 }
 
 func (i *Installer) ensureDirWithForbiddenPerm(directory string, mode, forbiddenPerm fs.FileMode) error {
@@ -140,11 +165,17 @@ func (i *Installer) validateTrustedDirectoryWithForbiddenPerm(directory string, 
 }
 
 func (i *Installer) installFiles(ctx context.Context, plan installPlan, options Options, secret []byte, b *backup) (string, error) {
+	if err := installContextError(ctx); err != nil {
+		return "", err
+	}
 	payload := options.Payload.withEmbeddedDefaults()
 	for directory, mode := range map[string]fs.FileMode{
 		"/usr/local/sbin":     0o755,
 		"/etc/systemd/system": 0o755,
 	} {
+		if err := installContextError(ctx); err != nil {
+			return "", err
+		}
 		if err := i.ensureDir(directory, mode); err != nil {
 			return "", failure("create install directory", err)
 		}
@@ -156,11 +187,17 @@ func (i *Installer) installFiles(ctx context.Context, plan installPlan, options 
 		"/etc/security-update-notify": 0o750,
 		StateDirPath:                  0o750,
 	} {
+		if err := installContextError(ctx); err != nil {
+			return "", err
+		}
 		if err := i.ensureManagedDir(directory, mode); err != nil {
 			return "", failure("create managed install directory", err)
 		}
 	}
 	if err := i.ensureLogFile(); err != nil {
+		return "", err
+	}
+	if err := installContextError(ctx); err != nil {
 		return "", err
 	}
 	if logrotateDir, err := i.fs.Lstat("/etc/logrotate.d"); err == nil && logrotateDir.IsDir() && logrotateDir.Mode()&fs.ModeSymlink == 0 {
@@ -172,13 +209,25 @@ func (i *Installer) installFiles(ctx context.Context, plan installPlan, options 
 	} else if err == nil {
 		return "", failure("inspect logrotate directory", errors.New("/etc/logrotate.d must be a real directory"))
 	}
+	if err := installContextError(ctx); err != nil {
+		return "", err
+	}
 	if err := i.fs.WriteFileAtomic(BinaryPath, payload.Runtime, 0o755); err != nil {
 		return "", failure("install runtime", err)
+	}
+	if err := installContextError(ctx); err != nil {
+		return "", err
 	}
 	if err := i.fs.WriteFileAtomic(ServicePath, payload.Service, 0o644); err != nil {
 		return "", failure("install service unit", err)
 	}
+	if err := installContextError(ctx); err != nil {
+		return "", err
+	}
 	if err := i.installBackendPolicy(plan, payload, b); err != nil {
+		return "", err
+	}
+	if err := installContextError(ctx); err != nil {
 		return "", err
 	}
 	storage, err := i.installFeishuCredential(ctx, plan.values["NOTIFY_CHANNELS"], secret)
@@ -189,10 +238,16 @@ func (i *Installer) installFiles(ctx context.Context, plan installPlan, options 
 	if err != nil {
 		return "", failure("render config", err)
 	}
+	if err := installContextError(ctx); err != nil {
+		return "", err
+	}
 	if err := i.fs.WriteFileAtomic(ConfigPath, configData, 0o600); err != nil {
 		return "", failure("install config", err)
 	}
 	timerData := []byte(renderTimer(plan.checkTime))
+	if err := installContextError(ctx); err != nil {
+		return "", err
+	}
 	if err := i.fs.WriteFileAtomic(TimerPath, timerData, 0o644); err != nil {
 		return "", failure("install timer unit", err)
 	}

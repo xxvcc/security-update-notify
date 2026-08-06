@@ -16,10 +16,12 @@ import (
 
 var releaseSourcePaths = []string{
 	".env.example", "CHANGELOG.md", "LICENSE", "README.md", "README.en.md", "VERSION", "sun.sh",
+	"build",
 	"docs",
 	"files/needrestart-report-only.conf", "files/release-signing.pub.asc",
 	"files/security-update-notify.logrotate", "files/security-update-notify.service",
-	".github/workflows/ci.yml", ".github/workflows/mirror-release.yml",
+	".github/dependabot.yml", ".github/workflows/ci.yml", ".github/workflows/live-canary.yml",
+	".github/workflows/mirror-release.yml",
 	"cmd", "internal", "go.mod", "go.sum", "go.work", "go.work.sum", "vendor",
 }
 

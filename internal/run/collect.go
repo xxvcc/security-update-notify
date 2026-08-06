@@ -482,10 +482,16 @@ func collectHealthWithSystemd(be string, stale int, systemdQuery SystemdQuery) w
 	lastTs, lastTsOK := query.ShowValue(svc, "ExecMainExitTimestamp")
 	timerTrig, timerTrigOK := query.ShowValue(timer, "LastTriggerUSec")
 	svcResult, svcResultOK := query.ShowValue(svc, "Result")
+	timerActiveState, timerActiveOK := query.ShowValue(timer, "ActiveState")
+	timerActiveState = strings.TrimSpace(timerActiveState)
+	timerActiveKnown := timerActiveOK && timerActiveState != ""
+	timerActive := timerActiveKnown && timerActiveState == "active"
 	health := watchdog.CheckHealth(watchdog.HealthInput{
 		Backend:            be,
 		TimerEnabled:       timerEnabled,
-		SystemdQueryFailed: !lastTsOK || !timerTrigOK || !svcResultOK,
+		TimerActiveKnown:   timerActiveKnown,
+		TimerActive:        timerActive,
+		SystemdQueryFailed: !lastTsOK || !timerTrigOK || !svcResultOK || !timerActiveKnown,
 		SvcResult:          svcResult,
 		HaveSvcExit:        lastTs != "",
 		SvcExitEpoch:       parseSystemdTime(lastTs),
