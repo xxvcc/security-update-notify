@@ -31,7 +31,7 @@ func TestRootFSRejectsSymlinkedAncestor(t *testing.T) {
 		"lock": func() error {
 			unlock, err := (FileLocker{FS: filesystem, OwnerUID: uint32(os.Geteuid())}).Acquire(context.Background(), "/etc/install.lock", 0)
 			if err == nil {
-				_ = unlock()
+				_ = unlock.Unlock()
 			}
 			return err
 		},
@@ -48,6 +48,64 @@ func TestRootFSRejectsSymlinkedAncestor(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(outside, "nested")); !os.IsNotExist(err) {
 		t.Fatalf("mkdir escaped RootFS: %v", err)
+	}
+}
+
+func TestRootFSDirectoryCreationSynchronizesEveryNewParent(t *testing.T) {
+	rootDir := t.TempDir()
+	filesystem, err := NewRootFS(rootDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var synchronized []string
+	filesystem.beforeDirectoryEntrySync = func(_ *os.File, name string) error {
+		synchronized = append(synchronized, name)
+		return nil
+	}
+	if err := filesystem.MkdirAll("/one/two/three", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(synchronized, "/"), "one/two/three"; got != want {
+		t.Fatalf("mkdir-all synchronized entries = %q, want %q", got, want)
+	}
+	synchronized = nil
+	if err := filesystem.MkdirAll("/one/two/three", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if len(synchronized) != 0 {
+		t.Fatalf("existing directories were synchronized as new entries: %v", synchronized)
+	}
+	if err := filesystem.Mkdir("/one/leaf", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(synchronized, "/"), "leaf"; got != want {
+		t.Fatalf("mkdir synchronized entries = %q, want %q", got, want)
+	}
+}
+
+func TestRootFSDirectoryCreationStopsAtParentSyncFailure(t *testing.T) {
+	rootDir := t.TempDir()
+	filesystem, err := NewRootFS(rootDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncErr := errors.New("forced directory entry sync failure")
+	var synchronized []string
+	filesystem.beforeDirectoryEntrySync = func(_ *os.File, name string) error {
+		synchronized = append(synchronized, name)
+		if name == "two" {
+			return syncErr
+		}
+		return nil
+	}
+	if err := filesystem.MkdirAll("/one/two/three", 0o700); !errors.Is(err, syncErr) {
+		t.Fatalf("mkdir-all error = %v, want parent sync failure", err)
+	}
+	if got, want := strings.Join(synchronized, "/"), "one/two"; got != want {
+		t.Fatalf("synchronized entries = %q, want %q", got, want)
+	}
+	if _, err := os.Stat(filepath.Join(rootDir, "one", "two", "three")); !os.IsNotExist(err) {
+		t.Fatalf("mkdir-all continued after failed parent sync: %v", err)
 	}
 }
 
@@ -475,6 +533,72 @@ func TestRootFSCopyRegularFileRejectsConcurrentMetadataChange(t *testing.T) {
 	}
 }
 
+func TestRootFSValidateTrustedRegularFileRejectsChangesAtEveryBoundary(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		checkpoint copyRegularFileCheckpoint
+		mutate     func(string) error
+	}{
+		{name: "contents after read", checkpoint: copyRegularFileContentsCopied, mutate: func(source string) error {
+			if err := os.WriteFile(source, []byte("modified"), 0o600); err != nil {
+				return err
+			}
+			changed := time.Unix(1_700_000_100, 0)
+			return os.Chtimes(source, changed, changed)
+		}},
+		{name: "xattrs after capture", checkpoint: copyRegularFileXattrsCaptured, mutate: func(source string) error {
+			if err := syscall.Setxattr(source, "user.security-update-notify-validation-race", []byte("changed"), 0); err != nil {
+				return err
+			}
+			changed := time.Unix(1_700_000_100, 0)
+			return os.Chtimes(source, changed, changed)
+		}},
+		{name: "pathname before final check", checkpoint: copyRegularFileReadyToPublish, mutate: func(source string) error {
+			if err := os.Rename(source, source+".replaced"); err != nil {
+				return err
+			}
+			return os.WriteFile(source, []byte("original"), 0o600)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rootDir := t.TempDir()
+			filesystem, err := NewRootFS(rootDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			source := filepath.Join(rootDir, "source")
+			if err := os.WriteFile(source, []byte("original"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			initial := time.Unix(1_700_000_000, 0)
+			if err := os.Chtimes(source, initial, initial); err != nil {
+				t.Fatal(err)
+			}
+			mutationCalls := 0
+			var mutationErr error
+			err = filesystem.validateTrustedRegularFile("/source", 1024, uint32(os.Geteuid()), func(got copyRegularFileCheckpoint) {
+				if got != test.checkpoint {
+					return
+				}
+				mutationCalls++
+				mutationErr = test.mutate(source)
+			})
+			if errors.Is(mutationErr, syscall.ENOTSUP) || errors.Is(mutationErr, syscall.EOPNOTSUPP) {
+				t.Skip("xattrs are not supported by the test filesystem")
+			}
+			if mutationErr != nil {
+				t.Fatal(mutationErr)
+			}
+			if mutationCalls != 1 {
+				t.Fatalf("mutation calls = %d, want 1", mutationCalls)
+			}
+			if err == nil || !strings.Contains(err.Error(), "source") {
+				t.Fatalf("concurrent validation change was accepted: %v", err)
+			}
+		})
+	}
+}
+
 func TestRootFSAtomicPublishRejectsReplacedTemporaryEntry(t *testing.T) {
 	for _, operation := range []string{"write", "copy"} {
 		t.Run(operation, func(t *testing.T) {
@@ -675,6 +799,96 @@ func TestRootFSRemovalRecoversInterruptedQuarantines(t *testing.T) {
 		}
 	}
 	assertHostFile(t, filepath.Join(rootDir, nearMatch), "keep")
+}
+
+func TestRootFSRemovalSynchronizesParentOnEveryReturnPath(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		remove    func(*RootFS) error
+		logical   string
+		recursive bool
+		artifact  bool
+	}{
+		{name: "file", logical: "/managed", remove: func(filesystem *RootFS) error {
+			return filesystem.Remove("/managed")
+		}},
+		{name: "tree", logical: "/managed", recursive: true, remove: func(filesystem *RootFS) error {
+			return filesystem.RemoveAll("/managed")
+		}},
+		{name: "missing", logical: "/missing", remove: func(filesystem *RootFS) error {
+			return filesystem.Remove("/missing")
+		}},
+		{name: "missing after quarantine cleanup", logical: "/missing", artifact: true, remove: func(filesystem *RootFS) error {
+			return filesystem.Remove("/missing")
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rootDir := t.TempDir()
+			filesystem, err := NewRootFS(rootDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.logical == "/managed" {
+				if test.recursive {
+					if err := os.Mkdir(filepath.Join(rootDir, "managed"), 0o700); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.WriteFile(filepath.Join(rootDir, "managed"), []byte("data"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			artifactName := removalPrefix + strings.Repeat("c", 32)
+			if test.artifact {
+				if err := os.WriteFile(filepath.Join(rootDir, artifactName), []byte("residue"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			syncErr := errors.New("forced removal directory sync failure")
+			syncCalls := 0
+			filesystem.beforeRemovalDirectorySync = func(*os.File) error {
+				syncCalls++
+				return syncErr
+			}
+			err = test.remove(filesystem)
+			if !errors.Is(err, syncErr) {
+				t.Fatalf("removal error = %v, want sync failure", err)
+			}
+			if syncCalls != 1 {
+				t.Fatalf("parent sync calls = %d, want 1", syncCalls)
+			}
+			if test.artifact {
+				if _, err := os.Lstat(filepath.Join(rootDir, artifactName)); !os.IsNotExist(err) {
+					t.Fatalf("cleanup artifact survived synchronized error path: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestRootFSRemovalJoinsPrimaryAndSyncErrors(t *testing.T) {
+	rootDir := t.TempDir()
+	filesystem, err := NewRootFS(rootDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(rootDir, "managed")
+	held := filepath.Join(rootDir, "managed-held")
+	if err := os.WriteFile(target, []byte("managed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	syncErr := errors.New("forced removal sync failure")
+	filesystem.beforeRemovalDirectorySync = func(*os.File) error { return syncErr }
+	err = filesystem.remove("/managed", func() error {
+		if err := os.Rename(target, held); err != nil {
+			return err
+		}
+		return os.WriteFile(target, []byte("administrator replacement"), 0o640)
+	})
+	if !errors.Is(err, syncErr) || !strings.Contains(err.Error(), "entry changed before removal") {
+		t.Fatalf("joined removal error = %v", err)
+	}
+	assertHostFile(t, held, "managed")
+	assertHostFile(t, target, "administrator replacement")
 }
 
 func assertHostFile(t *testing.T, name, want string) {

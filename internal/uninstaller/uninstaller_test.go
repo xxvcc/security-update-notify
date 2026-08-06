@@ -77,6 +77,95 @@ func TestUninstallNormalRemovesRuntimeAndPreservesUserData(t *testing.T) {
 	}
 }
 
+func TestUninstallRejectsInterruptedInstallStateBeforeMutation(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		logical string
+	}{
+		{
+			name:    "transaction journal",
+			logical: "/var/backups/security-update-notify/20260806010101/transaction.json",
+		},
+		{
+			name:    "plain credential recovery",
+			logical: "/etc/security-update-notify/credentials/.feishu-app-secret.install-recovery",
+		},
+		{
+			name:    "encrypted credential recovery",
+			logical: "/etc/credstore.encrypted/.security-update-notify-feishu-app-secret.cred.install-recovery",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			marker := writeFixture(t, root, "/usr/local/sbin/security-update-notify", "runtime")
+			state := writeFixture(t, root, test.logical, "recovery state")
+			if err := os.Chmod(state, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			_, err := uninstallAsRoot(Options{
+				RootDir: root,
+				RunCommand: func(string, ...string) sysexec.Result {
+					calls++
+					return sysexec.Result{Code: 0}
+				},
+			})
+			if err == nil || ExitCode(err) != 1 || !strings.Contains(err.Error(), "interrupted installation") {
+				t.Fatalf("Uninstall() error=%v, want interrupted-install refusal", err)
+			}
+			if calls != 0 {
+				t.Fatalf("systemctl ran %d times before interrupted-install refusal", calls)
+			}
+			if got, readErr := os.ReadFile(marker); readErr != nil || string(got) != "runtime" {
+				t.Fatalf("runtime changed before refusal: data=%q err=%v", got, readErr)
+			}
+			if got, readErr := os.ReadFile(state); readErr != nil || string(got) != "recovery state" {
+				t.Fatalf("recovery state changed before refusal: data=%q err=%v", got, readErr)
+			}
+		})
+	}
+}
+
+func TestUninstallRejectsUntrustedInterruptedStateDirectoryBeforeMutation(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		logical string
+	}{
+		{name: "backup directory", logical: "/var/backups/security-update-notify/20260806010101"},
+		{name: "plain recovery parent", logical: "/etc/security-update-notify/credentials"},
+		{name: "encrypted recovery parent", logical: "/etc/credstore.encrypted"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			marker := writeFixture(t, root, "/usr/local/sbin/security-update-notify", "runtime")
+			unsafeDirectory := hostPath(root, test.logical)
+			if err := os.MkdirAll(unsafeDirectory, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(unsafeDirectory, 0o770); err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			_, err := uninstallAsRoot(Options{
+				RootDir: root,
+				RunCommand: func(string, ...string) sysexec.Result {
+					calls++
+					return sysexec.Result{Code: 0}
+				},
+			})
+			if err == nil || ExitCode(err) != 1 || !strings.Contains(err.Error(), "forbidden permissions") {
+				t.Fatalf("Uninstall() error=%v, want untrusted interrupted-state refusal", err)
+			}
+			if calls != 0 {
+				t.Fatalf("systemctl ran %d times before untrusted-state refusal", calls)
+			}
+			if got, readErr := os.ReadFile(marker); readErr != nil || string(got) != "runtime" {
+				t.Fatalf("runtime changed before refusal: data=%q err=%v", got, readErr)
+			}
+		})
+	}
+}
+
 func TestPurgeRestoresFixedAPTBackupAndRemovesSensitiveData(t *testing.T) {
 	root := t.TempDir()
 	writeFixture(t, root, "/etc/apt/apt.conf.d/20auto-upgrades", "managed")
@@ -783,6 +872,90 @@ func TestRestoreFileRejectsUnsafeBackupSourceMetadata(t *testing.T) {
 				t.Fatalf("restore temporary created before source validation: %v", temporary)
 			}
 		})
+	}
+}
+
+func TestRestoreDecisionFilesRejectUnsafeMetadata(t *testing.T) {
+	targets := []struct {
+		name    string
+		logical string
+		content string
+		read    func(*restoreDirectory, string) error
+	}{
+		{
+			name: "apt marker", logical: aptAbsentLogical, content: aptAbsentContents,
+			read: func(directory *restoreDirectory, name string) error {
+				_, err := readAPTMarkerSnapshot(directory, name)
+				return err
+			},
+		},
+		{
+			name: "apt proof", logical: aptDependencyProof, content: "proof\n",
+			read: func(directory *restoreDirectory, name string) error {
+				_, err := directory.readTrustedRegular(name, 256)
+				return err
+			},
+		},
+		{
+			name: "dnf marker", logical: "/etc/dnf/" + dnfAbsentName, content: dnf4AbsentContents,
+			read: func(directory *restoreDirectory, name string) error {
+				_, _, err := readDNFMarkerSnapshot(directory, name)
+				return err
+			},
+		},
+		{
+			name: "dnf proof", logical: "/etc/dnf/" + dnfDependencyProofName, content: "proof\n",
+			read: func(directory *restoreDirectory, name string) error {
+				_, err := directory.readTrustedRegular(name, 256)
+				return err
+			},
+		},
+	}
+	mutations := []struct {
+		name    string
+		prepare func(*testing.T, *restoreDirectory, string)
+		reason  string
+	}{
+		{
+			name: "wrong owner", reason: "owner uid",
+			prepare: func(_ *testing.T, directory *restoreDirectory, _ string) { directory.ownerUID++ },
+		},
+		{
+			name: "group writable", reason: "forbidden permissions",
+			prepare: func(t *testing.T, _ *restoreDirectory, file string) {
+				if err := os.Chmod(file, 0o660); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "hard linked", reason: "exactly one hard link",
+			prepare: func(t *testing.T, _ *restoreDirectory, file string) {
+				if err := os.Link(file, file+".alias"); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, target := range targets {
+		for _, mutation := range mutations {
+			t.Run(target.name+"/"+mutation.name, func(t *testing.T) {
+				root := t.TempDir()
+				file := writeFixture(t, root, target.logical, target.content)
+				directory, err := openRestoreDirectory(root, filepath.Dir(target.logical))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer directory.close()
+				mutation.prepare(t, directory, file)
+
+				err = target.read(directory, filepath.Base(target.logical))
+				if err == nil || !strings.Contains(err.Error(), "unsafe restore decision file") ||
+					!strings.Contains(err.Error(), mutation.reason) {
+					t.Fatalf("unsafe decision metadata error = %v, want %q", err, mutation.reason)
+				}
+			})
+		}
 	}
 }
 

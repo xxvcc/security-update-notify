@@ -47,7 +47,7 @@ func restoreAPTWithRemove(root string, beforeRemove func(string) error) (string,
 		return "", fmt.Errorf("inspect apt timestamp backups: %w", err)
 	}
 
-	fixedSnapshot, err := directory.readRegular(fixed, restoreConfigLimit)
+	fixedSnapshot, err := directory.readTrustedRegular(fixed, restoreConfigLimit)
 	if err != nil {
 		return "", fmt.Errorf("inspect apt fixed backup: %w", err)
 	}
@@ -59,7 +59,7 @@ func restoreAPTWithRemove(root string, beforeRemove func(string) error) (string,
 	if err != nil {
 		return "", fmt.Errorf("inspect legacy apt absence marker: %w", err)
 	}
-	proofSnapshot, err := directory.readRegular(proof, 256)
+	proofSnapshot, err := directory.readTrustedRegular(proof, 256)
 	if err != nil {
 		return "", fmt.Errorf("inspect apt dependency proof: %w", err)
 	}
@@ -72,7 +72,7 @@ func restoreAPTWithRemove(root string, beforeRemove func(string) error) (string,
 	preserveDependencyDefault := false
 	var configSnapshot regularSnapshot
 	if source != "" || markerExists {
-		configSnapshot, err = directory.readRegular(destination, restoreConfigLimit)
+		configSnapshot, err = directory.readTrustedRegular(destination, restoreConfigLimit)
 		if err != nil {
 			return "", fmt.Errorf("inspect apt configuration: %w", err)
 		}
@@ -178,7 +178,7 @@ func restoreAPTWithRemove(root string, beforeRemove func(string) error) (string,
 }
 
 func readAPTMarkerSnapshot(directory *restoreDirectory, name string) (regularSnapshot, error) {
-	snapshot, err := directory.readRegular(name, 256)
+	snapshot, err := directory.readTrustedRegular(name, 256)
 	if err != nil || !snapshot.exists {
 		return snapshot, err
 	}

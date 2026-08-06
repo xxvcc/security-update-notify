@@ -45,7 +45,7 @@ func TestCheckHealthMultiReasonSortedWithTrailingComma(t *testing.T) {
 func TestCheckHealthStale(t *testing.T) {
 	now := int64(1_700_000_000)
 	h := CheckHealth(HealthInput{
-		Backend: "apt", TimerEnabled: true, SvcResult: "success",
+		Backend: "apt", TimerEnabled: true, TimerActiveKnown: true, TimerActive: true, SvcResult: "success",
 		HaveSvcExit: true, SvcExitEpoch: now - 10*86400, Now: now, StaleDays: 7,
 	})
 	if !h.Attention || h.Sig != "stale," {
@@ -56,10 +56,10 @@ func TestCheckHealthStale(t *testing.T) {
 func TestCheckHealthRejectsInvalidSystemdTimestamps(t *testing.T) {
 	now := int64(1_700_000_000)
 	for _, test := range []HealthInput{
-		{Backend: "apt", TimerEnabled: true, HaveSvcExit: true, SvcExitEpoch: 0, Now: now, StaleDays: 7},
-		{Backend: "apt", TimerEnabled: true, HaveSvcExit: true, SvcExitEpoch: now + 1, Now: now, StaleDays: 7},
-		{Backend: "dnf", TimerEnabled: true, HaveTimerTrigger: true, TimerTriggerEpoch: 0, Now: now, StaleDays: 7},
-		{Backend: "dnf", TimerEnabled: true, HaveTimerTrigger: true, TimerTriggerEpoch: now + 1, Now: now, StaleDays: 7},
+		{Backend: "apt", TimerEnabled: true, TimerActiveKnown: true, TimerActive: true, HaveSvcExit: true, SvcExitEpoch: 0, Now: now, StaleDays: 7},
+		{Backend: "apt", TimerEnabled: true, TimerActiveKnown: true, TimerActive: true, HaveSvcExit: true, SvcExitEpoch: now + 1, Now: now, StaleDays: 7},
+		{Backend: "dnf", TimerEnabled: true, TimerActiveKnown: true, TimerActive: true, HaveTimerTrigger: true, TimerTriggerEpoch: 0, Now: now, StaleDays: 7},
+		{Backend: "dnf", TimerEnabled: true, TimerActiveKnown: true, TimerActive: true, HaveTimerTrigger: true, TimerTriggerEpoch: now + 1, Now: now, StaleDays: 7},
 	} {
 		health := CheckHealth(test)
 		if !health.Attention || health.Sig != "timestamp," {
@@ -70,11 +70,25 @@ func TestCheckHealthRejectsInvalidSystemdTimestamps(t *testing.T) {
 
 func TestCheckHealthHealthy(t *testing.T) {
 	h := CheckHealth(HealthInput{
-		Backend: "apt", TimerEnabled: true, SvcResult: "success", StaleDays: 7,
+		Backend: "apt", TimerEnabled: true, TimerActiveKnown: true, TimerActive: true,
+		SvcResult: "success", StaleDays: 7,
 		Disks: []DiskAvail{{Mount: "/", AvailKB: 99000000}},
 	})
 	if h.Attention || h.Sig != "" {
 		t.Errorf("healthy host: Attention=%v Sig=%q", h.Attention, h.Sig)
+	}
+}
+
+func TestCheckHealthReportsEnabledInactiveTimer(t *testing.T) {
+	h := CheckHealth(HealthInput{
+		Backend: "apt", TimerEnabled: true, TimerActiveKnown: true,
+		SvcResult: "success", StaleDays: 7,
+	})
+	if !h.Attention || h.Sig != "inactive," {
+		t.Fatalf("inactive timer health=%+v", h)
+	}
+	if !strings.Contains(h.TxtZH, "已启用但未激活") || !strings.Contains(h.TxtEN, "enabled but not active") {
+		t.Fatalf("inactive timer text zh=%q en=%q", h.TxtZH, h.TxtEN)
 	}
 }
 

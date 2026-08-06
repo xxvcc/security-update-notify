@@ -90,6 +90,50 @@ func AcquireWait(path string, timeout time.Duration) (release func(), acquired b
 	}, true, nil
 }
 
+// AcquireInherited validates and adopts an already-open descriptor for path.
+// It is used by installer child checks while the parent keeps the same open
+// file description locked. The returned release closes only the child's
+// descriptor: issuing LOCK_UN here would also release the parent's flock.
+func AcquireInherited(path string, descriptor int) (release func(), err error) {
+	if descriptor < 3 {
+		return nil, fmt.Errorf("invalid inherited runtime lock descriptor: %d", descriptor)
+	}
+	inherited := os.NewFile(uintptr(descriptor), path)
+	if inherited == nil {
+		return nil, errors.New("could not create inherited runtime lock handle")
+	}
+	fail := func(err error) (func(), error) {
+		_ = inherited.Close()
+		return nil, err
+	}
+
+	uid := os.Geteuid()
+	info, err := validateLockFile(inherited, uid)
+	if err != nil {
+		return fail(fmt.Errorf("validate inherited runtime lock: %w", err))
+	}
+	if info.Mode().Perm() != 0o600 {
+		return fail(fmt.Errorf("inherited runtime lock has permissions %#o, want 0600", info.Mode().Perm()))
+	}
+
+	current, parent, name, err := openLockFile(path)
+	if err != nil {
+		return fail(fmt.Errorf("open canonical runtime lock: %w", err))
+	}
+	_ = current.Close()
+	defer parent.Close()
+	if err := validateLockPath(parent, name, inherited, uid); err != nil {
+		return fail(fmt.Errorf("validate inherited runtime lock path: %w", err))
+	}
+	if err := syscall.Flock(descriptor, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return fail(fmt.Errorf("validate inherited runtime lock ownership: %w", err))
+	}
+	if err := validateLockPath(parent, name, inherited, uid); err != nil {
+		return fail(fmt.Errorf("revalidate inherited runtime lock path: %w", err))
+	}
+	return func() { _ = inherited.Close() }, nil
+}
+
 // openLockFile resolves every parent component through directory descriptors
 // with O_NOFOLLOW, then opens the leaf relative to the final descriptor. A
 // concurrent ancestor rename cannot redirect the open through a symlink.

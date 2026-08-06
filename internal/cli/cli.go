@@ -16,6 +16,7 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/dist"
 	"github.com/xxvcc/security-update-notify/internal/i18n"
 	"github.com/xxvcc/security-update-notify/internal/run"
+	"github.com/xxvcc/security-update-notify/internal/runtimeenv"
 	"github.com/xxvcc/security-update-notify/internal/textsafe"
 	"github.com/xxvcc/security-update-notify/internal/version"
 )
@@ -246,7 +247,7 @@ func takeValue(args []string, i *int) (string, bool) {
 }
 
 func envFile() string {
-	if v := os.Getenv("SECURITY_UPDATE_NOTIFY_ENV"); v != "" {
+	if v := runtimeenv.Override("SECURITY_UPDATE_NOTIFY_ENV"); v != "" {
 		return v
 	}
 	return defaultEnvFile

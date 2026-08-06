@@ -14,6 +14,7 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/feishu"
 	"github.com/xxvcc/security-update-notify/internal/httpx"
 	"github.com/xxvcc/security-update-notify/internal/installer"
+	"github.com/xxvcc/security-update-notify/internal/sysexec"
 	"github.com/xxvcc/security-update-notify/internal/telegram"
 	"github.com/xxvcc/security-update-notify/internal/textsafe"
 )
@@ -209,13 +210,16 @@ func (c *installCommand) run(rawArgs []string, configure bool) int {
 		return 1
 	}
 	preflight := c.makePreflight(&parsed, effective, original, existing)
-	result, err := api.Install(context.Background(), installer.Options{
+	installContext, installComplete := sysexec.TerminationContext(context.Background())
+	defer installComplete()
+	result, err := api.Install(installContext, installer.Options{
 		Config: parsed.config, CheckTime: parsed.checkTime, AllowBestEffort: parsed.allowBestEffort,
 		Payload: installer.Payload{Runtime: runtime}, FeishuSecret: parsed.feishuSecret,
 		Preflight: preflight, ConfirmDependencies: c.confirmDependencies(&parsed),
 		SendTest: parsed.sendTest, SkipPostInstallCheck: parsed.skipPostInstallCheck,
 		LockWait: parsed.lockWait, LockWaitSet: parsed.lockWaitSet,
 	})
+	installComplete()
 	if err != nil {
 		fmt.Fprintln(c.console.errOut, safeCLIText(err.Error()))
 		return installer.ExitCode(err)

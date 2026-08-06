@@ -53,10 +53,18 @@ var (
 	terminationCleanupMu sync.Mutex
 	terminationCleanups  = make(map[uint64]func())
 	terminationCleanupID atomic.Uint64
+	terminationWaitMu    sync.Mutex
+	terminationWaiters   = make(map[uint64]terminationWaiter)
+	terminationWaiterID  atomic.Uint64
 	commandPathMu        sync.RWMutex
 	testCommandPath      string
 	testCommandPathSet   bool
 )
+
+type terminationWaiter struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
 
 // capBuffer 是带上限的写入缓冲：达到上限后丢弃多余字节，但始终向子进程声明"已全部写入"，
 // 避免因短写让子进程收到写错误（镜像运行时 `set +e` 的宽松语义）。
@@ -159,7 +167,7 @@ func (c *Cmd) Start() error {
 	}
 	c.processGroup = c.Process.Pid
 	activeProcessGroups.Store(c.processGroup, struct{}{})
-	if terminating.Load() {
+	if terminating.Load() && !terminationWaitActive() {
 		_ = syscall.Kill(-c.processGroup, syscall.SIGKILL)
 	}
 	return nil
@@ -171,7 +179,7 @@ func (c *Cmd) Wait() error {
 		activeProcessGroups.Delete(c.processGroup)
 		c.processGroup = 0
 	}
-	if terminating.Load() {
+	if terminating.Load() && !terminationWaitActive() {
 		// Keep the main goroutine alive until the signal-forwarding goroutine
 		// re-raises the original signal with the default disposition.
 		<-terminationBarrier
@@ -214,9 +222,10 @@ func CommandContext(ctx context.Context, name string, args ...string) *Cmd {
 }
 
 // InstallSignalForwarding makes SIGHUP/SIGINT/SIGTERM reach every active child process group before the
-// signal is re-raised in the parent. The short grace period preserves normal command cleanup; a
-// second signal or the grace deadline force-kills any remaining descendants. It is process-global
-// and idempotent, so command entrypoints should call it once during startup.
+// signal is re-raised in the parent. A registered termination context gets one complete cancellation
+// handshake before re-raise so a privileged transaction can roll back. Without one, the short grace
+// period preserves the normal command cleanup behavior. A second signal always forces termination.
+// This is process-global and idempotent, so command entrypoints should call it once during startup.
 func InstallSignalForwarding() {
 	signalForwardingOnce.Do(func() {
 		signals := make(chan os.Signal, 2)
@@ -228,17 +237,11 @@ func InstallSignalForwarding() {
 				sig = syscall.SIGTERM
 			}
 			terminating.Store(true)
+			waiters := cancelTerminationWaiters()
 			runTerminationCleanups()
 			signalActiveProcessGroups(sig)
 
-			timer := time.NewTimer(signalGraceDelay)
-			select {
-			case <-timer.C:
-			case <-signals:
-				if !timer.Stop() {
-					<-timer.C
-				}
-			}
+			waitForTermination(signals, waiters)
 			signalActiveProcessGroups(syscall.SIGKILL)
 			signal.Stop(signals)
 			signal.Reset(syscall.SIGHUP, os.Interrupt, syscall.SIGTERM)
@@ -247,6 +250,78 @@ func InstallSignalForwarding() {
 			}
 		}()
 	})
+}
+
+// TerminationContext returns a child context canceled by the first process
+// termination signal. The completion function is a handshake: signal
+// forwarding will not re-raise that first signal until every context present at
+// signal time reports completion. Call it only after transactional defers and
+// locks have finished unwinding.
+func TerminationContext(parent context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(parent)
+	waiter := terminationWaiter{cancel: cancel, done: make(chan struct{})}
+	id := terminationWaiterID.Add(1)
+	terminationWaitMu.Lock()
+	if terminating.Load() {
+		terminationWaitMu.Unlock()
+		cancel()
+		return ctx, cancel
+	}
+	terminationWaiters[id] = waiter
+	terminationWaitMu.Unlock()
+
+	var once sync.Once
+	return ctx, func() {
+		once.Do(func() {
+			cancel()
+			terminationWaitMu.Lock()
+			if current, ok := terminationWaiters[id]; ok {
+				delete(terminationWaiters, id)
+				close(current.done)
+			}
+			terminationWaitMu.Unlock()
+		})
+	}
+}
+
+func terminationWaitActive() bool {
+	terminationWaitMu.Lock()
+	defer terminationWaitMu.Unlock()
+	return len(terminationWaiters) > 0
+}
+
+func cancelTerminationWaiters() []<-chan struct{} {
+	terminationWaitMu.Lock()
+	defer terminationWaitMu.Unlock()
+	waiters := make([]<-chan struct{}, 0, len(terminationWaiters))
+	for _, waiter := range terminationWaiters {
+		waiter.cancel()
+		waiters = append(waiters, waiter.done)
+	}
+	return waiters
+}
+
+func waitForTermination(signals <-chan os.Signal, waiters []<-chan struct{}) {
+	if len(waiters) == 0 {
+		timer := time.NewTimer(signalGraceDelay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-signals:
+		}
+		return
+	}
+	completed := make(chan struct{})
+	go func() {
+		for _, waiter := range waiters {
+			<-waiter
+		}
+		close(completed)
+	}()
+	select {
+	case <-completed:
+	case <-signals:
+	}
 }
 
 // RegisterTerminationCleanup registers a short, non-blocking cleanup that must

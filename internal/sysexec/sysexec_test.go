@@ -154,6 +154,82 @@ func TestSignalForwardingHelper(t *testing.T) {
 	}
 }
 
+func TestTerminationContextWaitsForRollbackHandshake(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		signal syscall.Signal
+	}{
+		{name: "SIGHUP", signal: syscall.SIGHUP},
+		{name: "SIGINT", signal: syscall.SIGINT},
+		{name: "SIGTERM", signal: syscall.SIGTERM},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			marker := filepath.Join(t.TempDir(), "rollback-complete")
+			ready := marker + ".ready"
+			cmd := exec.Command(os.Args[0], "-test.run=^TestTerminationContextHelper$")
+			cmd.Env = append(os.Environ(),
+				"SUN_SYSEXEC_TERMINATION_CONTEXT_HELPER=1",
+				"SUN_SYSEXEC_TERMINATION_CONTEXT_MARKER="+marker,
+				"SUN_SYSEXEC_TERMINATION_CONTEXT_READY="+ready,
+			)
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().Add(3 * time.Second)
+			for {
+				if _, err := os.Stat(ready); err == nil {
+					break
+				} else if !errors.Is(err, os.ErrNotExist) {
+					t.Fatal(err)
+				}
+				if time.Now().After(deadline) {
+					_ = cmd.Process.Kill()
+					_ = cmd.Wait()
+					t.Fatal("termination-context helper did not become ready")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			started := time.Now()
+			if err := syscall.Kill(cmd.Process.Pid, test.signal); err != nil {
+				t.Fatal(err)
+			}
+			err := cmd.Wait()
+			if elapsed := time.Since(started); elapsed < 500*time.Millisecond {
+				t.Fatalf("signal was re-raised after %s, before rollback handshake", elapsed)
+			}
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) {
+				t.Fatalf("helper exit=%v, want signal termination", err)
+			}
+			status, ok := exitErr.Sys().(syscall.WaitStatus)
+			if !ok || !status.Signaled() || status.Signal() != test.signal {
+				t.Fatalf("helper wait status=%v, want %s", exitErr.Sys(), test.name)
+			}
+			if contents, err := os.ReadFile(marker); err != nil || string(contents) != "rolled back" {
+				t.Fatalf("rollback handshake marker=%q err=%v", contents, err)
+			}
+		})
+	}
+}
+
+func TestTerminationContextHelper(t *testing.T) {
+	if os.Getenv("SUN_SYSEXEC_TERMINATION_CONTEXT_HELPER") != "1" {
+		return
+	}
+	InstallSignalForwarding()
+	ctx, complete := TerminationContext(context.Background())
+	if err := os.WriteFile(os.Getenv("SUN_SYSEXEC_TERMINATION_CONTEXT_READY"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	<-ctx.Done()
+	time.Sleep(600 * time.Millisecond)
+	if err := os.WriteFile(os.Getenv("SUN_SYSEXEC_TERMINATION_CONTEXT_MARKER"), []byte("rolled back"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	complete()
+	select {}
+}
+
 func TestTerminationCleanupCanBeUnregistered(t *testing.T) {
 	called := 0
 	unregister := RegisterTerminationCleanup(func() { called++ })

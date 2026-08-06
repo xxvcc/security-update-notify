@@ -19,6 +19,7 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/assets"
 	"github.com/xxvcc/security-update-notify/internal/commandpath"
 	"github.com/xxvcc/security-update-notify/internal/dist"
+	"github.com/xxvcc/security-update-notify/internal/filetrust"
 	"github.com/xxvcc/security-update-notify/internal/httpx"
 	"github.com/xxvcc/security-update-notify/internal/i18n"
 	"github.com/xxvcc/security-update-notify/internal/sysexec"
@@ -30,6 +31,7 @@ var latestVersionRe = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$`)
 const (
 	maxUpgradeVersionOutputBytes = 4 << 10
 	privilegedUpgradePath        = commandpath.TrustedPATH
+	privilegedUpgradeTempBase    = "/var/tmp"
 	upgradeInstallerTimeout      = time.Hour
 	// http.Client.Timeout bounds the whole exchange including reading the body, so the metadata
 	// ceiling below would force the multi-megabyte release archive to arrive within a minute and
@@ -107,7 +109,7 @@ func SelfUpgrade(ver string, disp i18n.Lang, langExplicit bool) int {
 		return 0
 	}
 
-	tmp, err := os.MkdirTemp("", "sun-upgrade-")
+	tmp, err := createUpgradeTempDir(privilegedUpgradeTempBase)
 	if err != nil {
 		say(os.Stderr, disp, "创建临时目录失败", "Failed to create temp dir")
 		return 1
@@ -120,14 +122,12 @@ func SelfUpgrade(ver string, disp i18n.Lang, langExplicit bool) int {
 	say(os.Stdout, disp, "正在下载并校验发布包: "+ver+" -> "+latest, "Downloading and verifying release: "+ver+" -> "+latest)
 	tarPath := filepath.Join(tmp, pkg)
 	shaPath := tarPath + ".sha256"
-	hasGPG := dist.GPGAvailable()
-	allowUnsigned := os.Getenv("SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED") == "1"
-	if !hasGPG && !allowUnsigned {
-		say(os.Stderr, disp, "缺少 gpg 且未 opt-in；为安全起见拒绝升级。",
-			"Missing gpg and not opted in; refusing to upgrade for safety.")
+	if err := requireUpgradeGPG(dist.GPGAvailable()); err != nil {
+		say(os.Stderr, disp, "缺少 gpg；为安全起见拒绝升级。",
+			"Missing gpg; refusing to upgrade for safety.")
 		return 1
 	}
-	selectedBase, err := dist.DownloadReleaseSet(httpx.New(releaseDownloadTimeout), dist.ReleaseBases(Repo, latest), pkg, tmp, hasGPG)
+	selectedBase, err := dist.DownloadReleaseSet(httpx.New(releaseDownloadTimeout), dist.ReleaseBases(Repo, latest), pkg, tmp, true)
 	if err != nil {
 		say(os.Stderr, disp, "镜像和 GitHub 均无法提供完整发布包", "Neither the mirror nor GitHub provided a complete release set")
 		return 1
@@ -138,23 +138,13 @@ func SelfUpgrade(ver string, disp i18n.Lang, langExplicit bool) int {
 		say(os.Stdout, disp, "发布镜像不可用，已回退 GitHub", "Release mirror unavailable; fell back to GitHub")
 	}
 
-	// GPG 存在时签名恒为必需（缺 .asc 即拒，绝不静默降级到 sha256-only）；sha256-only 仅在本机确实无 gpg
-	// 且显式 opt-in 时保留，网络攻击者无法触发。验签在解包前完成。
-	if hasGPG {
-		ascPath := tarPath + ".asc"
-		if err := dist.VerifyReleaseKey(tarPath, shaPath, ascPath, assets.ReleaseSigningPublicKey(), assets.ReleaseSigningFingerprint); err != nil {
-			say(os.Stderr, disp, "签名或校验失败；拒绝升级："+err.Error(), "Verification failed; refusing to upgrade: "+err.Error())
-			return 1
-		}
-		say(os.Stdout, disp, "签名校验通过 ("+assets.ReleaseSigningFingerprint+")", "Signature verified ("+assets.ReleaseSigningFingerprint+")")
-	} else if allowUnsigned {
-		if err := dist.VerifySHA256(tarPath, shaPath); err != nil {
-			say(os.Stderr, disp, "sha256 校验失败；拒绝升级", "Checksum verification failed; refusing to upgrade")
-			return 1
-		}
-		say(os.Stderr, disp, "警告：本机没有 gpg 且已 opt-in，仅校验 sha256（不推荐）。",
-			"WARNING: gpg absent and opt-in set; sha256-only verification (not recommended).")
+	// 签名和固定指纹校验在解包前恒为必需；缺 .asc 或缺 gpg 都会 fail closed。
+	ascPath := tarPath + ".asc"
+	if err := dist.VerifyReleaseKey(tarPath, shaPath, ascPath, assets.ReleaseSigningPublicKey(), assets.ReleaseSigningFingerprint); err != nil {
+		say(os.Stderr, disp, "签名或校验失败；拒绝升级："+err.Error(), "Verification failed; refusing to upgrade: "+err.Error())
+		return 1
 	}
+	say(os.Stdout, disp, "签名校验通过 ("+assets.ReleaseSigningFingerprint+")", "Signature verified ("+assets.ReleaseSigningFingerprint+")")
 
 	// 安全解包（拒绝穿越/特殊条目/顶层目录外条目），并做版本绑定核对。
 	if err := validateUpgradeArchive(tarPath, pkgdir); err != nil {
@@ -220,6 +210,24 @@ func selfUpgradeSudoArgs(sudo, self string, disp i18n.Lang, langExplicit bool) [
 
 func trustedPATHEnvironment(env []string) []string {
 	return commandpath.SanitizedEnvironmentFrom(env, commandpath.TrustedPATH, nil)
+}
+
+func requireUpgradeGPG(available bool) error {
+	if !available {
+		return errors.New("gpg is required for release signature verification")
+	}
+	return nil
+}
+
+// createUpgradeTempDir deliberately takes an explicit base and never consults TMPDIR. Shared system
+// temporary directories are accepted only when the sticky bit prevents unprivileged users from
+// replacing the root-owned upgrade tree after its release signature has been verified.
+func createUpgradeTempDir(base string) (string, error) {
+	return createUpgradeTempDirForOwner(base, 0)
+}
+
+func createUpgradeTempDirForOwner(base string, ownerUID int) (string, error) {
+	return filetrust.MkdirTemp(base, "sun-upgrade-", ownerUID)
 }
 
 func validateUpgradeArchive(tarPath, pkgdir string) error {

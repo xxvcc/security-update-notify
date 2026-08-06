@@ -34,6 +34,8 @@ type DiskAvail struct {
 type HealthInput struct {
 	Backend            string // apt|dnf；其它直接返回空 Health
 	TimerEnabled       bool   // systemctl is-enabled <timer> 成功
+	TimerActiveKnown   bool   // ActiveState 查询成功且非空
+	TimerActive        bool   // ActiveState == active
 	SystemdQueryFailed bool   // one or more required systemctl show queries failed
 	SvcResult          string // systemctl show <svc> -p Result --value（可空）
 	HaveSvcExit        bool   // ExecMainExitTimestamp 是否非空
@@ -45,8 +47,8 @@ type HealthInput struct {
 	Disks              []DiskAvail
 }
 
-// CheckHealth 复刻 check_update_health：定时器未启用 / 上次失败 / 超期未成功 / 磁盘将满，任一命中即
-// 关注。reason 顺序化为 HEALTH_SIG（sort -u + 尾逗号），文案按检查顺序拼接。
+// CheckHealth 检查定时器启用/激活、上次失败、超期未成功与磁盘空间。
+// reason 排序并保留尾逗号，作为稳定的 HEALTH_SIG 去重输入。
 func CheckHealth(in HealthInput) Health {
 	var h Health
 	var timer, svc string
@@ -61,7 +63,8 @@ func CheckHealth(in HealthInput) Health {
 	var reasons []string
 	var zh, en strings.Builder
 
-	if in.SystemdQueryFailed {
+	queryFailed := in.SystemdQueryFailed || in.TimerEnabled && !in.TimerActiveKnown
+	if queryFailed {
 		h.Attention = true
 		reasons = append(reasons, "query")
 		zh.WriteString("• 无法可靠查询 systemd 自动安全更新状态\n")
@@ -72,6 +75,11 @@ func CheckHealth(in HealthInput) Health {
 		reasons = append(reasons, "disabled")
 		fmt.Fprintf(&zh, "• 自动安全更新定时器未启用（%s）\n", timer)
 		fmt.Fprintf(&en, "• Automatic security-update timer is not enabled (%s)\n", timer)
+	} else if in.TimerActiveKnown && !in.TimerActive {
+		h.Attention = true
+		reasons = append(reasons, "inactive")
+		fmt.Fprintf(&zh, "• 自动安全更新定时器已启用但未激活（%s）\n", timer)
+		fmt.Fprintf(&en, "• Automatic security-update timer is enabled but not active (%s)\n", timer)
 	}
 	if in.SvcResult != "" && in.SvcResult != "success" {
 		h.Attention = true

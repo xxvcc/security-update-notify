@@ -231,11 +231,14 @@ func (i *Installer) persistAPTDependencyBaseline(b *backup, configOriginallyAbse
 		{path: aptLegacyAbsentPath, op: "remove superseded legacy apt absence marker"},
 		{path: aptDependencyProofPath, op: "remove promoted apt dependency proof"},
 	} {
-		if err := i.fs.Remove(metadata.path); err != nil {
-			return failure(metadata.op, err)
-		}
+		// Publish the adopted absence before unlinking the live metadata. A crash
+		// in between then makes recovery finish the unlink instead of resurrecting
+		// a marker alongside the promoted stable baseline.
 		if err := i.keepPathAbsentOnRollback(b, metadata.path); err != nil {
 			return err
+		}
+		if err := i.fs.Remove(metadata.path); err != nil {
+			return failure(metadata.op, err)
 		}
 	}
 	return nil

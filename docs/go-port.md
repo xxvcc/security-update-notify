@@ -248,11 +248,15 @@ support promise for armv7, riscv64, or any other architecture.
 
 `sun.sh` 与 Go 自升级采用同一信任原则：镜像优先、GitHub 仅在完整资产集合传输失败时回退；一旦选定完整
 集合，任何 checksum、签名、指纹或版本失败都会中止，不能用回退掩盖篡改。GPG 验签在解包前完成，固定
-指纹 `C678256ACBFC6491BF5076655F3AE24999921FFC` 不可由环境覆盖。`gpg` 存在时签名恒为必需；Go 自升级的
-SHA-256-only 应急分支仅在本机确实没有 `gpg` 且管理员显式设置
-`SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1` 时可达，网络失败不能触发降级。`sun.sh` 默认也始终
-要求签名，只有显式 `--verify-signature off` 才会关闭。归档检查拒绝绝对路径、`..`、顶层目录外条目、
-链接/特殊文件、过多条目和超出声明上限的内容，并剥离归档所有者及特殊权限。
+指纹 `C678256ACBFC6491BF5076655F3AE24999921FFC` 不可由环境覆盖。Go 自升级始终要求可信系统路径中的
+`gpg` 和归档 `.asc`，没有 SHA-256-only 分支；特权进程忽略 `TMPDIR`，只在逐级 no-follow 验证过的 root
+所有系统临时目录下创建私有工作区。`sun.sh` 默认也始终要求签名，只有显式 `--verify-signature off` 才会
+关闭。归档检查拒绝绝对路径、`..`、顶层目录外条目、链接/特殊文件、过多条目和超出声明上限的内容，并
+剥离归档所有者及特殊权限。
+
+Go self-upgrade always requires `gpg` from the trusted system path and the archive `.asc`; there is no
+SHA-256-only branch. A privileged upgrade ignores `TMPDIR` and creates private workspaces only below a
+root-owned system temporary hierarchy validated component by component without following symlinks.
 
 首次安装另有一条更早的信任边界：便捷 `curl | /bin/bash -p` 必须在脚本能够自验之前先信任 HTTPS。正式发布工具
 因此使用同一离线密钥额外生成 `sun.sh.asc`；其 hashed 子包以关键 notation 绑定根 `VERSION`。镜像将它绑定到

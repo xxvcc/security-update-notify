@@ -16,7 +16,7 @@ This guide is only for maintainers with the offline signing key and GitHub relea
 Complete the gates in [Development and local validation](development.en.md), then run:
 
 ```bash
-go run ./cmd/sun-release package
+go run ./cmd/sun-release package --release --sign required
 cd dist && sha256sum -c security-update-notify-*.tar.gz.sha256
 ```
 

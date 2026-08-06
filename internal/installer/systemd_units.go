@@ -107,12 +107,20 @@ func automaticUnitNames(plan installPlan) []string {
 }
 
 func (i *Installer) snapshotAutomaticUnits(ctx context.Context, plan installPlan) ([]unitSnapshot, error) {
-	units := automaticUnitNames(plan)
+	return i.snapshotAutomaticUnitNames(ctx, automaticUnitNames(plan), plan.profile.AutomaticTimer)
+}
+
+func (i *Installer) snapshotAutomaticUnitNames(ctx context.Context, units []string, selectedTimer string) ([]unitSnapshot, error) {
 	if len(units) == 0 {
 		return nil, failure("snapshot automatic-update units", errors.New("distribution profile does not define a timer"))
 	}
+	seen := make(map[string]bool, len(units))
 	snapshots := make([]unitSnapshot, 0, len(units))
 	for _, unit := range units {
+		if seen[unit] || !validAutomaticUnitName(unit) {
+			return nil, failure("snapshot automatic-update units", fmt.Errorf("invalid or duplicate unit name %q", unit))
+		}
+		seen[unit] = true
 		snapshot, err := i.snapshotUnit(ctx, unit)
 		if err != nil {
 			return nil, err
@@ -121,7 +129,7 @@ func (i *Installer) snapshotAutomaticUnits(ctx context.Context, plan installPlan
 			return nil, failure("snapshot automatic-update unit "+unit,
 				fmt.Errorf("enablement state %q cannot be restored without changing related units", snapshot.enablement))
 		}
-		if unit == plan.profile.AutomaticTimer && isMaskedEnablement(snapshot.enablement) {
+		if unit == selectedTimer && isMaskedEnablement(snapshot.enablement) {
 			return nil, failure("snapshot automatic-update unit "+unit,
 				fmt.Errorf("selected automatic-update timer is %s; unmask it before installation", snapshot.enablement))
 		}
@@ -418,10 +426,10 @@ func (i *Installer) restoreUnitEnablement(want, got unitSnapshot) error {
 	}
 }
 
-func (i *Installer) acquireRuntimeLock(ctx context.Context, wait time.Duration) (UnlockFunc, error) {
-	unlock, err := i.locker.Acquire(ctx, RuntimeLockPath, wait)
+func (i *Installer) acquireRuntimeLock(ctx context.Context, wait time.Duration) (*HeldLock, error) {
+	lock, err := i.locker.Acquire(ctx, RuntimeLockPath, wait)
 	if err == nil {
-		return unlock, nil
+		return lock, nil
 	}
 	if errors.Is(err, ErrLockBusy) || errors.Is(err, context.DeadlineExceeded) {
 		return nil, temporary("quiesce runtime", errors.New("timed out waiting for the existing security-update-notify run"))

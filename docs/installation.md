@@ -351,7 +351,7 @@ curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo /bin/bash -p -s
 
 如果已安装过 SUN，安装器会自动读取 `/etc/security-update-notify/telegram.env` 和现有 timer 时间，并复用未显式覆盖的设置。运行 `sudo security-update-notify configure notifications` 可以事务化更改接收平台、Telegram 配置、飞书应用、App Secret 或接收人。移除接收平台会删除其保存凭据，新增或修改只重复验证受影响的平台；任一步失败都会随安装事务回滚。旧配置没有 `NOTIFY_CHANNELS` 时自动按 `telegram` 处理，未显式覆盖的其他选项继续沿用。
 
-升级前会备份关键文件到 `/var/backups/security-update-notify/<timestamp>`，但飞书 App Secret 不进入该备份；升级失败会尝试自动回滚，并恢复 SUN timer 安装前的启用链接与 active 状态。升级后默认运行自检；可用 `--notify-upgrade 1` 向已配置接收平台发送升级通知。升级通知采用 best-effort 语义，不会因通知失败回滚已经完成的升级，也不会整体重试双发而重复已成功平台。
+升级前会备份关键文件到 `/var/backups/security-update-notify/<timestamp>`，但飞书 App Secret 不进入该备份。普通失败和终止信号会在退出前回滚，并恢复 SUN timer 安装前的启用链接与 active 状态；SIGKILL、崩溃或掉电后的下一次安装会先恢复可安全回滚的中断事务。包管理器尚未完成可信状态捕获时不会自动猜测回滚，事务现场会保留且安装/卸载均失败关闭；完整边界和人工处置要求见[安装事务与中断恢复](operations.md#安装事务与中断恢复)。升级后默认运行自检；可用 `--notify-upgrade 1` 向已配置接收平台发送升级通知。升级通知采用 best-effort 语义，不会因通知失败回滚已经完成的升级，也不会整体重试双发而重复已成功平台。
 
 ## 相关文档
 

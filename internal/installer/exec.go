@@ -102,7 +102,7 @@ type FileLocker struct {
 	OwnerUID uint32
 }
 
-func (l FileLocker) Acquire(ctx context.Context, path string, wait time.Duration) (UnlockFunc, error) {
+func (l FileLocker) Acquire(ctx context.Context, path string, wait time.Duration) (*HeldLock, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -131,14 +131,14 @@ func (l FileLocker) Acquire(ctx context.Context, path string, wait time.Duration
 				_ = file.Close()
 				return nil, err
 			}
-			return func() error {
+			return &HeldLock{File: file, unlock: func() error {
 				unlockErr := syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
 				closeErr := file.Close()
 				if unlockErr != nil {
 					return unlockErr
 				}
 				return closeErr
-			}, nil
+			}}, nil
 		}
 		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
 			_ = file.Close()

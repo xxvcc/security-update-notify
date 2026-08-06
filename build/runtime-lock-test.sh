@@ -2,6 +2,11 @@
 # Production-entrypoint lock contract for the compiled Go runtime.
 set -euo pipefail
 
+if (( EUID == 0 )); then
+  echo "runtime-lock-test.sh must run as a non-root user so test-only path overrides remain isolated" >&2
+  exit 1
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
 cleanup() { rm -rf "$TMP"; }

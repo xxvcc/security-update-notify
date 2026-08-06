@@ -51,6 +51,80 @@ func TestUpgradeRejectsMalformedLocalVersionIdentity(t *testing.T) {
 	}
 }
 
+func TestUpgradeRequiresGPGRegardlessOfLegacyUnsignedEnvironment(t *testing.T) {
+	t.Setenv("SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED", "1")
+	if err := requireUpgradeGPG(false); err == nil {
+		t.Fatal("missing gpg was accepted through the legacy unsigned-upgrade environment")
+	}
+	if err := requireUpgradeGPG(true); err != nil {
+		t.Fatalf("available gpg was rejected: %v", err)
+	}
+}
+
+func TestCreateUpgradeTempDirIgnoresTMPDIR(t *testing.T) {
+	trustedBase := t.TempDir()
+	attackerBase := t.TempDir()
+	t.Setenv("TMPDIR", attackerBase)
+
+	tmp, err := createUpgradeTempDirForOwner(trustedBase, os.Geteuid())
+	if err != nil {
+		t.Fatalf("createUpgradeTempDir(): %v", err)
+	}
+	defer os.RemoveAll(tmp)
+	if filepath.Dir(tmp) != trustedBase {
+		t.Fatalf("temporary directory=%q, want child of explicit base %q", tmp, trustedBase)
+	}
+	entries, err := os.ReadDir(attackerBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("caller-controlled TMPDIR was used: %v", entries)
+	}
+}
+
+func TestCreateUpgradeTempDirRequiresProtectedOrStickyBase(t *testing.T) {
+	root := t.TempDir()
+	protected := filepath.Join(root, "protected")
+	sticky := filepath.Join(root, "sticky")
+	unsafe := filepath.Join(root, "unsafe")
+	for path, mode := range map[string]os.FileMode{
+		protected: 0o700,
+		sticky:    os.ModeSticky | 0o777,
+		unsafe:    0o0777,
+	} {
+		if err := os.Mkdir(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, base := range []string{protected, sticky} {
+		tmp, err := createUpgradeTempDirForOwner(base, os.Geteuid())
+		if err != nil {
+			t.Errorf("safe base %q rejected: %v", base, err)
+			continue
+		}
+		if err := os.RemoveAll(tmp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if tmp, err := createUpgradeTempDirForOwner(unsafe, os.Geteuid()); err == nil {
+		_ = os.RemoveAll(tmp)
+		t.Fatal("group/other-writable non-sticky base was accepted")
+	}
+
+	symlink := filepath.Join(root, "symlink")
+	if err := os.Symlink(protected, symlink); err != nil {
+		t.Fatal(err)
+	}
+	if tmp, err := createUpgradeTempDirForOwner(symlink, os.Geteuid()); err == nil {
+		_ = os.RemoveAll(tmp)
+		t.Fatal("symlink temporary base was accepted")
+	}
+}
+
 func TestReadPackageVersionIsStrict(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "VERSION")
@@ -250,6 +324,7 @@ func TestUpgradeInstallCommandUsesGoInstallerEntrypoint(t *testing.T) {
 	t.Setenv("LD_PRELOAD", "/tmp/hostile.so")
 	t.Setenv("HTTPS_PROXY", "http://proxy.example:8080")
 	t.Setenv("SECURITY_UPDATE_NOTIFY_LOCK_WAIT_SECONDS", "120")
+	t.Setenv("SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED", "1")
 	binary := filepath.Join(t.TempDir(), "security-update-notify-linux-amd64")
 	extractDir := t.TempDir()
 	cmd := upgradeInstallCommand(context.Background(), binary, extractDir, i18n.EN)
@@ -275,7 +350,8 @@ func TestUpgradeInstallCommandUsesGoInstallerEntrypoint(t *testing.T) {
 		if strings.HasPrefix(item, "SECURITY_UPDATE_NOTIFY_UPGRADE=") && item != "SECURITY_UPDATE_NOTIFY_UPGRADE=1" {
 			t.Fatalf("stale upgrade environment survived: %q", item)
 		}
-		if item == "PATH=/hostile/bin" || strings.HasPrefix(item, "LD_PRELOAD=") {
+		if item == "PATH=/hostile/bin" || strings.HasPrefix(item, "LD_PRELOAD=") ||
+			strings.HasPrefix(item, "SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=") {
 			t.Fatalf("unsafe inherited environment survived: %q", item)
 		}
 		if _, ok := wantEnvironment[item]; ok {
@@ -296,6 +372,7 @@ func TestTrustedPATHEnvironmentReplacesCallerPATH(t *testing.T) {
 	got := trustedPATHEnvironment([]string{
 		"PATH=/hostile/bin", "TERM=xterm", "PATH=/second/hostile",
 		"LD_PRELOAD=/tmp/attacker.so", "SUDO_ASKPASS=/tmp/attacker", "APT_CONFIG=/tmp/apt.conf",
+		"SECURITY_UPDATE_NOTIFY_UPGRADE_ALLOW_UNSIGNED=1",
 	})
 	if strings.Join(got, "\n") != "TERM=xterm\nLC_ALL=C\nPATH="+privilegedUpgradePath {
 		t.Fatalf("trusted environment=%q", got)

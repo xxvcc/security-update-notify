@@ -22,15 +22,17 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/xxvcc/security-update-notify/internal/filetrust"
 	"github.com/xxvcc/security-update-notify/internal/sysexec"
 	"github.com/xxvcc/security-update-notify/internal/textsafe"
 )
 
 const (
-	gpgCommandTimeout = 30 * time.Second
-	maxGPGOutputBytes = 1 << 20
-	maxGPGErrorBytes  = 4 << 10
-	trustedSystemPath = "/usr/sbin:/usr/bin:/sbin:/bin"
+	gpgCommandTimeout    = 30 * time.Second
+	maxGPGOutputBytes    = 1 << 20
+	maxGPGErrorBytes     = 4 << 10
+	trustedSystemPath    = "/usr/sbin:/usr/bin:/sbin:/bin"
+	verificationTempBase = "/var/tmp"
 )
 
 var trustedGPGPaths = [...]string{"/usr/bin/gpg", "/bin/gpg"}
@@ -73,7 +75,7 @@ func VerifyRelease(tarball, sha256File, ascFile, pubKeyFile, wantFpr string) err
 	}
 
 	// 2) 隔离 keyring 导入公钥，取指纹，与 pin 比对
-	home, err := os.MkdirTemp("", "sun-verify-gpg-")
+	home, err := createVerificationTempDir(verificationTempBase, "sun-verify-gpg-", 0)
 	if err != nil {
 		return err
 	}
@@ -126,7 +128,8 @@ func VerifyRelease(tarball, sha256File, ascFile, pubKeyFile, wantFpr string) err
 	return nil
 }
 
-// VerifySHA256 只做 sha256 校验（sha256-only 分支用；gpg 缺失且显式 opt-in 时）。
+// VerifySHA256 performs an integrity-only check for non-upgrade callers. Self-upgrade authentication
+// always requires VerifyReleaseKey and never accepts this function as a signature substitute.
 func VerifySHA256(tarball, sha256File string) error {
 	tarFile, tarInfo, err := openRegularInput(tarball, maxArchiveBytes)
 	if err != nil {
@@ -161,19 +164,31 @@ func VerifySHA256(tarball, sha256File string) error {
 // VerifyReleaseKey 与 VerifyRelease 相同，但公钥以字节传入（内置 go:embed 公钥用）：写入临时文件后
 // 复用文件版校验（sha256 → 指纹 pin → GPG 验签，fail-closed）。
 func VerifyReleaseKey(tarball, sha256File, ascFile string, pubKey []byte, wantFpr string) error {
-	tmp, err := os.CreateTemp("", "sun-pubkey-*.asc")
+	workspace, err := createVerificationTempDir(verificationTempBase, "sun-pubkey-", 0)
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmp.Name())
+	defer os.RemoveAll(workspace)
+	tmpPath := filepath.Join(workspace, "release-signing-key.asc")
+	tmp, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
 	if _, err := tmp.Write(pubKey); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return VerifyRelease(tarball, sha256File, ascFile, tmp.Name(), wantFpr)
+	return VerifyRelease(tarball, sha256File, ascFile, tmpPath, wantFpr)
+}
+
+// createVerificationTempDir uses an explicit base and never consults TMPDIR. Production callers
+// require the fixed system base to be root-owned. A shared base is safe only with the sticky bit,
+// which prevents other users from replacing a verifier-owned keyring directory.
+func createVerificationTempDir(base, prefix string, ownerUID int) (string, error) {
+	return filetrust.MkdirTemp(base, prefix, ownerUID)
 }
 
 func readExpectedSHAFile(f *os.File, archiveName string) (string, error) {

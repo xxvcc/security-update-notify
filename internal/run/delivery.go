@@ -18,6 +18,7 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/feishu"
 	"github.com/xxvcc/security-update-notify/internal/filetrust"
 	"github.com/xxvcc/security-update-notify/internal/httpx"
+	"github.com/xxvcc/security-update-notify/internal/runtimeenv"
 	"github.com/xxvcc/security-update-notify/internal/sysexec"
 	"github.com/xxvcc/security-update-notify/internal/telegram"
 )
@@ -86,7 +87,7 @@ func senderFor(cfg *config.Config, name string) (delivery.Sender, error) {
 			return nil, fmt.Errorf("missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
 		}
 		return &telegramSender{
-			client: &telegram.Client{HTTP: httpx.New(30 * time.Second), BaseURL: os.Getenv(telegramBaseURLEnv)},
+			client: &telegram.Client{HTTP: httpx.New(30 * time.Second), BaseURL: runtimeenv.Override(telegramBaseURLEnv)},
 			token:  token,
 			chatID: chatID,
 		}, nil
@@ -104,7 +105,7 @@ func senderFor(cfg *config.Config, name string) (delivery.Sender, error) {
 			return nil, err
 		}
 		return &feishuSender{
-			client:    &feishu.Client{HTTP: httpx.New(30 * time.Second), BaseURL: os.Getenv(feishuBaseURLEnv)},
+			client:    &feishu.Client{HTTP: httpx.New(30 * time.Second), BaseURL: runtimeenv.Override(feishuBaseURLEnv)},
 			appID:     appID,
 			appSecret: secret,
 			receiveID: receiveID,
@@ -124,10 +125,10 @@ func readFeishuSecretWithDefaults(defaultEncryptedPath, defaultPlainPath string)
 		// LoadCredential entry could silently use stale host credentials that the unit did not load.
 		return readSecretFile(filepath.Join(dir, feishuCredentialName))
 	}
-	if path := os.Getenv(feishuSecretFileEnv); path != "" {
+	if path := runtimeenv.Override(feishuSecretFileEnv); path != "" {
 		return readSecretFile(path)
 	}
-	path, encryptedPathSet := os.LookupEnv(feishuEncryptedCredentialEnv)
+	path, encryptedPathSet := runtimeenv.LookupOverride(feishuEncryptedCredentialEnv)
 	if !encryptedPathSet {
 		path = defaultEncryptedPath
 	}
@@ -140,7 +141,7 @@ func readFeishuSecretWithDefaults(defaultEncryptedPath, defaultPlainPath string)
 			return "", fmt.Errorf("Feishu app secret credential is unavailable")
 		}
 	}
-	plainPath, plainPathSet := os.LookupEnv(feishuPlainCredentialEnv)
+	plainPath, plainPathSet := runtimeenv.LookupOverride(feishuPlainCredentialEnv)
 	if !plainPathSet {
 		plainPath = defaultPlainPath
 	}

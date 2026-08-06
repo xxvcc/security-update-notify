@@ -32,7 +32,7 @@ In addition to reboot/service-restart and distro-EOL detection, SUN runs seven p
 
 | Key | Default | What it does |
 | --- | --- | --- |
-| `CHECK_UPDATE_HEALTH` | `1` | Checks the auto-update mechanism, effective policy, package consistency, and repository health: disabled timers, failed/stale runs, low disk space, policy drift, broken package state, missing/expired/stale metadata, and signature/TLS errors. Set `0` to disable this group; backlog age, restart age, EOL, and SUN release notices remain enabled. |
+| `CHECK_UPDATE_HEALTH` | `1` | Checks the auto-update mechanism, effective policy, package consistency, and repository health: disabled or inactive timers, failed/stale runs, low disk space, policy drift, broken package state, missing/expired/stale metadata, and signature/TLS errors. Set `0` to disable this group; backlog age, restart age, EOL, and SUN release notices remain enabled. |
 | `STALE_UPDATE_DAYS` | `7` | Days without a successful automatic security update before it's considered stale; set `0` to disable this sub-check. |
 | `PENDING_ALERT_DAYS` | `3` | Days that pending security updates may remain before alerting; set `0` to disable backlog alerts. The first-seen time is kept in root-only state and removed after the backlog clears. |
 | `RESTART_ALERT_DAYS` | `7` | Days before a persistent full-reboot or service-restart requirement is escalated; set `0` to disable age escalation. SUN never restarts the host or services automatically. |
@@ -40,7 +40,7 @@ In addition to reboot/service-restart and distro-EOL detection, SUN runs seven p
 | `SELF_UPDATE_CHECK_DAYS` | `7` | SUN release-check interval. Successful results are cached; `security-update-notify doctor` forces a read-only refresh. |
 | `CHECK_EOL` | `1` | Distro end-of-life (EOL) warning: a past-EOL release triggers an alert, an approaching one (within 90 days) is informational. Ubuntu 20.04 automatically checks the local `esm-infra` state. Consider `0` only for an external extended-support arrangement that SUN cannot recognize, accepting that it disables every EOL check. |
 
-The pending count remains informational until it reaches `PENDING_ALERT_DAYS`. DNF's high-severity subtotal includes both `critical` and `important`. Patch-backlog, full-reboot, and service-restart age tracking uses three-state observations: confirmed presence accumulates age, confirmed absence clears it, and a command failure, truncated output, or incomplete parse is unknown. An unknown run neither evaluates a stale alert nor loses the earlier `first_seen` value.
+The pending count remains informational until it reaches `PENDING_ALERT_DAYS`. DNF's high-severity subtotal includes both `critical` and `important`. An automatic-update timer alerts whenever it is enabled but not active; an active timer with no successful-run or trigger history is treated as waiting for its first run. Patch-backlog, full-reboot, and service-restart age tracking uses three-state observations: confirmed presence accumulates age, confirmed absence clears it, and a command failure, truncated output, or incomplete parse is unknown. An unknown run neither evaluates a stale alert nor loses the earlier `first_seen` value.
 
 Run `security-update-notify doctor` anytime to inspect all seven checks, pending counts, and the SUN release result. Each item is explicitly reported as `OK`, `SKIP`, or `UNKNOWN`; unknown results return a nonzero status, while a check explicitly disabled by configuration does not fail merely because it is skipped. Diagnostics never mutate age or release-cache state. Simulated `security-update-notify test` modes and `security-update-notify run --dry-run` neither write this state nor make the periodic release request.
 
@@ -69,6 +69,12 @@ Notification options, the Telegram Bot Token, Feishu App ID, and recipient `open
 ```
 
 The installer writes it as root-only (`0600`). The Feishu App Secret is never written there: it uses an encrypted systemd credential when available, or a separate root-only `0600` file on older systemd. Normal upgrade backups do not copy the App Secret.
+
+## Installation transactions and interruption recovery
+
+Before stopping an existing unit or changing any managed path, the installer durably writes a transaction journal to the current `/var/backups/security-update-notify/<timestamp>/transaction.json`. An existing Feishu App Secret never enters that backup directory or journal; when rollback needs it, the installer creates only a fixed-name, root-only private recovery copy beside the original credential. Normal errors, cancellation, and the first `SIGHUP`, `SIGINT`, or `SIGTERM` wait for transaction rollback before the process exits. After `SIGKILL`, a kernel crash, or power loss, the next installation holds the install lock and scans every valid backup directory before parsing a new request. It fully validates journal state, the path allowlist, every snapshot, and all private recovery material before the first `systemctl` call or filesystem restoration.
+
+Package-manager invocation is a separate fail-closed boundary. Before invoking it, the journal is durably marked unsafe for automatic recovery; the transaction becomes recoverable again only after dependency-created configuration baselines and the related automatic-unit state have both been captured and persisted. If the process stops in that interval or trustworthy capture cannot be completed, the installer does not use post-hoc probes such as `dpkg --audit`, `apt-get check`, or `rpm --verifydb` to guess that rollback is safe, and it does not automatically rewrite a partially changed host. The journal and private recovery material remain in place. Later install and uninstall attempts then stop before running systemd commands or deleting files. An administrator must inspect and repair package-manager state and complete a trusted manual recovery from the journal; do not delete the locator or recovery material first.
 
 ## Backend details
 
@@ -181,6 +187,8 @@ sudo security-update-notify uninstall --purge-config
 ```
 
 Packages installed as dependencies are left in place. `--purge-config` removes SUN config, Telegram/Feishu credentials, state, upgrade backups (which may contain bot-token copies) and rotated logs, and restores apt/dnf automatic-update config when a SUN-created backup exists. The uninstaller leaves the distribution's own automatic timer in its current state: removing the monitoring tool does not actively disable security updates or override later administrator changes to that timer.
+
+Both ordinary uninstall and `--purge-config` acquire the install and runtime locks before scanning installation journals and the fixed private-recovery paths. If an interrupted transaction or private recovery material exists, uninstall fails closed before any `systemctl` call, unit removal, or configuration cleanup. Rerun the installer first for an automatically recoverable transaction. A transaction marked unsafe during the package-manager phase requires the inspection and manual repair described above and cannot be bypassed through uninstall.
 
 The uninstaller fails closed on concurrent changes that return normally: it uses directory handles, no-overwrite renames, and content/metadata revalidation, and retains `.security-update-notify-restore.*`, `.security-update-notify-purge.*`, or `.security-update-notify-conflict.*` evidence instead of overwriting or deleting an administrator-created concurrent file. `--purge-config` does not, however, promise transactional atomicity across SIGKILL, a kernel crash, or power loss; do not forcibly terminate it. If purge is interrupted, inspect those retained files and the current apt/dnf configuration before retrying.
 

@@ -38,6 +38,14 @@ type RootFS struct {
 	// Tests use this hook to replace an atomic temporary entry at the last
 	// consistency boundary. Production instances leave it nil.
 	beforeAtomicPublish func(directory *os.File, temporary string) error
+
+	// Tests use this hook to observe or fail the durability boundary after a
+	// removal. Production instances leave it nil.
+	beforeRemovalDirectorySync func(directory *os.File) error
+
+	// Tests use this hook to observe or fail the parent-directory durability
+	// boundary after mkdirat. Production instances leave it nil.
+	beforeDirectoryEntrySync func(directory *os.File, name string) error
 }
 
 type regularFileState struct {
@@ -187,8 +195,12 @@ func (f *RootFS) openDir(logicalPath string, create bool, perm fs.FileMode) (*os
 				0,
 			)
 		}
+		created := false
 		if errors.Is(openErr, fs.ErrNotExist) && create {
-			if mkdirErr := syscall.Mkdirat(int(current.Fd()), component, uint32(perm.Perm())); mkdirErr != nil && !errors.Is(mkdirErr, fs.ErrExist) {
+			mkdirErr := syscall.Mkdirat(int(current.Fd()), component, uint32(perm.Perm()))
+			if mkdirErr == nil {
+				created = true
+			} else if !errors.Is(mkdirErr, fs.ErrExist) {
 				_ = current.Close()
 				return nil, mkdirErr
 			}
@@ -210,6 +222,13 @@ func (f *RootFS) openDir(logicalPath string, create bool, perm fs.FileMode) (*os
 			_ = syscall.Close(nextFD)
 			_ = current.Close()
 			return nil, errors.New("could not create directory handle")
+		}
+		if created {
+			if err := f.syncCreatedDirectoryEntry(current, component); err != nil {
+				_ = next.Close()
+				_ = current.Close()
+				return nil, err
+			}
 		}
 		_ = current.Close()
 		current = next

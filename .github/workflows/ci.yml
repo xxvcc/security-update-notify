@@ -481,14 +481,14 @@ jobs:
       max-parallel: 3
       matrix:
         image:
-          - 'rockylinux/rockylinux:8-minimal'
-          - 'rockylinux/rockylinux:9-minimal'
-          - 'rockylinux/rockylinux:10-minimal'
-          - 'almalinux:8-minimal'
-          - 'almalinux:9-minimal'
-          - 'almalinux:10-minimal'
-          - 'fedora:43'
-          - 'fedora:44'
+          - 'rockylinux/rockylinux:8-minimal@sha256:6d2ede107b4f005a638728711dae05d5fbbfd8abd521cecf5ab61196b361c965'
+          - 'rockylinux/rockylinux:9-minimal@sha256:e1d0a9f5ed99d52e7faf03afe7ee32e48b231c4dd9586808b3d1aedf894dff04'
+          - 'rockylinux/rockylinux:10-minimal@sha256:bc5c1e7a2ec7f4bcef1e51c7f0ebb2d43f05409e0108cdd34f693921d0604360'
+          - 'almalinux:8-minimal@sha256:4178368be5c3b49bd1c5708e3a217e837eefa6576226524fe11ae98cb0004846'
+          - 'almalinux:9-minimal@sha256:b0d6d72e3fc19c51119e3dbeee5a7211eba934d8dcf7d3ecddadf96b681645ed'
+          - 'almalinux:10-minimal@sha256:bafd259fb7b0475eed28376ddddea19f209e24efafc9eb21f4e9d5ed9825d2ef'
+          - 'fedora:43@sha256:762d73ba1c455232b0272c5d445a34f36c4b9f421cbc05ce8102552325b6a222'
+          - 'fedora:44@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -530,8 +530,8 @@ jobs:
       fail-fast: false
       matrix:
         image:
-          - 'debian:11'
-          - 'ubuntu:20.04'
+          - 'debian:11@sha256:99cdf7792e25416bd801861ccd8e2fb27fb527b25e8d9a8704ebc3ead2015675'
+          - 'ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -569,12 +569,12 @@ jobs:
       max-parallel: 3
       matrix:
         image:
-          - 'quay.io/centos/centos:stream9'
-          - 'quay.io/centos/centos:stream10'
-          - 'oraclelinux:8-slim'
-          - 'oraclelinux:9-slim'
-          - 'oraclelinux:10-slim'
-          - 'amazonlinux:2023'
+          - 'quay.io/centos/centos:stream9@sha256:e389f09f8af8baade5be5de6dbf70d8b5975ddc54641858f35552ea3c98ac872'
+          - 'quay.io/centos/centos:stream10@sha256:ed84a6789c59b1b132e7aa5994d98135938b3af329a855ff85be083a0956cb3e'
+          - 'oraclelinux:8-slim@sha256:aaef2b765b654067ef27e101dfb15c24df2133967575dfcf66bc968ff815c264'
+          - 'oraclelinux:9-slim@sha256:33bcb689f7c8e6bd15bcee9a253538bc0b7cafeadb8b1a9d6ac90669c4497ce3'
+          - 'oraclelinux:10-slim@sha256:afab39c390428a4fa3c909038c718dd893bc6b06b85bcad86c998fa9d0597c10'
+          - 'amazonlinux:2023@sha256:694092ae18877ed4e3cb9b643759ba95df1f12af12528fefa18f60f79d4c1568'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -615,11 +615,11 @@ jobs:
       fail-fast: false
       matrix:
         image:
-          - debian:12
-          - debian:13
-          - ubuntu:22.04
-          - ubuntu:24.04
-          - ubuntu:26.04
+          - 'debian:12@sha256:813017f3d62be4b5891a7acca6a01bdcd4b8513daa81b1ab99d3a50385b26931'
+          - 'debian:13@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958'
+          - 'ubuntu:22.04@sha256:3b06811b2afd352be909dd088a004166d665dc76d38b13eada33522a9d915c6f'
+          - 'ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea'
+          - 'ubuntu:26.04@sha256:678c6550cc43645e08669028bc177f50be4e7c5b8cca677067b1914d4afc7a03'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -10,13 +10,16 @@ import (
 	"unsafe"
 )
 
-func (f *RootFS) Mkdir(logicalPath string, perm fs.FileMode) error {
+func (f *RootFS) Mkdir(logicalPath string, perm fs.FileMode) (returnErr error) {
 	directory, name, err := f.openParent(logicalPath)
 	if err != nil {
 		return err
 	}
-	defer directory.Close()
-	return syscall.Mkdirat(int(directory.Fd()), name, uint32(perm.Perm()))
+	defer func() { returnErr = errors.Join(returnErr, directory.Close()) }()
+	if err := syscall.Mkdirat(int(directory.Fd()), name, uint32(perm.Perm())); err != nil {
+		return err
+	}
+	return f.syncCreatedDirectoryEntry(directory, name)
 }
 
 func (f *RootFS) MkdirAll(logicalPath string, perm fs.FileMode) error {
@@ -25,6 +28,24 @@ func (f *RootFS) MkdirAll(logicalPath string, perm fs.FileMode) error {
 		return err
 	}
 	return directory.Close()
+}
+
+func (f *RootFS) SyncDir(logicalPath string) error {
+	directory, err := f.openDir(logicalPath, false, 0)
+	if err != nil {
+		return err
+	}
+	syncErr := directory.Sync()
+	return errors.Join(syncErr, directory.Close())
+}
+
+func (f *RootFS) syncCreatedDirectoryEntry(directory *os.File, name string) error {
+	if f.beforeDirectoryEntrySync != nil {
+		if err := f.beforeDirectoryEntrySync(directory, name); err != nil {
+			return err
+		}
+	}
+	return directory.Sync()
 }
 
 func (f *RootFS) ReadDir(logicalPath string) ([]fs.DirEntry, error) {

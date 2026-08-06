@@ -522,7 +522,7 @@ func TestDependencyPackageProbeTruncationIsTreatedAsMissing(t *testing.T) {
 			attempted, err := installer.installDependencies(context.Background(), plan, func(_ context.Context, got DependencyRequest) (bool, error) {
 				request = got
 				return false, nil
-			})
+			}, func() error { return nil })
 			if attempted || err == nil || !strings.Contains(err.Error(), "declined") {
 				t.Fatalf("attempted=%v error=%v, want pre-install decline", attempted, err)
 			}

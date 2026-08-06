@@ -45,6 +45,7 @@ type backup struct {
 	paths                     []string
 	snapshots                 map[string]nodeSnapshot
 	skipDependencyCapturePath map[string]bool
+	transaction               *installTransaction
 }
 
 type privateSnapshot struct {
@@ -56,6 +57,9 @@ type privateSnapshot struct {
 func (i *Installer) createBackup() (_ *backup, returnErr error) {
 	if err := i.ensureManagedDir(BackupRoot, 0o700); err != nil {
 		return nil, failure("create backup root", err)
+	}
+	if err := i.syncDirectoryChain(BackupRoot); err != nil {
+		return nil, failure("sync backup directory chain", err)
 	}
 	stamp := i.now().Format("20060102150405")
 	var dir string
@@ -164,6 +168,14 @@ func (i *Installer) captureDependencyDefaults(b *backup) error {
 		if source == aptPeriodicPath || source == dnfAutomaticPath {
 			snapshot.preserveCurrent = true
 			b.snapshots[source] = snapshot
+			// Persist the non-destructive fallback before copying. A crash or
+			// copy failure must never leave recovery believing that this
+			// package-owned default is an installer-created path to delete.
+			if b.transaction != nil {
+				if err := b.transaction.syncBackup(b); err != nil {
+					return err
+				}
+			}
 		}
 		if err := i.copyNode(source, backupPath); err != nil {
 			return failure("capture dependency-created default", err)
@@ -190,11 +202,6 @@ func (i *Installer) keepPathAbsentOnRollback(b *backup, source string) error {
 	if !tracked {
 		return failure("update transaction baseline", fmt.Errorf("path is not tracked: %s", source))
 	}
-	if snapshot.backupPath != "" {
-		if err := i.fs.Remove(snapshot.backupPath); err != nil {
-			return failure("remove superseded transaction snapshot", err)
-		}
-	}
 	b.snapshots[source] = nodeSnapshot{}
 	logical := strings.TrimPrefix(source, "/")
 	manifest := b.manifest[:0]
@@ -204,7 +211,19 @@ func (i *Installer) keepPathAbsentOnRollback(b *backup, source string) error {
 		}
 	}
 	b.manifest = manifest
-	return i.writeManifest(b)
+	// Publish the new logical baseline before deleting its superseded bytes. If
+	// the process stops between these operations, recovery ignores the harmless
+	// extra backup instead of trying to restore a file that was already adopted
+	// as absent.
+	if err := i.writeManifest(b); err != nil {
+		return err
+	}
+	if snapshot.backupPath != "" {
+		if err := i.fs.Remove(snapshot.backupPath); err != nil {
+			return failure("remove superseded transaction snapshot", err)
+		}
+	}
+	return nil
 }
 
 func (i *Installer) writeManifest(b *backup) error {
@@ -214,6 +233,9 @@ func (i *Installer) writeManifest(b *backup) error {
 	}
 	if err := i.fs.WriteFileAtomic(path.Join(b.dir, "manifest"), data, 0o600); err != nil {
 		return failure("write backup manifest", err)
+	}
+	if b.transaction != nil {
+		return b.transaction.syncBackup(b)
 	}
 	return nil
 }
@@ -279,7 +301,10 @@ func (i *Installer) copyNode(source, destination string) error {
 		if err := i.fs.Remove(destination); err != nil {
 			return err
 		}
-		return i.fs.Symlink(target, destination)
+		if err := i.fs.Symlink(target, destination); err != nil {
+			return err
+		}
+		return i.fs.SyncDir(path.Dir(destination))
 	}
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("managed path is not a regular file or symlink: %s", source)
@@ -290,7 +315,77 @@ func (i *Installer) copyNode(source, destination string) error {
 	return i.fs.CopyTrustedRegularFileAtomic(source, destination, 256<<20, i.rootOwnerUID)
 }
 
+func (i *Installer) validateSnapshotCopySource(logicalPath, backupPath string) error {
+	info, err := i.fs.Lstat(backupPath)
+	if err != nil {
+		return fmt.Errorf("inspect snapshot for %s: %w", logicalPath, err)
+	}
+	if info.Mode()&fs.ModeSymlink != 0 {
+		if _, err := i.fs.Readlink(backupPath); err != nil {
+			return fmt.Errorf("read symlink snapshot for %s: %w", logicalPath, err)
+		}
+		finalInfo, err := i.fs.Lstat(backupPath)
+		if err != nil || !sameRemovalEntry(info, finalInfo) {
+			return errors.Join(fmt.Errorf("symlink snapshot for %s changed while validating", logicalPath), err)
+		}
+		return nil
+	}
+	if err := i.fs.ValidateTrustedRegularFile(backupPath, 256<<20, i.rootOwnerUID); err != nil {
+		return fmt.Errorf("validate snapshot copy source for %s: %w", logicalPath, err)
+	}
+	return nil
+}
+
+func (i *Installer) preflightRollback(b *backup, private map[string]privateSnapshot) error {
+	if b == nil {
+		return errors.New("rollback backup is missing")
+	}
+	seen := make(map[string]bool, len(b.paths))
+	for _, destination := range b.paths {
+		snapshot, ok := b.snapshots[destination]
+		if !ok || seen[destination] {
+			return fmt.Errorf("rollback snapshot is missing or duplicated: %s", destination)
+		}
+		seen[destination] = true
+		if snapshot.preserveCurrent {
+			if snapshot.exists || destination != aptPeriodicPath && destination != dnfAutomaticPath {
+				return fmt.Errorf("invalid preserve-current rollback snapshot: %s", destination)
+			}
+			continue
+		}
+		if !snapshot.exists {
+			continue
+		}
+		expected := path.Join(b.dir, strings.TrimPrefix(destination, "/"))
+		if snapshot.backupPath != expected {
+			return fmt.Errorf("rollback snapshot path does not match %s", destination)
+		}
+		if err := i.validateSnapshotCopySource(destination, expected); err != nil {
+			return err
+		}
+	}
+	for _, credentialPath := range []string{FeishuEncryptedCredPath, FeishuPlainCredentialPath} {
+		snapshot, ok := private[credentialPath]
+		if !ok {
+			return fmt.Errorf("private rollback snapshot is missing: %s", credentialPath)
+		}
+		if !snapshot.exists {
+			if len(snapshot.data) != 0 || snapshot.mode != 0 {
+				return fmt.Errorf("absent private rollback snapshot has state: %s", credentialPath)
+			}
+			continue
+		}
+		if snapshot.mode.Perm()&0o077 != 0 || int64(len(snapshot.data)) > privateLimit(credentialPath) {
+			return fmt.Errorf("private rollback snapshot is not protected or exceeds its limit: %s", credentialPath)
+		}
+	}
+	return nil
+}
+
 func (i *Installer) restoreBackup(b *backup, private map[string]privateSnapshot, timer timerSnapshot, automaticUnits []unitSnapshot) error {
+	if err := i.preflightRollback(b, private); err != nil {
+		return failure("preflight rollback", err)
+	}
 	var errs []error
 	systemctlAvailable := i.runner.LookPath("systemctl")
 	unitRestoreAllowed := systemctlAvailable
@@ -316,6 +411,13 @@ func (i *Installer) restoreBackup(b *backup, private map[string]privateSnapshot,
 			unitRestoreAllowed = false
 			continue
 		}
+		if !snapshot.exists {
+			if err := i.syncExistingDirectory(path.Dir(destination)); err != nil {
+				errs = append(errs, failure("sync removed path during rollback: "+destination, err))
+				unitRestoreAllowed = false
+			}
+			continue
+		}
 		if snapshot.exists {
 			parentMode := fs.FileMode(0o755)
 			if strings.HasPrefix(destination, "/etc/security-update-notify/") {
@@ -337,6 +439,13 @@ func (i *Installer) restoreBackup(b *backup, private map[string]privateSnapshot,
 		if err := i.fs.Remove(destination); err != nil {
 			errs = append(errs, failure("remove changed credential during rollback: "+destination, err))
 			unitRestoreAllowed = false
+			continue
+		}
+		if !snapshot.exists {
+			if err := i.syncExistingDirectory(path.Dir(destination)); err != nil {
+				errs = append(errs, failure("sync removed credential during rollback: "+destination, err))
+				unitRestoreAllowed = false
+			}
 			continue
 		}
 		if snapshot.exists {
