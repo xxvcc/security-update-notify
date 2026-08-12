@@ -1189,6 +1189,10 @@ func TestInstallSupportsFedoraStandardLocalSbinAlias(t *testing.T) {
 	if _, err := root.Lstat("/usr/local/bin/security-update-notify"); err != nil {
 		t.Fatalf("physical runtime target missing: %v", err)
 	}
+	assertCommandAliasTarget(t, root, AliasTarget)
+	if target, err := root.Readlink("/usr/local/bin/sun"); err != nil || target != AliasTarget {
+		t.Fatalf("physical command alias target=%q err=%v want=%q", target, err, AliasTarget)
+	}
 }
 
 func TestManagedDirectoryMustBeRootOwnedBeforePermissionsChange(t *testing.T) {
@@ -1559,7 +1563,7 @@ func TestCurrentInstalledVersionRejectsUnsafeRuntimeMetadata(t *testing.T) {
 			prepare func(*testing.T, *RootFS)
 		}{name: "wrong owner", prepare: func(t *testing.T, root *RootFS) {
 			if err := os.Chown(filepath.Join(root.Root, strings.TrimPrefix(BinaryPath, "/")), 1, 1); err != nil {
-				t.Fatal(err)
+				t.Skipf("filesystem does not allow changing fixture ownership: %v", err)
 			}
 		}})
 	}

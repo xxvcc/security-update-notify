@@ -48,6 +48,7 @@
 
 ```text
 /usr/local/sbin/security-update-notify
+/usr/local/sbin/sun -> security-update-notify                              # 安装时路径未被占用
 /etc/security-update-notify/telegram.env
 /etc/systemd/system/security-update-notify.service
 /etc/systemd/system/security-update-notify.service.d/credentials.conf  # 使用加密飞书凭据时
@@ -130,6 +131,46 @@ apply_updates = yes
 reboot = never
 ```
 
+## 交互菜单
+
+安装后推荐通过短命令打开菜单；完整命令始终可作为回退入口：
+
+```bash
+sudo sun
+sudo security-update-notify menu
+```
+
+可用 `--lang zh` 或 `--lang en` 为本次菜单显式选择界面语言，例如
+`sudo security-update-notify menu --lang en`。菜单提供预览本次检查、立即检查、系统诊断、修改通知设置、
+测试通知、检查新版本、升级、卸载、切换界面语言和退出。界面语言切换只影响当前菜单及其分发的动作；
+持久通知语言仍由 `NOTIFY_LANG` 配置决定。
+
+菜单有意采用严格的交互边界：有效 UID 必须为 root，且标准输入、标准输出和标准错误都必须连接真实 TTY。
+管道、重定向、cron、systemd unit 或无终端 SSH 调用会在读取任何选择前被拒绝。裸调用
+`security-update-notify` 仍保持既有的“运行一次检查”语义，不会因是否连接 TTY 而改变；脚本、cron 和
+systemd 应显式调用 `security-update-notify run`。安装的 systemd service 也使用这一显式 `run` 子命令。
+
+菜单中的只读或日常动作成功后会回到提示符，空行可重新显示完整菜单；动作失败会立即以该动作的原退出码
+退出。修改通知设置、升级或卸载一旦真正分发到相应子命令，菜单就会以该子命令的退出码退出，避免在配置
+改变、二进制被替换或删除后继续从旧进程接受特权操作。升级或卸载在菜单自己的确认处取消时不会分发动作，
+不会产生该动作的副作用，并会回到菜单。
+
+会产生外部效果或改变主机的入口使用 fail-closed 确认：立即检查和发送测试通知默认为 `N`；升级必须输入
+完整的 `YES`；卸载但保留配置必须输入完整的 `YES`。彻底清理会恢复 SUN 受管的 apt/dnf 自动更新配置，
+并删除 SUN 配置、通知凭据、状态、升级备份和日志，必须输入完整的 `PURGE`。文件结束符（EOF，例如提示处按
+`Ctrl-D`）视为取消并返回 `2`；`Ctrl-C` 按信号终止，shell 通常
+观察到退出状态 `130`。若动作已经开始，它仍遵循对应子命令已有的锁、事务回滚和退出码语义。
+
+安装器将短命令实现为 `/usr/local/sbin/sun -> security-update-notify` 的相对符号链接。路径不存在时创建，
+已经是这一精确链接时复用；普通文件、目录或指向其他目标的链接都不会被覆盖，核心安装仍可完成但会显示
+警告。卸载时只删除当时仍精确指向 `security-update-notify` 的相对链接；其他文件、目录或链接都会保留。
+发生冲突时使用 `sudo security-update-notify menu`。
+
+不支持直接降级到尚未提供交互菜单的旧版本。手工替换为这类旧版二进制时，现有 `sun` 链接可能继续存在，
+但旧版不会根据调用名进入菜单；此时 `sudo sun` 会按旧版裸命令语义立即执行一次检查，可能发送通知并写入
+状态。降级前应使用当前版本正常卸载；若已手工降级，请停止使用 `sun`，核对它仍是上述精确相对链接后再
+删除，并改用该旧版本文档中的完整命令。
+
 ## 日常操作
 
 查看 timer：
@@ -190,6 +231,15 @@ sudo security-update-notify uninstall --purge-config
 普通卸载与 `--purge-config` 都会先取得安装锁和运行锁，再扫描安装事务日志及固定的私密恢复路径。只要发现中断事务或私密恢复材料，卸载器就会在任何 `systemctl` 调用、unit 删除或配置清理之前失败关闭。可自动恢复的事务应先重新运行安装器完成回滚；包管理器阶段留下的“不适合自动恢复”事务必须按上文检查和人工修复，不能用卸载绕过。
 
 卸载器会对正常返回的并发变化失败关闭：它使用目录句柄、无覆盖 rename 和内容/元数据复验，并保留 `.security-update-notify-restore.*`、`.security-update-notify-purge.*` 或 `.security-update-notify-conflict.*` 现场，避免覆盖或删除管理员同时创建的文件。但 `--purge-config` 不承诺跨 SIGKILL、内核崩溃或掉电中间点的事务原子性；执行时不要强制终止。若 purge 异常中断，请先检查这些保留文件和当前 apt/dnf 配置，不要在未确认现场前反复重试。
+
+普通文件和目录删除还可能留下 `.security-update-notify-remove-pending.*`、旧格式
+`.security-update-notify-remove.*`，或带身份声明的 `.security-update-notify-remove-owned.*`。只有实际打开的父目录
+仍由 root 所有且禁止 group/other write 时，才视为可信私有父目录；重试只会自动删除稳定身份仍匹配的 owned
+项。父目录不再满足这些条件、pending 或旧格式项都会原样保留并失败关闭。`/var/log` 是共享父目录，即使 owned
+项的身份仍匹配，任何遗留隔离项也会保留并失败关闭，不能把可伪造
+的名称当作跨进程所有权证明；没有遗留隔离项时，本次 purge 仍会正常删除 SUN 日志和轮转日志。不要按名称盲删
+保留项。先核对报错中的原路径与隔离路径、inode、类型、所有权、内容及可用备份，再由管理员决定恢复原名或
+删除；无法确认时保留现场并从可信备份恢复。
 
 ## 相关文档
 

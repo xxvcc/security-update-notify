@@ -7,7 +7,7 @@ After=network-online.target
 Type=oneshot
 Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
 TimeoutStartSec=15min
-ExecStart=/usr/local/sbin/security-update-notify
+ExecStart=/usr/local/sbin/security-update-notify run
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true

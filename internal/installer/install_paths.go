@@ -254,6 +254,110 @@ func (i *Installer) installFiles(ctx context.Context, plan installPlan, options 
 	return storage, nil
 }
 
+func (i *Installer) installCommandAlias() string {
+	info, err := i.fs.Lstat(AliasPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		if err := i.fs.Symlink(AliasTarget, AliasPath); err == nil {
+			return i.verifyCreatedCommandAlias()
+		} else if !errors.Is(err, fs.ErrExist) {
+			return commandAliasUnavailableWarning(err)
+		}
+		info, err = i.fs.Lstat(AliasPath)
+	}
+	if err != nil {
+		return commandAliasUnavailableWarning(err)
+	}
+	verified, matches, inspectErr := i.inspectStableCommandAlias(info)
+	if inspectErr != nil {
+		return commandAliasUnavailableWarning(inspectErr)
+	}
+	if !matches {
+		return commandAliasConflictWarning()
+	}
+	syncErr := i.fs.SyncDir(path.Dir(AliasPath))
+	_, matches, inspectErr = i.inspectStableCommandAlias(verified)
+	if inspectErr != nil {
+		return commandAliasUnavailableWarning(inspectErr)
+	}
+	if !matches {
+		return commandAliasConflictWarning()
+	}
+	if syncErr != nil {
+		return commandAliasReuseDurabilityWarning(syncErr)
+	}
+	return ""
+}
+
+func (i *Installer) verifyCreatedCommandAlias() string {
+	created, err := i.fs.Lstat(AliasPath)
+	if err != nil {
+		return commandAliasUnavailableWarning(err)
+	}
+	verified, matches, inspectErr := i.inspectStableCommandAlias(created)
+	if inspectErr != nil {
+		return commandAliasUnavailableWarning(inspectErr)
+	}
+	if !matches {
+		return commandAliasConflictWarning()
+	}
+	syncErr := i.fs.SyncDir(path.Dir(AliasPath))
+	_, matches, inspectErr = i.inspectStableCommandAlias(verified)
+	if inspectErr != nil {
+		return commandAliasUnavailableWarning(inspectErr)
+	}
+	if !matches {
+		return commandAliasConflictWarning()
+	}
+	if syncErr != nil {
+		return commandAliasDurabilityWarning(syncErr)
+	}
+	return ""
+}
+
+func (i *Installer) inspectStableCommandAlias(info fs.FileInfo) (fs.FileInfo, bool, error) {
+	if info == nil || info.Mode()&fs.ModeSymlink == 0 {
+		return info, false, nil
+	}
+	target, err := i.fs.Readlink(AliasPath)
+	if err != nil {
+		finalInfo, statErr := i.fs.Lstat(AliasPath)
+		if errors.Is(statErr, fs.ErrNotExist) {
+			return nil, false, nil
+		}
+		if statErr != nil {
+			return nil, false, errors.Join(err, statErr)
+		}
+		if finalInfo.Mode()&fs.ModeSymlink == 0 || !sameRemovalEntry(info, finalInfo) {
+			return finalInfo, false, nil
+		}
+		return finalInfo, false, err
+	}
+	finalInfo, err := i.fs.Lstat(AliasPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return finalInfo, sameRemovalEntry(info, finalInfo) && target == AliasTarget, nil
+}
+
+func commandAliasConflictWarning() string {
+	return fmt.Sprintf("command alias %s was not installed because the path was occupied or changed concurrently; the installer did not overwrite it", AliasPath)
+}
+
+func commandAliasUnavailableWarning(err error) string {
+	return fmt.Sprintf("command alias %s could not be installed: %s; the core installation is complete", AliasPath, err)
+}
+
+func commandAliasDurabilityWarning(err error) string {
+	return fmt.Sprintf("command alias %s was created, but its durability could not be confirmed: %s; the core installation is complete", AliasPath, err)
+}
+
+func commandAliasReuseDurabilityWarning(err error) string {
+	return fmt.Sprintf("command alias %s already exists with the expected target, but its durability could not be confirmed: %s; the core installation is complete", AliasPath, err)
+}
+
 func (i *Installer) ensureLogFile() (returnErr error) {
 	file, err := i.fs.OpenFileNoFollow(LogPath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if errors.Is(err, fs.ErrNotExist) {

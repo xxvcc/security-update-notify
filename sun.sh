@@ -95,6 +95,7 @@ INSTALL_ARGS=()
 CURL_RETRY_OPTIONS=()
 readonly MAX_METADATA_BYTES=1048576
 readonly MAX_ARCHIVE_BYTES=268435456
+readonly MAX_TTY_INPUT_BYTES=1024
 readonly SYSTEM_TEMP_BASE=/var/tmp
 
 # 双语输出助手：sun.sh 运行在“选择语言”之前，自身输出默认 zh；
@@ -104,6 +105,46 @@ readonly SYSTEM_TEMP_BASE=/var/tmp
 # (otherwise the menu prompts for it as the first step).
 m()  { if [ "${UI_LANG:-zh}" = en ]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
 say(){ if [ "${UI_LANG:-zh}" = en ]; then printf '%s\n' "$2"; else printf '%s\n' "$1"; fi; }
+
+read_tty_line() {
+  local prompt="$1" value
+  while true; do
+    printf '%s' "$prompt" >&2
+    value=""
+    # Linux canonical TTY input is kernel-bounded; keep the smaller application
+    # limit so every accepted menu answer also has an explicit contract.
+    if ! IFS= read -r value < /dev/tty; then
+      return 2
+    fi
+    if [[ "${#value}" -le "$MAX_TTY_INPUT_BYTES" ]]; then
+      SUN_TTY_LINE="$value"
+      return 0
+    fi
+    say "输入过长，请重新输入。" "Input is too long; try again." >&2
+  done
+}
+
+confirm_tty_exact() {
+  local token="$1" prompt="$2"
+  read_tty_line "$prompt" || return 2
+  if [[ "$SUN_TTY_LINE" == "$token" ]]; then
+    return 0
+  fi
+  say "确认内容不匹配；已取消。" "Confirmation did not match; cancelled." >&2
+  return 1
+}
+
+confirm_tty_yes_no() {
+  local prompt="$1"
+  while true; do
+    read_tty_line "$prompt" || return 2
+    case "$SUN_TTY_LINE" in
+      y|Y) return 0 ;;
+      ''|n|N) return 1 ;;
+      *) say "无效输入，请输入 y 或 n。" "Invalid input; enter y or n." >&2 ;;
+    esac
+  done
+}
 
 usage() {
   if [ "${UI_LANG:-zh}" = en ]; then
@@ -591,10 +632,11 @@ if [[ -z "${UI_LANG:-}" ]]; then
       printf '%s\n' "请选择语言 / Choose a language:"
       printf '%s\n' "  1) 中文 (default)"
       printf '%s\n' "  2) English"
-      if ! read -r -p "[1]: " sun_lang_choice < /dev/tty; then
+      if ! read_tty_line "[1]: "; then
         say "已取消。" "Cancelled." >&2
         exit 2
       fi
+      sun_lang_choice="$SUN_TTY_LINE"
       case "${sun_lang_choice:-1}" in
         1|'') UI_LANG=zh; break ;;
         2) UI_LANG=en; break ;;
@@ -853,10 +895,11 @@ run_menu() {
     say "3) 卸载" "3) Uninstall"
     say "4) 检查或诊断" "4) Check or diagnose"
     say "0) 退出" "0) Exit"
-    if ! read -r -p "$(m '请输入选项 [1-4/0]: ' 'Enter choice [1-4/0]: ')" choice < /dev/tty; then
+    if ! read_tty_line "$(m '请输入选项 [1-4/0]: ' 'Enter choice [1-4/0]: ')"; then
       say "已取消。" "Cancelled." >&2
       exit 2
     fi
+    choice="$SUN_TTY_LINE"
     case "$choice" in
       1) run_go install "${INSTALL_ARGS[@]}" ;;
       2)
@@ -873,13 +916,30 @@ run_menu() {
         say "1) 只移除程序，保留配置" "1) Remove program only, keep configuration"
         say "2) 移除程序并删除配置和状态" "2) Remove program and delete configuration/state"
         say "0) 返回" "0) Back"
-        if ! read -r -p "$(m '请输入选项 [1/2/0]: ' 'Enter choice [1/2/0]: ')" uninstall_choice < /dev/tty; then
+        if ! read_tty_line "$(m '请输入选项 [1/2/0]: ' 'Enter choice [1/2/0]: ')"; then
           say "已取消。" "Cancelled." >&2
           exit 2
         fi
+        uninstall_choice="$SUN_TTY_LINE"
         case "$uninstall_choice" in
-          1) run_go uninstall ;;
-          2) run_go uninstall --purge-config ;;
+          1)
+            if confirm_tty_exact YES "$(m '输入 YES 确认卸载并保留配置: ' 'Type YES to uninstall and keep configuration: ')"; then
+              run_go uninstall
+            else
+              confirm_rc=$?
+              [[ "$confirm_rc" -eq 1 ]] || { say "已取消。" "Cancelled." >&2; exit 2; }
+              continue
+            fi
+            ;;
+          2)
+            if confirm_tty_exact PURGE "$(m '这会恢复 SUN 受管的 apt/dnf 自动更新配置，并删除 SUN 配置、通知凭据、状态、升级备份和日志。输入 PURGE 确认: ' 'This restores SUN-managed apt/dnf automatic-update configuration and removes SUN configuration, notification credentials, state, upgrade backups, and logs. Type PURGE to confirm: ')"; then
+              run_go uninstall --purge-config
+            else
+              confirm_rc=$?
+              [[ "$confirm_rc" -eq 1 ]] || { say "已取消。" "Cancelled." >&2; exit 2; }
+              continue
+            fi
+            ;;
           0|'') continue ;;
           *) say "无效选项" "Invalid choice" >&2 ;;
         esac
@@ -892,15 +952,32 @@ run_menu() {
         say "3) 发送普通测试消息" "3) Send normal test message"
         say "4) 发送模拟重启提醒（不会真的重启）" "4) Send simulated reboot alert (does not reboot)"
         say "0) 返回" "0) Back"
-        if ! read -r -p "$(m '请输入选项 [1/2/3/4/0]: ' 'Enter choice [1/2/3/4/0]: ')" check_choice < /dev/tty; then
+        if ! read_tty_line "$(m '请输入选项 [1/2/3/4/0]: ' 'Enter choice [1/2/3/4/0]: ')"; then
           say "已取消。" "Cancelled." >&2
           exit 2
         fi
+        check_choice="$SUN_TTY_LINE"
         case "$check_choice" in
           1) run_go doctor ;;
           2) run_go check-upgrade ;;
-          3) run_go test --send-test --no-dedupe ;;
-          4) run_go test --simulate-reboot --no-dedupe ;;
+          3)
+            if confirm_tty_yes_no "$(m '此操作将发送测试通知，是否继续？[y/N]: ' 'This action will send a test notification. Continue? [y/N]: ')"; then
+              run_go test --send-test --no-dedupe
+            else
+              confirm_rc=$?
+              [[ "$confirm_rc" -eq 1 ]] || { say "已取消。" "Cancelled." >&2; exit 2; }
+              continue
+            fi
+            ;;
+          4)
+            if confirm_tty_yes_no "$(m '此操作将发送测试通知，是否继续？[y/N]: ' 'This action will send a test notification. Continue? [y/N]: ')"; then
+              run_go test --simulate-reboot --no-dedupe
+            else
+              confirm_rc=$?
+              [[ "$confirm_rc" -eq 1 ]] || { say "已取消。" "Cancelled." >&2; exit 2; }
+              continue
+            fi
+            ;;
           0|'') continue ;;
           *) say "无效选项" "Invalid choice" >&2 ;;
         esac

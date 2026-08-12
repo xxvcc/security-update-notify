@@ -146,6 +146,15 @@ assert_same_file() {
   [[ "$left_sha" == "$right_sha" ]]
 }
 
+assert_sun_alias() {
+  [[ -L /usr/local/sbin/sun ]]
+  [[ "$(readlink -- /usr/local/sbin/sun)" == security-update-notify ]]
+}
+
+assert_sun_alias_absent() {
+  [[ ! -e /usr/local/sbin/sun && ! -L /usr/local/sbin/sun ]]
+}
+
 version="$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' "$ROOT/VERSION")"
 [[ -n "$version" && "$(wc -l <"$ROOT/VERSION")" -eq 1 ]]
 
@@ -428,6 +437,7 @@ PY
     fi
   done
   /usr/local/sbin/security-update-notify --version
+  assert_sun_alias
 
   binary_sha="$(sha256sum /usr/local/sbin/security-update-notify | awk '{print $1}')"
   config_sha="$(sha256sum /etc/security-update-notify/telegram.env | awk '{print $1}')"
@@ -455,9 +465,11 @@ PY
   grep -Fxq "HOST_LABEL='rpm-container-upgraded'" /etc/security-update-notify/telegram.env
   [[ ! -e /etc/dnf/automatic.conf.security-update-notify.dependency-default.bak ]]
   assert_automatic_timer_symlinks
+  assert_sun_alias
 
   PATH="$fixture_path" "$SUN_INSTALL_BINARY" uninstall --purge-config --lang en
   [[ ! -e /usr/local/sbin/security-update-notify ]]
+  assert_sun_alias_absent
   [[ ! -e /etc/security-update-notify ]]
   [[ ! -e /var/lib/security-update-notify ]]
   [[ ! -e /var/backups/security-update-notify ]]
@@ -551,8 +563,10 @@ EOF
   grep -Fq 'reboot = never' /etc/dnf/automatic.conf
   [[ -e "$fake_systemd_state/enabled/security-update-notify.timer" ]]
   assert_automatic_timer_symlinks
+  assert_sun_alias
 
   PATH="$fixture_path" "$SUN_INSTALL_BINARY" uninstall --purge-config --lang en
+  assert_sun_alias_absent
   assert_same_file "$legacy_vendor" /etc/dnf/automatic.conf
   [[ ! -e /etc/dnf/automatic.conf.security-update-notify.bak ]]
   if compgen -G '/etc/dnf/automatic.conf.security-update-notify.bak.*' >/dev/null; then

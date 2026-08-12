@@ -16,6 +16,8 @@ import (
 
 const (
 	BinaryPath                = "/usr/local/sbin/security-update-notify"
+	AliasPath                 = "/usr/local/sbin/sun"
+	AliasTarget               = "security-update-notify"
 	ConfigPath                = "/etc/security-update-notify/telegram.env"
 	ServicePath               = "/etc/systemd/system/security-update-notify.service"
 	TimerPath                 = "/etc/systemd/system/security-update-notify.timer"
@@ -243,6 +245,7 @@ type Result struct {
 	CredentialStorage string
 	PostInstallTest   *CommandResult
 	PostInstallDoctor *CommandResult
+	Warnings          []string
 }
 
 // Dependencies replaces every host-specific boundary in tests.

@@ -83,8 +83,10 @@ type localizedInputError struct {
 func (e *localizedInputError) Error() string { return e.message }
 func (e *localizedInputError) Unwrap() error { return e.cause }
 
-func defaultInstallCommand() *installCommand {
-	reader := bufio.NewReader(os.Stdin)
+func defaultInstallCommandWithReader(reader *bufio.Reader) *installCommand {
+	if reader == nil {
+		reader = bufio.NewReader(os.Stdin)
+	}
 	return &installCommand{
 		console: installConsole{
 			in: reader, out: os.Stdout, errOut: os.Stderr,
@@ -102,16 +104,16 @@ func defaultInstallCommand() *installCommand {
 	}
 }
 
-func installMode(_ string, args []string) int {
-	return defaultInstallCommand().run(args, false)
+func installModeWithReader(_ string, args []string, reader *bufio.Reader) int {
+	return defaultInstallCommandWithReader(reader).run(args, false)
 }
 
-func configureMode(_ string, args []string) int {
+func configureModeWithReader(_ string, args []string, reader *bufio.Reader) int {
 	if len(args) == 0 || args[0] != "notifications" {
 		fmt.Fprintln(os.Stderr, "Usage: security-update-notify configure notifications [install options]")
 		return 2
 	}
-	return defaultInstallCommand().run(args[1:], true)
+	return defaultInstallCommandWithReader(reader).run(args[1:], true)
 }
 
 func (c *installCommand) run(rawArgs []string, configure bool) int {
@@ -232,6 +234,9 @@ func (c *installCommand) run(rawArgs []string, configure bool) int {
 	c.say(c.console.out, parsed.lang, "配置文件: "+defaultEnvFile, "Config: "+defaultEnvFile)
 	if result.BackupDir != "" {
 		c.say(c.console.out, parsed.lang, "事务备份: "+result.BackupDir, "Transaction backup: "+result.BackupDir)
+	}
+	for _, warning := range result.Warnings {
+		fmt.Fprintf(c.console.errOut, "%s: %s\n", c.pick(parsed.lang, "警告", "Warning"), safeCLIText(warning))
 	}
 	c.reportPostInstallTest(parsed.lang, result.PostInstallTest)
 	c.reportPostInstallDoctor(parsed.lang, result.PostInstallDoctor)

@@ -81,9 +81,10 @@ grep -Fq 'Invalid choice; enter 1 or 2.' "$TMP/invalid-language"
 grep -Fq 'Invalid VERSION: bad/value' "$TMP/invalid-language"
 
 set +e
-timeout 10s script -qefc \
-  "/bin/bash -p '$ROOT/sun.sh' --verify-signature off --version bad/value install" /dev/null \
-  </dev/null >"$TMP/out" 2>&1
+python3 -I "$ROOT/build/pty-driver.py" \
+  --output "$TMP/out" --timeout 10 \
+  --step eof '[1]: ' '' \
+  -- /bin/bash -p "$ROOT/sun.sh" --verify-signature off --version bad/value install
 eof_rc=$?
 set -e
 [[ "$eof_rc" -eq 2 ]] || {
@@ -92,6 +93,118 @@ set -e
   exit 1
 }
 grep -Fq '已取消。' "$TMP/out"
+
+# Exercise the real bootstrap menu functions through a PTY without downloading
+# or installing a release. The fake run_go records only confirmed dispatches.
+python3 -I - "$ROOT/sun.sh" "$TMP/bootstrap-menu-harness.sh" <<'PY'
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+helpers_start = source.index("m()  {")
+helpers_end = source.index("\nusage() {", helpers_start)
+menu_start = source.index("run_menu() {")
+menu_end = source.index("\n\ncase \"$RUN_MODE\"", menu_start)
+harness = """#!/usr/bin/env bash
+set -euo pipefail
+UI_LANG=en
+INSTALL_ARGS=()
+readonly MAX_TTY_INPUT_BYTES=1024
+"""
+harness += source[helpers_start:helpers_end]
+harness += r'''
+run_go() {
+  printf '%s\n' "$@" >"${SUN_MENU_ACTION_LOG:?}"
+  exit 0
+}
+'''
+harness += source[menu_start:menu_end]
+harness += "\nrun_menu\n"
+Path(sys.argv[2]).write_text(harness, encoding="utf-8")
+PY
+chmod 0755 "$TMP/bootstrap-menu-harness.sh"
+if grep -Eq 'if[[:space:]]+![[:space:]]+confirm_tty_(exact|yes_no)' "$ROOT/sun.sh"; then
+  echo 'sun.sh negates a menu confirmation and would lose its original status' >&2
+  exit 1
+fi
+
+run_bootstrap_menu_pty() {
+  local expected="$1" name="$2" output="$TMP/menu-$2.out"
+  shift 2
+  rm -f "$TMP/menu-action"
+  set +e
+  SUN_MENU_ACTION_LOG="$TMP/menu-action" \
+    python3 -I "$ROOT/build/pty-driver.py" --output "$output" --timeout 20 "$@" \
+      -- /bin/bash "$TMP/bootstrap-menu-harness.sh"
+  local actual=$?
+  set -e
+  [[ "$actual" -eq "$expected" ]] || {
+    sed -n '1,240p' "$output" >&2
+    printf 'bootstrap menu %s exited %s, expected %s\n' "$name" "$actual" "$expected" >&2
+    exit 1
+  }
+}
+
+main_prompt='Enter choice [1-4/0]: '
+uninstall_prompt='Enter choice [1/2/0]: '
+check_prompt='Enter choice [1/2/3/4/0]: '
+purge_prompt='This restores SUN-managed apt/dnf automatic-update configuration and removes SUN configuration, notification credentials, state, upgrade backups, and logs. Type PURGE to confirm: '
+notify_prompt='This action will send a test notification. Continue? [y/N]: '
+
+run_bootstrap_menu_pty 0 cancelled \
+  --step visible "$main_prompt" $'3\n' \
+  --step visible "$uninstall_prompt" $'2\n' \
+  --step visible "$purge_prompt" $' PURGE \n' \
+  --step visible "$main_prompt" $'4\n' \
+  --step visible "$check_prompt" $'3\n' \
+  --step visible "$notify_prompt" $'n\n' \
+  --step visible "$main_prompt" $'0\n'
+[[ ! -e "$TMP/menu-action" ]]
+grep -Fq 'Confirmation did not match; cancelled.' "$TMP/menu-cancelled.out"
+
+run_bootstrap_menu_pty 0 keep-config \
+  --step visible "$main_prompt" $'3\n' \
+  --step visible "$uninstall_prompt" $'1\n' \
+  --step visible 'Type YES to uninstall and keep configuration: ' $'YES\n'
+[[ "$(cat "$TMP/menu-action")" == uninstall ]]
+
+run_bootstrap_menu_pty 0 purge \
+  --step visible "$main_prompt" $'3\n' \
+  --step visible "$uninstall_prompt" $'2\n' \
+  --step visible "$purge_prompt" $'PURGE\n'
+[[ "$(cat "$TMP/menu-action")" == $'uninstall\n--purge-config' ]]
+
+for notification in '3:--send-test' '4:--simulate-reboot'; do
+  choice="${notification%%:*}"
+  flag="${notification#*:}"
+  run_bootstrap_menu_pty 0 "notify-$choice" \
+    --step visible "$main_prompt" $'4\n' \
+    --step visible "$check_prompt" "$choice"$'\n' \
+    --step visible "$notify_prompt" $'invalid\n' \
+    --step visible "$notify_prompt" $'y\n'
+  [[ "$(cat "$TMP/menu-action")" == $'test\n'"$flag"$'\n--no-dedupe' ]]
+  grep -Fq 'Invalid input; enter y or n.' "$TMP/menu-notify-$choice.out"
+done
+
+run_bootstrap_menu_pty 2 eof \
+  --step visible "$main_prompt" $'3\n' \
+  --step visible "$uninstall_prompt" $'2\n' \
+  --step eof "$purge_prompt" ''
+[[ ! -e "$TMP/menu-action" ]]
+grep -Fq 'Cancelled.' "$TMP/menu-eof.out"
+
+printf -v oversized '%*s' 1025 ''
+oversized="${oversized// /x}"$'\n'
+run_bootstrap_menu_pty 0 oversized \
+  --step visible "$main_prompt" "$oversized" \
+  --step visible "$main_prompt" $'0\n'
+[[ ! -e "$TMP/menu-action" ]]
+grep -Fq 'Input is too long; try again.' "$TMP/menu-oversized.out"
+
+if [[ "${SUN_BOOTSTRAP_MENU_TEST_ONLY:-0}" == 1 ]]; then
+  echo 'Bootstrap menu confirmation and bounded-input tests passed'
+  exit 0
+fi
 
 python3 -I - "$ROOT/sun.sh" "$TMP/packages.sh" <<'PY'
 import sys

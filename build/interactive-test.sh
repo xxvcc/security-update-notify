@@ -108,6 +108,8 @@ dual_telegram_secret='123456:ptyDualHiddenToken'
 dual_telegram_chat_id='-100778'
 explicit_secret='123456:ptyExplicitHidden'
 explicit_chat_id='-100888'
+menu_config_secret='123456:ptyMenuConfigHidden'
+menu_config_chat_id='-100889'
 feishu_app_id='cli_pty_app'
 feishu_secret='feishu-pty-hidden-secret'
 dual_feishu_app_id='cli_pty_dual'
@@ -121,7 +123,8 @@ cat >"$EXPECTATIONS" <<EOF
   "telegram": {
     "$telegram_secret": ["$telegram_chat_id"],
     "$dual_telegram_secret": ["$dual_telegram_chat_id"],
-    "$explicit_secret": ["$explicit_chat_id"]
+    "$explicit_secret": ["$explicit_chat_id"],
+    "$menu_config_secret": ["$menu_config_chat_id"]
   },
   "feishu": {
     "$feishu_app_id": {
@@ -388,6 +391,132 @@ service_sha="$(sha256sum /etc/systemd/system/security-update-notify.service | aw
 timer_sha="$(sha256sum /etc/systemd/system/security-update-notify.timer | awk '{print $1}')"
 apt_sha="$(sha256sum /etc/apt/apt.conf.d/20auto-upgrades | awk '{print $1}')"
 
+echo "### Installed short alias and explicit systemd run contract"
+[[ -L /usr/local/sbin/sun ]] || fail "installed sun alias is not a symbolic link"
+assert_eq "$(readlink /usr/local/sbin/sun)" "security-update-notify" "installed sun alias target"
+assert_contains /etc/systemd/system/security-update-notify.service \
+  'ExecStart=/usr/local/sbin/security-update-notify run'
+
+echo "### Bare security-update-notify remains the non-interactive run contract"
+command -v flock >/dev/null || fail "flock is required for the bare-run compatibility test"
+exec 9>/run/security-update-notify.lock
+flock -n 9 || fail "could not hold the runtime lock for the bare-run compatibility test"
+set +e
+printf '0\n' | /usr/local/sbin/security-update-notify >"$TMP/menu-bare.out" 2>&1
+menu_bare_rc=$?
+set -e
+flock -u 9
+exec 9>&-
+assert_eq "$menu_bare_rc" 0 "bare security-update-notify exit status under lock contention"
+[[ ! -s "$TMP/menu-bare.out" ]] || fail "bare security-update-notify was not a quiet run under lock contention"
+
+echo "### Short alias opens the Chinese menu through argv[0]"
+run_pty 0 "$TMP/menu-sun.out" \
+  --rows 24 --columns 40 \
+  --step visible '请选择 [0-9]（回车重新显示菜单）: ' $'0\n' \
+  -- /usr/local/sbin/sun
+assert_contains "$TMP/menu-sun.out" '1) 预览本次检查（不发送、不写状态）'
+assert_contains "$TMP/menu-sun.out" '0) 退出'
+
+echo "### Explicit English menu runs one read-only action and continues"
+run_pty 0 "$TMP/menu-preview.out" \
+  --step visible 'Select [0-9] (Enter redraws the menu): ' $'1\n' \
+  --step visible 'Select [0-9] (Enter redraws the menu): ' $'0\n' \
+  -- /usr/local/sbin/security-update-notify menu --lang en
+assert_contains "$TMP/menu-preview.out" '1) Preview this check (no delivery or state writes)'
+assert_contains "$TMP/menu-preview.out" $'HASH\t'
+
+echo "### A failed routine action exits with its original status"
+mv /etc/security-update-notify/telegram.env "$TMP/menu-action-config"
+printf '%s\n' 'invalid-config-line' >/etc/security-update-notify/telegram.env
+chmod 0600 /etc/security-update-notify/telegram.env
+run_pty 2 "$TMP/menu-action-failure.out" \
+  --step visible 'Select [0-9] (Enter redraws the menu): ' $'1\n' \
+  -- /usr/local/sbin/security-update-notify menu --lang en
+rm -f /etc/security-update-notify/telegram.env
+mv "$TMP/menu-action-config" /etc/security-update-notify/telegram.env
+assert_eq "$(grep -cF 'Select [0-9] (Enter redraws the menu): ' "$TMP/menu-action-failure.out")" 1 \
+  "failed action menu prompt count"
+
+echo "### Blank input redraws and the language switch applies immediately"
+run_pty 0 "$TMP/menu-language.out" \
+  --step visible '请选择 [0-9]（回车重新显示菜单）: ' $'\n' \
+  --step visible '请选择 [0-9]（回车重新显示菜单）: ' $'9\n' \
+  --step visible '选择 / Select [0-2]: ' $'2\n' \
+  --step visible 'Select [0-9] (Enter redraws the menu): ' $'0\n' \
+  -- /usr/local/sbin/security-update-notify menu --lang zh
+assert_contains "$TMP/menu-language.out" 'Interface language switched to English for this session.'
+assert_contains "$TMP/menu-language.out" '1) Preview this check (no delivery or state writes)'
+assert_eq "$(grep -cF '1) 预览本次检查（不发送、不写状态）' "$TMP/menu-language.out")" 2 \
+  "menu redraw count before language switch"
+
+echo "### Menu EOF is a localized cancellation with status 2"
+run_pty 2 "$TMP/menu-eof.out" \
+  --step eof 'Select [0-9] (Enter redraws the menu): ' '' \
+  -- /usr/local/sbin/security-update-notify menu --lang en
+assert_contains "$TMP/menu-eof.out" 'Input ended; cancelled.'
+assert_not_contains "$TMP/menu-eof.out" 'EOF'
+
+echo "### Menu Ctrl-C terminates by SIGINT"
+run_pty 130 "$TMP/menu-interrupt.out" \
+  --step interrupt 'Select [0-9] (Enter redraws the menu): ' '' \
+  -- /usr/local/sbin/security-update-notify menu --lang en
+assert_not_contains "$TMP/menu-interrupt.out" 'Input ended; cancelled.'
+
+echo "### Menu refuses non-TTY streams before reading a selection"
+set +e
+printf '0\n' | /usr/local/sbin/security-update-notify menu --lang en >"$TMP/menu-nontty.out" 2>&1
+menu_nontty_rc=$?
+set -e
+assert_eq "$menu_nontty_rc" 2 "non-TTY menu exit status"
+assert_contains "$TMP/menu-nontty.out" \
+  'The interactive menu requires stdin, stdout, and stderr to all be attached to a real terminal.'
+assert_not_contains "$TMP/menu-nontty.out" 'Preview this check'
+
+echo "### Upgrade and purge cancellation do not dispatch either action"
+reset_api_log
+run_pty 0 "$TMP/menu-cancel.out" \
+  --step visible 'Select [0-9] (Enter redraws the menu): ' $'7\n' \
+  --step visible 'The upgrade will download and verify a release. Type YES to continue: ' $'NO\n' \
+  --step visible 'Select [0-9] (Enter redraws the menu): ' $'8\n' \
+  --step visible 'Select [0-2]: ' $'2\n' \
+  --step visible 'removes SUN configuration, notification credentials, state, upgrade backups, and logs. Type PURGE to confirm: ' $'NO\n' \
+  --step visible 'Select [0-9] (Enter redraws the menu): ' $'0\n' \
+  -- /usr/local/sbin/security-update-notify menu --lang en
+assert_eq "$(grep -cF 'Confirmation did not match; cancelled.' "$TMP/menu-cancel.out")" 2 \
+  "cancelled terminal-action count"
+assert_not_contains "$TMP/menu-cancel.out" 'Downloading and verifying release'
+[[ ! -s "$API_LOG" ]] || fail "cancelled menu actions reached the notification API"
+assert_eq "$(sha256sum /usr/local/sbin/security-update-notify | awk '{print $1}')" "$binary_sha" \
+  "cancelled menu runtime"
+assert_eq "$(sha256sum /etc/security-update-notify/telegram.env | awk '{print $1}')" "$config_sha" \
+  "cancelled menu config"
+assert_eq "$(sha256sum /etc/systemd/system/security-update-notify.service | awk '{print $1}')" "$service_sha" \
+  "cancelled menu service"
+assert_eq "$(sha256sum /etc/systemd/system/security-update-notify.timer | awk '{print $1}')" "$timer_sha" \
+  "cancelled menu timer"
+[[ -L /usr/local/sbin/sun && "$(readlink /usr/local/sbin/sun)" == security-update-notify ]] || \
+  fail "cancelled menu actions changed the sun alias"
+
+echo "### Menu configuration shares the PTY reader and preserves hidden input"
+reset_api_log
+run_pty 0 "$TMP/menu-configure.out" \
+  --step visible 'Select [0-9] (Enter redraws the menu): ' $'4\n' \
+  --step visible 'Change receiving platforms? [y/N]: ' $'n\n' \
+  --step visible 'Change Telegram settings? [y/N]: ' $'y\n' \
+  --step hidden 'Telegram Bot Token (input hidden): ' "$menu_config_secret"$'\n' \
+  --step visible 'Telegram Chat ID: ' "$menu_config_chat_id"$'\n' \
+  --step visible 'Send an additional post-install test message to configured receiving platforms? [y/N]: ' $'n\n' \
+  -- /usr/local/sbin/sun --lang en
+assert_contains "$TMP/menu-configure.out" 'Current notification method: telegram'
+assert_contains "$TMP/menu-configure.out" 'Telegram test message sent.'
+assert_contains "$TMP/menu-configure.out" 'Upgraded security-update-notify.'
+assert_not_contains "$TMP/menu-configure.out" "$menu_config_secret"
+assert_eq "$(api_count telegram_get_me)" 1 "menu configure Telegram getMe count"
+assert_eq "$(api_count telegram_send)" 1 "menu configure Telegram preflight send count"
+assert_contains /etc/security-update-notify/telegram.env "TELEGRAM_CHAT_ID='$menu_config_chat_id'"
+config_sha="$(sha256sum /etc/security-update-notify/telegram.env | awk '{print $1}')"
+
 echo "### Human-style failed upgrade rolls the installation back"
 run_pty 1 "$TMP/rollback.out" \
   --step visible '额外发送测试消息' $'invalid\n' \
@@ -405,7 +534,15 @@ assert_not_contains /etc/security-update-notify/telegram.env 'pty-rollback-must-
 [[ -L /etc/systemd/system/timers.target.wants/security-update-notify.timer ]] || fail "rollback lost timer enablement"
 [[ -e "$MOCK_STATE/timer-active" ]] || fail "rollback lost timer activity"
 
-/usr/local/sbin/security-update-notify uninstall --purge-config --lang en >/dev/null
+echo "### Confirmed menu purge exits after dispatch and removes its own entrypoints"
+run_pty 0 "$TMP/menu-purge.out" \
+  --step visible 'Select [0-9] (Enter redraws the menu): ' $'8\n' \
+  --step visible 'Select [0-2]: ' $'2\n' \
+  --step visible 'removes SUN configuration, notification credentials, state, upgrade backups, and logs. Type PURGE to confirm: ' $'PURGE\n' \
+  -- /usr/local/sbin/sun --lang en
+assert_contains "$TMP/menu-purge.out" 'Uninstalled security-update-notify.'
+[[ ! -e /usr/local/sbin/security-update-notify ]] || fail "menu purge retained the runtime"
+[[ ! -L /usr/local/sbin/sun && ! -e /usr/local/sbin/sun ]] || fail "menu purge retained the sun alias"
 assert_eq "$(sha256sum /etc/apt/apt.conf.d/20auto-upgrades | awk '{print $1}')" "$apt_vendor_sha" \
   "retained unattended-upgrades vendor baseline"
 find /etc/apt/apt.conf.d -maxdepth 1 -name '20auto-upgrades.security-update-notify*' -print -quit | \

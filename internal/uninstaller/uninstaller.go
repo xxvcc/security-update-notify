@@ -19,26 +19,30 @@ import (
 )
 
 const (
-	timerUnit              = "security-update-notify.timer"
-	serviceUnit            = "security-update-notify.service"
-	aptPeriodicLogical     = "/etc/apt/apt.conf.d/20auto-upgrades"
-	aptStableLogical       = aptPeriodicLogical + ".security-update-notify.bak"
-	aptAbsentLogical       = aptPeriodicLogical + ".security-update-notify.absent.bak"
-	aptLegacyAbsent        = aptPeriodicLogical + ".security-update-notify.absent"
-	aptDependencyProof     = aptPeriodicLogical + ".security-update-notify.dependency-default.bak"
-	aptAbsentContents      = "security-update-notify: original file absent\n"
-	dnfAutomaticName       = "automatic.conf"
-	dnfStableName          = dnfAutomaticName + ".security-update-notify.bak"
-	dnfAbsentName          = dnfAutomaticName + ".security-update-notify.absent.bak"
-	dnfDependencyProofName = dnfAutomaticName + ".security-update-notify.dependency-default.bak"
-	dnf4AbsentContents     = "security-update-notify: original file absent; engine=dnf4\n"
-	dnf5AbsentContents     = "security-update-notify: original file absent; engine=dnf5\n"
-	installLockLogical     = "/run/security-update-notify.install.lock"
-	runtimeLockLogical     = "/run/security-update-notify.lock"
-	systemctlTimeout       = 30 * time.Second
-	atRemoveDir            = 0x200
-	oPath                  = 0x200000
-	uninstallRemovalPrefix = "security-update-notify-remove"
+	timerUnit                     = "security-update-notify.timer"
+	serviceUnit                   = "security-update-notify.service"
+	aliasPath                     = "/usr/local/sbin/sun"
+	aliasTarget                   = "security-update-notify"
+	aptPeriodicLogical            = "/etc/apt/apt.conf.d/20auto-upgrades"
+	aptStableLogical              = aptPeriodicLogical + ".security-update-notify.bak"
+	aptAbsentLogical              = aptPeriodicLogical + ".security-update-notify.absent.bak"
+	aptLegacyAbsent               = aptPeriodicLogical + ".security-update-notify.absent"
+	aptDependencyProof            = aptPeriodicLogical + ".security-update-notify.dependency-default.bak"
+	aptAbsentContents             = "security-update-notify: original file absent\n"
+	dnfAutomaticName              = "automatic.conf"
+	dnfStableName                 = dnfAutomaticName + ".security-update-notify.bak"
+	dnfAbsentName                 = dnfAutomaticName + ".security-update-notify.absent.bak"
+	dnfDependencyProofName        = dnfAutomaticName + ".security-update-notify.dependency-default.bak"
+	dnf4AbsentContents            = "security-update-notify: original file absent; engine=dnf4\n"
+	dnf5AbsentContents            = "security-update-notify: original file absent; engine=dnf5\n"
+	installLockLogical            = "/run/security-update-notify.install.lock"
+	runtimeLockLogical            = "/run/security-update-notify.lock"
+	systemctlTimeout              = 30 * time.Second
+	atRemoveDir                   = 0x200
+	oPath                         = 0x200000
+	uninstallRemovalPrefix        = "security-update-notify-remove"
+	uninstallRemovalPendingPrefix = uninstallRemovalPrefix + "-pending"
+	uninstallRemovalOwnedPrefix   = uninstallRemovalPrefix + "-owned"
 )
 
 var ErrLockBusy = errors.New("lock is busy")
@@ -191,6 +195,9 @@ func Uninstall(opts Options) (report Report, returnErr error) {
 	}
 
 	var errs []error
+	if _, err := removeLogicalSymlinkTarget(root, aliasPath, aliasTarget); err != nil {
+		errs = append(errs, fmt.Errorf("remove command alias %s: %w", aliasPath, err))
+	}
 	for _, logical := range []string{
 		"/etc/systemd/system/security-update-notify.service",
 		"/etc/systemd/system/security-update-notify.timer",
@@ -423,7 +430,7 @@ func purge(root string, report *Report) []error {
 		}
 	}
 
-	if err := removeLogicalFile(root, "/var/log/security-update-notify.log"); err != nil {
+	if err := removeLogicalFileWithRecovery(root, "/var/log/security-update-notify.log", sharedParentRemovalRecovery); err != nil {
 		errs = append(errs, fmt.Errorf("remove security-update-notify log: %w", err))
 	}
 	if err := removeLogicalFilesWithPrefix(root, "/var/log", "security-update-notify.log.", nil); err != nil {

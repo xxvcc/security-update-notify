@@ -569,8 +569,8 @@ jobs:
       max-parallel: 3
       matrix:
         image:
-          - 'quay.io/centos/centos:stream9@sha256:e389f09f8af8baade5be5de6dbf70d8b5975ddc54641858f35552ea3c98ac872'
-          - 'quay.io/centos/centos:stream10@sha256:ed84a6789c59b1b132e7aa5994d98135938b3af329a855ff85be083a0956cb3e'
+          - 'quay.io/centos/centos:stream9@sha256:04bad0b08ac68a63b1810ea78a9d2ed4fb431e11d9c4c3916418edd4932856bd'
+          - 'quay.io/centos/centos:stream10@sha256:b7f85bb8be4c471bc62842156a51bbf224b15243943733bd54e86ba5fd79b1fc'
           - 'oraclelinux:8-slim@sha256:aaef2b765b654067ef27e101dfb15c24df2133967575dfcf66bc968ff815c264'
           - 'oraclelinux:9-slim@sha256:33bcb689f7c8e6bd15bcee9a253538bc0b7cafeadb8b1a9d6ac90669c4497ce3'
           - 'oraclelinux:10-slim@sha256:afab39c390428a4fa3c909038c718dd893bc6b06b85bcad86c998fa9d0597c10'

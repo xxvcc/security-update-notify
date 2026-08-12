@@ -8,18 +8,42 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/xxvcc/security-update-notify/internal/filetrust"
 
 	"unsafe"
 )
 
 type removalMode uint8
 
+type removalRecoveryPolicy uint8
+
+type removalIdentity struct {
+	device, inode        uint64
+	mode, uid, gid       uint32
+	size, mtimeSec, nsec int64
+}
+
+type removalHooks struct {
+	afterPendingClaim      func(string) error
+	afterPendingValidation func(string) error
+	afterOwnedPromotion    func(string) error
+	syncOwned              func(*os.File) error
+	beforeDelete           func(string) error
+}
+
 const (
 	removalLeaf removalMode = iota
 	removalEmptyDirectory
 	removalTree
+)
+
+const (
+	trustedParentRemovalRecovery removalRecoveryPolicy = iota + 1
+	sharedParentRemovalRecovery
 )
 
 func readRemovalEntry(parent *os.File, name string) (os.FileInfo, error) {
@@ -67,17 +91,45 @@ func sameRemovalIdentity(left, right os.FileInfo) bool {
 	return leftOK == rightOK && (!leftOK || leftStat.Uid == rightStat.Uid && leftStat.Gid == rightStat.Gid)
 }
 
-func newRemovalPlaceholder(parent *os.File, directory bool) (string, os.FileInfo, error) {
-	return newRemovalPlaceholderWithClose(parent, directory, nil)
+func removalIdentityFromInfo(info os.FileInfo) (removalIdentity, bool) {
+	if info == nil {
+		return removalIdentity{}, false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return removalIdentity{}, false
+	}
+	identity := removalIdentity{
+		device: uint64(stat.Dev),
+		inode:  stat.Ino,
+		mode:   stat.Mode,
+		uid:    stat.Uid,
+		gid:    stat.Gid,
+	}
+	if !info.IsDir() {
+		identity.size = stat.Size
+		identity.mtimeSec = int64(stat.Mtim.Sec)
+		identity.nsec = int64(stat.Mtim.Nsec)
+	}
+	return identity, true
 }
 
-func newRemovalPlaceholderWithClose(parent *os.File, directory bool, closePlaceholder func(*os.File, string) error) (string, os.FileInfo, error) {
+func (identity removalIdentity) matches(info os.FileInfo) bool {
+	current, ok := removalIdentityFromInfo(info)
+	return ok && current == identity
+}
+
+func newRemovalPlaceholder(parent *os.File, directory bool) (string, os.FileInfo, error) {
+	return newRemovalPlaceholderWithClose(parent, directory, uninstallRemovalPendingPrefix, nil)
+}
+
+func newRemovalPlaceholderWithClose(parent *os.File, directory bool, prefix string, closePlaceholder func(*os.File, string) error) (string, os.FileInfo, error) {
 	for range restoreTemporaryAttempts {
 		random := make([]byte, 16)
 		if _, err := rand.Read(random); err != nil {
 			return "", nil, err
 		}
-		name := fmt.Sprintf(".%s.%s", uninstallRemovalPrefix, hex.EncodeToString(random))
+		name := fmt.Sprintf(".%s.%s", prefix, hex.EncodeToString(random))
 		var placeholder *os.File
 		if directory {
 			err := syscall.Mkdirat(int(parent.Fd()), name, 0o700)
@@ -134,7 +186,19 @@ func newRemovalPlaceholderWithClose(parent *os.File, directory bool, closePlaceh
 	return "", nil, errors.New("could not create uninstall quarantine entry")
 }
 
-func cleanupUninstallRemovalArtifacts(parent *os.File) error {
+func cleanupUninstallRemovalArtifacts(parent *os.File, policy removalRecoveryPolicy) error {
+	if policy != trustedParentRemovalRecovery && policy != sharedParentRemovalRecovery {
+		return errors.New("invalid uninstall removal recovery policy")
+	}
+	if policy == trustedParentRemovalRecovery {
+		info, err := parent.Stat()
+		if err != nil {
+			return fmt.Errorf("inspect trusted uninstall recovery parent %s: %w", parent.Name(), err)
+		}
+		if err := filetrust.ValidateDirectory(info, os.Geteuid(), 0o022); err != nil {
+			return fmt.Errorf("unsafe trusted uninstall recovery parent %s: %w", parent.Name(), err)
+		}
+	}
 	directory, err := openRemovalDirectory(parent, ".")
 	if err != nil {
 		return err
@@ -146,15 +210,34 @@ func cleanupUninstallRemovalArtifacts(parent *os.File) error {
 	}
 	var errs []error
 	for _, entry := range entries {
-		if !isRestoreTemporaryName(entry.Name(), uninstallRemovalPrefix) {
+		if isRestoreTemporaryName(entry.Name(), uninstallRemovalPendingPrefix) {
+			errs = append(errs, errors.New("unverified uninstall quarantine retained at "+removalEntryPath(parent, entry.Name())))
+			continue
+		}
+		if isRestoreTemporaryName(entry.Name(), uninstallRemovalPrefix) {
+			errs = append(errs, errors.New("legacy uninstall quarantine has unverified ownership; retained at "+removalEntryPath(parent, entry.Name())))
+			continue
+		}
+		identity, mode, owned := parseOwnedRemovalName(entry.Name())
+		if !owned {
+			continue
+		}
+		if policy == sharedParentRemovalRecovery {
+			errs = append(errs, fmt.Errorf(
+				"owned uninstall quarantine mode %d is forbidden by shared-parent recovery policy; retained at %s",
+				mode, removalEntryPath(parent, entry.Name()),
+			))
 			continue
 		}
 		expected, err := readRemovalEntry(parent, entry.Name())
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
+		if err == nil && !identity.matches(expected) {
+			err = errors.New("owned uninstall quarantine does not match its durable identity; retained at " + removalEntryPath(parent, entry.Name()))
+		}
 		if err == nil {
-			err = removeValidatedEntryAt(parent, entry.Name(), expected, removalTree)
+			err = deleteOwnedRemovalEntry(parent, entry.Name(), expected, mode, nil, removalHooks{})
 		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("remove interrupted quarantine %s: %w", removalEntryPath(parent, entry.Name()), err))
@@ -196,6 +279,10 @@ func removeValidatedEntryAt(parent *os.File, name string, expected os.FileInfo, 
 }
 
 func removeValidatedEntryAtWithHook(parent *os.File, name string, expected os.FileInfo, mode removalMode, beforeDelete func(string) error) (returnErr error) {
+	return removeValidatedEntryAtWithHooks(parent, name, expected, mode, removalHooks{beforeDelete: beforeDelete})
+}
+
+func removeValidatedEntryAtWithHooks(parent *os.File, name string, expected os.FileInfo, mode removalMode, hooks removalHooks) (returnErr error) {
 	var claimedDirectory *os.File
 	if expected.IsDir() {
 		var err error
@@ -212,65 +299,177 @@ func removeValidatedEntryAtWithHook(parent *os.File, name string, expected os.Fi
 			returnErr = errors.Join(returnErr, claimedDirectory.Close())
 		}()
 	}
-	quarantine, placeholder, err := newRemovalPlaceholder(parent, expected.IsDir())
+	pending, placeholder, err := newRemovalPlaceholder(parent, expected.IsDir())
 	if err != nil {
 		return err
 	}
-	if err := syscall.Renameat(int(parent.Fd()), name, int(parent.Fd()), quarantine); err != nil {
-		cleanupErr := cleanupRemovalPlaceholder(parent, quarantine, placeholder)
+	if err := syscall.Renameat(int(parent.Fd()), name, int(parent.Fd()), pending); err != nil {
+		cleanupErr := cleanupRemovalPlaceholder(parent, pending, placeholder)
 		if errors.Is(err, os.ErrNotExist) {
 			return cleanupErr
 		}
-		return errors.Join(fmt.Errorf("claim validated entry; quarantine retained at %s: %w", removalEntryPath(parent, quarantine), err), cleanupErr)
+		return errors.Join(fmt.Errorf("claim validated entry; pending quarantine retained at %s: %w", removalEntryPath(parent, pending), err), cleanupErr)
 	}
-	claimed, readErr := readRemovalEntry(parent, quarantine)
-	if readErr != nil || !sameRemovalEntry(claimed, expected) {
-		return restoreUnexpectedClaim(parent, quarantine, name, readErr)
-	}
-	if beforeDelete != nil {
-		if err := beforeDelete(quarantine); err != nil {
-			return fmt.Errorf("remove claimed entry retained at %s: %w", removalEntryPath(parent, quarantine), err)
+	if hooks.afterPendingClaim != nil {
+		if err := hooks.afterPendingClaim(pending); err != nil {
+			return fmt.Errorf("validate pending uninstall quarantine retained at %s: %w", removalEntryPath(parent, pending), err)
 		}
+	}
+	claimed, readErr := readRemovalEntry(parent, pending)
+	if readErr != nil || !sameRemovalEntry(claimed, expected) {
+		return restoreUnexpectedClaim(parent, pending, name, readErr)
+	}
+	if hooks.afterPendingValidation != nil {
+		if err := hooks.afterPendingValidation(pending); err != nil {
+			return fmt.Errorf("publish pending uninstall quarantine retained at %s: %w", removalEntryPath(parent, pending), err)
+		}
+	}
+	owned, err := ownedRemovalName(pending, expected, mode)
+	if err != nil {
+		return fmt.Errorf("publish verified uninstall quarantine retained at %s: %w", removalEntryPath(parent, pending), err)
+	}
+	if err := renameRestoreEntry(int(parent.Fd()), pending, owned, restoreRenameNoReplace); err != nil {
+		return fmt.Errorf("publish verified uninstall quarantine retained at %s: %w", removalEntryPath(parent, pending), err)
+	}
+	if hooks.afterOwnedPromotion != nil {
+		if err := hooks.afterOwnedPromotion(owned); err != nil {
+			return fmt.Errorf("verify promoted uninstall quarantine retained at %s: %w", removalEntryPath(parent, owned), err)
+		}
+	}
+	current, readErr := readRemovalEntry(parent, owned)
+	if readErr != nil || !sameRemovalEntry(current, expected) {
+		return errors.Join(errors.New("owned uninstall quarantine changed before removal; retained at "+removalEntryPath(parent, owned)), readErr)
+	}
+	return deleteOwnedRemovalEntry(parent, owned, current, mode, claimedDirectory, hooks)
+}
+
+func deleteOwnedRemovalEntry(parent *os.File, owned string, expected os.FileInfo, mode removalMode, claimedDirectory *os.File, hooks removalHooks) (returnErr error) {
+	identity, encodedMode, validName := parseOwnedRemovalName(owned)
+	if !validName || encodedMode != mode || !identity.matches(expected) {
+		return errors.New("owned uninstall quarantine does not match its durable identity; retained at " + removalEntryPath(parent, owned))
+	}
+	if expected.IsDir() && claimedDirectory == nil {
+		var err error
+		claimedDirectory, err = openRemovalDirectory(parent, owned)
+		if err != nil {
+			return fmt.Errorf("open owned uninstall quarantine retained at %s: %w", removalEntryPath(parent, owned), err)
+		}
+		defer func() {
+			returnErr = errors.Join(returnErr, claimedDirectory.Close())
+		}()
+		info, err := claimedDirectory.Stat()
+		if err != nil || !sameRemovalEntry(info, expected) {
+			return errors.Join(errors.New("owned uninstall quarantine changed before removal; retained at "+removalEntryPath(parent, owned)), err)
+		}
+	}
+	current, readErr := readRemovalEntry(parent, owned)
+	if readErr != nil || !sameRemovalEntry(current, expected) || !identity.matches(current) {
+		return errors.Join(errors.New("owned uninstall quarantine changed before removal; retained at "+removalEntryPath(parent, owned)), readErr)
+	}
+	syncOwned := hooks.syncOwned
+	if syncOwned == nil {
+		syncOwned = syncLogicalRemovalParent
+	}
+	if err := syncOwned(parent); err != nil {
+		return fmt.Errorf("persist owned uninstall quarantine retained at %s: %w", removalEntryPath(parent, owned), err)
+	}
+	current, readErr = readRemovalEntry(parent, owned)
+	if readErr != nil || !sameRemovalEntry(current, expected) || !identity.matches(current) {
+		return errors.Join(errors.New("owned uninstall quarantine changed after persistence; retained at "+removalEntryPath(parent, owned)), readErr)
+	}
+	if hooks.beforeDelete != nil {
+		if err := hooks.beforeDelete(owned); err != nil {
+			return fmt.Errorf("remove claimed entry retained at %s: %w", removalEntryPath(parent, owned), err)
+		}
+	}
+	current, readErr = readRemovalEntry(parent, owned)
+	if readErr != nil || !sameRemovalEntry(current, expected) || !identity.matches(current) {
+		return errors.Join(errors.New("owned uninstall quarantine changed before deletion; retained at "+removalEntryPath(parent, owned)), readErr)
 	}
 
+	var removeErr error
 	switch mode {
 	case removalLeaf:
-		if claimed.IsDir() {
-			return restoreUnexpectedClaim(parent, quarantine, name, errors.New("validated leaf became a directory"))
+		if current.IsDir() {
+			return errors.New("owned uninstall quarantine changed type; retained at " + removalEntryPath(parent, owned))
 		}
-		if err := syscall.Unlinkat(int(parent.Fd()), quarantine); err != nil {
-			return fmt.Errorf("remove claimed entry retained at %s: %w", removalEntryPath(parent, quarantine), err)
+		if err := syscall.Unlinkat(int(parent.Fd()), owned); err != nil {
+			removeErr = fmt.Errorf("remove claimed entry retained at %s: %w", removalEntryPath(parent, owned), err)
 		}
-		return nil
 	case removalEmptyDirectory:
-		if !claimed.IsDir() || claimedDirectory == nil {
-			return restoreUnexpectedClaim(parent, quarantine, name, errors.New("validated directory changed type"))
+		if !current.IsDir() || claimedDirectory == nil {
+			return errors.New("owned uninstall quarantine changed type; retained at " + removalEntryPath(parent, owned))
 		}
 		empty, err := removalDirectoryEmptyOpened(claimedDirectory)
 		if err != nil || !empty {
 			if err == nil {
 				err = errors.New("validated empty directory gained an entry")
 			}
-			return restoreUnexpectedClaim(parent, quarantine, name, err)
+			return errors.Join(errors.New("owned uninstall quarantine changed before removal; retained at "+removalEntryPath(parent, owned)), err)
 		}
-		return unlinkRemovalDirectory(parent, quarantine, expected)
+		removeErr = unlinkRemovalDirectory(parent, owned, expected)
 	case removalTree:
-		if !claimed.IsDir() {
-			if err := syscall.Unlinkat(int(parent.Fd()), quarantine); err != nil {
-				return fmt.Errorf("remove claimed entry retained at %s: %w", removalEntryPath(parent, quarantine), err)
+		if !current.IsDir() {
+			if err := syscall.Unlinkat(int(parent.Fd()), owned); err != nil {
+				removeErr = fmt.Errorf("remove claimed entry retained at %s: %w", removalEntryPath(parent, owned), err)
 			}
-			return nil
+		} else if claimedDirectory == nil {
+			return errors.New("validated directory handle is unavailable; claimed entry retained at " + removalEntryPath(parent, owned))
+		} else if err := removeClaimedTree(claimedDirectory); err != nil {
+			removeErr = fmt.Errorf("remove quarantined tree retained at %s: %w", removalEntryPath(parent, owned), err)
+		} else {
+			removeErr = unlinkRemovalDirectory(parent, owned, expected)
 		}
-		if claimedDirectory == nil {
-			return restoreUnexpectedClaim(parent, quarantine, name, errors.New("validated directory handle is unavailable"))
-		}
-		if err := removeClaimedTree(claimedDirectory); err != nil {
-			return fmt.Errorf("remove quarantined tree retained at %s: %w", removalEntryPath(parent, quarantine), err)
-		}
-		return unlinkRemovalDirectory(parent, quarantine, expected)
 	default:
-		return errors.New("invalid uninstall removal mode; claimed entry retained at " + removalEntryPath(parent, quarantine))
+		return errors.New("invalid uninstall removal mode; claimed entry retained at " + removalEntryPath(parent, owned))
 	}
+	return errors.Join(removeErr, syncOwned(parent))
+}
+
+func ownedRemovalName(pending string, expected os.FileInfo, mode removalMode) (string, error) {
+	suffix, found := strings.CutPrefix(pending, "."+uninstallRemovalPendingPrefix+".")
+	if !found || !isRestoreTemporaryName("."+uninstallRemovalOwnedPrefix+"."+suffix, uninstallRemovalOwnedPrefix) {
+		return "", fmt.Errorf("invalid pending uninstall quarantine name: %q", pending)
+	}
+	identity, ok := removalIdentityFromInfo(expected)
+	if !ok {
+		return "", errors.New("uninstall quarantine identity is unavailable")
+	}
+	if mode > removalTree {
+		return "", errors.New("invalid uninstall quarantine removal mode")
+	}
+	return fmt.Sprintf(".%s.%s.%x.%x.%x.%x.%x.%x.%x.%x.%x",
+		uninstallRemovalOwnedPrefix, suffix, mode,
+		identity.device, identity.inode, identity.mode, identity.uid, identity.gid,
+		uint64(identity.size), uint64(identity.mtimeSec), uint64(identity.nsec),
+	), nil
+}
+
+func parseOwnedRemovalName(name string) (removalIdentity, removalMode, bool) {
+	rest, found := strings.CutPrefix(name, "."+uninstallRemovalOwnedPrefix+".")
+	if !found {
+		return removalIdentity{}, 0, false
+	}
+	fields := strings.Split(rest, ".")
+	if len(fields) != 10 || !isRestoreTemporaryName("."+uninstallRemovalOwnedPrefix+"."+fields[0], uninstallRemovalOwnedPrefix) {
+		return removalIdentity{}, 0, false
+	}
+	values := make([]uint64, 9)
+	for index, field := range fields[1:] {
+		value, err := strconv.ParseUint(field, 16, 64)
+		if err != nil || strconv.FormatUint(value, 16) != field {
+			return removalIdentity{}, 0, false
+		}
+		values[index] = value
+	}
+	if values[0] > uint64(removalTree) || values[3] > uint64(^uint32(0)) || values[4] > uint64(^uint32(0)) || values[5] > uint64(^uint32(0)) {
+		return removalIdentity{}, 0, false
+	}
+	return removalIdentity{
+		device: values[1], inode: values[2], mode: uint32(values[3]),
+		uid: uint32(values[4]), gid: uint32(values[5]), size: int64(values[6]),
+		mtimeSec: int64(values[7]), nsec: int64(values[8]),
+	}, removalMode(values[0]), true
 }
 
 func openRemovalDirectory(parent *os.File, name string) (*os.File, error) {
@@ -309,10 +508,21 @@ func removalDirectoryEmptyOpened(directory *os.File) (bool, error) {
 }
 
 func removeClaimedTree(directory *os.File) error {
+	return removeClaimedTreeWithSync(directory, nil, syncLogicalRemovalParent)
+}
+
+func removeClaimedTreeWithSync(directory *os.File, beforeChild func(string) error, syncDirectory func(*os.File) error) (returnErr error) {
+	defer func() {
+		returnErr = errors.Join(returnErr, syncDirectory(directory))
+	}()
 	entries, readErr := directory.ReadDir(-1)
 	if readErr == nil {
 		for _, entry := range entries {
-			if err := removeAllAt(directory, entry.Name()); err != nil {
+			var beforeClaim func() error
+			if beforeChild != nil {
+				beforeClaim = func() error { return beforeChild(entry.Name()) }
+			}
+			if err := removeAllAtWithHook(directory, entry.Name(), beforeClaim); err != nil {
 				readErr = err
 				break
 			}
@@ -352,6 +562,10 @@ func removeAllAt(parent *os.File, name string) error {
 }
 
 func removeAllAtWithHook(parent *os.File, name string, beforeClaim func() error) error {
+	return removeAllAtWithHooks(parent, name, beforeClaim, removalHooks{})
+}
+
+func removeAllAtWithHooks(parent *os.File, name string, beforeClaim func() error, hooks removalHooks) error {
 	expected, err := readRemovalEntry(parent, name)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -364,10 +578,14 @@ func removeAllAtWithHook(parent *os.File, name string, beforeClaim func() error)
 			return err
 		}
 	}
-	return removeValidatedEntryAt(parent, name, expected, removalTree)
+	return removeValidatedEntryAtWithHooks(parent, name, expected, removalTree, hooks)
 }
 
 func removeLogicalFilesWithPrefix(root, directoryLogical, prefix string, beforeClaim func(string) error) error {
+	return removeLogicalFilesWithPrefixWithSync(root, directoryLogical, prefix, beforeClaim, syncLogicalRemovalParent)
+}
+
+func removeLogicalFilesWithPrefixWithSync(root, directoryLogical, prefix string, beforeClaim func(string) error, syncParent func(*os.File) error) (returnErr error) {
 	parent, name, err := openLogicalParent(root, directoryLogical)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -375,21 +593,21 @@ func removeLogicalFilesWithPrefix(root, directoryLogical, prefix string, beforeC
 	if err != nil {
 		return err
 	}
-	defer parent.Close()
 	directory, err := openRemovalDirectory(parent, name)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return parent.Close()
 	}
 	if err != nil {
-		return err
+		return errors.Join(err, parent.Close())
 	}
-	if err := cleanupUninstallRemovalArtifacts(directory); err != nil {
-		_ = directory.Close()
+	defer func() {
+		returnErr = errors.Join(returnErr, syncParent(directory), directory.Close(), parent.Close())
+	}()
+	if err := cleanupUninstallRemovalArtifacts(directory, sharedParentRemovalRecovery); err != nil {
 		return fmt.Errorf("recover interrupted prefixed-file removal: %w", err)
 	}
 	entries, readErr := directory.ReadDir(-1)
 	if readErr != nil {
-		_ = directory.Close()
 		return readErr
 	}
 	var errs []error
@@ -408,11 +626,11 @@ func removeLogicalFilesWithPrefix(root, directoryLogical, prefix string, beforeC
 			err = beforeClaim(entry.Name())
 		}
 		if err == nil {
-			err = removeValidatedEntryAt(directory, entry.Name(), expected, removalLeaf)
+			err = removeValidatedEntryAtWithHooks(directory, entry.Name(), expected, removalLeaf, removalHooks{syncOwned: syncParent})
 		}
 		if err != nil {
 			errs = append(errs, err)
 		}
 	}
-	return errors.Join(errors.Join(errs...), directory.Close())
+	return errors.Join(errs...)
 }

@@ -1,5 +1,65 @@
 # 变更记录
 
+## 3.2.0
+
+- 新增仅供人工终端使用的显式 `security-update-notify menu` 与安装后短入口 `sudo sun`，同时保留裸
+  `security-update-notify` 等同 `run` 的既有自动化契约，并将 systemd service 改为显式调用 `run`。菜单要求
+  root 且三个标准流均为真实 TTY，提供预览、立即检查、诊断、通知配置/测试、版本检查、升级和卸载；普通动作
+  成功后继续、失败透传原退出码，配置、升级和卸载一旦分发即退出。EOF 取消、信号终止和分层确认不会绕过
+  现有锁与事务语义。
+  Adds an explicit `security-update-notify menu` for human-operated terminals and the installed `sudo sun`
+  shortcut while preserving the established automation contract in which a bare `security-update-notify`
+  means `run`; the systemd service now invokes `run` explicitly. The menu requires root and real TTYs on all
+  three standard streams and provides preview, run-now, doctor, notification configuration/testing, release
+  checks, upgrade, and uninstall. Successful routine actions continue, failures preserve their original exit
+  status, and configuration, upgrade, and uninstall exit once dispatched. EOF cancellation, signal termination,
+  and layered confirmations retain the existing lock and transaction semantics.
+- 安装器仅在 `/usr/local/sbin/sun` 不存在时创建指向 `security-update-notify` 的相对链接，并复用这一精确
+  链接；其他文件、目录或链接会原样保留并产生可见警告，但不阻断核心安装。卸载时只删除当时仍指向该精确
+  相对目标的链接。
+  单元测试覆盖别名冲突、root/TTY 拒绝、固定动作分发和退出码传播；真实 controlling-PTY 生命周期场景覆盖
+  裸命令兼容、TTY 拒绝、双语菜单、空行与 EOF、确认取消、通知配置、回滚和卸载。
+  Creates the relative `/usr/local/sbin/sun -> security-update-notify` link only when the alias path is absent
+  and reuses that exact link. Other files, directories, or links are preserved with a visible warning without
+  blocking core installation, and uninstall removes only a relative link that still has this exact target.
+  Unit tests cover alias conflicts, root/TTY refusal, fixed action dispatch, and exit propagation. Real
+  controlling-PTY lifecycle scenarios cover bare-command compatibility, TTY refusal, both menu languages,
+  blank input and EOF, confirmation cancellation, notification configuration, rollback, and uninstall.
+- 加固卸载删除的崩溃恢复与持久性：经验证的目标先进入未授权删除的 pending 隔离名，完成 inode、类型、
+  所有权和文件元数据复验后才提升为绑定稳定身份与删除模式的 owned 隔离名；只有实际目录句柄仍指向 root
+  所有且禁止 group/other write 的父目录时，可信私有恢复才会清理身份仍匹配的 owned 项，无法证明归属的
+  pending、旧格式隔离项或权限已放宽父目录中的遗留项会保留并要求人工核验。`/var/log` 共享父
+  目录中的任何遗留隔离项都保留并失败关闭，避免把可伪造名称当作跨进程所有权证明；没有遗留项时本次正常
+  日志删除不受影响。每层目录的隔离、递归删除和最终删除都同步实际父目录并合并同步/关闭错误，避免掉电后
+  把未持久状态误报为已完成；五架构交叉编译与崩溃点测试覆盖这一恢复协议。
+  Hardens crash recovery and durability for uninstall removals. A validated target first enters an unowned
+  pending quarantine name and is promoted to an owned name bound to stable identity and removal mode only
+  after inode, type, ownership, and file-metadata revalidation. Trusted private recovery cleans an identity-
+  matching owned entry only when the opened parent descriptor still identifies a root-owned directory that
+  forbids group/other write. Unprovable pending and legacy quarantines, and artifacts beneath a parent whose
+  permissions were widened, are retained for manual inspection. Every retained quarantine in the shared
+  `/var/log` parent remains in place and fails closed, so a
+  forgeable name cannot become cross-process proof of ownership; normal log deletion in a run with no retained
+  quarantine is unaffected. Quarantine, recursive removal, and final deletion sync the actual parent directory
+  at every level and join sync/close errors, preventing a power loss from turning an unpersisted state into
+  reported success. Five-architecture compilation and crash-point tests cover the recovery protocol.
+- 收紧引导菜单和 root 本地验证门禁：`sun.sh` 将每行终端输入限制为 1 KiB，超限时排空整行后重新提示，
+  并在 EOF 时可靠取消；卸载分别要求精确输入 `YES` 或 `PURGE`，可能发送通知的动作也要求显式确认。
+  root 维护者复制工作树运行无特权 runtime-lock 测试时，会以 `pwd -P` 固定源码根目录并用 `realpath -e`
+  逐个复验待复制文件，拒绝经符号链接祖先逃出源码根目录的条目；可执行回归测试覆盖超长输入和路径逃逸。
+  Tightens the bootstrap menu and the root local-validation gate. `sun.sh` limits each terminal input line to
+  1 KiB, drains an oversized line before prompting again, and cancels reliably on EOF. Uninstall requires an
+  exact `YES` or `PURGE` as appropriate, while actions that may send notifications require explicit
+  confirmation. When a root maintainer copies the worktree to run the runtime-lock test unprivileged, the gate
+  anchors the source root with `pwd -P`, revalidates each candidate with `realpath -e`, and rejects entries that
+  escape the source root through a symlinked ancestor. Executable regressions cover oversized input and path
+  escape.
+- 刷新已从上游 registry 移除的 CentOS Stream 9/10 固定容器摘要，继续使用不可变多架构 OCI index 运行
+  best-effort RPM 生命周期门禁，避免 fresh CI runner 在进入产品测试前因旧摘要不可解析而失败。
+  Refreshes the pinned CentOS Stream 9/10 container digests removed by the upstream registry while retaining
+  immutable multi-architecture OCI indexes for the best-effort RPM lifecycle gate, preventing fresh CI runners
+  from failing on an unresolvable stale digest before product tests begin.
+
 ## 3.1.6
 
 - 为安装、配置和升级增加可持久恢复的事务日志：在停止现有 unit 或改写受管路径前保存完整回滚状态，普通错误、取消及首次终止信号会等待回滚完成；异常中断后，下一次安装只会恢复经完整校验且明确标记为安全的事务。若中断发生在包管理器状态尚未可信捕获的阶段，安装器会保留事务与私密凭据恢复材料，并让后续安装和卸载在产生 systemd 或文件副作用前失败关闭，要求管理员检查并完成人工恢复。
