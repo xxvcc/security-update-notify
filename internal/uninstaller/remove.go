@@ -22,7 +22,7 @@ type removalMode uint8
 type removalRecoveryPolicy uint8
 
 type removalIdentity struct {
-	device, inode        uint64
+	device, inode, nlink uint64
 	mode, uid, gid       uint32
 	size, mtimeSec, nsec int64
 }
@@ -33,6 +33,7 @@ type removalHooks struct {
 	afterOwnedPromotion    func(string) error
 	syncOwned              func(*os.File) error
 	beforeDelete           func(string) error
+	validate               func(os.FileInfo) error
 }
 
 const (
@@ -88,7 +89,16 @@ func sameRemovalIdentity(left, right os.FileInfo) bool {
 	}
 	leftStat, leftOK := left.Sys().(*syscall.Stat_t)
 	rightStat, rightOK := right.Sys().(*syscall.Stat_t)
-	return leftOK == rightOK && (!leftOK || leftStat.Uid == rightStat.Uid && leftStat.Gid == rightStat.Gid)
+	if leftOK != rightOK {
+		return false
+	}
+	if !leftOK {
+		return true
+	}
+	if leftStat.Uid != rightStat.Uid || leftStat.Gid != rightStat.Gid {
+		return false
+	}
+	return left.IsDir() || leftStat.Nlink == rightStat.Nlink
 }
 
 func removalIdentityFromInfo(info os.FileInfo) (removalIdentity, bool) {
@@ -107,6 +117,7 @@ func removalIdentityFromInfo(info os.FileInfo) (removalIdentity, bool) {
 		gid:    stat.Gid,
 	}
 	if !info.IsDir() {
+		identity.nlink = uint64(stat.Nlink)
 		identity.size = stat.Size
 		identity.mtimeSec = int64(stat.Mtim.Sec)
 		identity.nsec = int64(stat.Mtim.Nsec)
@@ -220,6 +231,12 @@ func cleanupUninstallRemovalArtifacts(parent *os.File, policy removalRecoveryPol
 		}
 		identity, mode, owned := parseOwnedRemovalName(entry.Name())
 		if !owned {
+			if isOwnedRemovalCandidate(entry.Name()) {
+				errs = append(errs, errors.New(
+					"owned uninstall quarantine has an unsupported durable identity; retained at "+
+						removalEntryPath(parent, entry.Name()),
+				))
+			}
 			continue
 		}
 		if policy == sharedParentRemovalRecovery {
@@ -316,8 +333,16 @@ func removeValidatedEntryAtWithHooks(parent *os.File, name string, expected os.F
 		}
 	}
 	claimed, readErr := readRemovalEntry(parent, pending)
-	if readErr != nil || !sameRemovalEntry(claimed, expected) {
+	if readErr != nil {
 		return restoreUnexpectedClaim(parent, pending, name, readErr)
+	}
+	if hooks.validate != nil {
+		if err := hooks.validate(claimed); err != nil {
+			return restoreUnexpectedClaim(parent, pending, name, err)
+		}
+	}
+	if !sameRemovalEntry(claimed, expected) {
+		return restoreUnexpectedClaim(parent, pending, name, nil)
 	}
 	if hooks.afterPendingValidation != nil {
 		if err := hooks.afterPendingValidation(pending); err != nil {
@@ -337,8 +362,16 @@ func removeValidatedEntryAtWithHooks(parent *os.File, name string, expected os.F
 		}
 	}
 	current, readErr := readRemovalEntry(parent, owned)
-	if readErr != nil || !sameRemovalEntry(current, expected) {
+	if readErr != nil {
 		return errors.Join(errors.New("owned uninstall quarantine changed before removal; retained at "+removalEntryPath(parent, owned)), readErr)
+	}
+	if hooks.validate != nil {
+		if err := hooks.validate(current); err != nil {
+			return fmt.Errorf("owned uninstall quarantine failed removal policy; retained at %s: %w", removalEntryPath(parent, owned), err)
+		}
+	}
+	if !sameRemovalEntry(current, expected) {
+		return errors.New("owned uninstall quarantine changed before removal; retained at " + removalEntryPath(parent, owned))
 	}
 	return deleteOwnedRemovalEntry(parent, owned, current, mode, claimedDirectory, hooks)
 }
@@ -363,8 +396,16 @@ func deleteOwnedRemovalEntry(parent *os.File, owned string, expected os.FileInfo
 		}
 	}
 	current, readErr := readRemovalEntry(parent, owned)
-	if readErr != nil || !sameRemovalEntry(current, expected) || !identity.matches(current) {
+	if readErr != nil {
 		return errors.Join(errors.New("owned uninstall quarantine changed before removal; retained at "+removalEntryPath(parent, owned)), readErr)
+	}
+	if hooks.validate != nil {
+		if err := hooks.validate(current); err != nil {
+			return fmt.Errorf("owned uninstall quarantine failed removal policy; retained at %s: %w", removalEntryPath(parent, owned), err)
+		}
+	}
+	if !sameRemovalEntry(current, expected) || !identity.matches(current) {
+		return errors.New("owned uninstall quarantine changed before removal; retained at " + removalEntryPath(parent, owned))
 	}
 	syncOwned := hooks.syncOwned
 	if syncOwned == nil {
@@ -374,8 +415,16 @@ func deleteOwnedRemovalEntry(parent *os.File, owned string, expected os.FileInfo
 		return fmt.Errorf("persist owned uninstall quarantine retained at %s: %w", removalEntryPath(parent, owned), err)
 	}
 	current, readErr = readRemovalEntry(parent, owned)
-	if readErr != nil || !sameRemovalEntry(current, expected) || !identity.matches(current) {
+	if readErr != nil {
 		return errors.Join(errors.New("owned uninstall quarantine changed after persistence; retained at "+removalEntryPath(parent, owned)), readErr)
+	}
+	if hooks.validate != nil {
+		if err := hooks.validate(current); err != nil {
+			return fmt.Errorf("owned uninstall quarantine failed removal policy after persistence; retained at %s: %w", removalEntryPath(parent, owned), err)
+		}
+	}
+	if !sameRemovalEntry(current, expected) || !identity.matches(current) {
+		return errors.New("owned uninstall quarantine changed after persistence; retained at " + removalEntryPath(parent, owned))
 	}
 	if hooks.beforeDelete != nil {
 		if err := hooks.beforeDelete(owned); err != nil {
@@ -383,8 +432,16 @@ func deleteOwnedRemovalEntry(parent *os.File, owned string, expected os.FileInfo
 		}
 	}
 	current, readErr = readRemovalEntry(parent, owned)
-	if readErr != nil || !sameRemovalEntry(current, expected) || !identity.matches(current) {
+	if readErr != nil {
 		return errors.Join(errors.New("owned uninstall quarantine changed before deletion; retained at "+removalEntryPath(parent, owned)), readErr)
+	}
+	if hooks.validate != nil {
+		if err := hooks.validate(current); err != nil {
+			return fmt.Errorf("owned uninstall quarantine failed removal policy before deletion; retained at %s: %w", removalEntryPath(parent, owned), err)
+		}
+	}
+	if !sameRemovalEntry(current, expected) || !identity.matches(current) {
+		return errors.New("owned uninstall quarantine changed before deletion; retained at " + removalEntryPath(parent, owned))
 	}
 
 	var removeErr error
@@ -438,11 +495,20 @@ func ownedRemovalName(pending string, expected os.FileInfo, mode removalMode) (s
 	if mode > removalTree {
 		return "", errors.New("invalid uninstall quarantine removal mode")
 	}
-	return fmt.Sprintf(".%s.%s.%x.%x.%x.%x.%x.%x.%x.%x.%x",
+	return fmt.Sprintf(".%s.%s.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x",
 		uninstallRemovalOwnedPrefix, suffix, mode,
 		identity.device, identity.inode, identity.mode, identity.uid, identity.gid,
-		uint64(identity.size), uint64(identity.mtimeSec), uint64(identity.nsec),
+		identity.nlink, uint64(identity.size), uint64(identity.mtimeSec), uint64(identity.nsec),
 	), nil
+}
+
+func isOwnedRemovalCandidate(name string) bool {
+	rest, found := strings.CutPrefix(name, "."+uninstallRemovalOwnedPrefix+".")
+	if !found {
+		return false
+	}
+	suffix, _, found := strings.Cut(rest, ".")
+	return found && isRestoreTemporaryName("."+uninstallRemovalOwnedPrefix+"."+suffix, uninstallRemovalOwnedPrefix)
 }
 
 func parseOwnedRemovalName(name string) (removalIdentity, removalMode, bool) {
@@ -451,10 +517,10 @@ func parseOwnedRemovalName(name string) (removalIdentity, removalMode, bool) {
 		return removalIdentity{}, 0, false
 	}
 	fields := strings.Split(rest, ".")
-	if len(fields) != 10 || !isRestoreTemporaryName("."+uninstallRemovalOwnedPrefix+"."+fields[0], uninstallRemovalOwnedPrefix) {
+	if len(fields) != 11 || !isRestoreTemporaryName("."+uninstallRemovalOwnedPrefix+"."+fields[0], uninstallRemovalOwnedPrefix) {
 		return removalIdentity{}, 0, false
 	}
-	values := make([]uint64, 9)
+	values := make([]uint64, 10)
 	for index, field := range fields[1:] {
 		value, err := strconv.ParseUint(field, 16, 64)
 		if err != nil || strconv.FormatUint(value, 16) != field {
@@ -467,8 +533,8 @@ func parseOwnedRemovalName(name string) (removalIdentity, removalMode, bool) {
 	}
 	return removalIdentity{
 		device: values[1], inode: values[2], mode: uint32(values[3]),
-		uid: uint32(values[4]), gid: uint32(values[5]), size: int64(values[6]),
-		mtimeSec: int64(values[7]), nsec: int64(values[8]),
+		uid: uint32(values[4]), gid: uint32(values[5]), nlink: values[6], size: int64(values[7]),
+		mtimeSec: int64(values[8]), nsec: int64(values[9]),
 	}, removalMode(values[0]), true
 }
 

@@ -535,6 +535,9 @@ assert_not_contains /etc/security-update-notify/telegram.env 'pty-rollback-must-
 [[ -e "$MOCK_STATE/timer-active" ]] || fail "rollback lost timer activity"
 
 echo "### Confirmed menu purge exits after dispatch and removes its own entrypoints"
+mkdir -p /var/lib/systemd/timers
+printf '%s\n' 'SUN timer state' >/var/lib/systemd/timers/stamp-security-update-notify.timer
+printf '%s\n' 'unrelated timer state' >/var/lib/systemd/timers/stamp-unrelated.timer
 run_pty 0 "$TMP/menu-purge.out" \
   --step visible 'Select [0-9] (Enter redraws the menu): ' $'8\n' \
   --step visible 'Select [0-2]: ' $'2\n' \
@@ -543,6 +546,10 @@ run_pty 0 "$TMP/menu-purge.out" \
 assert_contains "$TMP/menu-purge.out" 'Uninstalled security-update-notify.'
 [[ ! -e /usr/local/sbin/security-update-notify ]] || fail "menu purge retained the runtime"
 [[ ! -L /usr/local/sbin/sun && ! -e /usr/local/sbin/sun ]] || fail "menu purge retained the sun alias"
+[[ ! -e /var/lib/systemd/timers/stamp-security-update-notify.timer &&
+   ! -L /var/lib/systemd/timers/stamp-security-update-notify.timer ]] ||
+  fail "menu purge retained the SUN timer timestamp"
+assert_contains /var/lib/systemd/timers/stamp-unrelated.timer 'unrelated timer state'
 assert_eq "$(sha256sum /etc/apt/apt.conf.d/20auto-upgrades | awk '{print $1}')" "$apt_vendor_sha" \
   "retained unattended-upgrades vendor baseline"
 find /etc/apt/apt.conf.d -maxdepth 1 -name '20auto-upgrades.security-update-notify*' -print -quit | \

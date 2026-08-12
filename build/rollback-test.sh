@@ -227,9 +227,13 @@ ok "! grep -q should-not-survive /etc/security-update-notify/telegram.env" \
   "failed override did not survive"
 
 echo "### Non-purge uninstall keeps configuration"
+mkdir -p /var/lib/systemd/timers
+printf 'timer state\n' >/var/lib/systemd/timers/stamp-security-update-notify.timer
 "$runtime" uninstall --lang en
 ok "[[ ! -e /usr/local/sbin/security-update-notify ]]" "runtime removed"
 ok "[[ -f /etc/security-update-notify/telegram.env ]]" "configuration retained"
+ok "[[ ! -e /var/lib/systemd/timers/stamp-security-update-notify.timer ]]" \
+  "persistent timer timestamp removed"
 
 echo "### Reinstall from retained configuration"
 "$runtime" install --skip-notify-test --non-interactive -y --skip-post-install-check --lang en \
@@ -240,11 +244,15 @@ ok "[[ \"$(/usr/local/sbin/security-update-notify --version)\" == 'security-upda
 echo "### Purge uninstall restores baseline and removes private state"
 mkdir -p /var/lib/security-update-notify
 printf 'state\n' >/var/lib/security-update-notify/pending-security.first-seen
+mkdir -p /var/lib/systemd/timers
+printf 'timer state\n' >/var/lib/systemd/timers/stamp-security-update-notify.timer
 "$runtime" uninstall --purge-config --lang en
 ok "[[ ! -e /usr/local/sbin/security-update-notify ]]" "runtime purged"
 ok "[[ ! -e /etc/security-update-notify ]]" "configuration and credentials purged"
 ok "[[ ! -e /var/lib/security-update-notify ]]" "state purged"
 ok "[[ ! -e /var/backups/security-update-notify ]]" "transaction backups purged"
+ok "[[ ! -e /var/lib/systemd/timers/stamp-security-update-notify.timer ]]" \
+  "persistent timer timestamp purged"
 ok "[[ \"$(sha256sum /etc/apt/apt.conf.d/20auto-upgrades | awk '{print $1}')\" == '$baseline_sha' ]]" \
   "APT baseline restored"
 ok "! find /etc/apt/apt.conf.d -maxdepth 1 -name '20auto-upgrades.security-update-notify*' | grep -q ." \

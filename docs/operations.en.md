@@ -53,6 +53,9 @@ Run `security-update-notify doctor` anytime to inspect all seven checks, pending
 /etc/systemd/system/security-update-notify.service
 /etc/systemd/system/security-update-notify.service.d/credentials.conf  # encrypted Feishu credential
 /etc/systemd/system/security-update-notify.timer
+/etc/systemd/system/timers.target.wants/security-update-notify.timer   # persistent systemd enablement link
+/run/systemd/system/timers.target.wants/security-update-notify.timer   # only while upgrading old runtime enablement
+/var/lib/systemd/timers/stamp-security-update-notify.timer             # systemd Persistent timer state
 /etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred # newer systemd
 /etc/security-update-notify/credentials/feishu-app-secret              # older-systemd fallback
 /etc/logrotate.d/security-update-notify
@@ -227,7 +230,8 @@ sudo tail -n 100 /var/log/security-update-notify.log
 
 ## Uninstall
 
-Remove the program and systemd/logrotate integration, while keeping config and state:
+Remove the program and systemd/logrotate integration, including SUN's timer enablement links and Persistent
+timestamp, while retaining SUN's business configuration and `/var/lib/security-update-notify` state:
 
 ```bash
 sudo security-update-notify uninstall
@@ -239,7 +243,15 @@ Remove config and state too:
 sudo security-update-notify uninstall --purge-config
 ```
 
-Packages installed as dependencies are left in place. `--purge-config` removes SUN config, Telegram/Feishu credentials, state, upgrade backups (which may contain bot-token copies) and rotated logs, and restores apt/dnf automatic-update config when a SUN-created backup exists. The uninstaller leaves the distribution's own automatic timer in its current state: removing the monitoring tool does not actively disable security updates or override later administrator changes to that timer.
+Both ordinary uninstall and `--purge-config` remove only the exact SUN timer unit, enablement links, and Persistent
+timestamp; a same-name link whose target was replaced by an administrator is preserved. The Persistent timestamp
+is removed only when it is a root-owned regular file that forbids group/other write and has exactly one hard link;
+an unexpected type or metadata is retained and reported as an error. Packages installed as dependencies are left in
+place. `--purge-config` additionally removes SUN config, Telegram/Feishu
+credentials, state, upgrade backups (which may contain bot-token copies), and rotated logs, and restores apt/dnf
+automatic-update config when a SUN-created backup exists. The uninstaller leaves the distribution's own automatic
+timer and timestamps in their current state: removing the monitoring tool does not actively disable security updates
+or override later administrator changes to that timer.
 
 Both ordinary uninstall and `--purge-config` acquire the install and runtime locks before scanning installation journals and the fixed private-recovery paths. If an interrupted transaction or private recovery material exists, uninstall fails closed before any `systemctl` call, unit removal, or configuration cleanup. Rerun the installer first for an automatically recoverable transaction. A transaction marked unsafe during the package-manager phase requires the inspection and manual repair described above and cannot be bypassed through uninstall.
 

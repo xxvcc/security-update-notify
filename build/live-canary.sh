@@ -51,6 +51,21 @@ done
 [[ ! -e /usr/local/sbin/sun && ! -L /usr/local/sbin/sun ]] ||
   die "runner is not clean: SUN command alias is already present"
 [[ ! -e /etc/security-update-notify ]] || die "runner is not clean: SUN config already exists"
+[[ ! -e /etc/systemd/system/security-update-notify.service &&
+   ! -L /etc/systemd/system/security-update-notify.service ]] ||
+  die "runner is not clean: SUN service unit is already present"
+[[ ! -e /etc/systemd/system/security-update-notify.timer &&
+   ! -L /etc/systemd/system/security-update-notify.timer ]] ||
+  die "runner is not clean: SUN timer unit is already present"
+[[ ! -e /etc/systemd/system/timers.target.wants/security-update-notify.timer &&
+   ! -L /etc/systemd/system/timers.target.wants/security-update-notify.timer ]] ||
+  die "runner is not clean: SUN persistent timer link is already present"
+[[ ! -e /run/systemd/system/timers.target.wants/security-update-notify.timer &&
+   ! -L /run/systemd/system/timers.target.wants/security-update-notify.timer ]] ||
+  die "runner is not clean: SUN runtime timer link is already present"
+[[ ! -e /var/lib/systemd/timers/stamp-security-update-notify.timer &&
+   ! -L /var/lib/systemd/timers/stamp-security-update-notify.timer ]] ||
+  die "runner is not clean: SUN persistent timer timestamp is already present"
 
 apt_policy=/etc/apt/apt.conf.d/20auto-upgrades
 apt_policy_backup="${apt_policy}.security-update-notify.bak"
@@ -374,6 +389,9 @@ for expected in \
 done
 systemctl is-enabled --quiet security-update-notify.timer || die "timer is not enabled"
 systemctl is-active --quiet security-update-notify.timer || die "timer is not active"
+[[ -f /var/lib/systemd/timers/stamp-security-update-notify.timer &&
+   ! -L /var/lib/systemd/timers/stamp-security-update-notify.timer ]] ||
+  die "systemd did not create the persistent timer timestamp"
 systemd-analyze verify \
   /etc/systemd/system/security-update-notify.service \
   /etc/systemd/system/security-update-notify.timer
@@ -449,6 +467,9 @@ grep -q $'^HASH\t' <<<"$dry_run_output" || die "dry-run did not produce a stable
 [[ ! -e /var/lib/security-update-notify ]] || die "state remained after purge"
 [[ ! -e /etc/systemd/system/security-update-notify.service ]] || die "service remained after purge"
 [[ ! -e /etc/systemd/system/security-update-notify.timer ]] || die "timer remained after purge"
+[[ ! -e /var/lib/systemd/timers/stamp-security-update-notify.timer &&
+   ! -L /var/lib/systemd/timers/stamp-security-update-notify.timer ]] ||
+  die "persistent timer timestamp remained after purge"
 assert_package_state_not_regressed after-purge
 case "$apt_policy_purge_expectation" in
   original)
