@@ -335,10 +335,15 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 	if err != nil {
 		return Result{}, err
 	}
+	var warnings []string
+	if warning := i.installCommandAlias(); warning != "" {
+		warnings = append(warnings, warning)
+	}
 	return Result{
 		Upgrade: plan.upgrade, Backend: plan.backend, SupportTier: plan.supportTier,
 		PreviousVersion: previousVersion, BackupDir: b.dir, CredentialStorage: storage,
 		PostInstallTest: postInstallTest, PostInstallDoctor: postInstallDoctor,
+		Warnings: warnings,
 	}, nil
 }
 

@@ -7,9 +7,11 @@
 package cli
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/xxvcc/security-update-notify/internal/config"
@@ -25,16 +27,40 @@ const defaultEnvFile = "/etc/security-update-notify/telegram.env"
 
 // Main 是进程入口逻辑，返回退出码。ver 为编译期注入的版本号。
 func Main(ver string, args []string) int {
+	return MainAs(ver, "security-update-notify", args)
+}
+
+// MainAs dispatches the process using its invoked name. The installed "sun"
+// alias opens the interactive menu when passed only menu options; every other
+// invocation preserves the security-update-notify CLI contract.
+func MainAs(ver, argv0 string, args []string) int {
+	if isAliasMenuInvocation(argv0, args) {
+		return menuModeWithSystemd(ver, args, nil)
+	}
 	return mainWithSystemd(ver, args, nil)
 }
 
+func isAliasMenuInvocation(argv0 string, args []string) bool {
+	return filepath.Base(argv0) == "sun" && (len(args) == 0 || aliasMenuArgs(args))
+}
+
+func aliasMenuArgs(args []string) bool {
+	return len(args) > 0 && (args[0] == "--lang" || args[0] == "-h" || args[0] == "--help")
+}
+
 func mainWithSystemd(ver string, args []string, systemdQuery run.SystemdQuery) int {
+	return mainWithSystemdAndReader(ver, args, systemdQuery, nil)
+}
+
+func mainWithSystemdAndReader(ver string, args []string, systemdQuery run.SystemdQuery, reader *bufio.Reader) int {
 	if len(args) > 0 {
 		switch args[0] {
 		case "install":
-			return installMode(ver, args[1:])
+			return installModeWithReader(ver, args[1:], reader)
 		case "configure":
-			return configureMode(ver, args[1:])
+			return configureModeWithReader(ver, args[1:], reader)
+		case "menu":
+			return menuModeWithSystemd(ver, args[1:], systemdQuery)
 		case "run":
 			return runModeWithSystemd(ver, args[1:], systemdQuery)
 		case "doctor":
@@ -262,6 +288,7 @@ func usage() {
   security-update-notify [run flags]
   security-update-notify install [install options]
   security-update-notify configure notifications [install options]
+  security-update-notify menu [--lang zh|en]
   security-update-notify run [run flags]
   security-update-notify doctor [doctor flags]
   security-update-notify check-upgrade [--lang zh|en]

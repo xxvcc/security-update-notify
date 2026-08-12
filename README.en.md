@@ -122,6 +122,20 @@ The interactive installer scans visible employees for selection and stores only 
 
 ## Common operations
 
+Open the interactive menu (the short command is recommended; use the full command if the `sun` path conflicts):
+
+```bash
+sudo sun
+sudo security-update-notify menu
+```
+
+The menu requires root and a real terminal on all standard streams; it refuses pipes, redirections, cron,
+and systemd input. For compatibility with existing automation, a bare `security-update-notify` still runs
+one check and never opens the menu. Automation should use `security-update-notify run` explicitly. The
+installer creates `/usr/local/sbin/sun` only when that path is absent. If another object already occupies it,
+the installer preserves that object and prints a warning; use the full menu entrypoint above. See
+[Operations and recovery](docs/operations.en.md#interactive-menu) for menu actions, confirmations, and exit behavior.
+
 Run diagnostics now:
 
 ```bash
@@ -169,7 +183,7 @@ Remove config and state too:
 sudo security-update-notify uninstall --purge-config
 ```
 
-`--purge-config` restores managed apt/dnf configuration and removes credentials, state, and upgrade backups. After interruption or a concurrent file change, read the [restoration semantics](docs/operations.en.md#uninstall) before retrying.
+`--purge-config` restores managed apt/dnf configuration and removes SUN configuration, credentials, state, upgrade backups, and logs. After interruption or a concurrent file change, read the [restoration semantics](docs/operations.en.md#uninstall) before retrying.
 
 ## Common configuration
 

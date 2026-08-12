@@ -61,6 +61,15 @@ assert_same_file() {
   [[ "$(sha256sum "$left" | awk '{print $1}')" == "$(sha256sum "$right" | awk '{print $1}')" ]]
 }
 
+assert_sun_alias() {
+  [[ -L /usr/local/sbin/sun ]]
+  [[ "$(readlink -- /usr/local/sbin/sun)" == security-update-notify ]]
+}
+
+assert_sun_alias_absent() {
+  [[ ! -e /usr/local/sbin/sun && ! -L /usr/local/sbin/sun ]]
+}
+
 real_package_manager=''
 for candidate in dnf microdnf yum; do
   if command -v "$candidate" >/dev/null 2>&1; then
@@ -204,6 +213,7 @@ if [[ -e "$mock_state/vendor-recorded" ]]; then
   assert_same_file "$vendor_baseline" /etc/dnf/automatic.conf.security-update-notify.bak
 fi
 /usr/local/sbin/security-update-notify --version
+assert_sun_alias
 
 PATH="$fixture_path" "$SUN_INSTALL_BINARY" install \
   --allow-best-effort --lang en --non-interactive --yes \
@@ -211,9 +221,11 @@ PATH="$fixture_path" "$SUN_INSTALL_BINARY" install \
 grep -Fxq "HOST_LABEL='rpm-best-effort-upgraded'" /etc/security-update-notify/telegram.env
 [[ -e "$mock_state/enabled/dnf-automatic.timer" ]]
 [[ -e "$mock_state/enabled/security-update-notify.timer" ]]
+assert_sun_alias
 
 PATH="$fixture_path" "$SUN_INSTALL_BINARY" uninstall --purge-config --lang en
 [[ ! -e /usr/local/sbin/security-update-notify ]]
+assert_sun_alias_absent
 [[ ! -e /etc/security-update-notify ]]
 [[ ! -e /var/lib/security-update-notify ]]
 [[ ! -e /var/backups/security-update-notify ]]

@@ -517,6 +517,9 @@ func TestRootFSCopyRegularFileRejectsConcurrentMetadataChange(t *testing.T) {
 					mutationErr = mutation.mutate(filepath.Join(rootDir, "source"))
 				})
 				if mutationErr != nil {
+					if mutation.name == "owner" {
+						t.Skipf("filesystem does not allow changing fixture ownership: %v", mutationErr)
+					}
 					t.Fatal(mutationErr)
 				}
 				if mutationCalls != 1 {

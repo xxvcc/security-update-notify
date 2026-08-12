@@ -9,12 +9,15 @@ import pty
 import select
 import signal
 import subprocess
+import struct
 import sys
 import termios
 import time
 
 
 MAX_OUTPUT_BYTES = 8 << 20
+DEFAULT_ROWS = 24
+DEFAULT_COLUMNS = 80
 
 
 def positive_timeout(value):
@@ -27,17 +30,29 @@ def positive_timeout(value):
     return timeout
 
 
+def terminal_dimension(value):
+    try:
+        dimension = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("terminal dimension must be an integer") from exc
+    if not 1 <= dimension <= 1000:
+        raise argparse.ArgumentTypeError("terminal dimension must be in [1, 1000]")
+    return dimension
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True)
     parser.add_argument("--timeout", type=positive_timeout, default=180.0)
+    parser.add_argument("--rows", type=terminal_dimension, default=DEFAULT_ROWS)
+    parser.add_argument("--columns", type=terminal_dimension, default=DEFAULT_COLUMNS)
     parser.add_argument(
         "--step",
         action="append",
         nargs=3,
         metavar=("KIND", "PROMPT", "RESPONSE"),
         default=[],
-        help="KIND is visible, hidden, or eof",
+        help="KIND is visible, hidden, eof, or interrupt",
     )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -46,7 +61,7 @@ def parse_args():
     if not args.command:
         parser.error("missing command after --")
     for kind, _, _ in args.step:
-        if kind not in {"visible", "hidden", "eof"}:
+        if kind not in {"visible", "hidden", "eof", "interrupt"}:
             parser.error(f"invalid step kind: {kind}")
     return args
 
@@ -95,6 +110,11 @@ def terminate(proc):
 def main():
     args = parse_args()
     master_fd, slave_fd = pty.openpty()
+    fcntl.ioctl(
+        slave_fd,
+        termios.TIOCSWINSZ,
+        struct.pack("HHHH", args.rows, args.columns, 0, 0),
+    )
     proc = subprocess.Popen(
         args.command,
         stdin=slave_fd,
@@ -141,8 +161,8 @@ def main():
                 if proc.poll() is not None or not read_once():
                     raise RuntimeError(f"process exited before prompt: {prompt!r}")
 
-            if kind in {"visible", "hidden"}:
-                want_echo = kind == "visible"
+            if kind in {"visible", "hidden", "interrupt"}:
+                want_echo = kind != "hidden"
                 echo_deadline = min(deadline, time.monotonic() + 3)
                 while bool(termios.tcgetattr(master_fd)[3] & termios.ECHO) != want_echo:
                     if time.monotonic() >= echo_deadline:
@@ -152,7 +172,12 @@ def main():
                         )
                     time.sleep(0.01)
 
-            payload = b"\x04" if kind == "eof" else response.encode("utf-8")
+            if kind == "eof":
+                payload = b"\x04"
+            elif kind == "interrupt":
+                payload = b"\x03"
+            else:
+                payload = response.encode("utf-8")
             os.write(master_fd, payload)
 
         while proc.poll() is None:
@@ -172,6 +197,8 @@ def main():
         with open(args.output, "wb") as capture:
             capture.write(output)
 
+    if return_code < 0:
+        return 128 - return_code
     return return_code
 
 

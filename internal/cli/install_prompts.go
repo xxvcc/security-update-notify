@@ -210,14 +210,16 @@ func (c *installCommand) readPromptLine(lang string) (string, error) {
 
 func (c *installCommand) localizedInputError(lang string, err error) error {
 	message := c.pick(lang, "读取输入失败。", "Unable to read input.")
-	if errors.Is(err, io.EOF) {
+	if errors.Is(err, errInteractiveLineTooLong) {
+		message = c.pick(lang, "输入过长，已取消。", "Input is too long; cancelled.")
+	} else if errors.Is(err, io.EOF) {
 		message = c.pick(lang, "已取消。", "Cancelled.")
 	}
 	return &localizedInputError{message: message, cause: err}
 }
 
 func (c *installCommand) readLine() (string, error) {
-	line, err := c.console.in.ReadString('\n')
+	line, err := readBoundedLine(c.console.in)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return "", err
 	}

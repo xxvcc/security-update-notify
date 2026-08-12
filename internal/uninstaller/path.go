@@ -88,7 +88,123 @@ func removeLogicalFile(root, logical string) error {
 	return removeLogicalFileWithHook(root, logical, nil)
 }
 
+func removeLogicalSymlinkTarget(root, logical, target string) (bool, error) {
+	return removeLogicalSymlinkTargetWithHook(root, logical, target, nil)
+}
+
+func removeLogicalSymlinkTargetWithHook(root, logical, target string, beforeClaim func() error) (bool, error) {
+	return removeLogicalSymlinkTargetWithSync(root, logical, target, beforeClaim, syncLogicalRemovalParent)
+}
+
+func removeLogicalSymlinkTargetWithSync(root, logical, target string, beforeClaim func() error, syncParent func(*os.File) error) (bool, error) {
+	parent, name, err := openLogicalParent(root, logical)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer parent.Close()
+	if err := cleanupUninstallRemovalArtifacts(parent, trustedParentRemovalRecovery); err != nil {
+		return false, fmt.Errorf("recover interrupted file removal: %w", err)
+	}
+	expected, linkTarget, err := inspectLogicalSymlinkAt(parent, name)
+	if errors.Is(err, os.ErrNotExist) {
+		// The missing leaf may be the result of an earlier successful removal
+		// whose directory sync failed. A retry must cross that durability
+		// boundary before it can report success.
+		return false, syncParent(parent)
+	}
+	if err != nil {
+		return false, err
+	}
+	if expected == nil || linkTarget != target {
+		return false, syncParent(parent)
+	}
+	if beforeClaim != nil {
+		if err := beforeClaim(); err != nil {
+			return false, err
+		}
+	}
+	removeErr := removeValidatedEntryAt(parent, name, expected, removalLeaf)
+	syncErr := syncParent(parent)
+	if removeErr != nil {
+		return false, errors.Join(removeErr, syncErr)
+	}
+	return true, syncErr
+}
+
+func syncLogicalRemovalParent(parent *os.File) error {
+	directory, err := openRemovalDirectory(parent, ".")
+	if err != nil {
+		return err
+	}
+	return errors.Join(directory.Sync(), directory.Close())
+}
+
+func inspectLogicalSymlinkAt(parent *os.File, name string) (os.FileInfo, string, error) {
+	fd, err := syscall.Openat(
+		int(parent.Fd()), name,
+		oPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK,
+		0,
+	)
+	if err != nil {
+		return nil, "", err
+	}
+	entry := os.NewFile(uintptr(fd), name)
+	if entry == nil {
+		_ = syscall.Close(fd)
+		return nil, "", errors.New("could not create symbolic link handle")
+	}
+	defer entry.Close()
+	info, err := entry.Stat()
+	if err != nil {
+		return nil, "", err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return nil, "", nil
+	}
+	for size := 256; size <= 1<<20; size *= 2 {
+		buffer := make([]byte, size)
+		n, err := readlinkOpenedEntry(entry, buffer)
+		if err != nil {
+			return nil, "", err
+		}
+		if n < len(buffer) {
+			return info, string(buffer[:n]), nil
+		}
+	}
+	return nil, "", errors.New("symbolic link target exceeds 1 MiB")
+}
+
+func readlinkOpenedEntry(entry *os.File, buffer []byte) (int, error) {
+	empty, err := syscall.BytePtrFromString("")
+	if err != nil {
+		return 0, err
+	}
+	result, _, errno := syscall.Syscall6(
+		syscall.SYS_READLINKAT, entry.Fd(), uintptr(unsafe.Pointer(empty)),
+		uintptr(unsafe.Pointer(&buffer[0])), uintptr(len(buffer)), 0, 0,
+	)
+	if errno != 0 {
+		return 0, errno
+	}
+	return int(result), nil
+}
+
 func removeLogicalFileWithHook(root, logical string, beforeClaim func() error) error {
+	return removeLogicalFileWithSync(root, logical, beforeClaim, syncLogicalRemovalParent)
+}
+
+func removeLogicalFileWithRecovery(root, logical string, policy removalRecoveryPolicy) error {
+	return removeLogicalFileWithSyncAndRecovery(root, logical, nil, syncLogicalRemovalParent, policy)
+}
+
+func removeLogicalFileWithSync(root, logical string, beforeClaim func() error, syncParent func(*os.File) error) (returnErr error) {
+	return removeLogicalFileWithSyncAndRecovery(root, logical, beforeClaim, syncParent, trustedParentRemovalRecovery)
+}
+
+func removeLogicalFileWithSyncAndRecovery(root, logical string, beforeClaim func() error, syncParent func(*os.File) error, policy removalRecoveryPolicy) (returnErr error) {
 	parent, name, err := openLogicalParent(root, logical)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -96,8 +212,10 @@ func removeLogicalFileWithHook(root, logical string, beforeClaim func() error) e
 	if err != nil {
 		return err
 	}
-	defer parent.Close()
-	if err := cleanupUninstallRemovalArtifacts(parent); err != nil {
+	defer func() {
+		returnErr = errors.Join(returnErr, syncParent(parent), parent.Close())
+	}()
+	if err := cleanupUninstallRemovalArtifacts(parent, policy); err != nil {
 		return fmt.Errorf("recover interrupted file removal: %w", err)
 	}
 	expected, err := readRemovalEntry(parent, name)
@@ -115,7 +233,7 @@ func removeLogicalFileWithHook(root, logical string, beforeClaim func() error) e
 			return err
 		}
 	}
-	return removeValidatedEntryAt(parent, name, expected, removalLeaf)
+	return removeValidatedEntryAtWithHooks(parent, name, expected, removalLeaf, removalHooks{syncOwned: syncParent})
 }
 
 func removeLogicalEmptyDirectory(root, logical string) error {
@@ -123,6 +241,10 @@ func removeLogicalEmptyDirectory(root, logical string) error {
 }
 
 func removeLogicalEmptyDirectoryWithHook(root, logical string, beforeClaim func() error) error {
+	return removeLogicalEmptyDirectoryWithSync(root, logical, beforeClaim, syncLogicalRemovalParent)
+}
+
+func removeLogicalEmptyDirectoryWithSync(root, logical string, beforeClaim func() error, syncParent func(*os.File) error) (returnErr error) {
 	parent, name, err := openLogicalParent(root, logical)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -130,8 +252,10 @@ func removeLogicalEmptyDirectoryWithHook(root, logical string, beforeClaim func(
 	if err != nil {
 		return err
 	}
-	defer parent.Close()
-	if err := cleanupUninstallRemovalArtifacts(parent); err != nil {
+	defer func() {
+		returnErr = errors.Join(returnErr, syncParent(parent), parent.Close())
+	}()
+	if err := cleanupUninstallRemovalArtifacts(parent, trustedParentRemovalRecovery); err != nil {
 		return fmt.Errorf("recover interrupted directory removal: %w", err)
 	}
 	expected, err := readRemovalEntry(parent, name)
@@ -153,7 +277,7 @@ func removeLogicalEmptyDirectoryWithHook(root, logical string, beforeClaim func(
 			return err
 		}
 	}
-	return removeValidatedEntryAt(parent, name, expected, removalEmptyDirectory)
+	return removeValidatedEntryAtWithHooks(parent, name, expected, removalEmptyDirectory, removalHooks{syncOwned: syncParent})
 }
 
 // removeLogicalTree resolves the parent beneath an opened RootDir descriptor
@@ -165,6 +289,10 @@ func removeLogicalTree(root, logical string) error {
 }
 
 func removeLogicalTreeWithHook(root, logical string, beforeClaim func() error) error {
+	return removeLogicalTreeWithSync(root, logical, beforeClaim, syncLogicalRemovalParent)
+}
+
+func removeLogicalTreeWithSync(root, logical string, beforeClaim func() error, syncParent func(*os.File) error) (returnErr error) {
 	parent, name, err := openLogicalParent(root, logical)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -172,11 +300,13 @@ func removeLogicalTreeWithHook(root, logical string, beforeClaim func() error) e
 	if err != nil {
 		return err
 	}
-	defer parent.Close()
-	if err := cleanupUninstallRemovalArtifacts(parent); err != nil {
+	defer func() {
+		returnErr = errors.Join(returnErr, syncParent(parent), parent.Close())
+	}()
+	if err := cleanupUninstallRemovalArtifacts(parent, trustedParentRemovalRecovery); err != nil {
 		return fmt.Errorf("recover interrupted tree removal: %w", err)
 	}
-	return removeAllAtWithHook(parent, name, beforeClaim)
+	return removeAllAtWithHooks(parent, name, beforeClaim, removalHooks{syncOwned: syncParent})
 }
 
 func openLogicalParent(root, logical string) (*os.File, string, error) {

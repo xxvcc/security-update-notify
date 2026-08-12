@@ -122,6 +122,18 @@ Telegram：
 
 ## 常用操作
 
+打开交互菜单（推荐使用短命令；完整命令可在 `sun` 路径冲突时使用）：
+
+```bash
+sudo sun
+sudo security-update-notify menu
+```
+
+菜单只接受 root 的真实终端会话，不接受管道、重定向、cron 或 systemd 输入。为兼容现有自动化，裸命令
+`security-update-notify` 仍然立即运行一次检查，不会进入菜单；自动化建议显式使用
+`security-update-notify run`。安装器只会在 `/usr/local/sbin/sun` 不存在时创建短命令，若该路径已被占用会保留
+原对象并显示警告，此时使用上面的完整菜单入口。菜单动作、确认与退出语义见[日常运维与恢复](docs/operations.md#交互菜单)。
+
 立即诊断：
 
 ```bash
@@ -168,7 +180,7 @@ sudo security-update-notify uninstall
 sudo security-update-notify uninstall --purge-config
 ```
 
-`--purge-config` 会恢复受管 apt/dnf 配置并删除凭据、状态和升级备份；异常中断或并发文件变化时应先阅读[恢复语义](docs/operations.md#卸载)，不要盲目重复执行。
+`--purge-config` 会恢复受管 apt/dnf 配置，并删除 SUN 配置、凭据、状态、升级备份和日志；异常中断或并发文件变化时应先阅读[恢复语义](docs/operations.md#卸载)，不要盲目重复执行。
 
 ## 常用配置
 

@@ -47,6 +47,19 @@ while not Path(ready).exists():
 """
 
 
+WINDOW_SIZE = r"""
+import fcntl
+import struct
+import sys
+import termios
+
+rows, columns, _, _ = struct.unpack(
+    "HHHH", fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, b"\0" * 8)
+)
+print(f"{rows}x{columns}")
+"""
+
+
 def process_running(pid):
     try:
         state = Path(f"/proc/{pid}/stat").read_text(encoding="ascii").split()[2]
@@ -107,6 +120,34 @@ def main():
                     os.killpg(group_id, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+
+        dimensions = root / "dimensions"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(driver),
+                "--output",
+                str(dimensions),
+                "--rows",
+                "31",
+                "--columns",
+                "47",
+                "--",
+                sys.executable,
+                "-I",
+                "-c",
+                WINDOW_SIZE,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0 or b"31x47" not in dimensions.read_bytes():
+            raise AssertionError(
+                f"PTY dimensions were not applied; rc={result.returncode} stderr={result.stderr!r}"
+            )
 
     print("PTY process-group cleanup test passed")
 

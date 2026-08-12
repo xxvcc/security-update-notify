@@ -1,8 +1,8 @@
 # security-update-notify 3.x 全 Go 架构 / 3.x all-Go architecture
 
-本文记录 3.0.0 完成迁移后、持续加固到 3.1.x 的设计、Linux 兼容、恢复与发布约束。它描述当前实现，不是待办清单。
+本文记录 3.0.0 完成迁移后、持续加固到 3.2.0 的设计、Linux 兼容、恢复与发布约束。它描述当前实现，不是待办清单。
 
-This document records the design after the completed 3.0.0 migration and its hardening through 3.1.x,
+This document records the design after the completed 3.0.0 migration and its hardening through 3.2.0,
 including Linux compatibility, recovery, security, and release constraints. It describes the current implementation.
 
 ## 结论 / Bottom line
@@ -49,10 +49,12 @@ work when installation, diagnostics, or release packaging is interrupted.
 
 ## 命令面 / Command surface
 
-安装后的 `/usr/local/sbin/security-update-notify` 是唯一管理和运行入口：
+安装后的 `/usr/local/sbin/security-update-notify` 是完整管理和运行入口；安装器还会在路径未被占用时创建
+精确相对链接 `/usr/local/sbin/sun -> security-update-notify`，作为人工交互菜单的短入口：
 
 | 任务 / Task | 命令 / Command |
 | --- | --- |
+| 人工交互菜单 / interactive menu | `sun`（短入口）或 `security-update-notify menu`（完整入口） |
 | 定时或手动检查 / scheduled or manual check | `security-update-notify run`（裸调用仍兼容为 run） |
 | 安装或复用配置升级 / install or config-preserving upgrade | `security-update-notify install` |
 | 消息通知设置 / notification settings | `security-update-notify configure notifications` |

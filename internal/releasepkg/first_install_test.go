@@ -3,6 +3,7 @@ package releasepkg
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -142,6 +143,7 @@ func TestLiveCanaryIsolatesRunnerHealthAndSkipsFakeNotificationCredentialProbe(t
 		`RESTART_ALERT_DAYS=0`,
 		`CHECK_EOL=0`,
 		`CHECK_SELF_UPDATE=0`,
+		`for command in apt-get curl dpkg gpg gh head jq python3 readlink`,
 		`matches="$(grep -c "^${key}=" /etc/security-update-notify/telegram.env || :)"`,
 		`grep -qxF "$expected" /etc/security-update-notify/telegram.env`,
 		`apt_check=(apt-get -o DPkg::Lock::Timeout=300 check -qq)`,
@@ -155,7 +157,11 @@ func TestLiveCanaryIsolatesRunnerHealthAndSkipsFakeNotificationCredentialProbe(t
 		`apt_policy_dependency_proof="${apt_policy}.security-update-notify.dependency-default.bak"`,
 		`assert_restored_apt_policy()`,
 		`die "runner is not clean: SUN APT policy metadata already exists"`,
+		`die "runner is not clean: SUN command alias is already present"`,
 		`die "installed SUN APT baseline state is ambiguous"`,
+		`die "installed command alias is not the exact relative SUN link"`,
+		`die "installed sun command did not open the interactive menu"`,
+		`die "SUN command alias remained after purge"`,
 		`die "SUN APT policy metadata remained after purge"`,
 	} {
 		if !bytes.Contains(script, []byte(item)) {
@@ -177,7 +183,10 @@ func TestLiveCanaryIsolatesRunnerHealthAndSkipsFakeNotificationCredentialProbe(t
 		`grep -qxF "$expected" /etc/security-update-notify/telegram.env ||`,
 		`systemctl is-enabled --quiet security-update-notify.timer || die`,
 		`systemctl is-active --quiet security-update-notify.timer || die`,
-		"systemd-analyze verify \\\n  /etc/systemd/system/security-update-notify.service \\\n  /etc/systemd/system/security-update-notify.timer\n/usr/local/sbin/security-update-notify doctor --skip-notify --lang en\n",
+		"systemd-analyze verify \\\n  /etc/systemd/system/security-update-notify.service \\\n  /etc/systemd/system/security-update-notify.timer\npython3 -I \"$root_dir/build/pty-driver.py\" \\\n",
+		`-- /usr/local/sbin/sun --lang en`,
+		`grep -qF 'Preview this check (no delivery or state writes)' "$work/sun-menu.out" ||`,
+		`/usr/local/sbin/security-update-notify doctor --skip-notify --lang en`,
 		`assert_package_state_not_regressed after-install`,
 		`case "$apt_policy_was_present:$apt_policy_backup_exists:$apt_policy_absent_marker_exists:$apt_policy_legacy_absent_marker_exists:$apt_policy_dependency_proof_exists" in`,
 		`apt_policy_purge_expectation=original`,
@@ -186,6 +195,7 @@ func TestLiveCanaryIsolatesRunnerHealthAndSkipsFakeNotificationCredentialProbe(t
 		`dry_run_output="$(/usr/local/sbin/security-update-notify run`,
 		`grep -q $'^HASH\t' <<<"$dry_run_output" || die`,
 		"/usr/local/sbin/security-update-notify uninstall --purge-config --lang en\n[[ ! -e /usr/local/sbin/security-update-notify ]] || die",
+		`[[ ! -e /usr/local/sbin/sun && ! -L /usr/local/sbin/sun ]] || die`,
 		`[[ ! -e /etc/security-update-notify ]] || die`,
 		`[[ ! -e /var/lib/security-update-notify ]] || die`,
 		`[[ ! -e /etc/systemd/system/security-update-notify.service ]] || die`,
@@ -206,6 +216,404 @@ func TestLiveCanaryIsolatesRunnerHealthAndSkipsFakeNotificationCredentialProbe(t
 		}
 		previous = start + relative
 	}
+}
+
+func TestArchitectureDocumentListsBothMenuEntrypoints(t *testing.T) {
+	root := repositoryRoot(t)
+	document, err := os.ReadFile(filepath.Join(root, "docs", "go-port.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []string{
+		`/usr/local/sbin/sun -> security-update-notify`,
+		`security-update-notify menu`,
+		`security-update-notify run`,
+	} {
+		if !bytes.Contains(document, []byte(item)) {
+			t.Fatalf("architecture command surface is missing %q", item)
+		}
+	}
+	if bytes.Contains(document, []byte("`/usr/local/sbin/security-update-notify` 是唯一管理和运行入口")) {
+		t.Fatal("architecture document still calls the long command the only installed entrypoint")
+	}
+}
+
+func TestReleaseDocsRequireDraftVerificationBeforeImmutablePublication(t *testing.T) {
+	root := repositoryRoot(t)
+	documents := []struct {
+		name              string
+		immutableGate     string
+		missingFlagsGuard string
+	}{
+		{
+			name:              "docs/releasing.md",
+			immutableGate:     "只有 Draft 中的上述检查全部通过后，才能发布为不可变 Latest Release",
+			missingFlagsGuard: "省略 `--draft` 会过早公开 Release；省略 `--verify-tag` 会让 `gh` 在远端 tag 不存在时自动创建 lightweight tag",
+		},
+		{
+			name:              "docs/releasing.en.md",
+			immutableGate:     "Only after every Draft check passes may it be published as an immutable Latest Release",
+			missingFlagsGuard: "Omitting `--draft` publishes the Release too early; omitting `--verify-tag` lets `gh` create a lightweight tag",
+		},
+	}
+	requiredInOrder := []string{
+		`tag="vX.Y.Z"`,
+		`release_sha="$(git rev-parse HEAD)"`,
+		`git tag -a`,
+		`release_dist="$(mktemp -d "/tmp/security-update-notify-${tag}.XXXXXX")"`,
+		`go run ./cmd/sun-release package`,
+		`--dist "$release_dist"`,
+		assets.ReleaseSigningFingerprint + "!",
+		`notes_file="$(mktemp`,
+		`awk -v heading="## ${tag#v}"`,
+		`[[ -s "$notes_file" ]]`,
+		`verify_release_set()`,
+		`actual_set="$(find "$set_dir"`,
+		`expected_set="$(printf '%s\tf\n' "${assets[@]}"`,
+		`[[ "$actual_set" == "$expected_set" ]]`,
+		`--tarball "$set_dir/$archive"`,
+		`--sha256 "$set_dir/$archive.sha256"`,
+		`--asc "$set_dir/$archive.asc"`,
+		`--known-notation "$release_notation"`,
+		`NOTATION_FLAGS`,
+		`verify_release_set "$release_dist"`,
+		`verify_remote_tag() {`,
+		`git ls-remote origin`,
+		`[[ "$remote_tag_object" == "$(git rev-parse "$tag")" ]]`,
+		`[[ "$remote_tag_commit" == "$release_sha" ]]`,
+		`git push origin`,
+		`verify_remote_tag`,
+		`gh release create`,
+		`"$release_dist/$archive"`,
+		`"$release_dist/$archive.sha256"`,
+		`"$release_dist/$archive.asc"`,
+		`"$release_dist/sun.sh.asc"`,
+		`--draft`,
+		`--verify-tag`,
+		`gh release download`,
+		`--json assets,body,isDraft,tagName`,
+		`actual_assets != sorted(expected_assets)`,
+		`metadata["body"] != expected_body`,
+		`verify_release_set "$verify_dir"`,
+		`cmp "$release_dist/$asset"`,
+		"verify_remote_tag\ngh release edit",
+		`--draft=false`,
+		`--latest`,
+		`--jq .immutable`,
+	}
+	for _, document := range documents {
+		t.Run(document.name, func(t *testing.T) {
+			content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(document.name)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := string(content)
+			previous := -1
+			for _, item := range requiredInOrder {
+				start := previous + 1
+				relative := strings.Index(text[start:], item)
+				if relative < 0 {
+					t.Fatalf("release publication invariant missing or out of order: %s", item)
+				}
+				previous = start + relative
+			}
+			if !strings.Contains(text, document.immutableGate) {
+				t.Fatal("release documentation must make immutable publication conditional on completed Draft verification")
+			}
+			if !strings.Contains(text, document.missingFlagsGuard) {
+				t.Fatal("release documentation must explain the --draft and --verify-tag fail-safe flags")
+			}
+			if strings.Count(text, "\nverify_remote_tag\n") != 2 {
+				t.Fatal("remote tag identity must be checked after push and immediately before publication")
+			}
+		})
+	}
+}
+
+func TestMaintainerDocumentationBashBlocksFailClosed(t *testing.T) {
+	root := repositoryRoot(t)
+	for _, name := range []string{
+		"docs/development.md", "docs/development.en.md",
+		"docs/releasing.md", "docs/releasing.en.md",
+	} {
+		t.Run(name, func(t *testing.T) {
+			content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			blocks := fencedBashBlocks(content)
+			if len(blocks) == 0 {
+				t.Fatal("no Bash blocks found")
+			}
+			for index, block := range blocks {
+				if !bytes.HasPrefix(block, []byte("set -euo pipefail\n")) {
+					t.Fatalf("Bash block %d is not fail-closed", index+1)
+				}
+				cmd := exec.Command("bash", "-n")
+				cmd.Stdin = bytes.NewReader(block)
+				if output, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("Bash block %d syntax: %v: %s", index+1, err, output)
+				}
+			}
+		})
+	}
+}
+
+func TestRootRuntimeGateCopiesOnlyNonIgnoredRegularSources(t *testing.T) {
+	root := repositoryRoot(t)
+	for _, name := range []string{"docs/development.md", "docs/development.en.md"} {
+		t.Run(name, func(t *testing.T) {
+			content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			block := findFencedBashBlock(content, `runtime_gate="$(mktemp -d`)
+			if block == nil {
+				t.Fatal("root runtime-gate Bash block not found")
+			}
+			for _, required := range []string{
+				`chmod 0700 "$runtime_gate"`,
+				`trap 'rm -rf -- "$runtime_gate"' EXIT`,
+				`source_root="$(pwd -P)"`,
+				`source_candidates="$runtime_gate/source-candidates"`,
+				`git ls-files --cached --others --exclude-standard -z >"$source_candidates"`,
+				`: >"$source_list"`,
+				`if [[ ! -e "$source" && ! -L "$source" ]]`,
+				`[[ -f "$source" && ! -L "$source" ]]`,
+				`resolved_source="$(realpath -e -- "$source")"`,
+				`[[ "$resolved_source" == "$source_root/$source" ]]`,
+				`printf '%s\0' "$source" >>"$source_list"`,
+				`done <"$source_candidates"`,
+				`rsync -a --from0 --files-from="$source_list" --relative`,
+				`rm -rf -- "$runtime_gate"`,
+				`trap - EXIT`,
+			} {
+				if !bytes.Contains(block, []byte(required)) {
+					t.Fatalf("runtime-gate source boundary missing %q", required)
+				}
+			}
+			for _, forbidden := range []string{
+				`--exclude='/.git'`,
+				`--exclude='/dist'`,
+				`rsync -a ./ "$runtime_gate/src/"`,
+			} {
+				if bytes.Contains(block, []byte(forbidden)) {
+					t.Fatalf("runtime gate reverted to broad worktree copying: %q", forbidden)
+				}
+			}
+		})
+	}
+}
+
+func TestRootRuntimeGateRejectsSymlinkedSourceAncestor(t *testing.T) {
+	for _, command := range []string{"git", "realpath", "rsync"} {
+		if _, err := exec.LookPath(command); err != nil {
+			t.Fatalf("runtime-gate prerequisite %s is unavailable: %v", command, err)
+		}
+	}
+	root := repositoryRoot(t)
+	for _, name := range []string{"docs/development.md", "docs/development.en.md"} {
+		t.Run(name, func(t *testing.T) {
+			content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			block := findFencedBashBlock(content, `runtime_gate="$(mktemp -d`)
+			if block == nil {
+				t.Fatal("root runtime-gate Bash block not found")
+			}
+			start := bytes.Index(block, []byte(`source_root="$(pwd -P)"`))
+			end := bytes.Index(block, []byte(`install -d "$runtime_gate/home"`))
+			if start < 0 || end <= start {
+				t.Fatal("could not isolate runtime-gate source-copy fragment")
+			}
+			fragment := append([]byte("set -euo pipefail\nruntime_gate=\"$1\"\n"), block[start:end]...)
+
+			fixture := t.TempDir()
+			repository := filepath.Join(fixture, "repository")
+			outside := filepath.Join(fixture, "outside")
+			if err := os.MkdirAll(filepath.Join(repository, "tracked"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(outside, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			tracked := filepath.Join(repository, "tracked", "payload")
+			if err := os.WriteFile(tracked, []byte("repository source"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			for _, args := range [][]string{{"init", "-q"}, {"add", "tracked/payload"}} {
+				cmd := exec.Command("git", args...)
+				cmd.Dir = repository
+				if output, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("git %v: %v: %s", args, err, output)
+				}
+			}
+
+			original := filepath.Join(fixture, "original-tracked")
+			if err := os.Rename(filepath.Dir(tracked), original); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(outside, "payload"), []byte("outside source"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, filepath.Join(repository, "tracked")); err != nil {
+				t.Fatal(err)
+			}
+			symlinkGate := filepath.Join(fixture, "symlink-gate")
+			if err := os.Mkdir(symlinkGate, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("bash", "-c", string(fragment), "runtime-gate", symlinkGate)
+			cmd.Dir = repository
+			if output, err := cmd.CombinedOutput(); err == nil {
+				t.Fatalf("runtime gate copied through a symlinked source ancestor: %s", output)
+			}
+			if _, err := os.Stat(filepath.Join(symlinkGate, "src", "tracked", "payload")); !os.IsNotExist(err) {
+				t.Fatalf("outside payload reached runtime gate: %v", err)
+			}
+
+			if err := os.Remove(filepath.Join(repository, "tracked")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(original, filepath.Join(repository, "tracked")); err != nil {
+				t.Fatal(err)
+			}
+			regularGate := filepath.Join(fixture, "regular-gate")
+			if err := os.Mkdir(regularGate, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			cmd = exec.Command("bash", "-c", string(fragment), "runtime-gate", regularGate)
+			cmd.Dir = repository
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("runtime gate rejected a regular tracked source: %v: %s", err, output)
+			}
+			copied, err := os.ReadFile(filepath.Join(regularGate, "src", "tracked", "payload"))
+			if err != nil || string(copied) != "repository source" {
+				t.Fatalf("copied source = %q, err = %v", copied, err)
+			}
+		})
+	}
+}
+
+func TestDocumentedDraftMetadataFailuresStopBeforeAssetVerification(t *testing.T) {
+	root := repositoryRoot(t)
+	assets := []string{
+		"security-update-notify-3.2.0.tar.gz",
+		"security-update-notify-3.2.0.tar.gz.sha256",
+		"security-update-notify-3.2.0.tar.gz.asc",
+		"sun.sh.asc",
+	}
+	for _, name := range []string{"docs/releasing.md", "docs/releasing.en.md"} {
+		content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		block := findFencedBashBlock(content, `release_json="$verify_dir/release.json.part"`)
+		if block == nil {
+			t.Fatalf("Draft verification Bash block not found in %s", name)
+		}
+		for _, test := range []struct {
+			name   string
+			assets []string
+			body   string
+		}{
+			{name: "extra asset", assets: append(append([]string(nil), assets...), "unexpected.bin"), body: "expected\n"},
+			{name: "wrong body", assets: assets, body: "wrong\n"},
+		} {
+			t.Run(name+"/"+test.name, func(t *testing.T) {
+				work := t.TempDir()
+				notes := filepath.Join(work, "notes.md")
+				if err := os.WriteFile(notes, []byte("expected\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				metadataAssets := make([]map[string]string, 0, len(test.assets))
+				for _, asset := range test.assets {
+					metadataAssets = append(metadataAssets, map[string]string{"name": asset})
+				}
+				metadata, err := json.Marshal(map[string]any{
+					"assets": metadataAssets, "body": test.body,
+					"isDraft": true, "tagName": "v3.2.0",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				metadataPath := filepath.Join(work, "release.json")
+				if err := os.WriteFile(metadataPath, metadata, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				fakeBin := filepath.Join(work, "bin")
+				if err := os.Mkdir(fakeBin, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				fakeGH := []byte("#!/bin/sh\nset -eu\n" +
+					"case \"${1:-} ${2:-}\" in\n" +
+					"  'release download') exit 0 ;;\n" +
+					"  'release view') cat \"$SUN_TEST_RELEASE_JSON\" ;;\n" +
+					"  *) exit 2 ;;\n" +
+					"esac\n")
+				if err := os.WriteFile(filepath.Join(fakeBin, "gh"), fakeGH, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				marker := filepath.Join(work, "asset-verifier-called")
+				releaseDist := filepath.Join(work, "release-dist")
+				if err := os.Mkdir(releaseDist, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				preamble := []byte("tag=v3.2.0\n" +
+					"assets=(security-update-notify-3.2.0.tar.gz " +
+					"security-update-notify-3.2.0.tar.gz.sha256 " +
+					"security-update-notify-3.2.0.tar.gz.asc sun.sh.asc)\n" +
+					"notes_file=\"$SUN_TEST_NOTES\"\n" +
+					"release_dist=\"$SUN_TEST_RELEASE_DIST\"\n" +
+					"verify_release_set() { : >\"$SUN_TEST_VERIFY_MARKER\"; }\n")
+				cmd := exec.Command("bash")
+				cmd.Stdin = bytes.NewReader(append(preamble, block...))
+				cmd.Env = append(os.Environ(),
+					"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+					"SUN_TEST_NOTES="+notes,
+					"SUN_TEST_RELEASE_JSON="+metadataPath,
+					"SUN_TEST_RELEASE_DIST="+releaseDist,
+					"SUN_TEST_VERIFY_MARKER="+marker,
+				)
+				if output, err := cmd.CombinedOutput(); err == nil {
+					t.Fatalf("invalid Draft metadata was accepted: %s", output)
+				}
+				if _, err := os.Stat(marker); !os.IsNotExist(err) {
+					t.Fatalf("asset verifier ran after rejected Draft metadata: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func fencedBashBlocks(document []byte) [][]byte {
+	const startMarker = "```bash\n"
+	const endMarker = "\n```"
+	remaining := string(document)
+	var blocks [][]byte
+	for {
+		start := strings.Index(remaining, startMarker)
+		if start < 0 {
+			return blocks
+		}
+		remaining = remaining[start+len(startMarker):]
+		end := strings.Index(remaining, endMarker)
+		if end < 0 {
+			return blocks
+		}
+		blocks = append(blocks, []byte(remaining[:end]+"\n"))
+		remaining = remaining[end+len(endMarker):]
+	}
+}
+
+func findFencedBashBlock(document []byte, marker string) []byte {
+	for _, block := range fencedBashBlocks(document) {
+		if bytes.Contains(block, []byte(marker)) {
+			return block
+		}
+	}
+	return nil
 }
 
 func TestWorkflowImmutableReleaseChecksUseContentsReadAPI(t *testing.T) {

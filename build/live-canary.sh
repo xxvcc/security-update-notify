@@ -44,10 +44,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for command in apt-get curl dpkg gpg gh head jq python3 sha256sum stat systemctl systemd-analyze tar timeout; do
+for command in apt-get curl dpkg gpg gh head jq python3 readlink sha256sum stat systemctl systemd-analyze tar timeout; do
   command -v "$command" >/dev/null 2>&1 || die "missing command: $command"
 done
 [[ ! -e /usr/local/sbin/security-update-notify ]] || die "runner is not clean: SUN is already installed"
+[[ ! -e /usr/local/sbin/sun && ! -L /usr/local/sbin/sun ]] ||
+  die "runner is not clean: SUN command alias is already present"
 [[ ! -e /etc/security-update-notify ]] || die "runner is not clean: SUN config already exists"
 
 apt_policy=/etc/apt/apt.conf.d/20auto-upgrades
@@ -353,6 +355,8 @@ canary_install_started=1
   die "installed version mismatch"
 [[ "$(stat -c %U:%G:%a /usr/local/sbin/security-update-notify)" == "root:root:755" ]] ||
   die "installed runtime ownership or mode mismatch"
+[[ -L /usr/local/sbin/sun && "$(readlink /usr/local/sbin/sun)" == "security-update-notify" ]] ||
+  die "installed command alias is not the exact relative SUN link"
 [[ "$(stat -c %U:%G:%a /etc/security-update-notify/telegram.env)" == "root:root:600" ]] ||
   die "installed config ownership or mode mismatch"
 for expected in \
@@ -373,6 +377,13 @@ systemctl is-active --quiet security-update-notify.timer || die "timer is not ac
 systemd-analyze verify \
   /etc/systemd/system/security-update-notify.service \
   /etc/systemd/system/security-update-notify.timer
+python3 -I "$root_dir/build/pty-driver.py" \
+  --output "$work/sun-menu.out" \
+  --timeout 30 \
+  --step visible 'Select [0-9] (Enter redraws the menu): ' $'0\n' \
+  -- /usr/local/sbin/sun --lang en
+grep -qF 'Preview this check (no delivery or state writes)' "$work/sun-menu.out" ||
+  die "installed sun command did not open the interactive menu"
 /usr/local/sbin/security-update-notify doctor --skip-notify --lang en
 assert_package_state_not_regressed after-install
 
@@ -433,6 +444,7 @@ grep -q $'^HASH\t' <<<"$dry_run_output" || die "dry-run did not produce a stable
 
 /usr/local/sbin/security-update-notify uninstall --purge-config --lang en
 [[ ! -e /usr/local/sbin/security-update-notify ]] || die "runtime remained after purge"
+[[ ! -e /usr/local/sbin/sun && ! -L /usr/local/sbin/sun ]] || die "SUN command alias remained after purge"
 [[ ! -e /etc/security-update-notify ]] || die "config remained after purge"
 [[ ! -e /var/lib/security-update-notify ]] || die "state remained after purge"
 [[ ! -e /etc/systemd/system/security-update-notify.service ]] || die "service remained after purge"

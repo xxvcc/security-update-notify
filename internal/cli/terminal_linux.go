@@ -29,7 +29,7 @@ func readHiddenLine(input *os.File, reader *bufio.Reader, out io.Writer, prompt 
 	var original syscall.Termios
 	if err := terminalIOCTL(fd, syscall.TCGETS, &original); err != nil {
 		if errors.Is(err, syscall.ENOTTY) || errors.Is(err, syscall.EINVAL) {
-			return reader.ReadString('\n')
+			return readBoundedLine(reader)
 		}
 		return "", fmt.Errorf("inspect terminal: %w", err)
 	}
@@ -54,8 +54,16 @@ func readHiddenLine(input *os.File, reader *bufio.Reader, out io.Writer, prompt 
 		}
 	}()
 
-	line, returnErr = reader.ReadString('\n')
+	line, returnErr = readBoundedLine(reader)
 	return line, returnErr
+}
+
+func isTerminalFile(file *os.File) bool {
+	if file == nil {
+		return false
+	}
+	var state syscall.Termios
+	return terminalIOCTL(file.Fd(), syscall.TCGETS, &state) == nil
 }
 
 var errTerminalTermination = errors.New("termination signal received while configuring terminal")

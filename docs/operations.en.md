@@ -48,6 +48,7 @@ Run `security-update-notify doctor` anytime to inspect all seven checks, pending
 
 ```text
 /usr/local/sbin/security-update-notify
+/usr/local/sbin/sun -> security-update-notify                              # when the path was free at install time
 /etc/security-update-notify/telegram.env
 /etc/systemd/system/security-update-notify.service
 /etc/systemd/system/security-update-notify.service.d/credentials.conf  # encrypted Feishu credential
@@ -130,6 +131,58 @@ apply_updates = yes
 reboot = never
 ```
 
+## Interactive menu
+
+After installation, the short command is the recommended menu entrypoint; the full command is always available
+as a fallback:
+
+```bash
+sudo sun
+sudo security-update-notify menu
+```
+
+Use `--lang zh` or `--lang en` to select the interface language for this invocation, for example
+`sudo security-update-notify menu --lang en`. The menu can preview a run, run a check now, run the system
+doctor, change notification settings, test notifications, check for a new release, upgrade, uninstall,
+switch the interface language, or exit. Switching the interface language affects only the current menu and
+the actions it dispatches; persistent notification language remains controlled by `NOTIFY_LANG`.
+
+The menu deliberately has a strict interactive boundary: the effective UID must be root and standard input,
+standard output, and standard error must all be attached to real TTYs. Pipes, redirections, cron, systemd
+units, and non-terminal SSH invocations are refused before any selection is read. A bare
+`security-update-notify` retains its established "run one check" behavior regardless of TTY state. Scripts,
+cron jobs, and systemd units should invoke `security-update-notify run` explicitly; the installed systemd
+service uses that explicit `run` subcommand too.
+
+Successful read-only and routine actions return to the prompt, and a blank line redraws the complete menu.
+An action failure exits immediately with that action's original status. Once notification configuration,
+upgrade, or uninstall has actually been dispatched, the menu exits with that command's status so an old
+privileged process does not continue accepting work after configuration changes or after its binary has been
+replaced or removed. Cancelling upgrade or uninstall at the menu's own confirmation does not dispatch the
+action, causes no action side effects, and returns to the menu.
+
+Entrypoints that have external effects or modify the host use fail-closed confirmation. Run-now and test-send
+confirmations default to `N`; upgrade requires the exact word `YES`; uninstall while retaining configuration
+requires the exact word `YES`. A full purge restores SUN-managed apt/dnf automatic-update configuration and
+removes SUN configuration, notification credentials, state, upgrade backups, and logs; it requires the exact
+word `PURGE`. End-of-file (for example, `Ctrl-D` at a prompt) is a cancellation and returns `2`.
+`Ctrl-C` terminates by signal, normally observed by the shell as status `130`. If an action has already begun,
+it retains that subcommand's existing lock, transactional rollback, and exit-status behavior.
+
+The installer implements the short command as the relative symlink
+`/usr/local/sbin/sun -> security-update-notify`. It creates the link when the path is absent and reuses that
+exact link. A regular file, directory, or link to any other target is never overwritten: core installation
+can still complete, but prints a warning. At uninstall time, only a relative link still pointing exactly to
+`security-update-notify` is removed; any other file, directory, or link is preserved. Use
+`sudo security-update-notify menu` after a conflict.
+
+Direct downgrades to a release that predates the interactive menu are unsupported. If its binary is installed
+manually, an existing `sun` link may remain, but that older binary does not dispatch by invocation name:
+`sudo sun` then performs the older release's bare check, which may send notifications and write state. Uninstall
+the current release normally before downgrading. If a manual downgrade has already occurred, stop using `sun`,
+remove it only after verifying that it is still the exact relative link above, and use the older release's
+documented long-form commands.
+
 ## Operations
 
 Check timer status:
@@ -191,6 +244,18 @@ Packages installed as dependencies are left in place. `--purge-config` removes S
 Both ordinary uninstall and `--purge-config` acquire the install and runtime locks before scanning installation journals and the fixed private-recovery paths. If an interrupted transaction or private recovery material exists, uninstall fails closed before any `systemctl` call, unit removal, or configuration cleanup. Rerun the installer first for an automatically recoverable transaction. A transaction marked unsafe during the package-manager phase requires the inspection and manual repair described above and cannot be bypassed through uninstall.
 
 The uninstaller fails closed on concurrent changes that return normally: it uses directory handles, no-overwrite renames, and content/metadata revalidation, and retains `.security-update-notify-restore.*`, `.security-update-notify-purge.*`, or `.security-update-notify-conflict.*` evidence instead of overwriting or deleting an administrator-created concurrent file. `--purge-config` does not, however, promise transactional atomicity across SIGKILL, a kernel crash, or power loss; do not forcibly terminate it. If purge is interrupted, inspect those retained files and the current apt/dnf configuration before retrying.
+
+Ordinary file and directory removal may also retain `.security-update-notify-remove-pending.*`, legacy
+`.security-update-notify-remove.*`, or identity-bearing `.security-update-notify-remove-owned.*` entries. An
+opened parent is trusted as private only while it remains root-owned and forbids group/other write. A retry then
+automatically removes only an owned entry whose stable identity still matches. A parent that no longer meets
+those conditions, or a pending or legacy entry, is retained and fails closed.
+`/var/log` is a shared parent, so every retained quarantine there fails closed and remains in place even when an
+owned identity matches: a forgeable name is not cross-process proof of ownership. With no retained quarantine,
+the current purge still removes SUN's log and rotated logs normally. Never delete retained entries by name
+alone. Compare the reported original and quarantine paths, inode, type, ownership, contents, and available
+backups before an administrator decides to restore the original name or remove the entry. Preserve the evidence
+and recover from a trusted backup when ownership cannot be established.
 
 ## Related documentation
 

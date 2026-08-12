@@ -1,10 +1,13 @@
 package uninstaller
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -2000,7 +2003,7 @@ func TestRemovalPlaceholderInitializationFailureReportsRetainedPath(t *testing.T
 	defer parent.Close()
 	forced := errors.New("forced quarantine close failure")
 	retained := ""
-	name, _, err := newRemovalPlaceholderWithClose(parent, false, func(file *os.File, name string) error {
+	name, _, err := newRemovalPlaceholderWithClose(parent, false, uninstallRemovalPendingPrefix, func(file *os.File, name string) error {
 		if err := file.Close(); err != nil {
 			return err
 		}
@@ -2079,40 +2082,541 @@ func TestRemoveLogicalTreeDoesNotDeleteConcurrentReplacement(t *testing.T) {
 	assertPathContent(t, filepath.Join(target, "administrator.conf"), "keep")
 }
 
-func TestLogicalRemovalRecoversInterruptedQuarantines(t *testing.T) {
+func TestLogicalRemovalRetainsUnverifiedQuarantinesAndRecoversOwned(t *testing.T) {
 	root := t.TempDir()
 	parent := filepath.Join(root, "etc")
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	prefix := "." + uninstallRemovalPrefix + "."
-	fileArtifact := prefix + strings.Repeat("a", 32)
-	directoryArtifact := prefix + strings.Repeat("b", 32)
-	nearMatch := prefix + "not-a-valid-artifact"
-	if err := os.WriteFile(filepath.Join(parent, fileArtifact), []byte("secret"), 0o600); err != nil {
+	legacy := "." + uninstallRemovalPrefix + "." + strings.Repeat("a", 32)
+	pending := "." + uninstallRemovalPendingPrefix + "." + strings.Repeat("b", 32)
+	nearMatch := "." + uninstallRemovalOwnedPrefix + ".not-a-valid-artifact"
+	for _, name := range []string{legacy, pending, nearMatch} {
+		if err := os.WriteFile(filepath.Join(parent, name), []byte("keep"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ownedSource := filepath.Join(parent, "owned-source")
+	if err := os.WriteFile(ownedSource, []byte("owned"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Mkdir(filepath.Join(parent, directoryArtifact), 0o700); err != nil {
+	ownedInfo, err := os.Lstat(ownedSource)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(parent, directoryArtifact, "credential"), []byte("secret"), 0o600); err != nil {
+	pendingOwned := "." + uninstallRemovalPendingPrefix + "." + strings.Repeat("c", 32)
+	owned, err := ownedRemovalName(pendingOwned, ownedInfo, removalLeaf)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(parent, nearMatch), []byte("keep"), 0o600); err != nil {
+	if err := os.Rename(ownedSource, filepath.Join(parent, owned)); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := removeLogicalTree(root, "/etc/security-update-notify"); err != nil {
+	logical := "/etc/missing"
+	err = removeLogicalTree(root, logical)
+	if err == nil || !strings.Contains(err.Error(), "legacy uninstall quarantine") || !strings.Contains(err.Error(), "unverified uninstall quarantine") {
+		t.Fatalf("removeLogicalTree error = %v, want legacy and pending retention", err)
+	}
+	for _, name := range []string{legacy, pending, nearMatch} {
+		assertPathContent(t, filepath.Join(parent, name), "keep")
+	}
+	if _, err := os.Lstat(filepath.Join(parent, owned)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("verified owned quarantine survived recovery: %v", err)
+	}
+}
+
+func TestInterruptedOwnedTreeRecoveryAllowsDirectoryMetadataChanges(t *testing.T) {
+	root := t.TempDir()
+	parentPath := filepath.Join(root, "etc")
+	tree := filepath.Join(parentPath, "owned-tree")
+	if err := os.MkdirAll(tree, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{fileArtifact, directoryArtifact} {
-		if _, err := os.Lstat(filepath.Join(parent, name)); !os.IsNotExist(err) {
-			t.Fatalf("interrupted uninstall artifact %s survived retry: %v", name, err)
+	for _, name := range []string{"removed-before-crash", "remaining"} {
+		if err := os.WriteFile(filepath.Join(tree, name), []byte(name), 0o600); err != nil {
+			t.Fatal(err)
 		}
 	}
-	if got, err := os.ReadFile(filepath.Join(parent, nearMatch)); err != nil || string(got) != "keep" {
-		t.Fatalf("near-match file data=%q err=%v", got, err)
+	info, err := os.Lstat(tree)
+	if err != nil {
+		t.Fatal(err)
 	}
+	pending := "." + uninstallRemovalPendingPrefix + "." + strings.Repeat("d", 32)
+	owned, err := ownedRemovalName(pending, info, removalTree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownedPath := filepath.Join(parentPath, owned)
+	if err := os.Rename(tree, ownedPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(ownedPath, "removed-before-crash")); err != nil {
+		t.Fatal(err)
+	}
+	parent, _, err := openLogicalParent(root, "/etc/missing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	if err := cleanupUninstallRemovalArtifacts(parent, trustedParentRemovalRecovery); err != nil {
+		t.Fatal(err)
+	}
+	assertPathMissing(t, ownedPath)
+}
+
+func TestTrustedParentRecoveryRejectsGroupWritableForgedOwnedEntries(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		mode  removalMode
+		setup func(*testing.T, string) string
+	}{
+		{
+			name: "leaf",
+			mode: removalLeaf,
+			setup: func(t *testing.T, path string) string {
+				if err := os.WriteFile(path, []byte("keep"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return path
+			},
+		},
+		{
+			name: "tree",
+			mode: removalTree,
+			setup: func(t *testing.T, path string) string {
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				retained := filepath.Join(path, "protected")
+				if err := os.WriteFile(retained, []byte("keep"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return retained
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			parentPath := filepath.Join(root, "etc", "logrotate.d")
+			if err := os.MkdirAll(parentPath, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			source := filepath.Join(parentPath, "administrator-entry")
+			retainedSuffix := strings.TrimPrefix(test.setup(t, source), source)
+			info, err := os.Lstat(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pending := "." + uninstallRemovalPendingPrefix + "." + strings.Repeat("2", 32)
+			owned, err := ownedRemovalName(pending, info, test.mode)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ownedPath := filepath.Join(parentPath, owned)
+			if err := os.Rename(source, ownedPath); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(parentPath, 0o770); err != nil {
+				t.Fatal(err)
+			}
+
+			err = removeLogicalTree(root, "/etc/logrotate.d/missing")
+			if err == nil || !strings.Contains(err.Error(), "unsafe trusted uninstall recovery parent") || !strings.Contains(err.Error(), "forbidden permissions") {
+				t.Fatalf("trusted recovery error = %v, want unsafe-parent refusal", err)
+			}
+			assertPathContent(t, ownedPath+retainedSuffix, "keep")
+		})
+	}
+}
+
+func TestTrustedParentRecoveryValidatesResolvedLocalSbinDirectory(t *testing.T) {
+	root := t.TempDir()
+	physicalParent := filepath.Join(root, "usr", "local", "bin")
+	if err := os.MkdirAll(physicalParent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("bin", filepath.Join(root, "usr", "local", "sbin")); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(physicalParent, "administrator-command")
+	if err := os.WriteFile(source, []byte("keep"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := "." + uninstallRemovalPendingPrefix + "." + strings.Repeat("3", 32)
+	owned, err := ownedRemovalName(pending, info, removalLeaf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownedPath := filepath.Join(physicalParent, owned)
+	if err := os.Rename(source, ownedPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(physicalParent, 0o770); err != nil {
+		t.Fatal(err)
+	}
+
+	err = removeLogicalFile(root, "/usr/local/sbin/missing")
+	if err == nil || !strings.Contains(err.Error(), physicalParent) || !strings.Contains(err.Error(), "forbidden permissions") {
+		t.Fatalf("resolved alias recovery error = %v, want physical bin refusal", err)
+	}
+	assertPathContent(t, ownedPath, "keep")
+}
+
+func TestTrustedParentRecoveryRemovesOwnedEntriesFromValidatedDirectory(t *testing.T) {
+	for _, mode := range []removalMode{removalLeaf, removalTree} {
+		t.Run(fmt.Sprintf("mode-%d", mode), func(t *testing.T) {
+			root := t.TempDir()
+			parentPath := filepath.Join(root, "etc")
+			if err := os.MkdirAll(parentPath, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			source := filepath.Join(parentPath, "interrupted")
+			if mode == removalTree {
+				if err := os.Mkdir(source, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(source, "remaining"), []byte("data"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(source, []byte("data"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Lstat(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pending := "." + uninstallRemovalPendingPrefix + "." + strings.Repeat("4", 32)
+			owned, err := ownedRemovalName(pending, info, mode)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ownedPath := filepath.Join(parentPath, owned)
+			if err := os.Rename(source, ownedPath); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := removeLogicalTree(root, "/etc/missing"); err != nil {
+				t.Fatal(err)
+			}
+			assertPathMissing(t, ownedPath)
+		})
+	}
+}
+
+func TestVarLogRecoveryRetainsForgedOwnedTree(t *testing.T) {
+	operations := []struct {
+		name string
+		run  func(string) error
+	}{
+		{
+			name: "prefixed log removal",
+			run: func(root string) error {
+				return removeLogicalFilesWithPrefix(root, "/var/log", "security-update-notify.log.", nil)
+			},
+		},
+		{
+			name: "purge",
+			run: func(root string) error {
+				_, err := uninstallAsRoot(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner})
+				return err
+			},
+		},
+	}
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			root := t.TempDir()
+			parentPath := filepath.Join(root, "var", "log")
+			tree := filepath.Join(parentPath, "administrator-tree")
+			if err := os.MkdirAll(tree, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(parentPath, 0o770); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(tree, "protected"), []byte("keep"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Lstat(tree)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pending := "." + uninstallRemovalPendingPrefix + "." + strings.Repeat("f", 32)
+			owned, err := ownedRemovalName(pending, info, removalTree)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ownedPath := filepath.Join(parentPath, owned)
+			if err := os.Rename(tree, ownedPath); err != nil {
+				t.Fatal(err)
+			}
+
+			err = operation.run(root)
+			if err == nil || !strings.Contains(err.Error(), "forbidden by shared-parent recovery policy") {
+				t.Fatalf("operation error = %v, want shared-parent recovery refusal", err)
+			}
+			assertPathContent(t, filepath.Join(ownedPath, "protected"), "keep")
+		})
+	}
+}
+
+func TestSharedParentRecoveryRetainsOwnedEmptyDirectory(t *testing.T) {
+	root := t.TempDir()
+	parentPath := filepath.Join(root, "var", "log")
+	directory := filepath.Join(parentPath, "administrator-empty-directory")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := "." + uninstallRemovalPendingPrefix + "." + strings.Repeat("0", 32)
+	owned, err := ownedRemovalName(pending, info, removalEmptyDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownedPath := filepath.Join(parentPath, owned)
+	if err := os.Rename(directory, ownedPath); err != nil {
+		t.Fatal(err)
+	}
+
+	err = removeLogicalFilesWithPrefix(root, "/var/log", "security-update-notify.log.", nil)
+	if err == nil || !strings.Contains(err.Error(), "forbidden by shared-parent recovery policy") {
+		t.Fatalf("prefixed removal error = %v, want shared-parent recovery refusal", err)
+	}
+	if info, err := os.Stat(ownedPath); err != nil || !info.IsDir() {
+		t.Fatalf("owned empty directory was not retained: info=%v err=%v", info, err)
+	}
+}
+
+func TestVarLogRecoveryRetainsForgedOwnedLeaf(t *testing.T) {
+	operations := []struct {
+		name string
+		run  func(string) error
+	}{
+		{
+			name: "prefixed log removal",
+			run: func(root string) error {
+				return removeLogicalFilesWithPrefix(root, "/var/log", "security-update-notify.log.", nil)
+			},
+		},
+		{
+			name: "purge",
+			run: func(root string) error {
+				_, err := uninstallAsRoot(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner})
+				return err
+			},
+		},
+	}
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			root := t.TempDir()
+			parentPath := filepath.Join(root, "var", "log")
+			source := writeFixture(t, root, "/var/log/root-owned-unrelated.log", "keep")
+			if err := os.Chmod(parentPath, 0o770); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Lstat(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pending := "." + uninstallRemovalPendingPrefix + "." + strings.Repeat("1", 32)
+			owned, err := ownedRemovalName(pending, info, removalLeaf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ownedPath := filepath.Join(parentPath, owned)
+			if err := os.Rename(source, ownedPath); err != nil {
+				t.Fatal(err)
+			}
+
+			err = operation.run(root)
+			if err == nil || !strings.Contains(err.Error(), "forbidden by shared-parent recovery policy") {
+				t.Fatalf("operation error = %v, want shared-parent recovery refusal", err)
+			}
+			assertPathContent(t, ownedPath, "keep")
+		})
+	}
+}
+
+func TestSharedParentRemovalDeletesRotatedLogWithoutQuarantine(t *testing.T) {
+	root := t.TempDir()
+	rotated := writeFixture(t, root, "/var/log/security-update-notify.log.1", "rotated")
+	if err := removeLogicalFilesWithPrefix(root, "/var/log", "security-update-notify.log.", nil); err != nil {
+		t.Fatal(err)
+	}
+	assertPathMissing(t, rotated)
+}
+
+func TestRemovalRecoveryDocumentationMatchesTrustBoundary(t *testing.T) {
+	_, current, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("could not locate repository root")
+	}
+	root := filepath.Clean(filepath.Join(filepath.Dir(current), "..", ".."))
+	for _, document := range []struct {
+		path     string
+		required []string
+	}{
+		{
+			path: "docs/operations.md",
+			required: []string{
+				"仍由 root 所有且禁止 group/other write 时，才视为可信私有父目录",
+				"`/var/log` 是共享父目录",
+				"任何遗留隔离项也会保留并失败关闭",
+				"本次 purge 仍会正常删除 SUN 日志和轮转日志",
+			},
+		},
+		{
+			path: "docs/operations.en.md",
+			required: []string{
+				"trusted as private only while it remains root-owned and forbids group/other write",
+				"`/var/log` is a shared parent",
+				"every retained quarantine there fails closed and remains in place",
+				"the current purge still removes SUN's log and rotated logs normally",
+			},
+		},
+		{
+			path: "CHANGELOG.md",
+			required: []string{
+				"`/var/log` 共享父",
+				"目录中的任何遗留隔离项都保留并失败关闭",
+				"Every retained quarantine in the shared",
+				"`/var/log` parent remains in place and fails closed",
+			},
+		},
+	} {
+		content, err := os.ReadFile(filepath.Join(root, document.path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, required := range document.required {
+			if !bytes.Contains(content, []byte(required)) {
+				t.Errorf("%s is missing removal-recovery boundary %q", document.path, required)
+			}
+		}
+	}
+}
+
+func TestInterruptedOwnedTreeRecoveryRetainsIdentityMismatch(t *testing.T) {
+	root := t.TempDir()
+	parentPath := filepath.Join(root, "etc")
+	tree := filepath.Join(parentPath, "owned-tree")
+	if err := os.MkdirAll(tree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := "." + uninstallRemovalPendingPrefix + "." + strings.Repeat("e", 32)
+	owned, err := ownedRemovalName(pending, info, removalTree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownedPath := filepath.Join(parentPath, owned)
+	if err := os.Remove(tree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(ownedPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ownedPath, "administrator-data"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	parent, _, err := openLogicalParent(root, "/etc/missing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	err = cleanupUninstallRemovalArtifacts(parent, trustedParentRemovalRecovery)
+	if err == nil || !strings.Contains(err.Error(), "does not match its durable identity") {
+		t.Fatalf("cleanup error = %v, want identity mismatch", err)
+	}
+	assertPathContent(t, filepath.Join(ownedPath, "administrator-data"), "keep")
+}
+
+func TestOwnedPromotionIdentityPreventsPostValidationReplacementCleanup(t *testing.T) {
+	root := t.TempDir()
+	logical := "/etc/logrotate.d/security-update-notify"
+	target := writeFixture(t, root, logical, "managed")
+	parent, name, err := openLogicalParent(root, logical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	expected, err := readRemovalEntry(parent, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replacementPath string
+	crash := errors.New("simulated crash after owned promotion")
+	err = removeValidatedEntryAtWithHooks(parent, name, expected, removalLeaf, removalHooks{
+		afterPendingValidation: func(pending string) error {
+			pendingPath := removalEntryPath(parent, pending)
+			if err := os.Rename(pendingPath, pendingPath+".held"); err != nil {
+				return err
+			}
+			return os.WriteFile(pendingPath, []byte("administrator replacement"), 0o640)
+		},
+		afterOwnedPromotion: func(owned string) error {
+			replacementPath = removalEntryPath(parent, owned)
+			return crash
+		},
+	})
+	if !errors.Is(err, crash) || replacementPath == "" {
+		t.Fatalf("removal error = %v replacement=%q, want simulated post-promotion crash", err, replacementPath)
+	}
+	assertPathContent(t, replacementPath, "administrator replacement")
+	err = cleanupUninstallRemovalArtifacts(parent, trustedParentRemovalRecovery)
+	if err == nil || !strings.Contains(err.Error(), "does not match its durable identity") {
+		t.Fatalf("cleanup error = %v, want durable identity mismatch", err)
+	}
+	assertPathContent(t, replacementPath, "administrator replacement")
+	assertPathMissing(t, target)
+}
+
+func TestOwnedPromotionIsSyncedBeforeDeletion(t *testing.T) {
+	root := t.TempDir()
+	logical := "/etc/logrotate.d/security-update-notify"
+	target := writeFixture(t, root, logical, "managed")
+	parent, name, err := openLogicalParent(root, logical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	expected, err := readRemovalEntry(parent, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	synced := false
+	err = removeValidatedEntryAtWithHooks(parent, name, expected, removalLeaf, removalHooks{
+		syncOwned: func(parent *os.File) error {
+			synced = true
+			return syncLogicalRemovalParent(parent)
+		},
+		beforeDelete: func(owned string) error {
+			if !synced {
+				return errors.New("delete ran before owned promotion sync")
+			}
+			if _, err := os.Lstat(removalEntryPath(parent, owned)); err != nil {
+				return err
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !synced {
+		t.Fatal("owned promotion was not synced")
+	}
+	assertPathMissing(t, target)
 }
 
 func TestRemoveClaimedTreeUsesHeldDirectoryDescriptor(t *testing.T) {
@@ -2240,27 +2744,49 @@ func TestPurgeUnlinksLeafSymlinkWithoutFollowingIt(t *testing.T) {
 }
 
 func TestUninstallSupportsFedoraStandardLocalSbinAlias(t *testing.T) {
-	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "usr/local/bin"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	link := filepath.Join(root, "usr/local/sbin")
-	if err := os.Symlink("bin", link); err != nil {
-		t.Fatal(err)
-	}
-	binary := filepath.Join(root, "usr/local/bin/security-update-notify")
-	if err := os.WriteFile(binary, []byte("runtime"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	for _, test := range []struct {
+		name        string
+		aliasTarget string
+		removed     bool
+	}{
+		{name: "exact command alias", aliasTarget: aliasTarget, removed: true},
+		{name: "conflicting command alias", aliasTarget: "operator-command"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(root, "usr/local/bin"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			link := filepath.Join(root, "usr/local/sbin")
+			if err := os.Symlink("bin", link); err != nil {
+				t.Fatal(err)
+			}
+			binary := filepath.Join(root, "usr/local/bin/security-update-notify")
+			if err := os.WriteFile(binary, []byte("runtime"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			alias := filepath.Join(root, "usr/local/bin/sun")
+			if err := os.Symlink(test.aliasTarget, alias); err != nil {
+				t.Fatal(err)
+			}
 
-	if _, err := uninstallAsRoot(Options{RootDir: root, RunCommand: successfulRunner}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Lstat(binary); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("runtime remained behind standard alias: %v", err)
-	}
-	if target, err := os.Readlink(link); err != nil || target != "bin" {
-		t.Fatalf("standard alias changed: target=%q err=%v", target, err)
+			if _, err := uninstallAsRoot(Options{RootDir: root, RunCommand: successfulRunner}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Lstat(binary); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("runtime remained behind standard alias: %v", err)
+			}
+			if target, err := os.Readlink(link); err != nil || target != "bin" {
+				t.Fatalf("standard alias changed: target=%q err=%v", target, err)
+			}
+			target, err := os.Readlink(alias)
+			if test.removed && !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("exact command alias remained behind standard alias: target=%q err=%v", target, err)
+			}
+			if !test.removed && (err != nil || target != test.aliasTarget) {
+				t.Fatalf("conflicting command alias changed: target=%q err=%v", target, err)
+			}
+		})
 	}
 }
 
