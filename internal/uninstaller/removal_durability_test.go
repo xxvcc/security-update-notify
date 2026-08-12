@@ -15,7 +15,7 @@ func TestOwnedRemovalIdentityIntegerEncodingIsReversible(t *testing.T) {
 	suffix := strings.Repeat("a", 32)
 	for _, value := range []int64{math.MinInt64, -1, 0, math.MaxInt64} {
 		identity, mode, ok := parseOwnedRemovalName(
-			"." + uninstallRemovalOwnedPrefix + "." + suffix + ".2.1.2.ffffffff.fffffffe.fffffffd." +
+			"." + uninstallRemovalOwnedPrefix + "." + suffix + ".2.1.2.ffffffff.fffffffe.fffffffd.4." +
 				strings.Join([]string{
 					formatRemovalIdentityWord(uint64(value)),
 					formatRemovalIdentityWord(uint64(value)),
@@ -31,12 +31,15 @@ func TestOwnedRemovalIdentityIntegerEncodingIsReversible(t *testing.T) {
 		if identity.mode != math.MaxUint32 || identity.uid != math.MaxUint32-1 || identity.gid != math.MaxUint32-2 {
 			t.Fatalf("bounded uint32 fields changed: %#v", identity)
 		}
+		if identity.nlink != 4 {
+			t.Fatalf("link count changed: %#v", identity)
+		}
 	}
 }
 
 func TestOwnedRemovalIdentityRejectsNarrowingOverflow(t *testing.T) {
 	suffix := strings.Repeat("b", 32)
-	valid := []string{"2", "1", "2", "ffffffff", "fffffffe", "fffffffd", "0", "0", "0"}
+	valid := []string{"2", "1", "2", "ffffffff", "fffffffe", "fffffffd", "4", "0", "0", "0"}
 	for _, test := range []struct {
 		name  string
 		index int
@@ -55,6 +58,29 @@ func TestOwnedRemovalIdentityRejectsNarrowingOverflow(t *testing.T) {
 				t.Fatalf("accepted overflowing %s field %q", test.name, test.value)
 			}
 		})
+	}
+}
+
+func TestOwnedRemovalRecoveryRetainsLegacyIdentityEncoding(t *testing.T) {
+	root := t.TempDir()
+	parentPath := filepath.Join(root, "etc")
+	if err := os.MkdirAll(parentPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacyName := "." + uninstallRemovalOwnedPrefix + "." + strings.Repeat("c", 32) +
+		".0.1.2.81a4.0.0.5.6.7"
+	legacyPath := filepath.Join(parentPath, legacyName)
+	if err := os.WriteFile(legacyPath, []byte("retain"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := removeLogicalFile(root, "/etc/missing")
+	if err == nil || !strings.Contains(err.Error(), "unsupported durable identity") {
+		t.Fatalf("legacy owned recovery error = %v, want unsupported-identity refusal", err)
+	}
+	data, readErr := os.ReadFile(legacyPath)
+	if readErr != nil || string(data) != "retain" {
+		t.Fatalf("legacy owned quarantine changed: data=%q err=%v", data, readErr)
 	}
 }
 

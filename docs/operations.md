@@ -53,6 +53,9 @@
 /etc/systemd/system/security-update-notify.service
 /etc/systemd/system/security-update-notify.service.d/credentials.conf  # 使用加密飞书凭据时
 /etc/systemd/system/security-update-notify.timer
+/etc/systemd/system/timers.target.wants/security-update-notify.timer   # systemd 持久 enablement 链接
+/run/systemd/system/timers.target.wants/security-update-notify.timer   # 仅升级旧 runtime enablement 时可能存在
+/var/lib/systemd/timers/stamp-security-update-notify.timer             # systemd 的 Persistent timer 状态
 /etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred # 新 systemd
 /etc/security-update-notify/credentials/feishu-app-secret              # 旧 systemd 回退
 /etc/logrotate.d/security-update-notify
@@ -214,7 +217,8 @@ sudo tail -n 100 /var/log/security-update-notify.log
 
 ## 卸载
 
-移除程序与 systemd/logrotate 集成，但保留配置和状态：
+移除程序与 systemd/logrotate 集成（包括 SUN timer 的 enablement 链接和 Persistent 时间戳），但保留
+SUN 的业务配置和 `/var/lib/security-update-notify` 状态：
 
 ```bash
 sudo security-update-notify uninstall
@@ -226,7 +230,13 @@ sudo security-update-notify uninstall
 sudo security-update-notify uninstall --purge-config
 ```
 
-作为依赖安装的软件包会保留，不会自动卸载。`--purge-config` 会删除 SUN 的配置、Telegram/飞书凭据、状态、升级备份（其中可能含 bot token 副本）以及轮转日志，并在备份存在时恢复 apt/dnf 自动更新配置。卸载器不会改变发行版自身 automatic timer 的当前状态；它不会因为移除监控工具而主动关闭安全更新，也不会覆盖管理员之后对该 timer 的调整。
+普通卸载和 `--purge-config` 都只删除精确属于 SUN timer 的 unit、enablement 链接和 Persistent 时间戳；
+目标已被管理员替换的同名链接会保留。Persistent 时间戳只有在它是 root 所有、禁止 group/other write 且
+仅有一个硬链接的普通文件时才会删除；异常类型或元数据会保留并返回错误。作为依赖安装的软件包会保留，
+不会自动卸载。
+`--purge-config` 还会删除 SUN 的配置、Telegram/飞书凭据、状态、升级备份（其中可能含 bot token 副本）
+以及轮转日志，并在备份存在时恢复 apt/dnf 自动更新配置。卸载器不会改变发行版自身 automatic timer 的当前
+状态或时间戳；它不会因为移除监控工具而主动关闭安全更新，也不会覆盖管理员之后对该 timer 的调整。
 
 普通卸载与 `--purge-config` 都会先取得安装锁和运行锁，再扫描安装事务日志及固定的私密恢复路径。只要发现中断事务或私密恢复材料，卸载器就会在任何 `systemctl` 调用、unit 删除或配置清理之前失败关闭。可自动恢复的事务应先重新运行安装器完成回滚；包管理器阶段留下的“不适合自动恢复”事务必须按上文检查和人工修复，不能用卸载绕过。
 

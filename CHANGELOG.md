@@ -1,5 +1,24 @@
 # 变更记录
 
+## 3.2.1
+
+- 修复卸载后遗留 SUN systemd timer 状态的问题：普通卸载和 `--purge-config` 现在都会在停止 timer 后，
+  通过 no-follow、目录句柄与持久化同步删除精确的 SUN 持久/runtime enablement 链接及
+  `/var/lib/systemd/timers/stamp-security-update-notify.timer`。系统总线不可用时仍会清理这些受管路径；目标被
+  管理员替换的同名链接与其他 timer 的时间戳保持不变；同名 stamp 只有在它是当前特权进程所有、禁止
+  group/other write 且仅有一个硬链接的普通文件时才会删除，异常类型或元数据会保留并失败关闭。单元、真实
+  PTY 生命周期和公开 systemd canary 均新增卸载后无残留断言，中英文运维文档也列明 systemd 自动生成的路径
+  与保留边界。
+  Fixes SUN systemd timer state left behind after uninstall. Both ordinary uninstall and `--purge-config` now
+  remove the exact persistent/runtime SUN enablement links and
+  `/var/lib/systemd/timers/stamp-security-update-notify.timer` after stopping the timer, using no-follow directory
+  handles and durable synchronization. Managed paths are still cleaned when the systemd bus is unavailable;
+  administrator-replaced same-name links and timestamps for other timers are preserved. A same-name stamp is
+  removed only when it is a regular file owned by the current privileged process, forbids group/other write, and
+  has exactly one hard link; unexpected types or metadata are retained with a fail-closed error. Unit, real-PTY
+  lifecycle, and public systemd canary coverage now assert a residue-free uninstall, and the bilingual operations
+  guide documents the systemd-generated paths and preservation boundary.
+
 ## 3.2.0
 
 - 新增仅供人工终端使用的显式 `security-update-notify menu` 与安装后短入口 `sudo sun`，同时保留裸

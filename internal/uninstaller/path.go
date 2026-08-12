@@ -9,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/xxvcc/security-update-notify/internal/filetrust"
+
 	"unsafe"
 )
 
@@ -200,11 +202,31 @@ func removeLogicalFileWithRecovery(root, logical string, policy removalRecoveryP
 	return removeLogicalFileWithSyncAndRecovery(root, logical, nil, syncLogicalRemovalParent, policy)
 }
 
+func removeTrustedLogicalRegularFile(root, logical string) error {
+	return removeTrustedLogicalRegularFileWithHook(root, logical, nil)
+}
+
+func removeTrustedLogicalRegularFileWithHook(root, logical string, beforeClaim func() error) error {
+	validate := func(info os.FileInfo) error {
+		if err := filetrust.ValidateRegular(info, os.Geteuid(), 0o022, true); err != nil {
+			return fmt.Errorf("unsafe managed regular file %s: %w", logical, err)
+		}
+		return nil
+	}
+	return removeLogicalFileValidatedWithSyncAndRecovery(
+		root, logical, beforeClaim, syncLogicalRemovalParent, trustedParentRemovalRecovery, validate,
+	)
+}
+
 func removeLogicalFileWithSync(root, logical string, beforeClaim func() error, syncParent func(*os.File) error) (returnErr error) {
 	return removeLogicalFileWithSyncAndRecovery(root, logical, beforeClaim, syncParent, trustedParentRemovalRecovery)
 }
 
 func removeLogicalFileWithSyncAndRecovery(root, logical string, beforeClaim func() error, syncParent func(*os.File) error, policy removalRecoveryPolicy) (returnErr error) {
+	return removeLogicalFileValidatedWithSyncAndRecovery(root, logical, beforeClaim, syncParent, policy, nil)
+}
+
+func removeLogicalFileValidatedWithSyncAndRecovery(root, logical string, beforeClaim func() error, syncParent func(*os.File) error, policy removalRecoveryPolicy, validate func(os.FileInfo) error) (returnErr error) {
 	parent, name, err := openLogicalParent(root, logical)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -228,12 +250,20 @@ func removeLogicalFileWithSyncAndRecovery(root, logical string, beforeClaim func
 	if expected.IsDir() {
 		return fmt.Errorf("refusing to remove directory as a file: %s", logical)
 	}
+	if validate != nil {
+		if err := validate(expected); err != nil {
+			return err
+		}
+	}
 	if beforeClaim != nil {
 		if err := beforeClaim(); err != nil {
 			return err
 		}
 	}
-	return removeValidatedEntryAtWithHooks(parent, name, expected, removalLeaf, removalHooks{syncOwned: syncParent})
+	return removeValidatedEntryAtWithHooks(parent, name, expected, removalLeaf, removalHooks{
+		syncOwned: syncParent,
+		validate:  validate,
+	})
 }
 
 func removeLogicalEmptyDirectory(root, logical string) error {

@@ -161,7 +161,9 @@ func TestLiveCanaryIsolatesRunnerHealthAndSkipsFakeNotificationCredentialProbe(t
 		`die "installed SUN APT baseline state is ambiguous"`,
 		`die "installed command alias is not the exact relative SUN link"`,
 		`die "installed sun command did not open the interactive menu"`,
+		`die "systemd did not create the persistent timer timestamp"`,
 		`die "SUN command alias remained after purge"`,
+		`die "persistent timer timestamp remained after purge"`,
 		`die "SUN APT policy metadata remained after purge"`,
 	} {
 		if !bytes.Contains(script, []byte(item)) {
@@ -178,11 +180,29 @@ func TestLiveCanaryIsolatesRunnerHealthAndSkipsFakeNotificationCredentialProbe(t
 		t.Fatal("live canary must be invoked as a dependency of a completed mirror job")
 	}
 	requiredInOrder := []string{
+		"[[ ! -e /etc/systemd/system/security-update-notify.service &&\n" +
+			"   ! -L /etc/systemd/system/security-update-notify.service ]] ||\n" +
+			`  die "runner is not clean: SUN service unit is already present"`,
+		"[[ ! -e /etc/systemd/system/security-update-notify.timer &&\n" +
+			"   ! -L /etc/systemd/system/security-update-notify.timer ]] ||\n" +
+			`  die "runner is not clean: SUN timer unit is already present"`,
+		"[[ ! -e /etc/systemd/system/timers.target.wants/security-update-notify.timer &&\n" +
+			"   ! -L /etc/systemd/system/timers.target.wants/security-update-notify.timer ]] ||\n" +
+			`  die "runner is not clean: SUN persistent timer link is already present"`,
+		"[[ ! -e /run/systemd/system/timers.target.wants/security-update-notify.timer &&\n" +
+			"   ! -L /run/systemd/system/timers.target.wants/security-update-notify.timer ]] ||\n" +
+			`  die "runner is not clean: SUN runtime timer link is already present"`,
+		"[[ ! -e /var/lib/systemd/timers/stamp-security-update-notify.timer &&\n" +
+			"   ! -L /var/lib/systemd/timers/stamp-security-update-notify.timer ]] ||\n" +
+			`  die "runner is not clean: SUN persistent timer timestamp is already present"`,
 		`apt_check_before_rc="$(capture_bounded_rc "$work/apt-check.before" 330s "${apt_check[@]}")"`,
 		`/bin/bash -p "$work/stable-sun.sh"`,
 		`grep -qxF "$expected" /etc/security-update-notify/telegram.env ||`,
 		`systemctl is-enabled --quiet security-update-notify.timer || die`,
 		`systemctl is-active --quiet security-update-notify.timer || die`,
+		"[[ -f /var/lib/systemd/timers/stamp-security-update-notify.timer &&\n" +
+			"   ! -L /var/lib/systemd/timers/stamp-security-update-notify.timer ]] ||\n" +
+			`  die "systemd did not create the persistent timer timestamp"`,
 		"systemd-analyze verify \\\n  /etc/systemd/system/security-update-notify.service \\\n  /etc/systemd/system/security-update-notify.timer\npython3 -I \"$root_dir/build/pty-driver.py\" \\\n",
 		`-- /usr/local/sbin/sun --lang en`,
 		`grep -qF 'Preview this check (no delivery or state writes)' "$work/sun-menu.out" ||`,
@@ -200,6 +220,9 @@ func TestLiveCanaryIsolatesRunnerHealthAndSkipsFakeNotificationCredentialProbe(t
 		`[[ ! -e /var/lib/security-update-notify ]] || die`,
 		`[[ ! -e /etc/systemd/system/security-update-notify.service ]] || die`,
 		`[[ ! -e /etc/systemd/system/security-update-notify.timer ]] || die`,
+		"[[ ! -e /var/lib/systemd/timers/stamp-security-update-notify.timer &&\n" +
+			"   ! -L /var/lib/systemd/timers/stamp-security-update-notify.timer ]] ||\n" +
+			`  die "persistent timer timestamp remained after purge"`,
 		`assert_package_state_not_regressed after-purge`,
 		`case "$apt_policy_purge_expectation" in`,
 		`assert_restored_apt_policy "$work/apt-policy.before" "original APT policy"`,

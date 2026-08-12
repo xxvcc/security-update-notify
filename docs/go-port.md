@@ -1,8 +1,8 @@
 # security-update-notify 3.x 全 Go 架构 / 3.x all-Go architecture
 
-本文记录 3.0.0 完成迁移后、持续加固到 3.2.0 的设计、Linux 兼容、恢复与发布约束。它描述当前实现，不是待办清单。
+本文记录 3.0.0 完成迁移后、持续加固到 3.2.1 的设计、Linux 兼容、恢复与发布约束。它描述当前实现，不是待办清单。
 
-This document records the design after the completed 3.0.0 migration and its hardening through 3.2.0,
+This document records the design after the completed 3.0.0 migration and its hardening through 3.2.1,
 including Linux compatibility, recovery, security, and release constraints. It describes the current implementation.
 
 ## 结论 / Bottom line

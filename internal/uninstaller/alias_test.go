@@ -60,6 +60,57 @@ func TestUninstallRemovesOnlyExactCommandAlias(t *testing.T) {
 	}
 }
 
+func TestUninstallRemovesOnlyProjectTimerEnablementLinks(t *testing.T) {
+	for _, logical := range []string{persistentTimerLinkLogical, runtimeTimerLinkLogical} {
+		for _, test := range []struct {
+			name    string
+			target  string
+			removed bool
+		}{
+			{name: "systemd absolute target", target: timerUnitLogical, removed: true},
+			{name: "other unit", target: "/etc/systemd/system/other.timer"},
+		} {
+			t.Run(filepath.Base(filepath.Dir(logical))+"/"+test.name, func(t *testing.T) {
+				root := t.TempDir()
+				link := hostPath(root, logical)
+				if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(test.target, link); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := uninstallAsRoot(Options{RootDir: root, RunCommand: successfulRunner}); err != nil {
+					t.Fatal(err)
+				}
+				_, err := os.Lstat(link)
+				if test.removed && !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("project timer link still exists: %v", err)
+				}
+				if !test.removed && err != nil {
+					t.Fatalf("conflicting timer link was not preserved: %v", err)
+				}
+			})
+		}
+	}
+
+	t.Run("legacy relative persistent target", func(t *testing.T) {
+		root := t.TempDir()
+		link := hostPath(root, persistentTimerLinkLogical)
+		if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("../security-update-notify.timer", link); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := uninstallAsRoot(Options{RootDir: root, RunCommand: successfulRunner}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Lstat(link); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("legacy project timer link still exists: %v", err)
+		}
+	})
+}
+
 func TestConditionalCommandAliasRemovalPreservesConcurrentReplacement(t *testing.T) {
 	root := t.TempDir()
 	alias := hostPath(root, aliasPath)

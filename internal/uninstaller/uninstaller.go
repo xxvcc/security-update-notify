@@ -21,6 +21,10 @@ import (
 const (
 	timerUnit                     = "security-update-notify.timer"
 	serviceUnit                   = "security-update-notify.service"
+	timerUnitLogical              = "/etc/systemd/system/security-update-notify.timer"
+	persistentTimerLinkLogical    = "/etc/systemd/system/timers.target.wants/security-update-notify.timer"
+	runtimeTimerLinkLogical       = "/run/systemd/system/timers.target.wants/security-update-notify.timer"
+	timerStampLogical             = "/var/lib/systemd/timers/stamp-security-update-notify.timer"
 	aliasPath                     = "/usr/local/sbin/sun"
 	aliasTarget                   = "security-update-notify"
 	aptPeriodicLogical            = "/etc/apt/apt.conf.d/20auto-upgrades"
@@ -195,12 +199,27 @@ func Uninstall(opts Options) (report Report, returnErr error) {
 	}
 
 	var errs []error
+	for _, link := range []string{persistentTimerLinkLogical, runtimeTimerLinkLogical} {
+		removed, err := removeLogicalSymlinkTarget(root, link, timerUnitLogical)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("remove timer enablement link %s: %w", link, err))
+			continue
+		}
+		// Retain compatibility with older installs and fixtures that used the
+		// equivalent relative persistent link. Never accept it for the runtime
+		// link, where it would resolve beneath /run instead of /etc.
+		if !removed && link == persistentTimerLinkLogical {
+			if _, err := removeLogicalSymlinkTarget(root, link, "../security-update-notify.timer"); err != nil {
+				errs = append(errs, fmt.Errorf("remove timer enablement link %s: %w", link, err))
+			}
+		}
+	}
 	if _, err := removeLogicalSymlinkTarget(root, aliasPath, aliasTarget); err != nil {
 		errs = append(errs, fmt.Errorf("remove command alias %s: %w", aliasPath, err))
 	}
 	for _, logical := range []string{
 		"/etc/systemd/system/security-update-notify.service",
-		"/etc/systemd/system/security-update-notify.timer",
+		timerUnitLogical,
 		"/etc/systemd/system/security-update-notify.service.d/credentials.conf",
 		"/etc/logrotate.d/security-update-notify",
 		"/usr/local/sbin/security-update-notify",
@@ -216,6 +235,9 @@ func Uninstall(opts Options) (report Report, returnErr error) {
 
 	if result := run("systemctl", "daemon-reload"); systemctlCleanupFailed(result, "daemon-reload", "") {
 		report.SystemctlFailureCount++
+	}
+	if err := removeTrustedLogicalRegularFile(root, timerStampLogical); err != nil {
+		errs = append(errs, fmt.Errorf("remove timer timestamp %s: %w", timerStampLogical, err))
 	}
 
 	if opts.PurgeConfig {

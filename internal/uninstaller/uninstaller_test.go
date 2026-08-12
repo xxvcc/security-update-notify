@@ -16,6 +16,7 @@ import (
 	"github.com/xxvcc/security-update-notify/internal/aptconfig"
 	"github.com/xxvcc/security-update-notify/internal/dependencyproof"
 	"github.com/xxvcc/security-update-notify/internal/dnfconfig"
+	"github.com/xxvcc/security-update-notify/internal/filetrust"
 	"github.com/xxvcc/security-update-notify/internal/sysexec"
 )
 
@@ -27,14 +28,25 @@ func TestUninstallNormalRemovesRuntimeAndPreservesUserData(t *testing.T) {
 		"/etc/systemd/system/security-update-notify.service.d/credentials.conf",
 		"/etc/logrotate.d/security-update-notify",
 		"/usr/local/sbin/security-update-notify",
+		timerStampLogical,
 		"/etc/security-update-notify/telegram.env",
 		"/var/lib/security-update-notify/last-alert.hash",
 		"/var/backups/security-update-notify/backup/telegram.env",
 		"/etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred",
 		"/var/log/security-update-notify.log",
 		"/etc/systemd/system/security-update-notify.service.d/keep.conf",
+		"/var/lib/systemd/timers/stamp-unrelated.timer",
 	} {
 		writeFixture(t, root, path, "data")
+	}
+	for _, logical := range []string{persistentTimerLinkLogical, runtimeTimerLinkLogical} {
+		link := hostPath(root, logical)
+		if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(timerUnitLogical, link); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	var calls [][]string
@@ -65,6 +77,9 @@ func TestUninstallNormalRemovesRuntimeAndPreservesUserData(t *testing.T) {
 		"/etc/systemd/system/security-update-notify.service.d/credentials.conf",
 		"/etc/logrotate.d/security-update-notify",
 		"/usr/local/sbin/security-update-notify",
+		timerStampLogical,
+		persistentTimerLinkLogical,
+		runtimeTimerLinkLogical,
 	} {
 		assertMissing(t, root, path)
 	}
@@ -75,9 +90,224 @@ func TestUninstallNormalRemovesRuntimeAndPreservesUserData(t *testing.T) {
 		"/etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred",
 		"/var/log/security-update-notify.log",
 		"/etc/systemd/system/security-update-notify.service.d/keep.conf",
+		"/var/lib/systemd/timers/stamp-unrelated.timer",
 	} {
 		assertContent(t, root, path, "data")
 	}
+}
+
+func TestUninstallTimerStampRemovalFailsClosedForUnsafeEntries(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(*testing.T, string) string
+		reason  string
+	}{
+		{
+			name: "symbolic link",
+			prepare: func(t *testing.T, root string) string {
+				target := writeFixture(t, root, "/outside-timer-state", "outside")
+				stamp := hostPath(root, timerStampLogical)
+				if err := os.MkdirAll(filepath.Dir(stamp), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, stamp); err != nil {
+					t.Fatal(err)
+				}
+				return target
+			},
+			reason: "must be a regular file",
+		},
+		{
+			name: "fifo",
+			prepare: func(t *testing.T, root string) string {
+				stamp := hostPath(root, timerStampLogical)
+				if err := os.MkdirAll(filepath.Dir(stamp), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := syscall.Mkfifo(stamp, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return ""
+			},
+			reason: "must be a regular file",
+		},
+		{
+			name: "directory",
+			prepare: func(t *testing.T, root string) string {
+				stamp := hostPath(root, timerStampLogical)
+				if err := os.MkdirAll(stamp, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				return ""
+			},
+			reason: "refusing to remove directory",
+		},
+		{
+			name: "wrong owner",
+			prepare: func(t *testing.T, root string) string {
+				if os.Geteuid() != 0 {
+					t.Skip("changing fixture ownership requires root")
+				}
+				stamp := writeFixture(t, root, timerStampLogical, "state")
+				if err := os.Chown(stamp, 1, 1); err != nil {
+					t.Skipf("cannot change fixture ownership: %v", err)
+				}
+				return ""
+			},
+			reason: "owner uid",
+		},
+		{
+			name: "group writable",
+			prepare: func(t *testing.T, root string) string {
+				stamp := writeFixture(t, root, timerStampLogical, "state")
+				if err := os.Chmod(stamp, 0o660); err != nil {
+					t.Fatal(err)
+				}
+				return ""
+			},
+			reason: "forbidden permissions",
+		},
+		{
+			name: "multiple hard links",
+			prepare: func(t *testing.T, root string) string {
+				stamp := writeFixture(t, root, timerStampLogical, "state")
+				alias := stamp + ".alias"
+				if err := os.Link(stamp, alias); err != nil {
+					t.Fatal(err)
+				}
+				return alias
+			},
+			reason: "exactly one hard link",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			other := test.prepare(t, root)
+			writeFixture(t, root, "/usr/local/sbin/security-update-notify", "runtime")
+
+			_, err := uninstallAsRoot(Options{RootDir: root, RunCommand: successfulRunner})
+			if err == nil || !strings.Contains(err.Error(), test.reason) {
+				t.Fatalf("Uninstall() error = %v, want %q", err, test.reason)
+			}
+			if _, statErr := os.Lstat(hostPath(root, timerStampLogical)); statErr != nil {
+				t.Fatalf("unsafe timer stamp was not retained: %v", statErr)
+			}
+			assertMissing(t, root, "/usr/local/sbin/security-update-notify")
+			if other != "" {
+				if _, statErr := os.Lstat(other); statErr != nil {
+					t.Fatalf("related external entry changed: %v", statErr)
+				}
+			}
+		})
+	}
+}
+
+func TestTimerStampRemovalRejectsHardLinkAddedAfterValidation(t *testing.T) {
+	root := t.TempDir()
+	stamp := writeFixture(t, root, timerStampLogical, "state")
+	alias := filepath.Join(root, "hard-link-after-validation")
+	validate := func(info os.FileInfo) error {
+		return filetrust.ValidateRegular(info, os.Geteuid(), 0o022, true)
+	}
+	err := removeLogicalFileValidatedWithSyncAndRecovery(
+		root,
+		timerStampLogical,
+		func() error { return os.Link(stamp, alias) },
+		syncLogicalRemovalParent,
+		trustedParentRemovalRecovery,
+		validate,
+	)
+	if err == nil || !strings.Contains(err.Error(), "entry changed before removal") {
+		t.Fatalf("post-validation hard link error = %v, want fail-closed concurrent-change error", err)
+	}
+	stampInfo, stampErr := os.Stat(stamp)
+	aliasInfo, aliasErr := os.Stat(alias)
+	if stampErr != nil || aliasErr != nil || !os.SameFile(stampInfo, aliasInfo) {
+		t.Fatalf("validated stamp and concurrent alias were not both retained: stamp=%v alias=%v", stampErr, aliasErr)
+	}
+}
+
+func TestTimerStampOwnedRecoveryRejectsChangedHardLinkCount(t *testing.T) {
+	root := t.TempDir()
+	stamp := writeFixture(t, root, timerStampLogical, "state")
+	info, err := os.Lstat(stamp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := "." + uninstallRemovalPendingPrefix + "." + strings.Repeat("d", 32)
+	owned, err := ownedRemovalName(pending, info, removalLeaf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownedPath := filepath.Join(filepath.Dir(stamp), owned)
+	if err := os.Rename(stamp, ownedPath); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "hard-link-after-crash")
+	if err := os.Link(ownedPath, alias); err != nil {
+		t.Fatal(err)
+	}
+
+	err = removeLogicalFile(root, filepath.Join(filepath.Dir(timerStampLogical), "missing"))
+	if err == nil || !strings.Contains(err.Error(), "does not match its durable identity") {
+		t.Fatalf("changed owned hard-link count error = %v, want durable-identity refusal", err)
+	}
+	ownedInfo, ownedErr := os.Stat(ownedPath)
+	aliasInfo, aliasErr := os.Stat(alias)
+	if ownedErr != nil || aliasErr != nil || !os.SameFile(ownedInfo, aliasInfo) {
+		t.Fatalf("changed owned quarantine and alias were not retained: owned=%v alias=%v", ownedErr, aliasErr)
+	}
+}
+
+func TestTrustedTimerStampRemovalRestoresStampWhenHardLinkAppearsBeforeClaim(t *testing.T) {
+	root := t.TempDir()
+	stamp := writeFixture(t, root, timerStampLogical, "state")
+	alias := stamp + ".alias"
+
+	err := removeTrustedLogicalRegularFileWithHook(root, timerStampLogical, func() error {
+		return os.Link(stamp, alias)
+	})
+	if err == nil || !strings.Contains(err.Error(), "exactly one hard link") ||
+		!strings.Contains(err.Error(), "concurrent entry restored") {
+		t.Fatalf("removeTrustedLogicalRegularFileWithHook() error = %v, want restored hard-link refusal", err)
+	}
+	assertPathContent(t, stamp, "state")
+	assertPathContent(t, alias, "state")
+}
+
+func TestTrustedTimerStampRemovalRetainsQuarantineWhenHardLinkAppearsBeforeDelete(t *testing.T) {
+	root := t.TempDir()
+	stamp := writeFixture(t, root, timerStampLogical, "state")
+	parent, name, err := openLogicalParent(root, timerStampLogical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	expected, err := readRemovalEntry(parent, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validate := func(info os.FileInfo) error {
+		return filetrust.ValidateRegular(info, os.Geteuid(), 0o022, true)
+	}
+	alias := stamp + ".alias"
+	retained := ""
+	err = removeValidatedEntryAtWithHooks(parent, name, expected, removalLeaf, removalHooks{
+		validate: validate,
+		beforeDelete: func(owned string) error {
+			retained = filepath.Join(filepath.Dir(stamp), owned)
+			return os.Link(retained, alias)
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "exactly one hard link") ||
+		!strings.Contains(err.Error(), "retained at "+retained) {
+		t.Fatalf("removeValidatedEntryAtWithHooks() error = %v, want retained hard-link refusal", err)
+	}
+	assertPathMissing(t, stamp)
+	assertPathContent(t, retained, "state")
+	assertPathContent(t, alias, "state")
 }
 
 func TestUninstallRejectsInterruptedInstallStateBeforeMutation(t *testing.T) {
@@ -2091,7 +2321,8 @@ func TestLogicalRemovalRetainsUnverifiedQuarantinesAndRecoversOwned(t *testing.T
 	legacy := "." + uninstallRemovalPrefix + "." + strings.Repeat("a", 32)
 	pending := "." + uninstallRemovalPendingPrefix + "." + strings.Repeat("b", 32)
 	nearMatch := "." + uninstallRemovalOwnedPrefix + ".not-a-valid-artifact"
-	for _, name := range []string{legacy, pending, nearMatch} {
+	oldOwned := "." + uninstallRemovalOwnedPrefix + "." + strings.Repeat("d", 32) + ".0.1.2.81a0.0.0.5.6.7"
+	for _, name := range []string{legacy, pending, nearMatch, oldOwned} {
 		if err := os.WriteFile(filepath.Join(parent, name), []byte("keep"), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -2115,10 +2346,12 @@ func TestLogicalRemovalRetainsUnverifiedQuarantinesAndRecoversOwned(t *testing.T
 
 	logical := "/etc/missing"
 	err = removeLogicalTree(root, logical)
-	if err == nil || !strings.Contains(err.Error(), "legacy uninstall quarantine") || !strings.Contains(err.Error(), "unverified uninstall quarantine") {
-		t.Fatalf("removeLogicalTree error = %v, want legacy and pending retention", err)
+	if err == nil || !strings.Contains(err.Error(), "legacy uninstall quarantine") ||
+		!strings.Contains(err.Error(), "unverified uninstall quarantine") ||
+		!strings.Contains(err.Error(), "unsupported durable identity") {
+		t.Fatalf("removeLogicalTree error = %v, want legacy, pending, and old owned retention", err)
 	}
-	for _, name := range []string{legacy, pending, nearMatch} {
+	for _, name := range []string{legacy, pending, nearMatch, oldOwned} {
 		assertPathContent(t, filepath.Join(parent, name), "keep")
 	}
 	if _, err := os.Lstat(filepath.Join(parent, owned)); !errors.Is(err, os.ErrNotExist) {
