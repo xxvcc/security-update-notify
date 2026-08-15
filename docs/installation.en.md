@@ -277,7 +277,7 @@ curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo /bin/bash -p -s
   -y
 ```
 
-The App Secret source must be a root-owned regular file, not a symlink, with no group or other access (`0600` recommended). The installer validates these conditions and detects replacement during path validation before reading it.
+The App Secret source must be a root-owned regular file, not a symlink, with no group or other access (`0600` recommended), and it must have exactly one hard link. The installer validates these conditions and detects replacement during path validation before reading it.
 
 The installer stores the App Secret as an encrypted systemd credential when available. Older systemd versions fall back to a separate root-only `0600` file. Neither form enters the normal config or upgrade backups.
 
@@ -308,6 +308,8 @@ curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo /bin/bash -p -s
   --non-interactive \
   -y
 ```
+
+A Bot Token is a bearer credential exactly like the App Secret, so the token source file follows the same contract: a root-owned regular file, not a symlink, with no group or other access (`0600` recommended), and exactly one hard link. The installer validates these conditions before reading it.
 
 Common options:
 

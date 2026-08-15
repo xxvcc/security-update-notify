@@ -1,5 +1,80 @@
 # 变更记录
 
+## 3.3.0
+
+- 修复在不实现 `renameat2` 标志位的文件系统上卸载失败并永久卡死的问题。卸载与 `--purge-config` 恢复过去
+  无条件依赖 `RENAME_NOREPLACE` 与 `RENAME_EXCHANGE`；OpenZFS 2.2 之前、NFS 及部分 FUSE 后端会返回
+  `EINVAL`，此时受管文件已被移入 `.security-update-notify-remove-pending.*` 隔离名，原路径消失，且下一次
+  卸载会因检测到该隔离名而硬失败，必须人工清理。现在仅在内核或文件系统拒绝标志位本身（`ENOSYS`、
+  `EINVAL`、`EOPNOTSUPP`）时按站点回退：隔离名晋升改用原子的普通 rename，无覆盖发布改用具备同等
+  `EEXIST` 语义的 `linkat` 加 unlink，交换恢复改用保留名三步 rename。`EEXIST` 仍是真实结果，绝不触发回退；
+  回退中断留下的每个中间态都仍带 restore 前缀，下一次运行照常失败关闭并指向保留文件。
+  Fixes an uninstall that failed and then permanently wedged on filesystems that do not implement
+  `renameat2` flags. Uninstall and `--purge-config` restore relied unconditionally on `RENAME_NOREPLACE` and
+  `RENAME_EXCHANGE`; OpenZFS before 2.2, NFS, and several FUSE backends answer `EINVAL`, by which point the
+  managed file had already been moved to a `.security-update-notify-remove-pending.*` quarantine name, its
+  original path was gone, and the next uninstall hard-failed on that quarantine and required manual cleanup.
+  A per-site fallback now engages only when the kernel or filesystem rejects the flag itself (`ENOSYS`,
+  `EINVAL`, `EOPNOTSUPP`): quarantine promotion uses an atomic plain rename, no-overwrite publication uses
+  `linkat` plus unlink for the identical `EEXIST` guarantee, and exchange restore uses a reserved-name
+  three-step rename. `EEXIST` remains a real result and never selects a fallback, and every intermediate
+  state an interrupted fallback can leave still carries a restore prefix, so the next run fails closed and
+  names the retained file exactly as before.
+- `--purge-config` 不再无条件删除 `/etc/apt/apt.conf.d/52unattended-upgrades-local`。该文件只有 1.1.x 写过，
+  1.2 起改写 `52unattended-upgrades-security-update-notify`，因此在首次安装 2.x 或 3.x 的主机上，同名路径
+  属于管理员本人。现在仅当其字节与 1.1.x 写入的策略完全一致时才删除；内容不符、非普通文件或不可读一律
+  原样保留。
+  `--purge-config` no longer removes `/etc/apt/apt.conf.d/52unattended-upgrades-local` unconditionally. Only
+  1.1.x ever wrote that file — 1.2 onwards writes `52unattended-upgrades-security-update-notify` — so on a
+  host first installed with 2.x or 3.x the same path belongs to the administrator. It is now removed only
+  when its bytes exactly match the policy 1.1.x wrote; different contents, a non-regular file, or an
+  unreadable entry are left untouched.
+- 配置写出现在真正兑现其无损契约。线格式没有转义机制且读取器顺序剥离一层双引号再剥离一层单引号，
+  因此首尾恰为一对单引号的值无法表示，此前会被静默改写（`HOST_LABEL` 的 `'x'` 读回为 `x`）。新增
+  `Representable` 与 `Canonical`：显式提供的不可表示值在任何主机变更之前以退出码 2 拒绝，而既有配置文件
+  中继承的同类值一次性收敛到读取器本就会得到的形式，因此升级不会在事务后期失败。
+  Configuration writing now genuinely honours its lossless contract. The wire format has no escape mechanism
+  and the reader strips one double-quote layer then one single-quote layer, so a value wrapped in a matching
+  pair of single quotes cannot be represented and was previously rewritten silently (`'x'` in `HOST_LABEL`
+  read back as `x`). New `Representable` and `Canonical` helpers reject an explicitly supplied
+  unrepresentable value with exit status 2 before any host mutation, while an equivalent value inherited from
+  an existing configuration file converges once to the form the reader would have produced anyway, so an
+  upgrade cannot fail late inside the transaction.
+- `--telegram-token-file` 现在与 `--feishu-app-secret-file` 采用同一凭据源文件契约：必须是 root 所有、非
+  符号链接、不允许组或其他用户访问、且只有一个硬链接的普通文件。Bot Token 与 App Secret 同为 bearer
+  凭据，此前只校验“可读的普通文件”。
+  `--telegram-token-file` now enforces the same credential source-file contract as
+  `--feishu-app-secret-file`: a root-owned regular file that is not a symlink, forbids group and other
+  access, and has exactly one hard link. A Bot Token is a bearer credential exactly like the App Secret, and
+  the path was previously validated only as a readable regular file.
+- `uninstall --purge-config` 在检测到真实终端时要求输入 `PURGE` 确认，并新增 `--yes`/`-y` 跳过。确认仅在
+  stdin 与 stderr 同为 TTY 时出现，因此现有非交互自动化无需新增参数即可继续工作，`curl | bash` 引导路径
+  也不会把剩余脚本当作应答读走；交互菜单已自行要求过该 token，故显式传入 `--yes`。
+  `uninstall --purge-config` now requires the exact token `PURGE` when a real terminal is present, with a
+  new `--yes`/`-y` bypass. The prompt appears only when both stdin and stderr are TTYs, so existing
+  non-interactive automation keeps working without a new argument and the `curl | bash` bootstrap path
+  cannot consume the remaining script as its answer. The interactive menu already requires that token
+  itself and therefore passes `--yes` explicitly.
+- Telegram 请求构造失败的错误改为经过与其它失败相同的脱敏路径。该错误为 `*url.Error`，其 URL 路径中嵌有
+  bot token；虽然经校验的 API base 与 token 正则使该分支不可达，它是该文件里唯一未脱敏的返回。
+  A Telegram request-construction error now goes through the same redaction as every other surfaced
+  failure. That error is a `*url.Error` whose URL path embeds the bot token; the branch is unreachable given
+  the validated API base and the token pattern, but it was the only unredacted return in that file.
+- 构建工具链从 go1.26.5 升级到 go1.26.6，修复标准库 `net/url`、`crypto/tls`、`encoding/asn1` 与 `net/http`
+  的四项已知漏洞（GO-2026-6218、GO-2026-6090、GO-2026-5972、GO-2026-5026）。这些包承载 SUN 的全部出站
+  HTTPS 与发布信任路径，`govulncheck` 现已清零。
+  Upgrades the build toolchain from go1.26.5 to go1.26.6, clearing four known standard-library
+  vulnerabilities in `net/url`, `crypto/tls`, `encoding/asn1`, and `net/http` (GO-2026-6218, GO-2026-6090,
+  GO-2026-5972, GO-2026-5026). Those packages carry SUN's entire outbound HTTPS and release-trust path, and
+  `govulncheck` is now clean.
+- 文档补齐三处与实现不符或缺失的说明：SUN 自身的出站 HTTPS 不使用 `HTTP_PROXY`/`HTTPS_PROXY`（代理变量
+  仅传递给包管理器等子进程），升级备份中含 `TELEGRAM_BOT_TOKEN` 副本且普通卸载会保留，以及
+  `--verify-signature off` 之后仅剩同源 `.sha256` 的实际影响范围。
+  Documentation now states three behaviours that were missing or misleading: SUN's own outbound HTTPS does
+  not use `HTTP_PROXY`/`HTTPS_PROXY` (proxy variables are forwarded only to package-manager and similar
+  child processes), upgrade backups contain a copy of `TELEGRAM_BOT_TOKEN` that an ordinary uninstall
+  retains, and the real blast radius of `--verify-signature off`, which leaves only a same-origin `.sha256`.
+
 ## 3.2.1
 
 - 修复卸载后遗留 SUN systemd timer 状态的问题：普通卸载和 `--purge-config` 现在都会在停止 timer 后，

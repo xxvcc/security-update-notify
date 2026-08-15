@@ -105,7 +105,12 @@ func (i *Installer) prepare(ctx context.Context, options Options) (installPlan, 
 		values[key] = value
 	}
 	for key, value := range existing {
-		values[key] = value
+		// An existing telegram.env can hold a value the wire format cannot
+		// represent (nested quote layers). The reader already collapses it, so
+		// adopt the collapsed form: rewriting it verbatim would fail the writer's
+		// representability contract and dead-end an otherwise unattended upgrade
+		// deep inside the transaction, after packages were already installed.
+		values[key] = config.Canonical(value)
 	}
 	originalTargets := notificationTargetsFor(values)
 	oldFeishuAppID := values["FEISHU_APP_ID"]
@@ -304,6 +309,13 @@ func normalizeAndValidateConfig(values map[string]string, allowMissingFeishuReci
 		}
 		if strings.Contains(value, "'") && strings.Contains(value, `"`) {
 			return invalid("%s cannot contain both single and double quotes", key)
+		}
+		// Reject an explicitly supplied value the config file cannot store
+		// losslessly here, before any host mutation, so it surfaces as exit 2
+		// from prepare() instead of a rollback from renderConfig. Values
+		// inherited from an existing file were canonicalized in prepare().
+		if !config.Representable(value) {
+			return invalid("%s cannot be represented in the config file format; remove the surrounding quote characters", key)
 		}
 	}
 	channels, err := normalizeChannels(values["NOTIFY_CHANNELS"])

@@ -158,7 +158,7 @@ func TestMenuDispatchesFixedArguments(t *testing.T) {
 		{name: "check upgrade", input: "6\n0\n", want: []string{"check-upgrade", "--lang", "en"}},
 		{name: "upgrade", input: "7\nYES\n", want: []string{"upgrade", "--lang", "en"}},
 		{name: "uninstall keep config", input: "8\n1\nYES\n", want: []string{"uninstall", "--lang", "en"}},
-		{name: "uninstall purge", input: "8\n2\nPURGE\n", want: []string{"uninstall", "--purge-config", "--lang", "en"}},
+		{name: "uninstall purge", input: "8\n2\nPURGE\n", want: []string{"uninstall", "--purge-config", "--yes", "--lang", "en"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

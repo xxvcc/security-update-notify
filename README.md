@@ -207,6 +207,8 @@ sudo security-update-notify uninstall --purge-config
 - 安装和自升级优先访问 `dl.ll.cd`，传输失败时回退 GitHub。
 - Release 默认必须通过 SHA-256、GPG 签名和固定指纹验证。
 - 飞书 App Secret 不进入普通配置、命令行、日志或升级备份。
+- Telegram Bot Token 属于普通配置，升级备份中含有它的 `0600` 副本；普通卸载保留该备份，`--purge-config` 才会删除。
+- 上述出站请求全部直连，SUN 自己不使用 `HTTP_PROXY`/`HTTPS_PROXY`；代理变量只转发给包管理器等子进程。
 - SUN 不开放 HTTP 入口，不接收远程命令，不自动重启。
 
 签名验证、首次执行信任边界、凭据和网络威胁模型见[安全与信任模型](docs/security.md)。

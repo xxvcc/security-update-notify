@@ -157,7 +157,10 @@ func (c *Client) GetMe(ctx context.Context, token string) error {
 func (c *Client) getMeAttempt(ctx context.Context, client *http.Client, endpoint, token string) (retryable, transient bool, delay time.Duration, returnErr error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return false, false, 0, err
+		// A *url.Error carries the request URL, and the bot token is embedded in
+		// that path (/bot<token>/…). Never surface it unredacted, even though the
+		// validated base and token make a parse failure unreachable today.
+		return false, false, 0, sanitizeErr(err, token)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -244,7 +247,9 @@ func (c *Client) SendMessage(ctx context.Context, token, chatID, text string) er
 func (c *Client) attempt(ctx context.Context, client *http.Client, endpoint string, form url.Values, secrets ...string) (retryable, transient, ok bool, delay time.Duration, msg string) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
-		return false, false, false, 0, err.Error()
+		// See getMeAttempt: the endpoint embeds the bot token, so this error must
+		// go through the same redaction as every other surfaced failure.
+		return false, false, false, 0, sanitizeErr(err, secrets...).Error()
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := client.Do(req)

@@ -223,7 +223,7 @@ grep -Fxq "HOST_LABEL='rpm-best-effort-upgraded'" /etc/security-update-notify/te
 [[ -e "$mock_state/enabled/security-update-notify.timer" ]]
 assert_sun_alias
 
-PATH="$fixture_path" "$SUN_INSTALL_BINARY" uninstall --purge-config --lang en
+PATH="$fixture_path" "$SUN_INSTALL_BINARY" uninstall --purge-config --lang en </dev/null
 [[ ! -e /usr/local/sbin/security-update-notify ]]
 assert_sun_alias_absent
 [[ ! -e /etc/security-update-notify ]]

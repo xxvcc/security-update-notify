@@ -32,7 +32,7 @@ cleanup() {
   trap - EXIT
   set +e
   if [[ "$canary_install_started" -eq 1 && -x /usr/local/sbin/security-update-notify ]]; then
-    if ! /usr/local/sbin/security-update-notify uninstall --purge-config --lang en; then
+    if ! /usr/local/sbin/security-update-notify uninstall --purge-config --lang en </dev/null; then
       cleanup_failed=1
     fi
   fi
@@ -460,7 +460,7 @@ dry_run_output="$(/usr/local/sbin/security-update-notify run \
   --test-reboot --no-dedupe --dry-run --wait-lock 0 --lang en)"
 grep -q $'^HASH\t' <<<"$dry_run_output" || die "dry-run did not produce a stable hash"
 
-/usr/local/sbin/security-update-notify uninstall --purge-config --lang en
+/usr/local/sbin/security-update-notify uninstall --purge-config --lang en </dev/null
 [[ ! -e /usr/local/sbin/security-update-notify ]] || die "runtime remained after purge"
 [[ ! -e /usr/local/sbin/sun && ! -L /usr/local/sbin/sun ]] || die "SUN command alias remained after purge"
 [[ ! -e /etc/security-update-notify ]] || die "config remained after purge"

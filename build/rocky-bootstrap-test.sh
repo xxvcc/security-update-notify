@@ -467,7 +467,7 @@ PY
   assert_automatic_timer_symlinks
   assert_sun_alias
 
-  PATH="$fixture_path" "$SUN_INSTALL_BINARY" uninstall --purge-config --lang en
+  PATH="$fixture_path" "$SUN_INSTALL_BINARY" uninstall --purge-config --lang en </dev/null
   [[ ! -e /usr/local/sbin/security-update-notify ]]
   assert_sun_alias_absent
   [[ ! -e /etc/security-update-notify ]]
@@ -565,7 +565,7 @@ EOF
   assert_automatic_timer_symlinks
   assert_sun_alias
 
-  PATH="$fixture_path" "$SUN_INSTALL_BINARY" uninstall --purge-config --lang en
+  PATH="$fixture_path" "$SUN_INSTALL_BINARY" uninstall --purge-config --lang en </dev/null
   assert_sun_alias_absent
   assert_same_file "$legacy_vendor" /etc/dnf/automatic.conf
   [[ ! -e /etc/dnf/automatic.conf.security-update-notify.bak ]]

@@ -34,6 +34,57 @@ type removalHooks struct {
 	syncOwned              func(*os.File) error
 	beforeDelete           func(string) error
 	validate               func(os.FileInfo) error
+
+	// Tests replace this to simulate a filesystem that implements renameat2 but
+	// rejects its flags. Production instances leave it nil.
+	renameAt func(directory int, oldName, newName string, flags uintptr) error
+}
+
+func (hooks removalHooks) rename(parent *os.File, oldName, newName string, flags uintptr) error {
+	if hooks.renameAt != nil {
+		return hooks.renameAt(int(parent.Fd()), oldName, newName, flags)
+	}
+	return renameRestoreEntry(int(parent.Fd()), oldName, newName, flags)
+}
+
+// promoteQuarantine publishes the durable owned name. RENAME_NOREPLACE is
+// defence in depth only here: the target carries the pending entry's 128-bit
+// random suffix, so it cannot pre-exist except through an actor that already
+// holds write access to this root-owned parent. When the filesystem rejects the
+// flag, a plain rename keeps the promotion ATOMIC, which matters far more than
+// the unreachable no-replace guarantee — a link+unlink fallback could be
+// interrupted and leave both names with a link count the owned name does not
+// encode, wedging every later recovery attempt on an identity mismatch.
+func (hooks removalHooks) promoteQuarantine(parent *os.File, pending, owned string) error {
+	err := hooks.rename(parent, pending, owned, restoreRenameNoReplace)
+	if err == nil || !renameFlagsUnsupported(err) {
+		return err
+	}
+	return syscall.Renameat(int(parent.Fd()), pending, int(parent.Fd()), owned)
+}
+
+// returnQuarantine puts a claimed entry back under its original name without
+// replacing anything that appeared concurrently. Unlike promoteQuarantine the
+// target is a well-known path, so the no-replace guarantee is load-bearing and
+// the fallback must preserve it: linkat carries the same EEXIST semantics.
+// Directories cannot be hard-linked, so they surface the original error and the
+// caller retains the quarantine exactly as it does today.
+func (hooks removalHooks) returnQuarantine(parent *os.File, quarantine, name string, directoryEntry bool) error {
+	err := hooks.rename(parent, quarantine, name, restoreRenameNoReplace)
+	if err == nil || !renameFlagsUnsupported(err) || directoryEntry {
+		return err
+	}
+	linkErr := linkRestoreEntry(int(parent.Fd()), quarantine, name)
+	if linkErr != nil {
+		if errors.Is(linkErr, os.ErrExist) {
+			return linkErr
+		}
+		return errors.Join(err, linkErr)
+	}
+	if unlinkErr := syscall.Unlinkat(int(parent.Fd()), quarantine); unlinkErr != nil {
+		return errors.Join(err, unlinkErr)
+	}
+	return nil
 }
 
 const (
@@ -280,8 +331,8 @@ func cleanupRemovalPlaceholder(parent *os.File, name string, expected os.FileInf
 	return nil
 }
 
-func restoreUnexpectedClaim(parent *os.File, quarantine, name string, cause error) error {
-	restoreErr := renameRestoreEntry(int(parent.Fd()), quarantine, name, restoreRenameNoReplace)
+func restoreUnexpectedClaim(parent *os.File, quarantine, name string, directoryEntry bool, hooks removalHooks, cause error) error {
+	restoreErr := hooks.returnQuarantine(parent, quarantine, name, directoryEntry)
 	if restoreErr == nil {
 		return errors.Join(errors.New("entry changed before removal; concurrent entry restored"), cause)
 	}
@@ -334,15 +385,15 @@ func removeValidatedEntryAtWithHooks(parent *os.File, name string, expected os.F
 	}
 	claimed, readErr := readRemovalEntry(parent, pending)
 	if readErr != nil {
-		return restoreUnexpectedClaim(parent, pending, name, readErr)
+		return restoreUnexpectedClaim(parent, pending, name, expected.IsDir(), hooks, readErr)
 	}
 	if hooks.validate != nil {
 		if err := hooks.validate(claimed); err != nil {
-			return restoreUnexpectedClaim(parent, pending, name, err)
+			return restoreUnexpectedClaim(parent, pending, name, expected.IsDir(), hooks, err)
 		}
 	}
 	if !sameRemovalEntry(claimed, expected) {
-		return restoreUnexpectedClaim(parent, pending, name, nil)
+		return restoreUnexpectedClaim(parent, pending, name, expected.IsDir(), hooks, nil)
 	}
 	if hooks.afterPendingValidation != nil {
 		if err := hooks.afterPendingValidation(pending); err != nil {
@@ -353,7 +404,7 @@ func removeValidatedEntryAtWithHooks(parent *os.File, name string, expected os.F
 	if err != nil {
 		return fmt.Errorf("publish verified uninstall quarantine retained at %s: %w", removalEntryPath(parent, pending), err)
 	}
-	if err := renameRestoreEntry(int(parent.Fd()), pending, owned, restoreRenameNoReplace); err != nil {
+	if err := hooks.promoteQuarantine(parent, pending, owned); err != nil {
 		return fmt.Errorf("publish verified uninstall quarantine retained at %s: %w", removalEntryPath(parent, pending), err)
 	}
 	if hooks.afterOwnedPromotion != nil {

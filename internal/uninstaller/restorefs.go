@@ -38,6 +38,10 @@ type restoreDirectory struct {
 	beforeTemporaryCommit func(string) error
 	beforeRemove          func(string) error
 	syncDirectory         func() error
+
+	// Tests replace this to simulate a filesystem that implements renameat2 but
+	// rejects its flags. Production instances leave it nil.
+	renameAt func(directory int, oldName, newName string, flags uintptr) error
 }
 
 type regularSnapshot struct {
@@ -543,7 +547,7 @@ func (d *restoreDirectory) publishTemporary(temporary, destination string, commi
 		return regularSnapshot{}, true, d.recordConflict("destination changed before restore", err)
 	}
 	if !expectedDestination.exists {
-		if err := renameRestoreEntry(int(d.file.Fd()), temporary, destination, restoreRenameNoReplace); err != nil {
+		if err := d.renameNoReplace(temporary, destination); err != nil {
 			return regularSnapshot{}, true, d.recordConflict("publish restored file without overwrite failed", err)
 		}
 		published, err := d.readRegular(destination, restoreConfigLimit)
@@ -556,7 +560,7 @@ func (d *restoreDirectory) publishTemporary(temporary, destination string, commi
 		return published, false, nil
 	}
 
-	if err := renameRestoreEntry(int(d.file.Fd()), temporary, destination, restoreRenameExchange); err != nil {
+	if err := d.exchangeWithDestination(temporary, destination); err != nil {
 		return regularSnapshot{}, true, d.recordConflict("exchange restored file with destination failed", err)
 	}
 	if d.afterExchange != nil {
@@ -653,6 +657,83 @@ const (
 	restoreRenameNoReplace = 1
 	restoreRenameExchange  = 2
 )
+
+// renameFlagsUnsupported reports whether renameat2 rejected the FLAG rather than
+// the operation itself. Linux answers ENOSYS when the syscall is absent and
+// EINVAL or EOPNOTSUPP when the filesystem does not implement the requested
+// flag; OpenZFS before 2.2, NFS, and several FUSE backends are in that group and
+// are reachable on officially supported distributions. EEXIST is a real
+// RENAME_NOREPLACE outcome and must never select a fallback.
+func renameFlagsUnsupported(err error) bool {
+	return errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EINVAL) ||
+		errors.Is(err, syscall.EOPNOTSUPP)
+}
+
+func (d *restoreDirectory) renameEntry(oldName, newName string, flags uintptr) error {
+	if d.renameAt != nil {
+		return d.renameAt(int(d.file.Fd()), oldName, newName, flags)
+	}
+	return renameRestoreEntry(int(d.file.Fd()), oldName, newName, flags)
+}
+
+// renameNoReplace publishes oldName as newName without replacing an existing
+// entry. Where renameat2 flags are unavailable it falls back to linkat, which
+// carries the same EEXIST guarantee, followed by unlinking the source. The
+// fallback is not crash-atomic: an interruption between the two syscalls leaves
+// both names, and the surviving restore-prefixed entry is what
+// unfinishedRestoreArtifact reports for manual recovery on the next run.
+func (d *restoreDirectory) renameNoReplace(oldName, newName string) error {
+	err := d.renameEntry(oldName, newName, restoreRenameNoReplace)
+	if err == nil || !renameFlagsUnsupported(err) {
+		return err
+	}
+	linkErr := linkRestoreEntry(int(d.file.Fd()), oldName, newName)
+	if errors.Is(linkErr, os.ErrExist) {
+		// Report the same outcome renameat2 would have produced.
+		return linkErr
+	}
+	if linkErr != nil {
+		return errors.Join(err, linkErr)
+	}
+	if unlinkErr := syscall.Unlinkat(int(d.file.Fd()), oldName); unlinkErr != nil {
+		return fmt.Errorf("remove source after no-replace link; entry retained at %s: %w", d.host(oldName), unlinkErr)
+	}
+	return nil
+}
+
+// exchangeWithDestination swaps the staged temporary with the live destination.
+// Filesystems without RENAME_EXCHANGE fall back to a reserved-name three-step
+// rename that reaches the identical end state. That sequence is not crash-atomic,
+// but it reuses the pattern removeValidated already relies on: every intermediate
+// state leaves a restore-prefixed entry, so unfinishedRestoreArtifact makes the
+// next run refuse and point at the retained file instead of proceeding blindly.
+func (d *restoreDirectory) exchangeWithDestination(temporary, destination string) error {
+	err := d.renameEntry(temporary, destination, restoreRenameExchange)
+	if err == nil || !renameFlagsUnsupported(err) {
+		return err
+	}
+	reserved, reservedName, reserveErr := d.newTemporary(restoreFilePrefix)
+	if reserveErr != nil {
+		return errors.Join(err, reserveErr)
+	}
+	if closeErr := reserved.Close(); closeErr != nil {
+		return errors.Join(err, d.cleanupUncommittedPlaceholder(reservedName, closeErr))
+	}
+	directory := int(d.file.Fd())
+	if moveErr := syscall.Renameat(directory, destination, directory, reservedName); moveErr != nil {
+		return errors.Join(err, d.cleanupUncommittedPlaceholder(reservedName, moveErr))
+	}
+	if publishErr := syscall.Renameat(directory, temporary, directory, destination); publishErr != nil {
+		// Put the original destination back before surfacing the failure so the
+		// host keeps a live configuration file either way.
+		return errors.Join(err, publishErr, syscall.Renameat(directory, reservedName, directory, destination))
+	}
+	if displaceErr := syscall.Renameat(directory, reservedName, directory, temporary); displaceErr != nil {
+		return errors.Join(err, fmt.Errorf(
+			"complete exchange fallback; displaced destination retained at %s: %w", d.host(reservedName), displaceErr))
+	}
+	return nil
+}
 
 func renameRestoreEntry(directory int, oldName, newName string, flags uintptr) error {
 	oldPointer, err := syscall.BytePtrFromString(oldName)

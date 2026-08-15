@@ -287,6 +287,8 @@ curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo /bin/bash -p -s
   -y
 ```
 
+Bot Token 与 App Secret 一样是 bearer 凭据，token 源文件因此遵循同一契约：必须是 root 所有的普通文件，不能是符号链接，不能允许组用户或其他用户访问（建议 `0600`），且只能有一个硬链接。安装器会在读取前校验这些条件。
+
 飞书非交互式安装使用独立的 App Secret 源文件，不能把 Secret 直接写进 `.env` 或命令行：
 
 ```bash
@@ -303,7 +305,7 @@ curl -fsSL https://dl.ll.cd/security-update-notify/sun.sh | sudo /bin/bash -p -s
   -y
 ```
 
-App Secret 源文件必须是 root 所有的普通文件，不能是符号链接，也不能允许组用户或其他用户访问（建议 `0600`）。安装器会在读取前校验这些条件，并在路径检查期间检测文件替换。
+App Secret 源文件必须是 root 所有的普通文件，不能是符号链接，不能允许组用户或其他用户访问（建议 `0600`），且只能有一个硬链接。安装器会在读取前校验这些条件，并在路径检查期间检测文件替换。
 
 安装器会优先把 App Secret 转存为加密的 systemd credential；旧 systemd 才回退到独立的 root-only `0600` 文件。两者都不进入普通配置或升级备份。
 

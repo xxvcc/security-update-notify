@@ -581,7 +581,7 @@ assert_contains /etc/security-update-notify/telegram.env "NOTIFY_CHANNELS='teleg
 assert_contains /etc/security-update-notify/telegram.env "TELEGRAM_CHAT_ID='$dual_telegram_chat_id'"
 assert_contains /etc/security-update-notify/telegram.env "FEISHU_APP_ID='$dual_feishu_app_id'"
 assert_contains /etc/security-update-notify/telegram.env "FEISHU_RECEIVE_ID='$feishu_receive_id'"
-/usr/local/sbin/security-update-notify uninstall --purge-config --lang en >/dev/null
+/usr/local/sbin/security-update-notify uninstall --purge-config --lang en </dev/null >/dev/null
 
 echo "### Fresh Feishu install performs the default strong recipient test"
 reset_api_log
@@ -605,7 +605,7 @@ assert_eq "$(api_count feishu_directory)" 1 "default Feishu directory count"
 assert_eq "$(api_count feishu_token)" 3 "default Feishu token count"
 assert_eq "$(api_count feishu_send)" 1 "default Feishu strong-test count"
 assert_contains /etc/security-update-notify/telegram.env "FEISHU_RECEIVE_ID='$feishu_receive_id'"
-/usr/local/sbin/security-update-notify uninstall --purge-config --lang en >/dev/null
+/usr/local/sbin/security-update-notify uninstall --purge-config --lang en </dev/null >/dev/null
 
 echo "### --skip-notify-test suppresses the default Feishu delivery"
 reset_api_log
@@ -622,7 +622,7 @@ assert_not_contains "$TMP/feishu-skip.out" "$skip_feishu_secret"
 assert_eq "$(api_count feishu_directory)" 1 "skipped Feishu directory count"
 assert_eq "$(api_count feishu_token)" 1 "skipped Feishu token count"
 assert_eq "$(api_count feishu_send)" 0 "skipped Feishu message count"
-/usr/local/sbin/security-update-notify uninstall --purge-config --lang en >/dev/null
+/usr/local/sbin/security-update-notify uninstall --purge-config --lang en </dev/null >/dev/null
 
 echo "### Explicit --send-test overrides the preflight skip only for the post-install test"
 reset_api_log
@@ -638,6 +638,6 @@ assert_not_contains "$TMP/explicit-send.out" "$explicit_secret"
 assert_eq "$(api_count telegram_get_me)" 0 "explicit skipped preflight getMe count"
 assert_eq "$(api_count telegram_send)" 1 "explicit post-install send count"
 assert_contains "$TMP/explicit-send.out" '已安装 security-update-notify。'
-/usr/local/sbin/security-update-notify uninstall --purge-config --lang en >/dev/null
+/usr/local/sbin/security-update-notify uninstall --purge-config --lang en </dev/null >/dev/null
 
 echo "Interactive PTY installation, notification, and rollback tests passed"

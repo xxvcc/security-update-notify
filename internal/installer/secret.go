@@ -42,9 +42,15 @@ func (i *Installer) openFeishuCredential(name string, maxBytes int64) (*os.File,
 // ReadTelegramTokenFile safely reads a token source without following a
 // symlink. The caller should place the returned value in Options.Config.
 func (i *Installer) ReadTelegramTokenFile(name string) (string, error) {
-	data, _, err := i.fs.ReadRegularFile(name, 4<<10)
+	data, info, err := i.fs.ReadRegularFile(name, 4<<10)
 	if err != nil {
 		return "", invalid("Telegram token path must be a readable regular file (not a symlink): %v", err)
+	}
+	// A Bot Token is a bearer credential exactly like the Feishu App Secret, so
+	// it gets the same source-file contract. Validate the opened inode before the
+	// content checks so a protected-file failure is never masked by a formatting one.
+	if err := filetrust.ValidateRegular(info, int(i.rootOwnerUID), 0o077, true); err != nil {
+		return "", invalid("Telegram token file must be protected, owned by root, and have one hard link: %v", err)
 	}
 	data = trimTerminalNewlines(data)
 	if len(data) == 0 || bytes.ContainsAny(data, "\r\n\x00") {
