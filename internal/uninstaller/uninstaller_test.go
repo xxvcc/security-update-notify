@@ -417,11 +417,13 @@ func TestPurgeRestoresFixedAPTBackupAndRemovesSensitiveData(t *testing.T) {
 		"/var/log/security-update-notify.log.2.gz",
 		"/var/log/security-update-notify.logger",
 		"/etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify",
-		"/etc/apt/apt.conf.d/52unattended-upgrades-local",
 		"/etc/needrestart/conf.d/99-security-update-notify-report-only.conf",
 	} {
 		writeFixture(t, root, path, "secret")
 	}
+	// The 1.1.x legacy policy is removed only when its bytes still match that
+	// release exactly; identical-path administrator files must survive.
+	writeFixture(t, root, aptLegacyLocalPolicyLogical, aptconfig.LegacyLocalPolicy)
 
 	report, err := uninstallAsRoot(Options{RootDir: root, PurgeConfig: true, RunCommand: successfulRunner})
 	if err != nil {
@@ -442,7 +444,7 @@ func TestPurgeRestoresFixedAPTBackupAndRemovesSensitiveData(t *testing.T) {
 		"/var/log/security-update-notify.log.1",
 		"/var/log/security-update-notify.log.2.gz",
 		"/etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify",
-		"/etc/apt/apt.conf.d/52unattended-upgrades-local",
+		aptLegacyLocalPolicyLogical,
 		"/etc/needrestart/conf.d/99-security-update-notify-report-only.conf",
 	} {
 		assertMissing(t, root, path)

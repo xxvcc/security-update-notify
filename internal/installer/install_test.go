@@ -4103,7 +4103,7 @@ func TestCredentialSymlinkRejectedBeforeBackup(t *testing.T) {
 
 func TestSafeSecretFileReaders(t *testing.T) {
 	installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
-	write(t, root, "/token", "123456:abc_DEF-ghi\n", 0o644)
+	write(t, root, "/token", "123456:abc_DEF-ghi\n", 0o600)
 	token, err := installer.ReadTelegramTokenFile("/token")
 	if err != nil || token != "123456:abc_DEF-ghi" {
 		t.Fatalf("token=%q err=%v", token, err)
@@ -4111,6 +4111,19 @@ func TestSafeSecretFileReaders(t *testing.T) {
 	write(t, root, "/bad-token", "first\nsecond\n", 0o600)
 	if _, err := installer.ReadTelegramTokenFile("/bad-token"); ExitCode(err) != 2 {
 		t.Fatalf("multiline token accepted: %v", err)
+	}
+	// A Bot Token is a bearer credential: the source file carries the same
+	// protected/root-owned/single-link contract as the Feishu App Secret.
+	write(t, root, "/wide-token", "123456:abc_DEF-ghi\n", 0o640)
+	if _, err := installer.ReadTelegramTokenFile("/wide-token"); ExitCode(err) != 2 {
+		t.Fatalf("group-readable token accepted: %v", err)
+	}
+	write(t, root, "/linked-token", "123456:abc_DEF-ghi\n", 0o600)
+	if err := os.Link(filepath.Join(root.Root, "linked-token"), filepath.Join(root.Root, "linked-token-alias")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := installer.ReadTelegramTokenFile("/linked-token"); ExitCode(err) != 2 {
+		t.Fatalf("hard-linked token accepted: %v", err)
 	}
 	write(t, root, "/secret", "app-secret\r\n", 0o600)
 	secret, err := installer.ReadFeishuSecretFile("/secret")

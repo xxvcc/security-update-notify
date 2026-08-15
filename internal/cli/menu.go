@@ -291,7 +291,10 @@ func (m *menuCommand) uninstallMenu() menuActionResult {
 			if confirmed != menuPromptConfirmed {
 				return menuActionResult{}
 			}
-			return m.runAction([]string{"uninstall", "--purge-config", "--lang", string(m.lang)}, true)
+			// The menu already required the exact PURGE token above, so it opts out of
+			// the command's own confirmation. This is skew-free: the menu and the
+			// uninstall command are always the same binary.
+			return m.runAction([]string{"uninstall", "--purge-config", "--yes", "--lang", string(m.lang)}, true)
 		default:
 			m.say(m.errOut, "无效选择。", "Invalid choice.")
 		}

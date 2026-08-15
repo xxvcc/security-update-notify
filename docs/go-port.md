@@ -26,6 +26,7 @@ Go installer plus a non-executable version marker. Neither is installed or resto
 2. `apt-get`、`dpkg`、`dnf`、`dnf5`、`microdnf`、`yum`、`rpm`、`needrestart`、`needs-restarting`、`systemctl`、`systemd-creds` 和
    `gpg` 是操作系统或信任链的数据源。Go 代码以有界超时和白名单环境执行它们：只继承终端、时区和代理变量，
    固定 `PATH`/`LC_ALL`，并丢弃 `LD_*`、Shell 启动文件、包管理器及 systemd/Git 配置覆盖，而不是不准确地重写它们。
+   代理变量是刻意为这些子进程以及 `sun.sh` 中的 `curl` 转发的，SUN 自身的出站 HTTPS 并不使用它们。
 
 Two boundaries remain explicit:
 
@@ -36,7 +37,17 @@ Two boundaries remain explicit:
 2. OS/trust commands such as `apt-get`, `dpkg`, `dnf`, `dnf5`, `microdnf`, `yum`, `rpm`, `needrestart`,
    `needs-restarting`, `systemctl`, `systemd-creds`, and `gpg` remain authoritative inputs executed with bounded timeouts and
    an allowlisted environment. Only terminal, timezone, and proxy settings are inherited; `PATH` and `LC_ALL` are fixed,
-   while loader, shell-startup, package-manager, systemd, and Git overrides are discarded.
+   while loader, shell-startup, package-manager, systemd, and Git overrides are discarded. Proxy variables are forwarded
+   deliberately for these child processes and for `curl` inside `sun.sh`; SUN's own outbound HTTPS does not use them.
+
+SUN 自己的 HTTPS 客户端在传输层禁用代理：Telegram、飞书、公网 IP 探测、发布镜像与 GitHub 下载和自升级都直连
+目标，不读取 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`。因此在出口只有 HTTP 代理的主机上，apt/dnf 仍能通过代理
+正常更新，通知和自升级检查却会失败；这类主机必须为上述目的地开放直连出口。
+
+SUN's own HTTPS client disables proxies at the transport layer: Telegram, Feishu, the public-IP echo, release-mirror
+and GitHub downloads, and self-upgrade all connect directly and never read `HTTP_PROXY`, `HTTPS_PROXY`, or
+`ALL_PROXY`. On a host whose only egress is an HTTP proxy, apt and dnf keep updating through that proxy while
+notifications and self-update checks fail; such a host needs direct egress to those destinations.
 
 这些外部命令统一在独立 Linux 进程组中运行；context 超时会终止整个组，入口进程也会把 `Ctrl+C`、
 `SIGHUP` 和 `SIGTERM` 转发给所有活动组，并在父进程异常死亡时触发直接子进程死亡信号。这样既限制等待时间，

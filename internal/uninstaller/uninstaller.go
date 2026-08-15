@@ -11,6 +11,7 @@ import (
 
 	"time"
 
+	"github.com/xxvcc/security-update-notify/internal/aptconfig"
 	"github.com/xxvcc/security-update-notify/internal/commandpath"
 	"github.com/xxvcc/security-update-notify/internal/filetrust"
 
@@ -31,6 +32,7 @@ const (
 	aptStableLogical              = aptPeriodicLogical + ".security-update-notify.bak"
 	aptAbsentLogical              = aptPeriodicLogical + ".security-update-notify.absent.bak"
 	aptLegacyAbsent               = aptPeriodicLogical + ".security-update-notify.absent"
+	aptLegacyLocalPolicyLogical   = "/etc/apt/apt.conf.d/52unattended-upgrades-local"
 	aptDependencyProof            = aptPeriodicLogical + ".security-update-notify.dependency-default.bak"
 	aptAbsentContents             = "security-update-notify: original file absent\n"
 	dnfAutomaticName              = "automatic.conf"
@@ -444,12 +446,14 @@ func purge(root string, report *Report) []error {
 	for _, logical := range []string{
 		"/etc/credstore.encrypted/security-update-notify-feishu-app-secret.cred",
 		"/etc/apt/apt.conf.d/52unattended-upgrades-security-update-notify",
-		"/etc/apt/apt.conf.d/52unattended-upgrades-local",
 		"/etc/needrestart/conf.d/99-security-update-notify-report-only.conf",
 	} {
 		if err := removeLogicalFile(root, logical); err != nil {
 			errs = append(errs, fmt.Errorf("remove %s: %w", logical, err))
 		}
+	}
+	if err := removeLegacyAPTLocalPolicy(root); err != nil {
+		errs = append(errs, fmt.Errorf("remove %s: %w", aptLegacyLocalPolicyLogical, err))
 	}
 
 	if err := removeLogicalFileWithRecovery(root, "/var/log/security-update-notify.log", sharedParentRemovalRecovery); err != nil {
@@ -477,6 +481,30 @@ func purge(root string, report *Report) []error {
 	}
 
 	return errs
+}
+
+// removeLegacyAPTLocalPolicy deletes the 1.1.x-era unattended-upgrades policy
+// only when its bytes still match exactly what that release wrote. Every release
+// from 1.2 onwards writes 52unattended-upgrades-security-update-notify and never
+// creates this name, so on a host first installed with 2.x or 3.x the same path
+// belongs to the administrator. Anything that is not a plain, bounded, regular
+// file with those exact bytes is left untouched: it cannot be the 1.1.x artifact,
+// and purge must never widen into third-party APT configuration.
+func removeLegacyAPTLocalPolicy(root string) error {
+	directory, err := openRestoreDirectory(root, filepath.Dir(aptLegacyLocalPolicyLogical))
+	if err != nil {
+		return err
+	}
+	if directory == nil {
+		return nil
+	}
+	defer directory.close()
+	name := filepath.Base(aptLegacyLocalPolicyLogical)
+	snapshot, readErr := directory.readRegular(name, restoreConfigLimit)
+	if readErr != nil || !snapshot.exists || string(snapshot.data) != aptconfig.LegacyLocalPolicy {
+		return nil
+	}
+	return directory.removeValidated(name, snapshot)
 }
 
 func flock(path string, wait time.Duration) (func() error, error) {

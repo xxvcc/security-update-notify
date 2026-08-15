@@ -214,7 +214,7 @@ func TestLiveCanaryIsolatesRunnerHealthAndSkipsFakeNotificationCredentialProbe(t
 		`apt_policy_purge_expectation=absent`,
 		`dry_run_output="$(/usr/local/sbin/security-update-notify run`,
 		`grep -q $'^HASH\t' <<<"$dry_run_output" || die`,
-		"/usr/local/sbin/security-update-notify uninstall --purge-config --lang en\n[[ ! -e /usr/local/sbin/security-update-notify ]] || die",
+		"/usr/local/sbin/security-update-notify uninstall --purge-config --lang en </dev/null\n[[ ! -e /usr/local/sbin/security-update-notify ]] || die",
 		`[[ ! -e /usr/local/sbin/sun && ! -L /usr/local/sbin/sun ]] || die`,
 		`[[ ! -e /etc/security-update-notify ]] || die`,
 		`[[ ! -e /var/lib/security-update-notify ]] || die`,

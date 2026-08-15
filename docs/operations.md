@@ -72,7 +72,7 @@
 /etc/security-update-notify/telegram.env
 ```
 
-安装器会将该文件设置为 root-only（`0600`）。飞书 App Secret 不写入其中：支持 `systemd-creds` 时使用加密 credential，否则回退到独立的 root-only `0600` 文件；普通升级备份不会复制 App Secret。
+安装器会将该文件设置为 root-only（`0600`）。飞书 App Secret 不写入其中：支持 `systemd-creds` 时使用加密 credential，否则回退到独立的 root-only `0600` 文件；普通升级备份不会复制 App Secret。但 `TELEGRAM_BOT_TOKEN` 就在这个文件里，因此每次升级都会把它连同其余配置一起复制到 `/var/backups/security-update-notify/<timestamp>/`（同样 `0600`，保留当前及前两次事务）。普通 `uninstall` 会原样保留这些备份，只有 `--purge-config` 会删除，因此轮换或作废 Telegram Bot Token 时也要一并处理该目录。
 
 ## 安装事务与中断恢复
 
@@ -91,7 +91,7 @@ SUN 会配置或使用：
 - `apt-listchanges`
 - apt periodic timers
 
-安装器会启用 unattended-upgrades 的安全更新周期任务。每次覆盖 `/etc/apt/apt.conf.d/20auto-upgrades` 前都会保存一份带时间戳的 SUN 专用备份；如果安装前已有该文件，首次安装还会固定保存原始基线；如果原本不存在，则在包管理器写入前记录一个受校验、可回滚的“原始缺失”标记。如果 SUN 本次安装的 `unattended-upgrades` 依赖包创建了发行版默认文件，SUN 会用内容绑定的 SHA-256 proof 确认来源，再把该文件提升为固定基线并移除缺失标记；因此 purge 保留依赖包和发行版 timer 时，也会恢复一份可用的 vendor 配置。部分依赖事务只在 proof 精确匹配当前文件时允许重试或 purge 保留它；proof 缺失、损坏或不匹配时会失败关闭并保留现场。若依赖包没有创建文件，原始缺失标记仍然有效，purge 会恢复为不存在。APT 目录内的标记、proof 和时间戳备份都以 `.bak` 结尾，避免 apt 对非配置文件输出扩展名提示；升级会迁移旧命名。`--purge-config` 最后会删除 SUN 的基线、标记、proof 及时间戳备份。
+安装器会启用 unattended-upgrades 的安全更新周期任务。每次覆盖 `/etc/apt/apt.conf.d/20auto-upgrades` 前都会保存一份带时间戳的 SUN 专用备份；如果安装前已有该文件，首次安装还会固定保存原始基线；如果原本不存在，则在包管理器写入前记录一个受校验、可回滚的“原始缺失”标记。如果 SUN 本次安装的 `unattended-upgrades` 依赖包创建了发行版默认文件，SUN 会用内容绑定的 SHA-256 proof 确认来源，再把该文件提升为固定基线并移除缺失标记；因此 purge 保留依赖包和发行版 timer 时，也会恢复一份可用的 vendor 配置。部分依赖事务只在 proof 精确匹配当前文件时允许重试或 purge 保留它；proof 缺失、损坏或不匹配时会失败关闭并保留现场。若依赖包没有创建文件，原始缺失标记仍然有效，purge 会恢复为不存在。APT 目录内的标记、proof 和时间戳备份都以 `.bak` 结尾，避免 apt 对非配置文件输出扩展名提示；升级会迁移旧命名。`--purge-config` 最后会删除 SUN 的基线、标记、proof 及时间戳备份，并清理 1.1.x 遗留的 `/etc/apt/apt.conf.d/52unattended-upgrades-local`；但只有当该文件的内容与 1.1.x 当年写入的策略逐字节一致时才会删除。3.x 从不创建这个文件，因此管理员自己放在同一路径的文件会原样保留。
 
 检测方式：
 

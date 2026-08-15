@@ -246,7 +246,7 @@ mkdir -p /var/lib/security-update-notify
 printf 'state\n' >/var/lib/security-update-notify/pending-security.first-seen
 mkdir -p /var/lib/systemd/timers
 printf 'timer state\n' >/var/lib/systemd/timers/stamp-security-update-notify.timer
-"$runtime" uninstall --purge-config --lang en
+"$runtime" uninstall --purge-config --lang en </dev/null
 ok "[[ ! -e /usr/local/sbin/security-update-notify ]]" "runtime purged"
 ok "[[ ! -e /etc/security-update-notify ]]" "configuration and credentials purged"
 ok "[[ ! -e /var/lib/security-update-notify ]]" "state purged"

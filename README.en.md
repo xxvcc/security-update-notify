@@ -210,6 +210,8 @@ The installer makes normal config root-only. Prefer `configure notifications` or
 - Install and self-upgrade prefer `dl.ll.cd` and fall back to GitHub on transport failure.
 - Releases require SHA-256, GPG signature, and pinned-fingerprint verification by default.
 - The Feishu App Secret never enters normal config, command lines, logs, or upgrade backups.
+- The Telegram Bot Token is normal config, so upgrade backups keep a `0600` copy; an ordinary uninstall retains those backups and only `--purge-config` removes them.
+- All of those outbound requests are direct: SUN itself never uses `HTTP_PROXY`/`HTTPS_PROXY`; proxy variables are forwarded only to child processes such as the package manager.
 - SUN exposes no HTTP endpoint, receives no remote commands, and never reboots automatically.
 
 See [Security and trust model](docs/security.en.md) for signature verification, first-execution trust, credential, and network threat boundaries.

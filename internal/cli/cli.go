@@ -72,7 +72,7 @@ func mainWithSystemdAndReader(ver string, args []string, systemdQuery run.System
 		case "test":
 			return testMode(ver, args[1:])
 		case "uninstall":
-			return uninstallMode(args[1:])
+			return uninstallModeWithReader(args[1:], reader)
 		case "version-newer":
 			return cmdVersionNewer(args[1:])
 		case "verify":

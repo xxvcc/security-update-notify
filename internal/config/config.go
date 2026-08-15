@@ -188,6 +188,43 @@ func stripInlineComment(v string) string {
 	return v
 }
 
+// Representable 报告 Write 能否无损存储 value：写出后再读回（包括与之字节兼容的 Bash 读取器）
+// 必须得到完全相同的字节。线格式没有转义机制，且读取器会顺序剥离一层双引号再剥离一层单引号，
+// 因此“自身首尾恰为一对单引号”的值无法表示。
+//
+// Representable reports whether Write can store value so that a later Load — and the Bash reader it
+// is byte-compatible with — reads back exactly the same bytes. The wire format has no escape
+// mechanism and the reader strips one double-quote layer then one single-quote layer, so a value
+// that is itself wrapped in a matching pair of single quotes cannot be represented.
+func Representable(value string) bool {
+	if strings.ContainsAny(value, "\r\n\x00") {
+		return false
+	}
+	if strings.Contains(value, "'") && strings.Contains(value, `"`) {
+		return false
+	}
+	return parseValue(quote(value)) == value
+}
+
+// Canonical 返回“Write 存储 value 后读取器实际会观察到”的值。它是幂等的：线格式无法表示的
+// 继承值会一次性收敛到不动点，而不是每次升级丢掉一层引号。仅用于既有配置的迁移，
+// 用户显式提供的值应当直接被 Representable 拒绝而不是被静默改写。
+//
+// Canonical returns the value a reader actually observes after Write stores value. It is
+// idempotent, so an inherited value the wire format cannot represent converges in one step
+// instead of losing one quote layer per upgrade. Use it only to migrate an existing file;
+// an explicitly supplied value must be rejected by Representable rather than silently rewritten.
+func Canonical(value string) string {
+	for !Representable(value) {
+		next := parseValue(quote(value))
+		if len(next) >= len(value) {
+			return next
+		}
+		value = next
+	}
+	return value
+}
+
 // quote 复刻 config_quote：值含单引号则用双引号包裹，否则用单引号包裹；不转义。
 // Write 在调用此函数前会拒绝无法用该线格式无损表示的值。
 func quote(value string) string {
@@ -255,6 +292,13 @@ func validateWriteValue(key, value string) error {
 	}
 	if strings.Contains(value, "'") && strings.Contains(value, `"`) {
 		return fmt.Errorf("config value %s contains conflicting quote characters", key)
+	}
+	// Make the documented contract real: never write a value the reader would
+	// hand back as something else. Callers migrating an existing file must run
+	// Canonical first so an unrepresentable inherited value cannot dead-end an
+	// otherwise unattended upgrade.
+	if !Representable(value) {
+		return fmt.Errorf("config value %s cannot be represented in the config file format", key)
 	}
 	return nil
 }
