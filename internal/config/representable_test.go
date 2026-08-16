@@ -98,6 +98,17 @@ func TestCanonicalCollapsesInheritedQuoteLayersToAnIdempotentFixedPoint(t *testi
 	}
 }
 
+func TestCanonicalConvergesAtTheMaximumConfigSizeInOnePass(t *testing.T) {
+	// Load accepts a config up to maxConfigBytes before installer validation.
+	// A layer-by-layer implementation rescans successively shorter slices and is
+	// quadratic for this valid input size, allowing a malformed inherited value
+	// to stall an otherwise unattended upgrade before the length check runs.
+	value := strings.Repeat("'", maxConfigBytes)
+	if got := Canonical(value); got != "" {
+		t.Fatalf("Canonical(maximum quote layers) retained %d bytes", len(got))
+	}
+}
+
 // TestWriteRejectsSingleQuoteWrappedValuesWithoutEmittingPartialOutput 断言写出前就失败：
 // 值若会被读取器多剥一层引号，Write 必须报错，且不能留下半份配置（沿用既有 fail-closed 断言方式）。
 func TestWriteRejectsSingleQuoteWrappedValuesWithoutEmittingPartialOutput(t *testing.T) {

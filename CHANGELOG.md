@@ -32,14 +32,16 @@
 - 配置写出现在真正兑现其无损契约。线格式没有转义机制且读取器顺序剥离一层双引号再剥离一层单引号，
   因此首尾恰为一对单引号的值无法表示，此前会被静默改写（`HOST_LABEL` 的 `'x'` 读回为 `x`）。新增
   `Representable` 与 `Canonical`：显式提供的不可表示值在任何主机变更之前以退出码 2 拒绝，而既有配置文件
-  中继承的同类值一次性收敛到读取器本就会得到的形式，因此升级不会在事务后期失败。
+  中继承的同类值一次性收敛到读取器本就会得到的形式，因此升级不会在事务后期失败。收敛使用单次线性扫描，
+  避免最大 4 MiB 的既有配置值通过大量嵌套引号触发二次方级 CPU 与分配开销。
   Configuration writing now genuinely honours its lossless contract. The wire format has no escape mechanism
   and the reader strips one double-quote layer then one single-quote layer, so a value wrapped in a matching
   pair of single quotes cannot be represented and was previously rewritten silently (`'x'` in `HOST_LABEL`
   read back as `x`). New `Representable` and `Canonical` helpers reject an explicitly supplied
   unrepresentable value with exit status 2 before any host mutation, while an equivalent value inherited from
   an existing configuration file converges once to the form the reader would have produced anyway, so an
-  upgrade cannot fail late inside the transaction.
+  upgrade cannot fail late inside the transaction. Convergence is a single linear scan, preventing a maximum
+  4 MiB inherited value with many nested quote layers from causing quadratic CPU and allocation cost.
 - `--telegram-token-file` 现在与 `--feishu-app-secret-file` 采用同一凭据源文件契约：必须是 root 所有、非
   符号链接、不允许组或其他用户访问、且只有一个硬链接的普通文件。Bot Token 与 App Secret 同为 bearer
   凭据，此前只校验“可读的普通文件”。

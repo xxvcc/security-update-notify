@@ -243,6 +243,11 @@ Remove config and state too:
 sudo security-update-notify uninstall --purge-config
 ```
 
+When both stdin and stderr are real TTYs, a full purge first displays its removal scope and requires the exact
+word `PURGE`; a mismatch, EOF, or read failure cancels with status `2`. Automation that has confirmed the action
+through an external control may pass `--yes` (or `-y`) explicitly. A non-interactive pipe or redirection does not
+prompt or consume stdin, preserving the existing automation contract.
+
 Both ordinary uninstall and `--purge-config` remove only the exact SUN timer unit, enablement links, and Persistent
 timestamp; a same-name link whose target was replaced by an administrator is preserved. The Persistent timestamp
 is removed only when it is a root-owned regular file that forbids group/other write and has exactly one hard link;
