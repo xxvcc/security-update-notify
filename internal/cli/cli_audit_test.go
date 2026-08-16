@@ -12,8 +12,6 @@ import (
 // root gate. Any non-zero uid reaches the gate; nobody is the least privileged.
 const nonRootTestUID = 65534
 
-const modeMismatchMessage = "One or more arguments do not apply to the selected run mode"
-
 // runWithNonRootEUID runs fn with a non-root effective uid. The uninstall root
 // gate reads the process euid directly, so a test process that happens to be
 // root has to drop privileges for real to reach it; the drop is reverted as
@@ -149,6 +147,19 @@ func TestUninstallHelpDocumentsTheAssumeYesFlag(t *testing.T) {
 				t.Fatalf("Main(%q) rc=%d stdout=%q stderr=%q", test.args, rc, stdout, stderr)
 			}
 		})
+	}
+}
+
+func TestGlobalHelpDocumentsTheUninstallAssumeYesFlag(t *testing.T) {
+	stdout, stderr, rc := captureCLIOutput(t, func() int {
+		return Main("3.3.0-test", []string{"--help"})
+	})
+	if rc != 0 || stdout != "" {
+		t.Fatalf("Main(--help) rc=%d stdout=%q stderr=%q", rc, stdout, stderr)
+	}
+	const want = "\n  security-update-notify uninstall [--purge-config] [--yes] [--lang zh|en]\n"
+	if !strings.Contains(stderr, want) {
+		t.Fatalf("global help does not document --yes: %q", stderr)
 	}
 }
 

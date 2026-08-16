@@ -215,14 +215,18 @@ func Representable(value string) bool {
 // instead of losing one quote layer per upgrade. Use it only to migrate an existing file;
 // an explicitly supplied value must be rejected by Representable rather than silently rewritten.
 func Canonical(value string) string {
-	for !Representable(value) {
-		next := parseValue(quote(value))
-		if len(next) >= len(value) {
-			return next
-		}
-		value = next
+	// quote chooses double quotes whenever value contains a single quote. The
+	// reader then removes that outer double-quote layer and, independently, one
+	// matching single-quote layer from value. Repeating the old write/read loop
+	// therefore did nothing except peel matching single quotes from both ends,
+	// but it rescanned and reallocated the remaining value on every iteration.
+	// Existing config can be up to maxConfigBytes, so perform the identical
+	// convergence in one linear pass.
+	layers := 0
+	for layers < len(value)/2 && value[layers] == '\'' && value[len(value)-1-layers] == '\'' {
+		layers++
 	}
-	return value
+	return value[layers : len(value)-layers]
 }
 
 // quote 复刻 config_quote：值含单引号则用双引号包裹，否则用单引号包裹；不转义。

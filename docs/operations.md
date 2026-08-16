@@ -230,6 +230,10 @@ sudo security-update-notify uninstall
 sudo security-update-notify uninstall --purge-config
 ```
 
+当 stdin 与 stderr 都连接真实 TTY 时，彻底清理会先显示删除范围，并要求输入完整的 `PURGE`；输入不匹配、
+EOF 或读取失败都会取消并返回 `2`。已经通过外部控制完成确认的自动化可显式传入 `--yes`（或 `-y`）跳过；
+非交互管道或重定向不会提示，也不会读取其 stdin，保持既有自动化兼容。
+
 普通卸载和 `--purge-config` 都只删除精确属于 SUN timer 的 unit、enablement 链接和 Persistent 时间戳；
 目标已被管理员替换的同名链接会保留。Persistent 时间戳只有在它是 root 所有、禁止 group/other write 且
 仅有一个硬链接的普通文件时才会删除；异常类型或元数据会保留并返回错误。作为依赖安装的软件包会保留，

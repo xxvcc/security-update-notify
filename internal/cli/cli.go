@@ -294,7 +294,7 @@ func usage() {
   security-update-notify check-upgrade [--lang zh|en]
   security-update-notify upgrade [--lang zh|en]
   security-update-notify test [--send-test] [--simulate-reboot] [--no-dedupe] [--lang zh|en]
-  security-update-notify uninstall [--purge-config] [--lang zh|en]
+  security-update-notify uninstall [--purge-config] [--yes] [--lang zh|en]
 
 Run flags:
   --test-ok --test-reboot --no-dedupe --wait-lock SECONDS --dry-run
