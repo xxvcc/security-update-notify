@@ -1276,6 +1276,84 @@ func TestPrivilegedDirectoriesRejectUnsafePermissionsBeforeChmod(t *testing.T) {
 	}
 }
 
+func TestLogrotatePolicyRejectsUntrustedDirectoryBeforeWriting(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, *Installer, *RootFS)
+		want   string
+	}{
+		{
+			name: "group-writable",
+			mutate: func(t *testing.T, _ *Installer, root *RootFS) {
+				t.Helper()
+				if err := root.Chmod("/etc/logrotate.d", 0o775); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "must not be writable by group or other users",
+		},
+		{
+			name: "other-writable",
+			mutate: func(t *testing.T, _ *Installer, root *RootFS) {
+				t.Helper()
+				if err := root.Chmod("/etc/logrotate.d", 0o757); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "must not be writable by group or other users",
+		},
+		{
+			name: "wrong-owner",
+			mutate: func(_ *testing.T, installer *Installer, _ *RootFS) {
+				installer.rootOwnerUID = uint32(os.Geteuid() + 1)
+			},
+			want: "must be owned by root",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+			write(t, root, LogrotatePath, "existing policy\n", 0o644)
+			test.mutate(t, installer, root)
+
+			err := installer.installLogrotatePolicy([]byte("replacement policy\n"))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("untrusted logrotate directory error = %v", err)
+			}
+			if got := readFile(t, root, LogrotatePath); got != "existing policy\n" {
+				t.Fatalf("logrotate policy changed before directory trust validation: %q", got)
+			}
+		})
+	}
+}
+
+func TestInstallRejectsUntrustedLogrotateDirectoryBeforeTransaction(t *testing.T) {
+	installer, root, _, _ := setupInstaller(t, "ID=debian\nVERSION_ID=13\n")
+	write(t, root, LogrotatePath, "administrator policy\n", 0o644)
+	if err := root.Chmod("/etc/logrotate.d", 0o775); err != nil {
+		t.Fatal(err)
+	}
+	options := telegramOptions()
+	options.SkipDependencies = true
+	options.SkipPostInstallCheck = true
+
+	_, err := installer.Install(context.Background(), options)
+	if err == nil || !strings.Contains(err.Error(), "inspect logrotate directory") ||
+		!strings.Contains(err.Error(), "must not be writable by group or other users") {
+		t.Fatalf("install with untrusted logrotate directory error = %v", err)
+	}
+	if got := readFile(t, root, LogrotatePath); got != "administrator policy\n" {
+		t.Fatalf("untrusted logrotate policy changed during failed install: %q", got)
+	}
+	for _, installed := range []string{BinaryPath, ConfigPath, ServicePath, TimerPath} {
+		if existsNoErr(root, installed) {
+			t.Fatalf("failed install retained %s", installed)
+		}
+	}
+	if tx, _, loadErr := installer.loadTransaction(); loadErr != nil || tx != nil {
+		t.Fatalf("failed install retained transaction state: tx=%v err=%v", tx, loadErr)
+	}
+}
+
 func TestSharedLogDirectoryAllowsOnlyGroupWrite(t *testing.T) {
 	installer, root, _, _ := setupInstaller(t, "ID=ubuntu\nVERSION_ID=24.04\n")
 	if err := root.Chmod("/var/log", 0o775); err != nil {

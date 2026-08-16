@@ -187,7 +187,6 @@ func TestRequestConstructionSucceedsForEveryGuardedBaseAndValidToken(t *testing.
 		{name: "punycode host", base: "https://xn--80ak6aa92e.com"},
 		{name: "loopback plaintext", base: "http://127.0.0.1:8080"},
 		{name: "loopback ipv6", base: "http://[::1]:8080"},
-		{name: "localhost", base: "http://localhost"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			base := strings.TrimRight(test.base, "/")

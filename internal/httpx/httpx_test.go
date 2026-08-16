@@ -27,14 +27,35 @@ func TestGuardHTTPS(t *testing.T) {
 }
 
 func TestGuardAPIBase(t *testing.T) {
-	for _, good := range []string{"https://api.example.com", "https://api.example.com:8443/", "http://127.0.0.1:8080", "http://[::1]:8080", "http://localhost:8080"} {
+	for _, good := range []string{"https://api.example.com", "https://api.example.com:8443/", "http://127.0.0.1:8080", "http://127.42.0.1", "http://[::1]:8080"} {
 		if err := GuardAPIBase(good); err != nil {
 			t.Errorf("GuardAPIBase(%q): %v", good, err)
 		}
 	}
-	for _, bad := range []string{"http://api.example.com", "https:///missing-host", "https://user@example.com", "https://example.com/path", "https://example.com?query=1", "file:///tmp/socket"} {
+	for _, bad := range []string{
+		"http://api.example.com", "http://localhost:8080", "http://localhost.:8080",
+		"http://127.0.0.1.nip.io:8080", "https:///missing-host", "https://user@example.com",
+		"https://example.com/path", "https://example.com?query=1", "file:///tmp/socket",
+	} {
 		if err := GuardAPIBase(bad); err == nil {
 			t.Errorf("GuardAPIBase(%q) should reject", bad)
+		}
+	}
+}
+
+func TestGuardRemoteHTTPSRejectsPlaintextHostnamesWithoutDNSResolution(t *testing.T) {
+	for _, raw := range []string{
+		"http://localhost:8080/path",
+		"http://localhost.:8080/path",
+		"http://127.0.0.1.nip.io:8080/path",
+		"http://loopback.example:8080/path",
+	} {
+		req, err := http.NewRequest(http.MethodGet, raw, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := guardRemoteHTTPS(req.URL); err == nil {
+			t.Errorf("guardRemoteHTTPS(%q) accepted a plaintext DNS hostname", raw)
 		}
 	}
 }

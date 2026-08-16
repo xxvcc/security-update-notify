@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // DNFGeneration distinguishes the two command-line interfaces hidden behind the public BACKEND=dnf.
@@ -14,6 +16,8 @@ type DNFGeneration uint8
 const (
 	DNF4 DNFGeneration = iota
 	DNF5
+
+	maxDNF5AdvisoryNameBytes = 256
 )
 
 var (
@@ -67,6 +71,9 @@ type DNF5Upgrade struct {
 // ParseDNF5Advisories validates DNF5's structured advisory output. A malformed security entry is an
 // error rather than an empty result so repository/output changes cannot become a false green status.
 func ParseDNF5Advisories(output string) ([]DNF5Advisory, error) {
+	if !utf8.ValidString(output) {
+		return nil, fmt.Errorf("parse dnf5 advisory JSON: input is not valid UTF-8")
+	}
 	var all []DNF5Advisory
 	if err := json.Unmarshal([]byte(output), &all); err != nil {
 		return nil, fmt.Errorf("parse dnf5 advisory JSON: %w", err)
@@ -77,7 +84,7 @@ func ParseDNF5Advisories(output string) ([]DNF5Advisory, error) {
 	out := make([]DNF5Advisory, 0, len(all))
 	for _, advisory := range all {
 		kind := strings.ToLower(advisory.Type)
-		if advisory.Name == "" || kind == "" || !validDNF5Severity(advisory.Severity) || dnf5PackageKey(advisory.NEVRA) == "" {
+		if !validDNF5AdvisoryName(advisory.Name) || kind == "" || !validDNF5Severity(advisory.Severity) || dnf5PackageKey(advisory.NEVRA) == "" {
 			return nil, fmt.Errorf("invalid dnf5 advisory entry")
 		}
 		switch kind {
@@ -420,4 +427,16 @@ func severityRank(severity string) int {
 
 func validDNF5Severity(severity string) bool {
 	return severityRank(severity) > 0
+}
+
+func validDNF5AdvisoryName(name string) bool {
+	if name == "" || len(name) > maxDNF5AdvisoryNameBytes || !utf8.ValidString(name) {
+		return false
+	}
+	for _, char := range name {
+		if char == unicode.ReplacementChar || !unicode.IsPrint(char) {
+			return false
+		}
+	}
+	return true
 }

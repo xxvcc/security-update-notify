@@ -200,14 +200,8 @@ func (i *Installer) installFiles(ctx context.Context, plan installPlan, options 
 	if err := installContextError(ctx); err != nil {
 		return "", err
 	}
-	if logrotateDir, err := i.fs.Lstat("/etc/logrotate.d"); err == nil && logrotateDir.IsDir() && logrotateDir.Mode()&fs.ModeSymlink == 0 {
-		if err := i.fs.WriteFileAtomic(LogrotatePath, payload.Logrotate, 0o644); err != nil {
-			return "", failure("install logrotate policy", err)
-		}
-	} else if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return "", failure("inspect logrotate directory", err)
-	} else if err == nil {
-		return "", failure("inspect logrotate directory", errors.New("/etc/logrotate.d must be a real directory"))
+	if err := i.installLogrotatePolicy(payload.Logrotate); err != nil {
+		return "", err
 	}
 	if err := installContextError(ctx); err != nil {
 		return "", err
@@ -252,6 +246,35 @@ func (i *Installer) installFiles(ctx context.Context, plan installPlan, options 
 		return "", failure("install timer unit", err)
 	}
 	return storage, nil
+}
+
+func (i *Installer) installLogrotatePolicy(payload []byte) error {
+	exists, err := i.validateLogrotateDirectory()
+	if err != nil || !exists {
+		return err
+	}
+	if err := i.fs.WriteFileAtomic(LogrotatePath, payload, 0o644); err != nil {
+		return failure("install logrotate policy", err)
+	}
+	return nil
+}
+
+func (i *Installer) validateLogrotateDirectory() (bool, error) {
+	const directory = "/etc/logrotate.d"
+	info, err := i.fs.Lstat(directory)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, failure("inspect logrotate directory", err)
+	}
+	if info.Mode()&fs.ModeSymlink != 0 || !info.IsDir() {
+		return false, failure("inspect logrotate directory", errors.New("/etc/logrotate.d must be a real directory"))
+	}
+	if err := i.validateTrustedDirectory(directory, info); err != nil {
+		return false, failure("inspect logrotate directory", err)
+	}
+	return true, nil
 }
 
 func (i *Installer) installCommandAlias() string {

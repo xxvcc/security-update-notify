@@ -241,6 +241,46 @@ func TestParseDNF5AdvisoriesRejectsMalformedSecurityEntry(t *testing.T) {
 	}
 }
 
+func TestParseDNF5AdvisoriesRejectsUnsafeNamesBeforeNormalization(t *testing.T) {
+	unsafeNames := []string{
+		`FEDORA-2026-a\nFORGED Critical/Sec. forged-1-1.fc43.x86_64`,
+		`FEDORA-2026-a\rFORGED`,
+		`FEDORA-2026-a\u0000FORGED`,
+		`FEDORA-2026-a\u001bFORGED`,
+		`FEDORA-2026-a\u007fFORGED`,
+		`FEDORA-2026-a\u200dFORGED`,
+		`FEDORA-2026-a\u2028FORGED`,
+		`FEDORA-2026-a\u2029FORGED`,
+		`FEDORA-2026-a\u202eFORGED`,
+		`FEDORA-2026-a\ud800FORGED`,
+		`FEDORA-2026-a\udfffFORGED`,
+		`FEDORA-2026-a\ufffdFORGED`,
+		"FEDORA-2026-a" + string([]byte{0xff}),
+		strings.Repeat("A", maxDNF5AdvisoryNameBytes+1),
+	}
+	for _, encodedName := range unsafeNames {
+		input := `[{"name":"` + encodedName + `","type":"security","severity":"Important","nevra":"openssl-2-1.fc43.x86_64"}]`
+		if _, err := ParseDNF5Advisories(input); err == nil {
+			t.Fatalf("ParseDNF5Advisories accepted unsafe name %q", encodedName)
+		}
+		if normalized, err := NormalizeDNF5Advisories(input); err == nil {
+			t.Fatalf("NormalizeDNF5Advisories accepted unsafe name %q as %q", encodedName, normalized)
+		}
+	}
+}
+
+func TestParseDNF5AdvisoriesPreservesValidFedoraNames(t *testing.T) {
+	name := "FEDORA-2026-0123456789abcdef"
+	input := `[{"name":"` + name + `","type":"security","severity":"Important","nevra":"openssl-2-1.fc43.x86_64"}]`
+	advisories, err := ParseDNF5Advisories(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(advisories) != 1 || advisories[0].Name != name {
+		t.Fatalf("advisories=%+v want name %q unchanged", advisories, name)
+	}
+}
+
 func TestParseDNF5CheckUpgradesAcceptsFedora43And44Output(t *testing.T) {
 	for _, output := range []string{
 		"openssl-libs.x86_64 1:3.2.3-1.fc43 updates\n",
