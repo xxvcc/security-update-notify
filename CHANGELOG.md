@@ -1,5 +1,37 @@
 # 变更记录
 
+## 3.3.1
+
+- DNF5 安全公告名称在进入任何标准化或通知文本前，现强制要求有效 UTF-8、最多 256 字节且不含控制字符、
+  不可打印格式控制或 Unicode 行/段分隔符。畸形仓库输出因此会失败关闭，不再能把伪造的新行、双向文本或
+  终端控制序列注入安全更新摘要。
+  DNF5 security-advisory names are now required to be valid UTF-8, at most 256 bytes, and free of control
+  characters, non-printing format controls, and Unicode line/paragraph separators before any normalization
+  or notification rendering. Malformed repository output therefore fails closed instead of injecting forged
+  lines, bidirectional text, or terminal controls into security-update summaries.
+- 运行时读取配置时先验证父目录为当前特权用户所有、非符号链接且不可由组或其他用户写入，再通过已验证目录
+  的固定文件描述符执行 `openat` 与 `O_NOFOLLOW`，阻断不受信目录写入者实施的目录替换、配置删除和旧文件
+  回放竞态；父目录完全不存在时仍保持未安装语义。安装器写入 `/etc/logrotate.d` 前也执行同一 root 所有和
+  权限信任检查，并在任何安装事务开始前拒绝不安全目录。
+  Runtime configuration loading now first requires a non-symlink parent directory owned by the effective
+  privileged user and not writable by group or other users, then uses `openat` plus `O_NOFOLLOW` relative to
+  that validated directory descriptor. This blocks untrusted directory writers from directory replacement,
+  deletion, and stale-file replay races while preserving the uninstalled meaning of a wholly absent parent.
+  The installer applies the same root-owner and permission trust check before writing under
+  `/etc/logrotate.d`, rejecting an unsafe directory before any installation transaction begins.
+- 飞书外部错误脱敏现在对原始、path-escaped 和 query-escaped 凭据变体去重并按最长优先一次替换，避免 App ID
+  是 App Secret 前缀时先替换短值而泄露 Secret 后缀。测试用明文 HTTP 例外同时收紧为数值型回环 IP；
+  `localhost`、尾点名称和解析到回环的 DNS 名称均不再绕过 HTTPS 要求。
+  Feishu external-error redaction now deduplicates raw, path-escaped, and query-escaped credential variants
+  and replaces them once in longest-first order, preventing an App ID that prefixes an App Secret from
+  exposing the secret suffix. The plaintext HTTP exception used by tests is also limited to numeric loopback
+  IP addresses; `localhost`, trailing-dot names, and DNS names that resolve to loopback no longer bypass HTTPS.
+- 所有普通 CI 与公开 canary 的 `actions/checkout` 均显式关闭凭据持久化，缩短 GitHub token 在工作区 Git 配置
+  中的暴露窗口；发布与镜像工作流原有的固定 revision、只读权限及无凭据检出边界保持不变。
+  Every ordinary CI and public-canary `actions/checkout` now explicitly disables credential persistence,
+  reducing the GitHub token's exposure in workspace Git configuration while preserving the release and mirror
+  workflows' existing pinned-revision, read-only-permission, and credential-free checkout boundaries.
+
 ## 3.3.0
 
 - 修复在不实现 `renameat2` 标志位的文件系统上卸载失败并永久卡死的问题。卸载与 `--purge-config` 恢复过去

@@ -8,6 +8,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/xxvcc/security-update-notify/internal/filetrust"
 )
 
 // 镜像 ci.yml “Config parser regression check” 的用例（load_config_file 运行时语义）：
@@ -161,6 +163,10 @@ func TestLoadRejectsUnsafeOrOversizedFilesWithoutBlocking(t *testing.T) {
 	if cfg, err := Load(missing); err != nil || len(cfg.Map()) != 0 {
 		t.Fatalf("missing config = %#v, %v", cfg, err)
 	}
+	missingParent := filepath.Join(dir, "not-installed", "missing.env")
+	if cfg, err := Load(missingParent); err != nil || len(cfg.Map()) != 0 {
+		t.Fatalf("config under missing parent = %#v, %v", cfg, err)
+	}
 
 	target := filepath.Join(dir, "target.env")
 	if err := os.WriteFile(target, []byte("NOTIFY_LANG=en\n"), 0o600); err != nil {
@@ -247,5 +253,89 @@ func TestLoadRequiresEffectiveOwnerPrivateModeAndSingleLink(t *testing.T) {
 				t.Fatal("unsafe config metadata was accepted")
 			}
 		})
+	}
+}
+
+func TestLoadRejectsUnsafeParentForReplacementAndDeletion(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "config")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(parent, "telegram.env")
+	if err := os.WriteFile(path, []byte("NOTIFY_LANG=en\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(parent, "stale.env")
+	if err := os.WriteFile(stale, []byte("NOTIFY_LANG=stale\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(stale, path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("replayed protected config in group-writable parent was accepted")
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("missing config in group-writable parent was treated as an uninstalled configuration")
+	}
+}
+
+func TestLoadRejectsSymlinkedParent(t *testing.T) {
+	root := t.TempDir()
+	realParent := filepath.Join(root, "real")
+	if err := os.Mkdir(realParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realParent, "telegram.env"), []byte("NOTIFY_LANG=en\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	linkedParent := filepath.Join(root, "linked")
+	if err := os.Symlink(realParent, linkedParent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(filepath.Join(linkedParent, "telegram.env")); err == nil {
+		t.Fatal("config through symlinked parent was accepted")
+	}
+}
+
+func TestLoadAtRemainsBoundToValidatedDirectory(t *testing.T) {
+	root := t.TempDir()
+	pathParent := filepath.Join(root, "config")
+	if err := os.Mkdir(pathParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const name = "telegram.env"
+	if err := os.WriteFile(filepath.Join(pathParent, name), []byte("NOTIFY_LANG=en\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	directory, exists, err := filetrust.OpenExistingDirectory(pathParent, os.Geteuid())
+	if err != nil || !exists {
+		t.Fatalf("open trusted directory: exists=%v err=%v", exists, err)
+	}
+	defer directory.Close()
+
+	originalParent := filepath.Join(root, "original")
+	if err := os.Rename(pathParent, originalParent); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(pathParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pathParent, name), []byte("NOTIFY_LANG=forged\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := loadAt(directory, name, os.Geteuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Get("NOTIFY_LANG"); got != "en" {
+		t.Fatalf("directory replacement changed loaded config to %q", got)
 	}
 }

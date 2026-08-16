@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"syscall"
@@ -83,14 +84,29 @@ func Load(path string) (*Config, error) {
 }
 
 func load(path string, euid int) (*Config, error) {
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	directory, exists, err := filetrust.OpenExistingDirectory(filepath.Dir(path), euid)
+	if err != nil {
+		return nil, fmt.Errorf("open config directory: %w", err)
+	}
+	if !exists {
+		return &Config{m: map[string]string{}}, nil
+	}
+	defer directory.Close()
+	return loadAt(directory, filepath.Base(path), euid)
+}
+
+func loadAt(directory *os.File, name string, euid int) (*Config, error) {
+	if name == "" || name == "." || name == ".." || filepath.Base(name) != name {
+		return nil, fmt.Errorf("invalid config file name %q", name)
+	}
+	fd, err := syscall.Openat(int(directory.Fd()), name, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return &Config{m: map[string]string{}}, nil
 		}
 		return nil, fmt.Errorf("open config: %w", err)
 	}
-	f := os.NewFile(uintptr(fd), path)
+	f := os.NewFile(uintptr(fd), name)
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {

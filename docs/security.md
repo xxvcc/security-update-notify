@@ -14,8 +14,9 @@
 
 SUN 的范围刻意保持很小：
 
-- 出站仅 HTTPS：提醒按配置发往 Telegram Bot API 和/或 `open.feishu.cn`；默认另向公网 IP 探测服务（api.ipify.org / ifconfig.me）获取出口 IP（`INCLUDE_PUBLIC_IP=0` 可关闭）；安装和自升级优先访问 `dl.ll.cd`，不可用时访问 GitHub。若要用出口防火墙收紧，请把这些目的地一并放行或关闭对应功能。这些请求全部直连：SUN 自己的 HTTPS 客户端在传输层禁用代理，不读取 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`；代理变量只刻意转发给包管理器、`gpg`、`systemctl` 等子进程以及 `sun.sh` 中的 `curl`。因此在出口只有 HTTP 代理的主机上，apt/dnf 仍能更新，通知和自升级检查却会失败；
-- 特权生产进程忽略用于 Go/隔离测试的 API 根地址、配置、凭据、状态、锁、日志及后端探测路径环境覆盖。安装器子进程仅能通过继承的锁文件描述符复用父进程已经持有的主运行锁，并会把描述符重新绑定到规范锁 inode 后验证 flock 能力；单独伪造描述符环境值会失败关闭。systemd 正式提供的 `CREDENTIALS_DIRECTORY` 仍是受支持的凭据入口。不要把测试覆盖当作受限 sudo 委派接口；
+- 出站仅 HTTPS：提醒按配置发往 Telegram Bot API 和/或 `open.feishu.cn`；默认另向公网 IP 探测服务（api.ipify.org / ifconfig.me）获取出口 IP（`INCLUDE_PUBLIC_IP=0` 可关闭）；安装和自升级优先访问 `dl.ll.cd`，不可用时访问 GitHub。若要用出口防火墙收紧，请把这些目的地一并放行或关闭对应功能。这些请求全部直连：SUN 自己的 HTTPS 客户端在传输层禁用代理，不读取 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`；代理变量只刻意转发给包管理器、`gpg`、`systemctl` 等子进程以及 `sun.sh` 中的 `curl`。因此在出口只有 HTTP 代理的主机上，apt/dnf 仍能更新，通知和自升级检查却会失败。隔离测试唯一允许的明文例外是数值型回环 IP；`localhost`、其它主机名及其重定向均不属于例外；
+- 特权生产进程忽略用于 Go/隔离测试的 API 根地址、配置、凭据、状态、锁、日志及后端探测路径环境覆盖。安装器子进程仅能通过继承的锁文件描述符复用父进程已经持有的主运行锁，并会把描述符重新绑定到规范锁 inode 后验证 flock 能力；单独伪造描述符环境值会失败关闭。systemd 正式提供的 `CREDENTIALS_DIRECTORY` 仍是受支持的凭据入口。不要把测试覆盖当作受限 sudo 委派接口。运行时打开已有配置前还要求其父目录为当前特权用户所有、不可由组或其他用户写入且不是符号链接，并通过固定目录描述符打开叶文件；安装器写入 `/etc/logrotate.d` 前执行等价的 root 目录信任检查；
+- systemd 服务使用 `ProtectSystem=full`，因此 `/usr`、boot loader 目录和 `/etc` 在服务 mount namespace 内只读；该级别刻意不把整个文件系统改成只读，使不安装软件的 APT/DNF 查询子进程仍能写入其 `/var` 缓存、锁和状态路径。除 `/run/security-update-notify.lock` 运行锁外，服务自身的持久写入仅限 `/var/lib/security-update-notify` 与日志文件；
 - 不接收远程命令；
 - 不提供公开 HTTP 入口；
 - 不自动重启；

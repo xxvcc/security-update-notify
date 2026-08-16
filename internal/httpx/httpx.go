@@ -16,7 +16,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 )
 
@@ -35,7 +34,7 @@ func (t remoteHTTPSOnlyTransport) RoundTrip(req *http.Request) (*http.Response, 
 }
 
 // New 构造一个远程 HTTPS-only 的客户端：初始请求在传输层复核，每一次重定向
-// 跳转都必须是 https，最多 10 跳。loopback HTTP 仅用于本地集成测试夹具。
+// 跳转都必须是 https，最多 10 跳。数值型 loopback HTTP 仅用于本地集成测试夹具。
 func New(timeout time.Duration) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil // 不受环境代理影响
@@ -62,16 +61,20 @@ func guardRemoteHTTPS(u *url.URL) error {
 	if u.Scheme == "https" {
 		return nil
 	}
-	host := strings.ToLower(u.Hostname())
-	ip := net.ParseIP(host)
-	if u.Scheme == "http" && (host == "localhost" || ip != nil && ip.IsLoopback()) {
+	if u.Scheme == "http" && isNumericLoopback(u.Hostname()) {
 		return nil
 	}
 	return fmt.Errorf("refusing remote non-https request")
 }
 
-// GuardAPIBase accepts an HTTPS API root, plus plain HTTP only on the local loopback interface for
-// deterministic integration tests. Credentials must never be sent to a remote plaintext endpoint.
+func isNumericLoopback(host string) bool {
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// GuardAPIBase accepts an HTTPS API root, plus plain HTTP only for a numeric loopback address used by
+// deterministic integration tests. Hostnames are never a plaintext exception because DNS may resolve
+// them to a remote address. Credentials must never be sent to a remote plaintext endpoint.
 func GuardAPIBase(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -83,9 +86,7 @@ func GuardAPIBase(raw string) error {
 	if u.Scheme == "https" {
 		return nil
 	}
-	host := strings.ToLower(u.Hostname())
-	ip := net.ParseIP(host)
-	if u.Scheme == "http" && (host == "localhost" || (ip != nil && ip.IsLoopback())) {
+	if u.Scheme == "http" && isNumericLoopback(u.Hostname()) {
 		return nil
 	}
 	return fmt.Errorf("refusing non-https API base URL")

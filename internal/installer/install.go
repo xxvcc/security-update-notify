@@ -91,6 +91,9 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 	if err != nil {
 		return Result{}, err
 	}
+	if _, err := i.validateLogrotateDirectory(); err != nil {
+		return Result{}, err
+	}
 	if err := i.requireSystemd(); err != nil {
 		return Result{}, err
 	}

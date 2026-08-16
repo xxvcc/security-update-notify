@@ -513,6 +513,24 @@ func TestTransportErrorsAreSafeAndRedacted(t *testing.T) {
 	}
 }
 
+func TestTransportErrorsRedactOverlappingSecretsLongestFirst(t *testing.T) {
+	appID := "cli_app"
+	appSecret := appID + "/secret value"
+	underlying := errors.New(strings.Join([]string{
+		appSecret,
+		url.PathEscape(appSecret),
+		url.QueryEscape(appSecret),
+	}, " "))
+
+	err := sanitizeExternalError("Feishu request failed", underlying, appID, appSecret, appSecret)
+	if !errors.Is(err, underlying) {
+		t.Fatal("sanitized error no longer unwraps to its cause")
+	}
+	if got, want := err.Error(), "Feishu request failed: [REDACTED] [REDACTED] [REDACTED]"; got != want {
+		t.Fatalf("overlapping credentials were not fully redacted:\n got: %q\nwant: %q", got, want)
+	}
+}
+
 func TestExhaustedServerFailureIsTemporary(t *testing.T) {
 	var requests int32
 	c, srv, slept := newTestClient(func(w http.ResponseWriter, _ *http.Request) {

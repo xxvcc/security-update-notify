@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -81,15 +82,33 @@ func (e *externalError) Unwrap() error { return e.cause }
 
 func sanitizeExternalError(prefix string, err error, secrets ...string) error {
 	safe := err.Error()
+	variants := make(map[string]struct{}, len(secrets)*3)
 	for _, secret := range secrets {
 		if secret == "" {
 			continue
 		}
 		for _, encoded := range []string{secret, url.PathEscape(secret), url.QueryEscape(secret)} {
 			if encoded != "" {
-				safe = strings.ReplaceAll(safe, encoded, "[REDACTED]")
+				variants[encoded] = struct{}{}
 			}
 		}
+	}
+	ordered := make([]string, 0, len(variants))
+	for variant := range variants {
+		ordered = append(ordered, variant)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if len(ordered[i]) == len(ordered[j]) {
+			return ordered[i] < ordered[j]
+		}
+		return len(ordered[i]) > len(ordered[j])
+	})
+	if len(ordered) > 0 {
+		replacements := make([]string, 0, len(ordered)*2)
+		for _, variant := range ordered {
+			replacements = append(replacements, variant, "[REDACTED]")
+		}
+		safe = strings.NewReplacer(replacements...).Replace(safe)
 	}
 	safe = textsafe.SingleLine(safe)
 	for len(safe) > 300 {
