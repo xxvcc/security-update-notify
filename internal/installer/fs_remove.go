@@ -2,6 +2,7 @@ package installer
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -14,6 +15,8 @@ import (
 	"syscall"
 	"unsafe"
 )
+
+const removalOwnedPrefix = ".security-update-notify-remove-owned."
 
 // Remove has rm -f semantics: it may unlink a file or symlink, but it never
 // broadens scope to removing a directory, including under a replacement race.
@@ -196,12 +199,61 @@ func newRemovalPlaceholder(parent *os.File, directory bool) (string, fs.FileInfo
 }
 
 func isRemovalArtifactName(name string) bool {
+	if strings.HasPrefix(name, removalOwnedPrefix) {
+		return true
+	}
 	suffix, found := strings.CutPrefix(name, removalPrefix)
 	if !found || len(suffix) != 32 {
 		return false
 	}
 	_, err := hex.DecodeString(suffix)
 	return err == nil
+}
+
+// The old random-only name is a pending claim, including on older installs:
+// a crash may have happened before the claimed inode was checked. Only a name
+// published after that check carries the identity needed to resume deletion.
+func ownedRemovalName(pending string, info fs.FileInfo) (string, error) {
+	suffix, found := strings.CutPrefix(pending, removalPrefix)
+	if !found || !isRemovalArtifactName(pending) {
+		return "", errors.New("invalid pending removal name")
+	}
+	digest, err := removalIdentityDigest(info)
+	if err != nil {
+		return "", err
+	}
+	return removalOwnedPrefix + suffix + "." + digest, nil
+}
+
+func removalIdentityDigest(info fs.FileInfo) (string, error) {
+	if info == nil {
+		return "", errors.New("removal identity is unavailable")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat == nil {
+		return "", errors.New("removal identity is unavailable")
+	}
+	identity := fmt.Sprintf("%x:%x:%x:%x:%x", stat.Dev, stat.Ino, stat.Mode, stat.Uid, stat.Gid)
+	// Recursive deletion changes directory size, timestamps and link count.
+	// Leaf entries must retain all of those facts except rename-sensitive ctime.
+	if !info.IsDir() {
+		identity += fmt.Sprintf(":%x:%x:%x:%x", stat.Nlink, stat.Size, stat.Mtim.Sec, stat.Mtim.Nsec)
+	}
+	digest := sha256.Sum256([]byte(identity))
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func ownedRemovalMatches(name string, info fs.FileInfo) bool {
+	suffix, found := strings.CutPrefix(name, removalOwnedPrefix)
+	if !found {
+		return false
+	}
+	random, digest, found := strings.Cut(suffix, ".")
+	if !found || !isRemovalArtifactName(removalPrefix+random) || len(digest) != sha256.Size*2 {
+		return false
+	}
+	expected, err := removalIdentityDigest(info)
+	return err == nil && digest == expected
 }
 
 func cleanupRemovalArtifactsAt(parent *os.File) error {
@@ -228,12 +280,19 @@ func cleanupRemovalArtifactsAt(parent *os.File) error {
 		if !isRemovalArtifactName(entry.Name()) {
 			continue
 		}
+		if !strings.HasPrefix(entry.Name(), removalOwnedPrefix) {
+			errs = append(errs, errors.New("unverified or legacy removal quarantine requires manual recovery; retained at "+entry.Name()))
+			continue
+		}
 		expected, err := readRemovalEntry(parent, entry.Name())
 		if errors.Is(err, fs.ErrNotExist) {
 			continue
 		}
+		if err == nil && !ownedRemovalMatches(entry.Name(), expected) {
+			err = errors.New("owned removal quarantine does not match its durable identity; retained at " + entry.Name())
+		}
 		if err == nil {
-			err = removeValidatedEntryAt(parent, entry.Name(), expected, true, nil)
+			err = removeOwnedEntryAt(parent, entry.Name(), expected, nil)
 		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("remove interrupted quarantine %s: %w", entry.Name(), err))
@@ -304,17 +363,59 @@ func removeValidatedEntryAt(parent *os.File, name string, expected fs.FileInfo, 
 	if readErr != nil || !sameRemovalEntry(claimed, expected) {
 		return restoreUnexpectedRemovalClaim(parent, quarantine, name, readErr)
 	}
-	if !claimed.IsDir() {
-		if err := syscall.Unlinkat(int(parent.Fd()), quarantine); err != nil {
-			return fmt.Errorf("remove claimed entry retained at %s: %w", quarantine, err)
+	if claimed.IsDir() && !recursive {
+		return restoreUnexpectedRemovalClaim(parent, quarantine, name, errors.New("validated leaf became a directory"))
+	}
+	if claimed.IsDir() && claimedDirectory == nil {
+		return restoreUnexpectedRemovalClaim(parent, quarantine, name, errors.New("validated directory handle is unavailable"))
+	}
+	owned, err := ownedRemovalName(quarantine, claimed)
+	if err != nil {
+		return fmt.Errorf("record removal ownership; pending entry retained at %s: %w", quarantine, err)
+	}
+	// Both names include the freshly reserved 128-bit random suffix. A plain
+	// rename keeps this promotion atomic on filesystems without renameat2 flags.
+	if err := syscall.Renameat(int(parent.Fd()), quarantine, int(parent.Fd()), owned); err != nil {
+		return fmt.Errorf("publish removal ownership; pending entry retained at %s: %w", quarantine, err)
+	}
+	return removeOwnedEntryAt(parent, owned, claimed, claimedDirectory)
+}
+
+func removeOwnedEntryAt(parent *os.File, owned string, expected fs.FileInfo, claimedDirectory *os.File) (returnErr error) {
+	current, err := readRemovalEntry(parent, owned)
+	if err != nil || !ownedRemovalMatches(owned, current) || !sameRemovalEntry(current, expected) {
+		return errors.Join(errors.New("owned removal quarantine changed; retained at "+owned), err)
+	}
+	// Persist the ownership decision before deleting any bytes. After a crash,
+	// recovery must never reinterpret an unverified claim as an owned one.
+	if err := parent.Sync(); err != nil {
+		return fmt.Errorf("persist owned removal quarantine retained at %s: %w", owned, err)
+	}
+	current, err = readRemovalEntry(parent, owned)
+	if err != nil || !ownedRemovalMatches(owned, current) || !sameRemovalEntry(current, expected) {
+		return errors.Join(errors.New("owned removal quarantine changed after persistence; retained at "+owned), err)
+	}
+	if !current.IsDir() {
+		if err := syscall.Unlinkat(int(parent.Fd()), owned); err != nil {
+			return fmt.Errorf("remove claimed entry retained at %s: %w", owned, err)
 		}
 		return nil
 	}
-	if !recursive {
-		return restoreUnexpectedRemovalClaim(parent, quarantine, name, errors.New("validated leaf became a directory"))
-	}
 	if claimedDirectory == nil {
-		return restoreUnexpectedRemovalClaim(parent, quarantine, name, errors.New("validated directory handle is unavailable"))
+		claimedDirectory, err = openRemovalDirectory(parent, owned)
+		if err != nil {
+			return err
+		}
+		defer func() { returnErr = errors.Join(returnErr, claimedDirectory.Close()) }()
+	}
+	info, err := claimedDirectory.Stat()
+	if err != nil || !sameRemovalIdentity(info, current) {
+		return errors.Join(errors.New("owned removal directory changed; retained at "+owned), err)
+	}
+	// A partially deleted tree can itself contain a pending child claim. Do not
+	// erase that unresolved conflict merely because its parent is owned.
+	if err := cleanupRemovalArtifactsAt(claimedDirectory); err != nil {
+		return err
 	}
 	entries, err := claimedDirectory.ReadDir(-1)
 	if err != nil {
@@ -322,10 +423,13 @@ func removeValidatedEntryAt(parent *os.File, name string, expected fs.FileInfo, 
 	}
 	for _, entry := range entries {
 		if err := removeAllAt(claimedDirectory, entry.Name()); err != nil {
-			return fmt.Errorf("remove quarantined tree retained at %s: %w", quarantine, err)
+			return fmt.Errorf("remove quarantined tree retained at %s: %w", owned, err)
 		}
 	}
-	return unlinkRemovalDirectory(parent, quarantine, expected)
+	if err := claimedDirectory.Sync(); err != nil {
+		return fmt.Errorf("sync removed tree contents retained at %s: %w", owned, err)
+	}
+	return unlinkRemovalDirectory(parent, owned, expected)
 }
 
 func unlinkRemovalDirectory(parent *os.File, name string, expected fs.FileInfo) error {

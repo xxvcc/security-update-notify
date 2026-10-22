@@ -26,7 +26,8 @@ ProtectHostname=true
 RestrictNamespaces=true
 RestrictRealtime=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-CapabilityBoundingSet=
+# needrestart/needs-restarting must inspect processes owned by other users.
+CapabilityBoundingSet=CAP_SYS_PTRACE
 UMask=0077
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM

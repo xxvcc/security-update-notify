@@ -230,6 +230,119 @@ func TestTerminationContextHelper(t *testing.T) {
 	select {}
 }
 
+func TestTransactionalChildFinishesRollbackBeforeParentSignalExit(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		signal syscall.Signal
+		force  bool
+		nested bool
+	}{
+		{"HUP", syscall.SIGHUP, false, false},
+		{"INT", syscall.SIGINT, false, false},
+		{"TERM", syscall.SIGTERM, false, false},
+		{"second-signal", syscall.SIGTERM, true, false},
+		{"nested-transaction", syscall.SIGTERM, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			marker := filepath.Join(t.TempDir(), "rollback")
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestTransactionalChildHelper$")
+			cmd.Env = append(os.Environ(), "SUN_TRANSACTION_HELPER="+marker)
+			if tc.nested {
+				cmd.Env = append(cmd.Env, "SUN_TRANSACTION_NESTED=1")
+			}
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = cmd.Process.Kill() })
+			for {
+				if _, err := os.Stat(marker + ".ready"); err == nil {
+					break
+				} else if !errors.Is(err, os.ErrNotExist) {
+					t.Fatal(err)
+				}
+				if ctx.Err() != nil {
+					_ = cmd.Wait()
+					t.Fatal("transactional child did not become ready")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			started := time.Now()
+			if err := cmd.Process.Signal(tc.signal); err != nil {
+				t.Fatal(err)
+			}
+			if tc.force {
+				time.Sleep(100 * time.Millisecond)
+				if err := cmd.Process.Signal(tc.signal); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := cmd.Wait()
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) {
+				t.Fatalf("parent exit=%v, want signal termination", err)
+			}
+			status := exitErr.Sys().(syscall.WaitStatus)
+			if !status.Signaled() || status.Signal() != tc.signal {
+				t.Fatalf("parent exit=%v, want original signal %v", status, tc.signal)
+			}
+			contents, readErr := os.ReadFile(marker)
+			if tc.force {
+				if !errors.Is(readErr, os.ErrNotExist) {
+					t.Fatalf("second signal did not interrupt rollback: %q, %v", contents, readErr)
+				}
+			} else if readErr != nil || string(contents) != "rolled back" || time.Since(started) < 500*time.Millisecond {
+				t.Fatalf("child rollback interrupted: %q, %v, elapsed %s", contents, readErr, time.Since(started))
+			}
+		})
+	}
+}
+
+func TestTransactionalChildHelper(t *testing.T) {
+	marker := os.Getenv("SUN_TRANSACTION_HELPER")
+	if marker == "" {
+		return
+	}
+	InstallSignalForwarding()
+	var completeOuter func()
+	if os.Getenv("SUN_TRANSACTION_NESTED") == "1" {
+		_, completeOuter = TerminationContext(context.Background())
+	}
+	cmd := CommandContext(context.Background(), os.Args[0], "-test.run=^TestTerminationContextHelper$")
+	cmd.Env = append(cmd.Env,
+		"SUN_SYSEXEC_TERMINATION_CONTEXT_HELPER=1",
+		"SUN_SYSEXEC_TERMINATION_CONTEXT_MARKER="+marker,
+		"SUN_SYSEXEC_TERMINATION_CONTEXT_READY="+marker+".ready",
+	)
+	err := cmd.RunWithTerminationWait()
+	if completeOuter != nil {
+		completeOuter()
+		select {}
+	}
+	if err != nil {
+		t.Fatalf("parent returned before original signal exit: %v", err)
+	}
+}
+
+func TestTransactionalCommandPreservesExitAndUnregisters(t *testing.T) {
+	err := CommandContext(context.Background(), "/bin/sh", "-c", "exit 75").RunWithTerminationWait()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 75 {
+		t.Fatalf("transactional exit=%v, want 75", err)
+	}
+	if terminationWaitActive() {
+		t.Fatal("completed command left a termination waiter")
+	}
+	cmd := CommandContext(context.Background(), "/bin/true")
+	cmd.transactionWait = true
+	terminating.Store(true)
+	defer terminating.Store(false)
+	if err := cmd.Start(); !errors.Is(err, context.Canceled) || cmd.Process != nil {
+		t.Fatalf("new transaction started during termination: error=%v, process=%v", err, cmd.Process)
+	}
+}
+
 func TestTerminationCleanupCanBeUnregistered(t *testing.T) {
 	called := 0
 	unregister := RegisterTerminationCleanup(func() { called++ })

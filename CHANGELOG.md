@@ -1,5 +1,50 @@
 # 变更记录
 
+## 3.3.2
+
+- 构建和 CI 工具链更新为 Go 1.26.10。服务沙箱保留检测其他用户进程所需的 `CAP_SYS_PTRACE`，
+  修复已删除可执行文件或库的重启需求漏报，同时继续启用 `NoNewPrivileges` 并限制其他 capability。
+  Updates the build and CI toolchain to Go 1.26.10. The service sandbox retains `CAP_SYS_PTRACE` so restart
+  checks can inspect processes owned by other users and detect deleted executables or libraries, while
+  retaining `NoNewPrivileges` and restricting other capabilities.
+- APT 待更新与 hold 检测使用支持新增依赖的模拟，正确识别依赖新 ABI 包的内核元包更新，并减少错误的阻塞告警。
+  已确认恢复的告警会标记本轮告警周期结束，使相同问题再次出现时重新通知；不同通知渠道分别保留成功投递记录，
+  未知采集结果不会被当作恢复。
+  APT pending-update and hold detection now simulates upgrades with new dependencies, correctly identifying
+  kernel metapackage updates that require a new ABI package and reducing incorrect blocked-update alerts.
+  Confirmed recovery marks the current alert episode as resolved so recurring problems notify again;
+  successful delivery records remain separate for each channel, and unknown results do not count as recovery.
+- 自升级父进程收到首次终止信号后会等待子安装器完成回滚，避免原先的短暂宽限期强行中断事务恢复；
+  再次终止与总运行时限仍能强制结束进程。
+  On the first termination signal, the self-upgrade supervisor waits for the child installer to finish
+  rollback instead of interrupting recovery after a short grace period. A second termination signal and
+  the overall execution timeout still permit forced termination.
+- 删除隔离文件前验证其身份并持久化授权状态；删除前持久化失败或身份冲突时保留相关对象和恢复证据，
+  后续运行能继续已授权的删除。
+  不支持 rename 标志位时，配置恢复的回退路径使用不覆盖移动，保留并发创建的管理员文件与原始配置。
+  Quarantined removals validate identity and persist authorization before deleting data; pre-deletion
+  persistence failures and identity conflicts retain the affected objects and recovery evidence, and later
+  runs can resume authorized deletion. On filesystems without rename
+  flag support, configuration-restoration fallbacks use no-overwrite moves to preserve concurrent
+  administrator files and the original configuration.
+- InRelease 元数据读取上限由 256 KiB 提高至 4 MiB，以兼容正常 Ubuntu 索引并完整检查 Valid-Until。
+  引导器和发布验证下载使用 curl 直接写入受大小限制的普通临时文件，
+  使中断重试、HTTP 重试和分块超限响应遵守同一下载边界。
+  Raises the InRelease metadata limit from 256 KiB to 4 MiB so normal Ubuntu indexes can be read with
+  complete Valid-Until checks. Bootstrap and release-verification downloads let curl write
+  directly to size-limited regular temporary files, preserving download bounds across interrupted
+  transfers, HTTP retries, and oversized chunked responses.
+- 无签名 CI 打包改为检出精确提交的无 tag 浅克隆，允许已打 tag 的提交重跑普通 CI，正式发布仍强制签名。
+  Debian 11 与 Fedora 44 的生命周期测试分别使用官方归档 HTTPS 源和禁用 zchunk 的测试容器配置，
+  修复失效软件源与元数据下载阻塞；不改变用户主机设置或放宽签名、TLS、校验和及过期检查。
+  同时更新已被上游移除的 CentOS Stream 容器固定摘要。
+  Unsigned CI packaging now uses a shallow, tag-free checkout of the exact commit, allowing ordinary CI
+  reruns for already-tagged commits while official releases still require signatures. Debian 11 and
+  Fedora 44 lifecycle fixtures use official archive HTTPS sources and disable zchunk respectively to
+  avoid unavailable packages and stalled metadata transfers, without changing user hosts or relaxing
+  signature, TLS, checksum, or expiry verification.
+  Also refreshes the pinned CentOS Stream container digests retired by the upstream registry.
+
 ## 3.3.1
 
 - DNF5 安全公告名称在进入任何标准化或通知文本前，现强制要求有效 UTF-8、最多 256 字节且不含控制字符、

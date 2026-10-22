@@ -548,3 +548,80 @@ func TestWriteDeliveryFailureLeavesPendingMarkerToBiasTowardResend(t *testing.T)
 		t.Fatalf("interrupted alert state=(%q,%d), want old state", hash, sentAt)
 	}
 }
+
+func TestRecoveryPreservesDeliveryIdentityUntilNextSuccessfulSend(t *testing.T) {
+	store := NewStore(t.TempDir())
+	target := TargetFingerprint("telegram", "123", "-100")
+	healthy := Hash(Fields{Host: "host"})
+	alert := Hash(Fields{Host: "host", RebootRequired: true})
+	if err := store.MarkRecovered(healthy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(store.TargetPendingFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("empty history acquired a recovery marker: %v", err)
+	}
+	if err := store.WriteDelivery(alert, 100, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkRecovered(healthy); err != nil {
+		t.Fatal(err)
+	}
+	if hash, sentAt := store.ReadLast(); hash != alert || sentAt != 100 {
+		t.Fatalf("recovery changed successful delivery: %q %d", hash, sentAt)
+	}
+	if b, err := os.ReadFile(store.TargetFile); err != nil || string(b) != target+"\n" {
+		t.Fatalf("recovery changed target: %q %v", b, err)
+	}
+	if store.ReadTargetStatus(target) != TargetChanged {
+		t.Fatal("resolved alert would suppress recurrence")
+	}
+	store.fileSync = func(*os.File) error { return errors.New("must not rewrite recovery") }
+	if err := store.MarkRecovered(healthy); err != nil {
+		t.Fatalf("repeated recovery rewrote persisted state: %v", err)
+	}
+	store.fileSync = nil
+	if err := store.WriteDelivery(alert, 200, target); err != nil {
+		t.Fatal(err)
+	}
+	if store.ReadTargetStatus(target) != TargetCurrent {
+		t.Fatal("successful recurrence did not close pending delivery")
+	}
+	if err := store.WriteDelivery(healthy, 300, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkRecovered(healthy); err != nil {
+		t.Fatal(err)
+	}
+	if store.ReadTargetStatus(target) != TargetCurrent {
+		t.Fatal("already delivered OK lost deduplication")
+	}
+}
+
+func TestRecoveryRejectsUnsafeMarkerAndReportsPersistenceFailure(t *testing.T) {
+	store := NewStore(t.TempDir())
+	healthy := Hash(Fields{})
+	if err := store.Write("previous-alert", 100); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("preserve"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, store.TargetPendingFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkRecovered(healthy); err == nil {
+		t.Fatal("symlinked recovery marker accepted")
+	}
+	if b, err := os.ReadFile(outside); err != nil || string(b) != "preserve" {
+		t.Fatalf("outside file changed: %q %v", b, err)
+	}
+	if err := os.Remove(store.TargetPendingFile); err != nil {
+		t.Fatal(err)
+	}
+	want := errors.New("recovery sync failed")
+	store.fileSync = func(*os.File) error { return want }
+	if err := store.MarkRecovered(healthy); !errors.Is(err, want) {
+		t.Fatalf("MarkRecovered error=%v want %v", err, want)
+	}
+}

@@ -149,32 +149,21 @@ download_limited() {
   local limit="$1" output="$2" part="${2}.part"
   shift 2
   rm -f -- "$part"
-  if curl "${curl_args[@]}" --max-filesize "$limit" "$@" | python3 -I -c '
+  if python3 -I -c '
 import os
+import resource
 import sys
 
 limit = int(sys.argv[1])
 path = sys.argv[2]
-if limit < 0:
+if limit <= 0:
     raise SystemExit(1)
-try:
-    with open(path, "xb") as output:
-        remaining = limit
-        while True:
-            chunk = sys.stdin.buffer.read(min(65536, remaining + 1))
-            if not chunk:
-                break
-            if len(chunk) > remaining:
-                raise ValueError("download exceeds size limit")
-            output.write(chunk)
-            remaining -= len(chunk)
-except Exception:
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
-    raise SystemExit(1)
-' "$limit" "$part"; then
+with open(path, "xb"):
+    pass
+resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+# A regular curl-owned output lets retries truncate an incomplete response.
+os.execvp("curl", ["curl"] + sys.argv[3:])
+' "$limit" "$part" "${curl_args[@]}" --max-filesize "$limit" --output "$part" "$@"; then
     if mv -f -- "$part" "$output"; then
       return 0
     fi

@@ -35,8 +35,9 @@ type Input struct {
 	Patch   watchdog.Patch
 	EOL     watchdog.EOL
 
-	SendOK   bool // --test-ok 或 NOTIFY_OK=1
-	NoDedupe bool
+	SendOK        bool // --test-ok 或 NOTIFY_OK=1
+	NoDedupe      bool
+	RecoveryKnown bool // every enabled probe can establish a real recovery
 }
 
 // Output 是决策结果。

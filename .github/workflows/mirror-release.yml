@@ -157,36 +157,23 @@ jobs:
           url="$3"
           part="${output}.part"
           rm -f -- "$part"
-          if /usr/bin/timeout --signal=TERM --kill-after=5s 180s \
-              /usr/bin/curl --disable --fail --location --silent --show-error \
-                --connect-timeout 20 --max-time 120 --retry 3 --retry-delay 1 \
-                --retry-all-errors --retry-max-time 150 --max-filesize "$limit" \
-                --proto '=https' --proto-redir '=https' "$url" | \
-              /usr/bin/python3 -I -c '
+          if /usr/bin/python3 -I -c '
           import os
+          import resource
           import sys
 
           limit = int(sys.argv[1])
           path = sys.argv[2]
-          try:
-              with open(path, "xb") as output:
-                  remaining = limit
-                  while True:
-                      chunk = sys.stdin.buffer.read(min(65536, remaining + 1))
-                      if not chunk:
-                          break
-                      if len(chunk) > remaining:
-                          raise ValueError("download exceeds byte limit")
-                      output.write(chunk)
-                      remaining -= len(chunk)
-          except Exception as exc:
-              try:
-                  os.unlink(path)
-              except FileNotFoundError:
-                  pass
-              print(f"bounded download failed: {exc}", file=sys.stderr)
-              raise SystemExit(1)
-          ' "$limit" "$part" && mv -f -- "$part" "$output"; then
+          with open(path, "xb"):
+              pass
+          resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+          os.execv(sys.argv[3], sys.argv[3:])
+          ' "$limit" "$part" /usr/bin/timeout --signal=TERM --kill-after=5s 180s \
+              /usr/bin/curl --disable --fail --location --silent --show-error \
+                --connect-timeout 20 --max-time 120 --retry 3 --retry-delay 1 \
+                --retry-all-errors --retry-max-time 150 --max-filesize "$limit" \
+                --proto '=https' --proto-redir '=https' --output "$part" "$url" \
+              && mv -f -- "$part" "$output"; then
             exit 0
           fi
           rm -f -- "$part"
@@ -1052,37 +1039,24 @@ jobs:
           url="$3"
           part="${output}.part"
           rm -f -- "$part"
-          if /usr/bin/env -i PATH=/usr/bin:/bin \
-              /usr/bin/timeout --signal=TERM --kill-after=5s 180s \
-              curl --disable --fail --location --silent --show-error \
-                --connect-timeout 20 --max-time 120 --retry 3 --retry-delay 1 \
-                --retry-all-errors --retry-max-time 150 --max-filesize "$limit" \
-                --proto '=https' --proto-redir '=https' "$url" | \
-              /usr/bin/python3 -I -c '
+          if /usr/bin/python3 -I -c '
           import os
+          import resource
           import sys
 
           limit = int(sys.argv[1])
           path = sys.argv[2]
-          try:
-              with open(path, "xb") as output:
-                  remaining = limit
-                  while True:
-                      chunk = sys.stdin.buffer.read(min(65536, remaining + 1))
-                      if not chunk:
-                          break
-                      if len(chunk) > remaining:
-                          raise ValueError("download exceeded configured limit")
-                      output.write(chunk)
-                      remaining -= len(chunk)
-          except Exception as exc:
-              try:
-                  os.unlink(path)
-              except FileNotFoundError:
-                  pass
-              print(f"bounded download failed: {exc}", file=sys.stderr)
-              raise SystemExit(1)
-          ' "$limit" "$part" && mv -f -- "$part" "$output"; then
+          with open(path, "xb"):
+              pass
+          resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+          os.execv(sys.argv[3], sys.argv[3:])
+          ' "$limit" "$part" /usr/bin/env -i PATH=/usr/bin:/bin \
+              /usr/bin/timeout --signal=TERM --kill-after=5s 180s \
+              curl --disable --fail --location --silent --show-error \
+                --connect-timeout 20 --max-time 120 --retry 3 --retry-delay 1 \
+                --retry-all-errors --retry-max-time 150 --max-filesize "$limit" \
+                --proto '=https' --proto-redir '=https' --output "$part" "$url" \
+              && mv -f -- "$part" "$output"; then
             exit 0
           fi
           rm -f -- "$part"

@@ -114,6 +114,8 @@ func Collect(cfg *config.Config, f Flags) Input {
 	persistPatchState := !f.NoStateWrites && !f.TestReboot && !f.TestOK
 	skipSelfUpdate := f.NoStateWrites || f.TestReboot || f.TestOK
 	in.Health, in.Pending, in.Patch, in.EOL = collectWatchdog(cfg, be, o, in.Restart, f.Version, persistPatchState, false, skipSelfUpdate)
+	in.RecoveryKnown = in.Restart.ProbeIssue == "" && in.Pending.Known && !in.Patch.SelfUpdateCheckErr &&
+		(!truthyLooseDefault(cfg.Get("CHECK_EOL"), true) || in.EOL.Known)
 	if be == "dnf" && len(in.Pending.Packages) > 0 {
 		pkgs := in.Pending.Packages
 		if len(pkgs) > 40 {

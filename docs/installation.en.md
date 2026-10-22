@@ -59,34 +59,22 @@ download_limited() {
   output="$SUN_WORK/$asset"
   part="${output}.part"
   rm -f -- "$part"
-  if curl --disable --fail --silent --show-error --location \
-      --proto '=https' --proto-redir '=https' \
-      --connect-timeout 20 --retry 4 --retry-delay 1 --retry-max-time 180 \
-      --max-time 180 --max-filesize 1048576 "$SUN_BASE/$asset" |
-      python3 -I -c '
+  if python3 -I -c '
 import os
+import resource
 import sys
 
 limit = 1048576
 path = sys.argv[1]
-try:
-    with open(path, "xb") as output:
-        remaining = limit
-        while True:
-            chunk = sys.stdin.buffer.read(min(65536, remaining + 1))
-            if not chunk:
-                break
-            if len(chunk) > remaining:
-                raise ValueError("download exceeds size limit")
-            output.write(chunk)
-            remaining -= len(chunk)
-except Exception:
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
-    raise SystemExit(1)
-' "$part"; then
+with open(path, "xb"):
+    pass
+resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+os.execvp("curl", ["curl", "--disable", "--fail", "--silent", "--show-error", "--location",
+                  "--proto", "=https", "--proto-redir", "=https",
+                  "--connect-timeout", "20", "--retry", "4", "--retry-delay", "1",
+                  "--retry-max-time", "180", "--max-time", "180", "--max-filesize", str(limit),
+                  "--output", path, sys.argv[2]])
+' "$part" "$SUN_BASE/$asset"; then
     if mv -f -- "$part" "$output"; then
       return 0
     fi

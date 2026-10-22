@@ -67,7 +67,7 @@ jobs:
       - name: Set up pinned Go toolchain
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.6'
+          go-version: '1.26.10'
           check-latest: false
           cache: false
 
@@ -104,7 +104,7 @@ jobs:
       - name: Set up pinned Go toolchain
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.6'
+          go-version: '1.26.10'
           check-latest: false
           cache: false
 
@@ -174,7 +174,7 @@ jobs:
       - name: Set up pinned Go toolchain
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.6'
+          go-version: '1.26.10'
           check-latest: false
           cache: false
 
@@ -186,6 +186,7 @@ jobs:
             build/bootstrap-test.sh \
             build/build.sh \
             build/compat-test.sh \
+            build/container-lifecycle-test.sh \
             build/dnf5-versionlock-test.sh \
             build/interactive-test.sh \
             build/live-canary.sh \
@@ -203,6 +204,7 @@ jobs:
             build/bootstrap-test.sh \
             build/build.sh \
             build/compat-test.sh \
+            build/container-lifecycle-test.sh \
             build/dnf5-versionlock-test.sh \
             build/interactive-test.sh \
             build/live-canary.sh \
@@ -216,6 +218,7 @@ jobs:
         run: |
           python3 -I -m py_compile \
             build/fake-notify-api.py \
+            build/download-retry-test.py \
             build/pty-driver.py \
             build/pty-driver-test.py \
             build/release-archive-test.py
@@ -283,7 +286,7 @@ jobs:
               '"$(wc -c < "$output")" -eq "$((${#expected} + 1))"',
               '"rel/$tarball" "$version" "$epoch" released-source',
               '/usr/bin/timeout --signal=TERM --kill-after=5s 180s',
-              'raise ValueError("download exceeds byte limit")',
+              'resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))',
               'gpg --no-options --batch --status-fd=1',
               'cmp "deploy/$TAG/$asset" "public-check/$asset"',
               '- name: Confirm GitHub Latest before stable update',
@@ -329,9 +332,9 @@ jobs:
               raise SystemExit('mirror verification must ignore runner GPG option files')
           if 'gh release download' in workflow or workflow.count('/usr/bin/curl') != 1:
               raise SystemExit('every release download must use the bounded HTTPS helper')
-          if (workflow.count('raise ValueError("download exceeds byte limit")') != 1 or
+          if (workflow.count('resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))') != 2 or
                   workflow.count('"$RUNNER_TEMP/download-limited"') != 6):
-              raise SystemExit('the bounded HTTPS helper and all four call sites must remain intact')
+              raise SystemExit('both bounded HTTPS helpers and all download call sites must remain intact')
 
           stable = workflow.split(
               '- name: Confirm GitHub Latest before stable update', 1
@@ -382,7 +385,8 @@ jobs:
               'raise ValueError("input exceeds byte limit")',
               '/usr/bin/curl --disable --fail --location --silent --show-error',
               '--max-filesize "$limit"',
-              '/usr/bin/python3 -I "$RUNNER_TEMP/write-limited.py" "$limit" "$part"',
+              'resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))',
+              '--output "$part" "$url"',
               '/usr/bin/env -i LC_ALL=C PATH=/usr/bin:/bin',
               '/usr/bin/timeout --signal=TERM --kill-after=5s 15s "$runtime" --version',
               '/usr/bin/python3 -I "$RUNNER_TEMP/write-limited.py" 4096 "$runtime_version_part"',
@@ -405,16 +409,20 @@ jobs:
     env:
       GOTOOLCHAIN: local
     steps:
-      - name: Checkout complete history
+      # Unsigned CI packages use this exact commit without release tag refs.
+      # Official packaging still enforces signing when --release or a tag is present.
+      - name: Checkout unsigned CI source snapshot
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          fetch-tags: false
           persist-credentials: false
 
       - name: Set up pinned Go toolchain
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.6'
+          go-version: '1.26.10'
           check-latest: false
           cache: false
 
@@ -528,7 +536,7 @@ jobs:
             -e SUN_INSTALL_BINARY=/sun-bin \
             -v "$PWD:/src:ro" \
             -v "$SUN_INSTALL_BINARY:/sun-bin:ro" \
-            "${{ matrix.image }}" bash /src/build/rocky-bootstrap-test.sh
+            "${{ matrix.image }}" bash /src/build/container-lifecycle-test.sh rocky-bootstrap
 
   best-effort-apt-lifecycle:
     if: ${{ github.event_name != 'release' && needs.changes.outputs.full_ci == 'true' }}
@@ -560,7 +568,8 @@ jobs:
             -e SUN_CONTAINER_TEST=1 \
             -e SUN_ALLOW_BEST_EFFORT=1 \
             -v "$PWD:/src:ro" \
-            "${{ matrix.image }}" bash /src/build/compat-test.sh
+            --mount type=bind,src=/etc/ssl/certs/ca-certificates.crt,dst=/sun-test-ca-certificates.crt,readonly \
+            "${{ matrix.image }}" bash /src/build/container-lifecycle-test.sh compat
 
       - name: Fresh install, failed-upgrade rollback, and uninstall lifecycle
         run: |
@@ -568,7 +577,8 @@ jobs:
             -e SUN_CONTAINER_TEST=1 \
             -e SUN_ALLOW_BEST_EFFORT=1 \
             -v "$PWD:/src:ro" \
-            "${{ matrix.image }}" bash /src/build/rollback-test.sh
+            --mount type=bind,src=/etc/ssl/certs/ca-certificates.crt,dst=/sun-test-ca-certificates.crt,readonly \
+            "${{ matrix.image }}" bash /src/build/container-lifecycle-test.sh rollback
 
   best-effort-rpm-lifecycle:
     if: ${{ github.event_name != 'release' && needs.changes.outputs.full_ci == 'true' }}
@@ -581,8 +591,8 @@ jobs:
       max-parallel: 3
       matrix:
         image:
-          - 'quay.io/centos/centos:stream9@sha256:04bad0b08ac68a63b1810ea78a9d2ed4fb431e11d9c4c3916418edd4932856bd'
-          - 'quay.io/centos/centos:stream10@sha256:b7f85bb8be4c471bc62842156a51bbf224b15243943733bd54e86ba5fd79b1fc'
+          - 'quay.io/centos/centos:stream9@sha256:467b387a39503bb0c7a34199477bbc848a25699937990ec7f6692d46a492a3fe'
+          - 'quay.io/centos/centos:stream10@sha256:bab116bbc06c9128e248c47ac9c4a4892ae3cb89d339eb7c2911150e92d0e5ff'
           - 'oraclelinux:8-slim@sha256:aaef2b765b654067ef27e101dfb15c24df2133967575dfcf66bc968ff815c264'
           - 'oraclelinux:9-slim@sha256:33bcb689f7c8e6bd15bcee9a253538bc0b7cafeadb8b1a9d6ac90669c4497ce3'
           - 'oraclelinux:10-slim@sha256:afab39c390428a4fa3c909038c718dd893bc6b06b85bcad86c998fa9d0597c10'
@@ -671,7 +681,7 @@ jobs:
       - name: Set up pinned Go toolchain
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.6'
+          go-version: '1.26.10'
           check-latest: false
           cache: false
 
@@ -691,7 +701,7 @@ jobs:
           set -euo pipefail
           work="$(mktemp -d)"
           trap 'rm -rf "$work"' EXIT
-          tests='^(TestPurgeRestorePreservesFileMetadataAndXattrs|TestPurgeRestoresFixedAPTBackupWhenDestinationIsMissing|TestPurgeAPTDoesNotDeleteFixedBackupReplacedDuringCleanup|TestPurgeDNFDoesNotDeleteConfigRecreatedAfterValidatedTargetDisappears|TestRestoreFileRetainsConcurrentDestinationChangedAfterExchange)$'
+          tests='^(TestPurgeRestorePreservesFileMetadataAndXattrs|TestPurgeRestoresFixedAPTBackupWhenDestinationIsMissing|TestPurgeAPTDoesNotDeleteFixedBackupReplacedDuringCleanup|TestPurgeDNFDoesNotDeleteConfigRecreatedAfterValidatedTargetDisappears|TestRestoreFileRetainsConcurrentDestinationChangedAfterExchange|TestRestoreFileExchangeFallbackPreservesConcurrentWritesAndCompensatesSafely|TestRestoreFileExchangeFallbackPublishesRestoredBytesWhenRenameFlagsAreRejected)$'
           for arch in amd64 arm64 386 ppc64le s390x; do
             binary="$work/uninstaller-$arch.test"
             CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
@@ -936,13 +946,23 @@ jobs:
           download_limited() {
             local limit="$1" output="$2" url="$3" part="${2}.part"
             rm -f -- "$part"
-            if /usr/bin/timeout --signal=TERM --kill-after=5s 180s \
+            if /usr/bin/python3 -I -c '
+          import os
+          import resource
+          import sys
+
+          limit = int(sys.argv[1])
+          path = sys.argv[2]
+          with open(path, "xb"):
+              pass
+          resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+          os.execv(sys.argv[3], sys.argv[3:])
+          ' "$limit" "$part" /usr/bin/timeout --signal=TERM --kill-after=5s 180s \
                 /usr/bin/curl --disable --fail --location --silent --show-error \
                   --connect-timeout 20 --max-time 120 --retry 3 --retry-delay 1 \
                   --retry-all-errors --retry-max-time 150 --max-filesize "$limit" \
-                  --proto '=https' --proto-redir '=https' "$url" | \
-                /usr/bin/python3 -I "$RUNNER_TEMP/write-limited.py" "$limit" "$part" && \
-                mv -f -- "$part" "$output"; then
+                  --proto '=https' --proto-redir '=https' --output "$part" "$url" \
+                && mv -f -- "$part" "$output"; then
               return 0
             fi
             rm -f -- "$part"

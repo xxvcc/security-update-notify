@@ -57,8 +57,8 @@ func TestRestoreFileExchangeFallbackPublishesRestoredBytesWhenRenameFlagsAreReje
 	if _, err := directory.restoreFile(sourceName, destinationName, sourceSnapshot, destinationSnapshot); err != nil {
 		t.Fatalf("restoreFile() error = %v", err)
 	}
-	if rejections != 1 {
-		t.Fatalf("flagged renames = %d, want exactly one rejected exchange", rejections)
+	if rejections != 3 {
+		t.Fatalf("flagged renames = %d, want rejected exchange and two no-replace moves", rejections)
 	}
 	assertContent(t, root, aptPeriodicLogical, "vendor baseline")
 	names, err := directory.names()
@@ -70,6 +70,93 @@ func TestRestoreFileExchangeFallbackPublishesRestoredBytesWhenRenameFlagsAreReje
 	want := []string{destinationName, sourceName}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("apt configuration directory = %v, want %v", names, want)
+	}
+}
+
+func TestRestoreFileExchangeFallbackPreservesConcurrentWritesAndCompensatesSafely(t *testing.T) {
+	for _, scenario := range []string{"concurrent publication", "publication failure", "concurrent compensation"} {
+		t.Run(scenario, func(t *testing.T) {
+			root := t.TempDir()
+			writeFixture(t, root, aptPeriodicLogical, "managed before purge")
+			writeFixture(t, root, aptStableLogical, "vendor baseline")
+			directory, err := openRestoreDirectory(root, filepath.Dir(aptPeriodicLogical))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer directory.close()
+			sourceName, destinationName := filepath.Base(aptStableLogical), filepath.Base(aptPeriodicLogical)
+			source, err := directory.readRegular(sourceName, restoreConfigLimit)
+			if err != nil {
+				t.Fatal(err)
+			}
+			destination, err := directory.readRegular(destinationName, restoreConfigLimit)
+			if err != nil {
+				t.Fatal(err)
+			}
+			publicationAttempted, compensationAttempted := false, false
+			var temporary string
+			directory.renameAt = func(_ int, oldName, newName string, flags uintptr) error {
+				if flags == restoreRenameExchange {
+					temporary = oldName
+					return syscall.EINVAL
+				}
+				if flags != restoreRenameNoReplace || newName != destinationName {
+					t.Fatalf("unexpected fallback move %s -> %s flags=%d", oldName, newName, flags)
+				}
+				if oldName == temporary {
+					publicationAttempted = true
+					if scenario != "concurrent publication" {
+						return syscall.EIO
+					}
+				} else {
+					compensationAttempted = true
+				}
+				if scenario == "concurrent publication" && oldName == temporary ||
+					scenario == "concurrent compensation" && oldName != temporary {
+					file, err := os.OpenFile(directory.host(destinationName), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := file.WriteString("administrator concurrent configuration"); err != nil {
+						t.Fatal(err)
+					}
+					if err := file.Close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return syscall.EINVAL
+			}
+			_, err = directory.restoreFile(sourceName, destinationName, source, destination)
+			if err == nil || !publicationAttempted || !compensationAttempted {
+				t.Fatalf("fallback error=%v publication=%t compensation=%t", err, publicationAttempted, compensationAttempted)
+			}
+			wantLive := "administrator concurrent configuration"
+			if scenario == "publication failure" {
+				wantLive = "managed before purge"
+			}
+			assertContent(t, root, aptPeriodicLogical, wantLive)
+			assertContent(t, root, aptStableLogical, "vendor baseline")
+			names, err := directory.names()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if unfinishedRestoreArtifact(names) == "" {
+				t.Fatal("failed fallback did not preserve recovery evidence")
+			}
+			oldCopies := 0
+			for _, name := range names {
+				data, err := os.ReadFile(directory.host(name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(data) == "managed before purge" {
+					oldCopies++
+				}
+			}
+			if oldCopies != 1 {
+				t.Fatalf("previous live configuration copies = %d, want one preserved copy", oldCopies)
+			}
+		})
 	}
 }
 
@@ -127,6 +214,72 @@ func TestRestoreFileNoReplaceFallbackPublishesSingleLinkedFileWhenRenameFlagsAre
 	want := []string{destinationName, sourceName}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("apt configuration directory = %v, want %v", names, want)
+	}
+}
+
+func TestRestoreFileExchangeFallbackPreservesConflictAtFinalDisplacement(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, aptPeriodicLogical, "managed before purge")
+	writeFixture(t, root, aptStableLogical, "vendor baseline")
+	directory, err := openRestoreDirectory(root, filepath.Dir(aptPeriodicLogical))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directory.close()
+	sourceName, destinationName := filepath.Base(aptStableLogical), filepath.Base(aptPeriodicLogical)
+	source, err := directory.readRegular(sourceName, restoreConfigLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination, err := directory.readRegular(destinationName, restoreConfigLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var temporary, displaced string
+	directory.renameAt = func(_ int, oldName, newName string, flags uintptr) error {
+		if flags == restoreRenameExchange {
+			temporary = oldName
+		} else if flags == restoreRenameNoReplace && newName == temporary {
+			displaced = oldName
+			file, err := os.OpenFile(directory.host(temporary), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			if _, err := file.WriteString("administrator concurrent data"); err != nil {
+				t.Fatal(err)
+			}
+			if err := file.Close(); err != nil {
+				t.Fatal(err)
+			}
+		} else if flags != restoreRenameNoReplace || oldName != temporary || newName != destinationName {
+			t.Fatalf("unexpected fallback move %s -> %s flags=%d", oldName, newName, flags)
+		}
+		return syscall.EINVAL
+	}
+	if _, err := directory.restoreFile(sourceName, destinationName, source, destination); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("final displacement conflict error=%v, want EEXIST", err)
+	}
+	if displaced == "" {
+		t.Fatal("test did not reach final fallback displacement")
+	}
+	assertContent(t, root, aptPeriodicLogical, "vendor baseline")
+	assertContent(t, root, aptStableLogical, "vendor baseline")
+	for name, want := range map[string]string{
+		temporary: "administrator concurrent data",
+		displaced: "managed before purge",
+	} {
+		data, err := os.ReadFile(directory.host(name))
+		if err != nil || string(data) != want {
+			t.Fatalf("retained %s=%q error=%v, want %q", name, data, err, want)
+		}
+	}
+	names, err := directory.names()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unfinishedRestoreArtifact(names) == "" {
+		t.Fatal("failed fallback lost its recovery evidence")
 	}
 }
 

@@ -200,7 +200,6 @@ EOF
 
 require_arg() { [[ $# -ge 2 && -n "${2:-}" ]] || { say "缺少 $1 的值" "Missing value for $1" >&2; exit 2; }; }
 validate_version() { [[ ${#1} -le 128 && "$1" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]] || { say "无效版本: $1" "Invalid VERSION: $1" >&2; exit 2; }; }
-curl_https() { curl --disable --proto '=https' --proto-redir '=https' "$@"; }
 configure_curl_retry_options() {
   local curl_help
   curl_help="$(curl --disable --help all 2>/dev/null || true)"
@@ -210,40 +209,30 @@ configure_curl_retry_options() {
     CURL_RETRY_OPTIONS=(--retry-connrefused)
   fi
 }
-curl_retry() {
-  curl_https --connect-timeout 20 --retry 4 --retry-delay 1 --retry-max-time 180 --max-time 180 \
-    "${CURL_RETRY_OPTIONS[@]}" "$@"
-}
 download_limited() {
   local limit="$1" output="$2" part="${2}.part"
   shift 2
   rm -f -- "$part"
-  if curl_retry --max-filesize "$limit" "$@" | python3 -I -c '
+  # curl must own a seekable output file: retries then discard any partial
+  # response instead of appending it to the next response through a pipe.
+  # RLIMIT_FSIZE also bounds chunked downloads on older curl versions.
+  if python3 -I -c '
 import os
+import resource
 import sys
 
 limit = int(sys.argv[1])
 path = sys.argv[2]
-if limit < 0:
+if limit <= 0:
     raise SystemExit(1)
-try:
-    with open(path, "xb") as output:
-        remaining = limit
-        while True:
-            chunk = sys.stdin.buffer.read(min(65536, remaining + 1))
-            if not chunk:
-                break
-            if len(chunk) > remaining:
-                raise ValueError("download exceeds size limit")
-            output.write(chunk)
-            remaining -= len(chunk)
-except Exception:
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
-    raise SystemExit(1)
-' "$limit" "$part"; then
+with open(path, "xb"):
+    pass
+resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+os.execvp("curl", ["curl", "--disable", "--proto", "=https", "--proto-redir", "=https",
+                  "--connect-timeout", "20", "--retry", "4", "--retry-delay", "1",
+                  "--retry-max-time", "180", "--max-time", "180", "--max-filesize", str(limit),
+                  "--output", path] + sys.argv[3:])
+' "$limit" "$part" "${CURL_RETRY_OPTIONS[@]}" "$@"; then
     if mv -f -- "$part" "$output"; then
       return 0
     fi
@@ -726,11 +715,17 @@ fi
 
 configure_curl_retry_options
 
+TMP="$(create_trusted_temp_dir)"
+trap 'rm -rf "$TMP"' EXIT
+cd "$TMP"
+
 if [[ "$VERSION" == "latest" ]]; then
-  if ! VERSION="$(curl_retry --max-filesize "$MAX_METADATA_BYTES" -fsSL "${RELEASE_MIRROR_BASE%/}/latest.json" 2>/dev/null | parse_mirror_latest 2>/dev/null)"; then
+  if ! download_limited "$MAX_METADATA_BYTES" latest-mirror.json -fsSL "${RELEASE_MIRROR_BASE%/}/latest.json" 2>/dev/null \
+      || ! VERSION="$(parse_mirror_latest < latest-mirror.json 2>/dev/null)"; then
     say "发布镜像版本索引不可用，正在回退 GitHub。" "Release mirror index unavailable; falling back to GitHub."
     api="https://api.github.com/repos/${REPO}/releases/latest"
-    VERSION="$(curl_retry --max-filesize "$MAX_METADATA_BYTES" -fsSL "$api" | parse_github_latest)"
+    download_limited "$MAX_METADATA_BYTES" latest-github.json -fsSL "$api"
+    VERSION="$(parse_github_latest < latest-github.json)"
   fi
 fi
 validate_version "$VERSION"
@@ -744,10 +739,6 @@ else
   DOWNLOAD_BASES+=("${RELEASE_MIRROR_BASE%/}/v${VERSION}")
   DOWNLOAD_BASES+=("https://github.com/${REPO}/releases/download/v${VERSION}")
 fi
-
-TMP="$(create_trusted_temp_dir)"
-trap 'rm -rf "$TMP"' EXIT
-cd "$TMP"
 
 download_release_set() {
   local base

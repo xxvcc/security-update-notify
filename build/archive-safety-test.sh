@@ -58,7 +58,6 @@ import sys
 from pathlib import Path
 
 sun = Path(sys.argv[1]).read_text()
-live_canary = Path(sys.argv[2]).read_text()
 out = Path(sys.argv[3])
 
 def extract(source, start_marker, end_marker):
@@ -68,10 +67,9 @@ def extract(source, start_marker, end_marker):
 
 sun_function = extract(sun, "safe_extract_tar() {", "\nrelease_signing_public_key()",)
 checksum_function = extract(sun, "verify_checksum() {", "\nsafe_extract_tar()",)
-curl_functions = extract(sun, "curl_https() {", "\ntar_clean_env()",)
+curl_functions = extract(sun, "configure_curl_retry_options() {", "\ntar_clean_env()",)
 capture_function = extract(sun, "capture_limited() {", "\ntar_clean_env()",)
 latest_functions = extract(sun, "parse_mirror_latest() {", "\nverify_checksum() {",)
-canary_download_functions = extract(live_canary, "curl_args=(", "\ncache_key=",)
 
 (out / "sun-harness.sh").write_text("""#!/usr/bin/env bash
 set -euo pipefail
@@ -102,16 +100,7 @@ curl() {
   fi
   printf '%s\\n' \"$@\" >\"$capture\"
 }
-""" + curl_functions + "\nconfigure_curl_retry_options\ncurl_retry -f https://example.invalid/release\n")
-
-(out / "download-limit-harness.sh").write_text("""#!/usr/bin/env bash
-set -euo pipefail
-CURL_RETRY_OPTIONS=()
-curl() {
-  printf '%s\\n' "$@" >"$FAKE_CURL_ARGS"
-  python3 -I -c 'import os, sys; sys.stdout.buffer.write(b"x" * int(os.environ["FAKE_RESPONSE_BYTES"]))'
-}
-""" + curl_functions + "\ndownload_limited \"$1\" \"$2\" -fsL https://example.invalid/chunked\n")
+""" + curl_functions + "\nconfigure_curl_retry_options\nprintf '%s\\n' \"${CURL_RETRY_OPTIONS[@]}\" >\"$capture\"\n")
 
 (out / "capture-limit-harness.sh").write_text("""#!/usr/bin/env bash
 set -euo pipefail
@@ -129,14 +118,6 @@ sys.stdout.buffer.write(b"x" * int(sys.argv[1]))
 ' "$bytes" "$delay"
 """)
 
-(out / "canary-download-limit-harness.sh").write_text("""#!/usr/bin/env bash
-set -euo pipefail
-curl() {
-  printf '%s\\n' "$@" >"$FAKE_CURL_ARGS"
-  python3 -I -c 'import os, sys; sys.stdout.buffer.write(b"x" * int(os.environ["FAKE_RESPONSE_BYTES"]))'
-}
-""" + canary_download_functions + "\ndownload_limited \"$1\" \"$2\" https://example.invalid/chunked\n")
-
 (out / "latest-limit-harness.sh").write_text("""#!/usr/bin/env bash
 set -euo pipefail
 readonly MAX_METADATA_BYTES=256
@@ -153,9 +134,7 @@ chmod +x \
   "$TMP/sun-harness.sh" \
   "$TMP/checksum-harness.sh" \
   "$TMP/curl-retry-harness.sh" \
-  "$TMP/download-limit-harness.sh" \
   "$TMP/capture-limit-harness.sh" \
-  "$TMP/canary-download-limit-harness.sh" \
   "$TMP/latest-limit-harness.sh"
 
 top=security-update-notify-9.9.9
@@ -201,12 +180,7 @@ for checksum in wrong-name multiple one-space binary-marker no-newline; do
 done
 
 "$TMP/curl-retry-harness.sh" all-errors "$TMP/curl-all.args"
-[[ "$(head -n 1 "$TMP/curl-all.args")" == '--disable' ]]
 grep -Fxq -- '--retry-all-errors' "$TMP/curl-all.args"
-grep -Fxq -- '--retry' "$TMP/curl-all.args"
-grep -Fxq -- '4' "$TMP/curl-all.args"
-grep -Fxq -- '--retry-max-time' "$TMP/curl-all.args"
-grep -Fxq -- '--max-time' "$TMP/curl-all.args"
 "$TMP/curl-retry-harness.sh" connrefused "$TMP/curl-connrefused.args"
 grep -Fxq -- '--retry-connrefused' "$TMP/curl-connrefused.args"
 if grep -Fxq -- '--retry-all-errors' "$TMP/curl-connrefused.args"; then
@@ -234,36 +208,6 @@ for source in mirror github; do
   grep -Fq 'exceeds size limit' "$TMP/latest-$source-oversized.out"
 done
 
-FAKE_CURL_ARGS="$TMP/download-exact.args" FAKE_RESPONSE_BYTES=16 \
-  "$TMP/download-limit-harness.sh" 16 "$TMP/download-exact"
-[[ "$(wc -c <"$TMP/download-exact")" -eq 16 ]]
-grep -Fxq -- '--max-filesize' "$TMP/download-exact.args"
-grep -Fxq -- '16' "$TMP/download-exact.args"
-
-if FAKE_CURL_ARGS="$TMP/download-oversized.args" FAKE_RESPONSE_BYTES=17 \
-    "$TMP/download-limit-harness.sh" 16 "$TMP/download-oversized" \
-      >"$TMP/download-oversized.out" 2>&1; then
-  echo "sun.sh accepted a chunked response beyond the download limit" >&2
-  exit 1
-fi
-[[ ! -e "$TMP/download-oversized" ]]
-[[ ! -e "$TMP/download-oversized.part" ]]
-
-FAKE_CURL_ARGS="$TMP/canary-download-exact.args" FAKE_RESPONSE_BYTES=16 \
-  "$TMP/canary-download-limit-harness.sh" 16 "$TMP/canary-download-exact"
-[[ "$(wc -c <"$TMP/canary-download-exact")" -eq 16 ]]
-grep -Fxq -- '--max-time' "$TMP/canary-download-exact.args"
-grep -Fxq -- '--max-filesize' "$TMP/canary-download-exact.args"
-
-if FAKE_CURL_ARGS="$TMP/canary-download-oversized.args" FAKE_RESPONSE_BYTES=17 \
-    "$TMP/canary-download-limit-harness.sh" 16 "$TMP/canary-download-oversized" \
-      >"$TMP/canary-download-oversized.out" 2>&1; then
-  echo "live canary accepted a chunked response beyond the download limit" >&2
-  exit 1
-fi
-[[ ! -e "$TMP/canary-download-oversized" ]]
-[[ ! -e "$TMP/canary-download-oversized.part" ]]
-
 "$TMP/capture-limit-harness.sh" 16 "$TMP/capture-exact" 2s 16 0
 [[ "$(wc -c <"$TMP/capture-exact")" -eq 16 ]]
 if "$TMP/capture-limit-harness.sh" 16 "$TMP/capture-oversized" 2s 17 0; then
@@ -277,7 +221,6 @@ if "$TMP/capture-limit-harness.sh" 16 "$TMP/capture-timeout" 0.2s 0 10; then
 fi
 [[ ! -e "$TMP/capture-timeout" && ! -e "$TMP/capture-timeout.part" ]]
 
-[[ "$(grep -Fc "curl \"\${curl_args[@]}\"" "$ROOT/build/live-canary.sh")" -eq 1 ]]
 grep -Fq -- '--disable --fail --silent --show-error --location' "$ROOT/build/live-canary.sh"
 grep -Fq 'canary_install_started=0' "$ROOT/build/live-canary.sh"
 # shellcheck disable=SC2016 # These assertions intentionally match literal shell variables.
@@ -303,5 +246,7 @@ grep -Fq 'TERM|TZ|http_proxy|https_proxy|no_proxy|all_proxy|HTTP_PROXY|HTTPS_PRO
 grep -Fq 'builtin unset -f "$sun_name"' "$ROOT/sun.sh"
 # shellcheck disable=SC2016 # The assertion intentionally matches literal shell variables.
 grep -Fq 'capture_limited 4096 "$runtime_version_file" 15s "$GO_RUNTIME" --version' "$ROOT/sun.sh"
+
+python3 -I "$ROOT/build/download-retry-test.py"
 
 echo "sun.sh archive, checksum, and retry safety tests passed."

@@ -172,7 +172,7 @@ const (
 
 // ReadTargetStatus compares current with the last successfully delivered
 // target. The pending marker is deliberately identity-free and forces another
-// attempt after an installer change or interrupted state commit.
+// attempt after an installer change, a confirmed recovery, or interrupted state commit.
 func (s *Store) ReadTargetStatus(current string) TargetStatus {
 	if !validFingerprint(current) {
 		return TargetChanged
@@ -207,6 +207,44 @@ func (s *Store) ReadTargetStatus(current string) TargetStatus {
 		return TargetChanged
 	}
 	return TargetCurrent
+}
+
+// MarkRecovered closes the last alert episode without changing its successful
+// delivery hash, time, or target. The existing pending marker makes a recurrence
+// eligible for delivery and is cleared only by WriteDelivery's durable commit.
+// Callers must hold the execution lock and prove recovery from real observations.
+func (s *Store) MarkRecovered(healthyHash string) error {
+	if !validFingerprint(healthyHash) {
+		return fmt.Errorf("invalid healthy observation hash")
+	}
+	hashName, err := s.entryName(s.HashFile)
+	if err != nil {
+		return err
+	}
+	pendingName, err := s.entryName(s.TargetPendingFile)
+	if err != nil {
+		return err
+	}
+	directory, exists, err := s.openDirectory()
+	if err != nil || !exists {
+		return err
+	}
+	defer directory.Close()
+	if _, err := readStateFileAt(directory, pendingName, 64, os.Geteuid()); err == nil {
+		return nil // Preserve installer and interrupted-delivery markers too.
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read delivery pending marker: %w", err)
+	}
+	last, err := readStateFileAt(directory, hashName, 256, os.Geteuid())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil // No successful delivery exists to suppress a future alert.
+	} else if err != nil {
+		return fmt.Errorf("read last alert before recovery: %w", err)
+	}
+	if strings.TrimRight(string(last), "\n") == healthyHash {
+		return nil // An already delivered OK must retain normal daily/once dedup.
+	}
+	return s.atomicAt(directory, pendingName, "recovered\n")
 }
 
 // AdoptLegacyTarget binds target-less legacy state to the current stable

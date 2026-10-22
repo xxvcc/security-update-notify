@@ -703,7 +703,9 @@ func (d *restoreDirectory) renameNoReplace(oldName, newName string) error {
 
 // exchangeWithDestination swaps the staged temporary with the live destination.
 // Filesystems without RENAME_EXCHANGE fall back to a reserved-name three-step
-// rename that reaches the identical end state. That sequence is not crash-atomic,
+// move that reaches the identical end state. Publishing and compensation use
+// no-replace moves so an administrator's concurrent file is never overwritten.
+// That sequence is not crash-atomic,
 // but it reuses the pattern removeValidated already relies on: every intermediate
 // state leaves a restore-prefixed entry, so unfinishedRestoreArtifact makes the
 // next run refuse and point at the retained file instead of proceeding blindly.
@@ -723,12 +725,12 @@ func (d *restoreDirectory) exchangeWithDestination(temporary, destination string
 	if moveErr := syscall.Renameat(directory, destination, directory, reservedName); moveErr != nil {
 		return errors.Join(err, d.cleanupUncommittedPlaceholder(reservedName, moveErr))
 	}
-	if publishErr := syscall.Renameat(directory, temporary, directory, destination); publishErr != nil {
-		// Put the original destination back before surfacing the failure so the
-		// host keeps a live configuration file either way.
-		return errors.Join(err, publishErr, syscall.Renameat(directory, reservedName, directory, destination))
+	if publishErr := d.renameNoReplace(temporary, destination); publishErr != nil {
+		// Restore the old name only if it is still free. A concurrent replacement
+		// must remain live, with the previous configuration retained for recovery.
+		return errors.Join(err, publishErr, d.renameNoReplace(reservedName, destination))
 	}
-	if displaceErr := syscall.Renameat(directory, reservedName, directory, temporary); displaceErr != nil {
+	if displaceErr := d.renameNoReplace(reservedName, temporary); displaceErr != nil {
 		return errors.Join(err, fmt.Errorf(
 			"complete exchange fallback; displaced destination retained at %s: %w", d.host(reservedName), displaceErr))
 	}

@@ -762,7 +762,7 @@ func TestRootFSRemovalDoesNotDeleteConcurrentReplacement(t *testing.T) {
 			t.Fatal(readErr)
 		}
 		for _, entry := range entries {
-			if strings.HasPrefix(entry.Name(), ".security-update-notify-remove.") {
+			if isRemovalArtifactName(entry.Name()) {
 				t.Fatalf("removal quarantine remained after conflict restoration: %s", entry.Name())
 			}
 		}
@@ -790,6 +790,8 @@ func TestRootFSRemovalRecoversInterruptedQuarantines(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(rootDir, nearMatch), []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	fileArtifact = publishOwnedRemovalFixture(t, rootDir, fileArtifact)
+	directoryArtifact = publishOwnedRemovalFixture(t, rootDir, directoryArtifact)
 
 	// The original path is already absent, as it would be after a crash between
 	// quarantine rename and deletion. A retry must still discover the residue.
@@ -802,6 +804,98 @@ func TestRootFSRemovalRecoversInterruptedQuarantines(t *testing.T) {
 		}
 	}
 	assertHostFile(t, filepath.Join(rootDir, nearMatch), "keep")
+}
+
+func publishOwnedRemovalFixture(t *testing.T, parent, pending string) string {
+	t.Helper()
+	info, err := os.Lstat(filepath.Join(parent, pending))
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned, err := ownedRemovalName(pending, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(parent, pending), filepath.Join(parent, owned)); err != nil {
+		t.Fatal(err)
+	}
+	return owned
+}
+
+func TestRootFSRemovalRetainsConcurrentClaimWhenRestorationConflicts(t *testing.T) {
+	rootDir := t.TempDir()
+	filesystem, err := NewRootFS(rootDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := os.Open(rootDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	quarantine := removalPrefix + strings.Repeat("a", 32)
+	// A replacement was claimed before its inode could be validated, and a
+	// second writer then occupied the original name before conflict recovery.
+	if err := os.WriteFile(filepath.Join(rootDir, quarantine), []byte("first administrator replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "managed"), []byte("second administrator replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreUnexpectedRemovalClaim(parent, quarantine, "managed", nil); err == nil ||
+		!strings.Contains(err.Error(), "concurrent entry retained") {
+		t.Fatalf("restore conflict = %v", err)
+	}
+	for _, remove := range []func(string) error{filesystem.Remove, filesystem.RemoveAll} {
+		if err := remove("/unrelated-missing"); err == nil || !strings.Contains(err.Error(), "manual recovery") {
+			t.Fatalf("retry accepted an unverified claim: %v", err)
+		}
+		assertHostFile(t, filepath.Join(rootDir, quarantine), "first administrator replacement")
+		assertHostFile(t, filepath.Join(rootDir, "managed"), "second administrator replacement")
+	}
+}
+
+func TestRootFSRemovalRetainsLegacyAndChangedOwnedQuarantines(t *testing.T) {
+	for _, kind := range []string{"legacy tree", "owned replacement", "owned partial tree with pending child"} {
+		t.Run(kind, func(t *testing.T) {
+			rootDir := t.TempDir()
+			filesystem, err := NewRootFS(rootDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			artifact := removalPrefix + strings.Repeat("b", 32)
+			preserved := ""
+			switch kind {
+			case "legacy tree":
+				if err := os.Mkdir(filepath.Join(rootDir, artifact), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				preserved = filepath.Join(rootDir, artifact, "administrator.conf")
+			case "owned replacement":
+				if err := os.WriteFile(filepath.Join(rootDir, artifact), []byte("managed"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				artifact = publishOwnedRemovalFixture(t, rootDir, artifact)
+				if err := os.Rename(filepath.Join(rootDir, artifact), filepath.Join(rootDir, "held")); err != nil {
+					t.Fatal(err)
+				}
+				preserved = filepath.Join(rootDir, artifact)
+			case "owned partial tree with pending child":
+				if err := os.Mkdir(filepath.Join(rootDir, artifact), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				artifact = publishOwnedRemovalFixture(t, rootDir, artifact)
+				preserved = filepath.Join(rootDir, artifact, removalPrefix+strings.Repeat("c", 32))
+			}
+			if err := os.WriteFile(preserved, []byte("administrator data"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := filesystem.RemoveAll("/already-absent"); err == nil {
+				t.Fatal("unverified or changed quarantine was accepted for recovery")
+			}
+			assertHostFile(t, preserved, "administrator data")
+		})
+	}
 }
 
 func TestRootFSRemovalSynchronizesParentOnEveryReturnPath(t *testing.T) {
@@ -845,6 +939,7 @@ func TestRootFSRemovalSynchronizesParentOnEveryReturnPath(t *testing.T) {
 				if err := os.WriteFile(filepath.Join(rootDir, artifactName), []byte("residue"), 0o600); err != nil {
 					t.Fatal(err)
 				}
+				artifactName = publishOwnedRemovalFixture(t, rootDir, artifactName)
 			}
 			syncErr := errors.New("forced removal directory sync failure")
 			syncCalls := 0
@@ -863,6 +958,58 @@ func TestRootFSRemovalSynchronizesParentOnEveryReturnPath(t *testing.T) {
 				if _, err := os.Lstat(filepath.Join(rootDir, artifactName)); !os.IsNotExist(err) {
 					t.Fatalf("cleanup artifact survived synchronized error path: %v", err)
 				}
+			}
+		})
+	}
+}
+
+func TestOwnedRemovalPreservesDataWhenPreDeleteSyncFails(t *testing.T) {
+	for _, tree := range []bool{false, true} {
+		t.Run(fmt.Sprintf("tree=%t", tree), func(t *testing.T) {
+			rootDir := t.TempDir()
+			pending := removalPrefix + strings.Repeat("d", 32)
+			payload := filepath.Join(rootDir, pending)
+			if tree {
+				if err := os.Mkdir(payload, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				payload = filepath.Join(payload, "credential")
+			}
+			if err := os.WriteFile(payload, []byte("must survive failed persistence"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			owned := publishOwnedRemovalFixture(t, rootDir, pending)
+			// O_PATH supports relative lookups, but fsync fails with EBADF. This
+			// exercises a real pre-delete persistence error without a product hook.
+			fd, err := syscall.Open(rootDir, oPath|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parent := os.NewFile(uintptr(fd), rootDir)
+			defer parent.Close()
+			expected, err := readRemovalEntry(parent, owned)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := removeOwnedEntryAt(parent, owned, expected, nil); !errors.Is(err, syscall.EBADF) ||
+				!strings.Contains(err.Error(), "persist owned removal quarantine") {
+				t.Fatalf("pre-delete sync error=%v, want retained quarantine and EBADF", err)
+			}
+			preserved := filepath.Join(rootDir, owned)
+			if tree {
+				preserved = filepath.Join(preserved, "credential")
+			}
+			assertHostFile(t, preserved, "must survive failed persistence")
+			filesystem, err := NewRootFS(rootDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer filesystem.root.Close()
+			if err := filesystem.RemoveAll("/original-name-already-absent"); err != nil {
+				t.Fatalf("retry with a functioning directory failed: %v", err)
+			}
+			if _, err := os.Lstat(filepath.Join(rootDir, owned)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("authorized deletion did not resume after persistence recovered: %v", err)
 			}
 		})
 	}
