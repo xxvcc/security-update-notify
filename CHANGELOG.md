@@ -37,11 +37,13 @@
 - 无签名 CI 打包改为检出精确提交的无 tag 浅克隆，允许已打 tag 的提交重跑普通 CI，正式发布仍强制签名。
   Debian 11 与 Fedora 44 的生命周期测试分别使用官方归档 HTTPS 源和禁用 zchunk 的测试容器配置，
   修复失效软件源与元数据下载阻塞；不改变用户主机设置或放宽签名、TLS、校验和及过期检查。
+  同时更新已被上游移除的 CentOS Stream 容器固定摘要。
   Unsigned CI packaging now uses a shallow, tag-free checkout of the exact commit, allowing ordinary CI
   reruns for already-tagged commits while official releases still require signatures. Debian 11 and
   Fedora 44 lifecycle fixtures use official archive HTTPS sources and disable zchunk respectively to
   avoid unavailable packages and stalled metadata transfers, without changing user hosts or relaxing
   signature, TLS, checksum, or expiry verification.
+  Also refreshes the pinned CentOS Stream container digests retired by the upstream registry.
 
 ## 3.3.1
 
