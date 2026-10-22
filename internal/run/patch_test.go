@@ -23,11 +23,11 @@ func TestCollectAPTPackageFactsClassifiesCommandAndRepositoryFailures(t *testing
 	dir := t.TempDir()
 	writeTestCommand(t, dir, "apt-get", `
 case "$*" in
-  "-s upgrade")
+  "-s --with-new-pkgs upgrade")
     printf '%s\n' 'Inst openssl [1] (2 Debian-Security:stable-security [amd64])'
     exit 1
     ;;
-  "-s --ignore-hold upgrade")
+  "-s --with-new-pkgs --ignore-hold upgrade")
     printf '%s\n' \
       'Inst openssl [1] (2 Debian-Security:stable-security [amd64])' \
       'Inst linux-image [1] (2 Debian-Security:stable-security [amd64])'
@@ -62,8 +62,8 @@ func TestCollectAPTPackageFactsReportsBlockedQueryFailure(t *testing.T) {
 	dir := t.TempDir()
 	writeTestCommand(t, dir, "apt-get", `
 case "$*" in
-  "-s upgrade") ;;
-  "-s --ignore-hold upgrade") exit 2 ;;
+  "-s --with-new-pkgs upgrade") ;;
+  "-s --with-new-pkgs --ignore-hold upgrade") exit 2 ;;
   "check -qq") ;;
   *) exit 2 ;;
 esac
@@ -97,6 +97,52 @@ exit 2
 	pending, blocked, issues := collectAPTPackageFacts(false, time.Now(), 7)
 	if pending.Count != 0 || len(pending.Packages) != 0 || len(blocked) != 0 || len(issues) != 0 {
 		t.Fatalf("failed APT output was trusted: pending=%+v blocked=%v issues=%v", pending, blocked, issues)
+	}
+}
+
+func TestCollectAPTPackageFactsIncludesNewKernelDependenciesAndHeldMetapackages(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCommand(t, dir, "apt-get", `
+case "$*" in
+  "-s --with-new-pkgs upgrade")
+    printf '%s\n' 'Inst linux-image-2 (2 Ubuntu:jammy-security [amd64])' \
+      'Inst linux-image-generic [1] (2 Ubuntu:jammy-security [amd64])' ;;
+  "-s --with-new-pkgs --ignore-hold upgrade")
+    printf '%s\n' 'Inst linux-image-2 (2 Ubuntu:jammy-security [amd64])' \
+      'Inst linux-image-generic [1] (2 Ubuntu:jammy-security [amd64])' \
+      'Inst linux-image-lowlatency [1] (2 Ubuntu:jammy-security [amd64])' ;;
+  "-s upgrade"|"-s --ignore-hold upgrade")
+    printf '%s\n' 'The following packages have been kept back:' 'linux-image-generic linux-image-lowlatency' ;;
+  "check -qq") ;;
+  *) exit 2 ;;
+esac
+`)
+	writeTestCommand(t, dir, "apt-mark", "printf '%s\\n' linux-image-lowlatency\n")
+	writeTestCommand(t, dir, "apt-config", "exit 1\n")
+	writeTestCommand(t, dir, "dpkg", "exit 0\n")
+	writeTestCommand(t, dir, "systemctl", "printf '%s\\n' success\n")
+	t.Setenv("SECURITY_UPDATE_NOTIFY_APT_LISTS_DIR", t.TempDir())
+	pending, observation, blocked, _ := collectAPTPackageFactsObserved(true, time.Now(), 7)
+	if !pending.Known || pending.Count != 2 || observation != statefile.ObservationPresent || strings.Join(pending.Packages, ",") != "linux-image-2,linux-image-generic" {
+		t.Fatalf("pending=%+v observation=%v", pending, observation)
+	}
+	if strings.Join(blocked, ",") != "linux-image-lowlatency" {
+		t.Fatalf("held metapackage was not detected: %v", blocked)
+	}
+}
+
+func TestPartialPositivePackageObservationCannotProveRecovery(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCommand(t, dir, "apt-get", `printf '%s\n' \
+  'Inst openssl [1] (2 Ubuntu:jammy-security [amd64])' \
+  'Inst incomplete-record'
+`)
+	pending, observation, _, issues := collectAPTPackageFactsObserved(false, time.Now(), 7)
+	if pending.Count != 1 || observation != statefile.ObservationPresent {
+		t.Fatalf("confirmed positive evidence was lost: pending=%+v observation=%v", pending, observation)
+	}
+	if pending.Known || len(issues) != 0 {
+		t.Fatalf("hidden partial-query failure could close an alert episode: pending=%+v issues=%v", pending, issues)
 	}
 }
 
@@ -689,6 +735,19 @@ func TestInspectAPTMetadata(t *testing.T) {
 		dir := write(t, "deb.debian.org_debian-security_dists_trixie-security_InRelease", now.Add(24*time.Hour).Format(time.RFC1123Z), now)
 		if got := inspectAPTMetadata(dir, now, 7); len(got) != 0 {
 			t.Fatalf("issues=%v", got)
+		}
+	})
+	t.Run("ordinary jammy main index exceeds the old 256 KiB cap", func(t *testing.T) {
+		dir := write(t, "security.ubuntu.com_ubuntu_dists_jammy-security_InRelease", now.Add(24*time.Hour).Format(time.RFC1123Z), now)
+		// Official jammy/InRelease measured 270087 bytes. Keep the fixture local
+		// and deterministic while retaining the genuine metadata size boundary.
+		prefix := "Origin: Ubuntu\nSuite: jammy\n"
+		body := prefix + strings.Repeat("x", 270087-len(prefix))
+		if err := os.WriteFile(filepath.Join(dir, "archive.ubuntu.com_ubuntu_dists_jammy_InRelease"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got := inspectAPTMetadata(dir, now, 7); len(got) != 0 {
+			t.Fatalf("legitimate distribution metadata rejected: %v", got)
 		}
 	})
 	t.Run("expired", func(t *testing.T) {

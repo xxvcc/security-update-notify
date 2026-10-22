@@ -122,6 +122,20 @@ func Execute(cfg *config.Config, f DryRunFlags) int {
 
 	if !out.Attention {
 		logEvent(fmt.Sprintf("check ok backend=%s host=%s no_attention=1 pending_sec=%d", backend, host, in.Pending.Count))
+		if in.RecoveryKnown && !f.NoStateWrites && !f.TestOK && !f.TestReboot {
+			// The execution lock remains held. Record a resolved episode for
+			// each channel without claiming another message was delivered.
+			failed := false
+			for _, name := range channels {
+				if err := channelStore(name).MarkRecovered(out.Hash()); err != nil {
+					failed = true
+					fmt.Fprintf(os.Stderr, "%s recovery state could not be persisted: %v\n", channelLabel(name), err)
+				}
+			}
+			if failed {
+				return 1
+			}
+		}
 		if !out.Send { // 无关注且未要求 OK 通知：静默
 			logEvent(fmt.Sprintf("silent ok backend=%s host=%s", backend, host))
 			return 0

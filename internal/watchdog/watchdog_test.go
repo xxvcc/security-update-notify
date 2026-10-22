@@ -143,11 +143,11 @@ func TestCheckEOL(t *testing.T) {
 		t.Errorf("soon: Attention=%v Sig=%q (approaching is informational only)", soon.Attention, soon.Sig)
 	}
 	far := CheckEOL("debian", "11", "Debian 11", eol-200*86400)
-	if far.Attention || far.Sig != "" {
+	if !far.Known || far.Attention || far.Sig != "" {
 		t.Errorf("far: Attention=%v Sig=%q", far.Attention, far.Sig)
 	}
 	none := CheckEOL("fedora", "40", "Fedora 40", eol)
-	if none.Sig != "" {
+	if none.Known || none.Sig != "" {
 		t.Errorf("not in table: Sig=%q", none.Sig)
 	}
 	fromSupportEnd := CheckEOLDate("2026-08-31", eol-30*86400)

@@ -368,7 +368,7 @@ if grep -En '(^|[^[:alnum:]_])awk([[:space:]]|$)' "$ROOT/sun.sh" >"$TMP/awk-usag
 fi
 
 grep -Fxq 'readonly SYSTEM_PATH=/usr/sbin:/usr/bin:/sbin:/bin' "$ROOT/sun.sh"
-grep -Fxq 'curl_https() { curl --disable --proto '\''=https'\'' --proto-redir '\''=https'\'' "$@"; }' "$ROOT/sun.sh"
+grep -Fq 'resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))' "$ROOT/sun.sh"
 grep -Fq 'gpg --no-options --batch --no-tty --homedir' "$ROOT/sun.sh"
 
 # The privileged bootstrap must create its workspace under a fixed system base.
@@ -476,7 +476,12 @@ fi
 } >"$TMP/clean-env"
 case "\${!#}" in
   */latest.json)
-    printf '%s\n' '{"version":"9.9.9","tag":"v9.9.9","base_url":"https://dl.ll.cd/security-update-notify/v9.9.9"}'
+    output=''
+    while [[ "\$#" -gt 0 ]]; do
+      if [[ "\$1" == --output ]]; then output="\$2"; break; fi
+      shift
+    done
+    printf '%s\n' '{"version":"9.9.9","tag":"v9.9.9","base_url":"https://dl.ll.cd/security-update-notify/v9.9.9"}' >"\$output"
     ;;
   *) exit 22 ;;
 esac

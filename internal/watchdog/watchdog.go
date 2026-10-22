@@ -164,6 +164,7 @@ func sortUniqCSV(xs []string) string {
 
 // Pending 是 collect_security_updates 的结果（信息项，不单独触发发送）。
 type Pending struct {
+	Known    bool // the runtime completed the entire package query, including parsing
 	Count    int
 	Crit     int // critical + important security advisories
 	Packages []string
@@ -363,6 +364,7 @@ func stringSet(xs []string) map[string]bool {
 
 // EOL 是 check_eol 的结果。
 type EOL struct {
+	Known     bool // a valid support-end date was available, even when no notice is due
 	Attention bool
 	Sig       string // "past" | "soon" | ""
 	TxtZH     string
@@ -469,6 +471,7 @@ func CheckEOLDate(eol string, now int64) EOL {
 	if eolEpoch <= 0 {
 		return e
 	}
+	e.Known = true
 	const warnDays = 90
 	if now > eolEpoch {
 		e.Attention = true

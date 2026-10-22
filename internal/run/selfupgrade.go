@@ -171,7 +171,7 @@ func SelfUpgrade(ver string, disp i18n.Lang, langExplicit bool) int {
 	say(os.Stdout, disp, "正在以已校验的发布包升级...", "Upgrading from the verified release...")
 	installCtx, cancelInstall := context.WithTimeout(context.Background(), upgradeInstallerTimeout)
 	cmd := upgradeInstallCommand(installCtx, installBinary, extractDir, disp)
-	if err := cmd.Run(); err != nil {
+	if err := cmd.RunWithTerminationWait(); err != nil {
 		installCtxErr := installCtx.Err()
 		cancelInstall()
 		if errors.Is(installCtxErr, context.DeadlineExceeded) {

@@ -95,6 +95,17 @@ func TestEmbeddedServiceUsesExplicitRunSubcommand(t *testing.T) {
 	}
 }
 
+func TestEmbeddedServiceAllowsCrossUserProcessInspection(t *testing.T) {
+	unit := string(SystemdServiceUnit())
+	const directive = "CapabilityBoundingSet=CAP_SYS_PTRACE"
+	if !strings.Contains(unit, "\n"+directive+"\n") || strings.Count(unit, "CapabilityBoundingSet=") != 1 {
+		t.Fatal("restart probes need cross-user process access within an explicit capability bound")
+	}
+	if !strings.Contains(unit, "\nNoNewPrivileges=true\n") {
+		t.Fatal("probe subprocesses must not gain additional privileges")
+	}
+}
+
 // 内置公钥的实际指纹必须等于 pin 常量（复刻 Bash CI 的 hardening 校验，Go 侧对齐）。gpg 缺失则跳过。
 func TestEmbeddedKeyFingerprintMatchesPin(t *testing.T) {
 	if _, err := exec.LookPath("gpg"); err != nil {

@@ -419,7 +419,7 @@ func TestUpgradeInstallCommandHonorsContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	err := upgradeInstallCommand(ctx, binary, t.TempDir(), i18n.EN).Run()
+	err := upgradeInstallCommand(ctx, binary, t.TempDir(), i18n.EN).RunWithTerminationWait()
 	if err == nil || !errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		t.Fatalf("timed installer error=%v context=%v", err, ctx.Err())
 	}

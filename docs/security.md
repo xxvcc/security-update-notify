@@ -18,6 +18,7 @@ SUN 的范围刻意保持很小：
 - 特权生产进程忽略用于 Go/隔离测试的 API 根地址、配置、凭据、状态、锁、日志及后端探测路径环境覆盖。安装器子进程仅能通过继承的锁文件描述符复用父进程已经持有的主运行锁，并会把描述符重新绑定到规范锁 inode 后验证 flock 能力；单独伪造描述符环境值会失败关闭。systemd 正式提供的 `CREDENTIALS_DIRECTORY` 仍是受支持的凭据入口。不要把测试覆盖当作受限 sudo 委派接口。运行时打开已有配置前还要求其父目录为当前特权用户所有、不可由组或其他用户写入且不是符号链接，并通过固定目录描述符打开叶文件；安装器写入 `/etc/logrotate.d` 前执行等价的 root 目录信任检查；
 - systemd 服务使用 `ProtectSystem=full`，因此 `/usr`、boot loader 目录和 `/etc` 在服务 mount namespace 内只读；该级别刻意不把整个文件系统改成只读，使不安装软件的 APT/DNF 查询子进程仍能写入其 `/var` 缓存、锁和状态路径。除 `/run/security-update-notify.lock` 运行锁外，服务自身的持久写入仅限 `/var/lib/security-update-notify` 与日志文件；
 - 不接收远程命令；
+- 服务能力集只保留 `CAP_SYS_PTRACE`，使 `needrestart` / `needs-restarting` 能读取其他用户进程的 `/proc` 信息；清空能力集会使重启检查不完整。该能力本身具有跨用户进程访问权限，并非内核强制的只读权限，因此仍保留 `NoNewPrivileges`、系统调用过滤及其余 systemd 沙箱限制；
 - 不提供公开 HTTP 入口；
 - 不自动重启；
 - 普通通知配置仅 root 可读；飞书 App Secret 使用独立 systemd/root 凭据，不进入普通配置、命令行、日志或升级备份。Telegram Bot Token 属于普通配置，因此 `/var/backups/security-update-notify/<timestamp>/` 下的升级备份含有 `telegram.env` 的 `0600` 副本（保留当前及前两次事务）；普通 `uninstall` 会保留这些备份，只有 `--purge-config` 删除它们；

@@ -83,17 +83,32 @@ separately on the exact clean release commit. Do not reuse the repository's `dis
 ```bash
 set -euo pipefail
 [[ -z "$(git status --porcelain=v1)" ]]
-package_epoch="$(git show -s --format=%ct HEAD)"
-package_dist="$(mktemp -d /tmp/security-update-notify-package.XXXXXX)"
-go run ./cmd/sun-release package --sign off \
-  --source-date-epoch "$package_epoch" --dist "$package_dist"
-(cd "$package_dist" && sha256sum -c security-update-notify-*.tar.gz.sha256)
-[[ "$(find "$package_dist" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 2 ]]
+package_commit="$(git rev-parse HEAD)"
+package_work="$(mktemp -d /tmp/security-update-notify-package.XXXXXX)"
+git clone --no-tags --depth 1 "file://$(pwd -P)" "$package_work/source"
+(
+  cd "$package_work/source"
+  [[ "$(git rev-parse HEAD)" == "$package_commit" ]]
+  package_epoch="$(git show -s --format=%ct HEAD)"
+  go run ./cmd/sun-release package --sign off \
+    --source-date-epoch "$package_epoch" --dist "$package_work/dist"
+)
+(cd "$package_work/dist" && sha256sum -c security-update-notify-*.tar.gz.sha256)
+[[ "$(find "$package_work/dist" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 2 ]]
 ```
+
+The unsigned gate uses a separate shallow clone of the exact source commit without release tag refs, as CI does. An official tagged checkout still rejects `--sign off`; use the signed-release procedure for publication.
 
 `build/compat-test.sh`, `build/rollback-test.sh`, `build/interactive-test.sh`, `build/rocky-bootstrap-test.sh`, `build/rpm-best-effort-test.sh`, and `build/dnf5-versionlock-test.sh` modify system paths and must only run in disposable Docker containers, never directly on the host. An official release must also pass CI's five-architecture execution, hostile-archive, signature, and public-asset verification gates.
 
 CI uses a documentation/version-binding fast path for documentation-only changes. Source, build-script, workflow, and release-input changes retain the complete quality, distribution-lifecycle, and five-architecture gates. See [3.x Go architecture](go-port.md) for the architecture and gate invariants.
+
+RPM and best-effort APT CI containers invoke the original lifecycle scripts through
+`build/container-lifecycle-test.sh compat|rollback|rocky-bootstrap`. Before writing system paths, the wrapper requires a disposable
+container and a read-only `/src`. Debian 11 uses official archive HTTPS sources and requires the host's public CA bundle mounted
+read-only at `/sun-test-ca-certificates.crt`; this tests historical compatibility, not ongoing security support. Fedora 44 disables
+zchunk only inside the test container to avoid stalled metadata chunk transfers. TLS, signatures, checksums, and APT expiry checks
+remain enabled. These settings are not part of the installer and do not change user hosts.
 
 ## Related documentation
 

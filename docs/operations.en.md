@@ -18,6 +18,8 @@ With dual delivery, each channel has independent state. If Telegram succeeds and
 
 Channel state is also bound to a stable target identity: Telegram uses the numeric bot identity plus Chat ID, while Feishu uses App ID plus the app-scoped `open_id`; only a one-way fingerprint is stored. When `configure notifications` changes a target, the installer marks that channel within the same rollback transaction before the new configuration becomes visible, so the next real alert cannot be suppressed by the old target's `once` or interval state. A failed send does not advance the target; only successful delivery commits its fingerprint. Existing target-less state is silently bound to the current target the first time deduplication suppresses it, without sending a message. Later runtime checks can therefore detect manual target changes in the protected config file.
 
+A confirmed healthy observation closes the previous alert episode independently for each channel. If the same alert returns later, it can be sent again even in `once` mode. Failed or incomplete probes and dry-run/test invocations do not count as recovery; only successful delivery advances the recorded delivery hash and time.
+
 ## Security-update watchdog
 
 In addition to reboot/service-restart and distro-EOL detection, SUN runs seven patch-maintenance checks by default:
@@ -79,6 +81,12 @@ The installer writes it as root-only (`0600`). The Feishu App Secret is never wr
 Before stopping an existing unit or changing any managed path, the installer durably writes a transaction journal to the current `/var/backups/security-update-notify/<timestamp>/transaction.json`. An existing Feishu App Secret never enters that backup directory or journal; when rollback needs it, the installer creates only a fixed-name, root-only private recovery copy beside the original credential. Normal errors, cancellation, and the first `SIGHUP`, `SIGINT`, or `SIGTERM` wait for transaction rollback before the process exits. After `SIGKILL`, a kernel crash, or power loss, the next installation holds the install lock and scans every valid backup directory before parsing a new request. It fully validates journal state, the path allowlist, every snapshot, and all private recovery material before the first `systemctl` call or filesystem restoration.
 
 Package-manager invocation is a separate fail-closed boundary. Before invoking it, the journal is durably marked unsafe for automatic recovery; the transaction becomes recoverable again only after dependency-created configuration baselines and the related automatic-unit state have both been captured and persisted. If the process stops in that interval or trustworthy capture cannot be completed, the installer does not use post-hoc probes such as `dpkg --audit`, `apt-get check`, or `rpm --verifydb` to guess that rollback is safe, and it does not automatically rewrite a partially changed host. The journal and private recovery material remain in place. Later install and uninstall attempts then stop before running systemd commands or deleting files. An administrator must inspect and repair package-manager state and complete a trusted manual recovery from the journal; do not delete the locator or recovery material first.
+
+Self-upgrade also waits for the installer child to finish rollback after the first signal. A second termination signal forces exit; the installer still has a one-hour deadline.
+
+This package-manager boundary includes `apt-get update`: it can run privileged APT hooks before package installation begins. A refresh failure after the existing timer has stopped can therefore retain an unsafe journal and leave that timer stopped. Inspect the journal and hook effects before manual recovery; a network error alone does not prove that no system state changed.
+
+Installer cleanup preserves `.security-update-notify-remove.*` entries whose ownership cannot be verified, including legacy entries. Only a validated `.security-update-notify-remove-owned.*` identity can resume deletion automatically. If cleanup reports a conflict, inspect both the original path and retained entry before restoring or deleting anything.
 
 ## Backend details
 

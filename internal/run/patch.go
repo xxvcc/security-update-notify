@@ -26,9 +26,12 @@ import (
 )
 
 const (
-	patchCommandTimeout      = 60 * time.Second
-	maxAutomaticConfigBytes  = 1 << 20
-	maxAPTMetadataParseBytes = 256 << 10
+	patchCommandTimeout     = 60 * time.Second
+	maxAutomaticConfigBytes = 1 << 20
+	// Ubuntu 22.04's ordinary InRelease is already larger than 256 KiB.
+	// Keep the complete-file check bounded while allowing distribution indexes
+	// to grow; parsing only a prefix could miss a trailing Valid-Until field.
+	maxAPTMetadataParseBytes = 4 << 20
 )
 
 type patchCollectOptions struct {
@@ -96,13 +99,16 @@ func collectAPTPackageFacts(healthEnabled bool, now time.Time, stale int) (watch
 }
 
 func collectAPTPackageFactsObserved(healthEnabled bool, now time.Time, stale int) (watchdog.Pending, statefile.Observation, []string, []watchdog.Issue) {
-	regular := sysexec.RunTimeout(patchCommandTimeout, "apt-get", "-s", "upgrade")
+	regular := sysexec.RunTimeout(patchCommandTimeout, "apt-get", "-s", "--with-new-pkgs", "upgrade")
 	regularUsable := regular.Code == 0 && !commandOutputIncomplete(regular)
 	pending := watchdog.Pending{}
 	regularParsed := false
 	if regularUsable {
 		pending, regularParsed = watchdog.CollectAPTPending(regular.Stdout)
 	}
+	// A partially parsed positive observation can retain an age timestamp, but
+	// it cannot prove that all previous alert conditions have recovered.
+	pending.Known = regularUsable && regularParsed
 	pendingObservation := observationFor(pending.Count > 0, regularUsable && regularParsed)
 	var blocked []string
 	var issues []watchdog.Issue
@@ -115,7 +121,7 @@ func collectAPTPackageFactsObserved(healthEnabled bool, now time.Time, stale int
 		issues = append(issues, watchdog.Issue{Code: "apt-simulation-output-invalid", ZH: "APT 返回了无法完整解析的更新模拟结果", EN: "APT returned update-simulation output that could not be fully parsed"})
 	}
 	held := sysexec.RunTimeout(patchCommandTimeout, "apt-mark", "showhold")
-	ignoreHold := sysexec.RunTimeout(patchCommandTimeout, "apt-get", "-s", "--ignore-hold", "upgrade")
+	ignoreHold := sysexec.RunTimeout(patchCommandTimeout, "apt-get", "-s", "--with-new-pkgs", "--ignore-hold", "upgrade")
 	if held.Code == 0 && ignoreHold.Code == 0 && !commandOutputIncomplete(held) && !commandOutputIncomplete(ignoreHold) {
 		ignorePending, ignoreParsed := watchdog.CollectAPTPending(ignoreHold.Stdout)
 		if regularUsable && regularParsed && ignoreParsed {
@@ -172,6 +178,7 @@ func collectDNFPackageFactsObserved(healthEnabled bool) (watchdog.Pending, state
 	if !regularFailed {
 		pending = watchdog.CollectPending("dnf", regular.Stdout)
 	}
+	pending.Known = !regularFailed
 	pendingObservation := observationFor(pending.Count > 0, !regularFailed)
 	var blocked []string
 	var issues []watchdog.Issue
@@ -226,6 +233,7 @@ func collectDNF5PackageFactsObserved(healthEnabled bool, runtime dnfRuntime) (wa
 		}
 	}
 	pending := watchdog.CollectPending("dnf", normalized)
+	pending.Known = !regularFailed && parseErr == nil && transactionUsable
 	pendingObservation := observationFor(pending.Count > 0, !regularFailed && parseErr == nil)
 	if !healthEnabled {
 		return pending, pendingObservation, nil, nil

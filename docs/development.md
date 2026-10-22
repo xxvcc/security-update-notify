@@ -82,17 +82,30 @@ fi
 ```bash
 set -euo pipefail
 [[ -z "$(git status --porcelain=v1)" ]]
-package_epoch="$(git show -s --format=%ct HEAD)"
-package_dist="$(mktemp -d /tmp/security-update-notify-package.XXXXXX)"
-go run ./cmd/sun-release package --sign off \
-  --source-date-epoch "$package_epoch" --dist "$package_dist"
-(cd "$package_dist" && sha256sum -c security-update-notify-*.tar.gz.sha256)
-[[ "$(find "$package_dist" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 2 ]]
+package_commit="$(git rev-parse HEAD)"
+package_work="$(mktemp -d /tmp/security-update-notify-package.XXXXXX)"
+git clone --no-tags --depth 1 "file://$(pwd -P)" "$package_work/source"
+(
+  cd "$package_work/source"
+  [[ "$(git rev-parse HEAD)" == "$package_commit" ]]
+  package_epoch="$(git show -s --format=%ct HEAD)"
+  go run ./cmd/sun-release package --sign off \
+    --source-date-epoch "$package_epoch" --dist "$package_work/dist"
+)
+(cd "$package_work/dist" && sha256sum -c security-update-notify-*.tar.gz.sha256)
+[[ "$(find "$package_work/dist" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 2 ]]
 ```
+
+无签名门禁与 CI 一样，在不带发布 tag 引用的独立浅克隆中验证精确源码提交。正式带 tag 的检出仍会拒绝 `--sign off`；发布时必须执行签名发布流程。
 
 `build/compat-test.sh`、`build/rollback-test.sh`、`build/interactive-test.sh`、`build/rocky-bootstrap-test.sh`、`build/rpm-best-effort-test.sh` 和 `build/dnf5-versionlock-test.sh` 会修改系统路径，只能在一次性 Docker 容器中运行，禁止直接在宿主机执行。正式发布还必须完成 CI 的五架构实跑、恶意归档、签名和公开资产复验门禁。
 
 CI 会对纯文档变更运行文档结构和版本绑定快速门禁；源码、构建脚本、workflow 或发布输入变化仍运行完整质量、发行版生命周期和五架构门禁。具体架构与门禁不变量见 [3.x Go 架构](go-port.md)。
+
+RPM 和尽力支持 APT 的 CI 容器通过 `build/container-lifecycle-test.sh compat|rollback|rocky-bootstrap` 调用原生命周期脚本。
+包装器在任何系统路径写入前检查一次性容器与只读 `/src`。Debian 11 使用官方 archive HTTPS 源，并要求将宿主公共 CA bundle
+只读挂载到 `/sun-test-ca-certificates.crt`；这只验证历史系统兼容性，不代表仍有持续安全支持。Fedora 44 仅在测试容器中关闭
+zchunk，以避开元数据分块传输阻塞。TLS、签名、校验和与 APT 过期检查保持开启；这些设置不进入安装器或用户主机。
 
 ## 相关文档
 

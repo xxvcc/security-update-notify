@@ -3462,11 +3462,14 @@ func TestPruneBackupsRecoversInterruptedRemovalQuarantine(t *testing.T) {
 	if err := root.MkdirAll(BackupRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	artifact := path.Join(BackupRoot, removalPrefix+strings.Repeat("c", 32))
+	artifactName := removalPrefix + strings.Repeat("c", 32)
+	artifact := path.Join(BackupRoot, artifactName)
 	if err := root.MkdirAll(artifact, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	write(t, root, path.Join(artifact, "telegram.env"), "token", 0o600)
+	artifactName = publishOwnedRemovalFixture(t, filepath.Join(root.Root, BackupRoot), artifactName)
+	artifact = path.Join(BackupRoot, artifactName)
 	current := path.Join(BackupRoot, "20260731010101")
 	if err := root.Mkdir(current, 0o700); err != nil {
 		t.Fatal(err)

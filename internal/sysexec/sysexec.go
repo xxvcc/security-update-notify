@@ -47,6 +47,7 @@ const (
 
 var (
 	activeProcessGroups  sync.Map
+	processStartMu       sync.Mutex // serializes child registration with the first termination signal
 	signalForwardingOnce sync.Once
 	terminating          atomic.Bool
 	terminationBarrier   = make(chan struct{})
@@ -158,10 +159,16 @@ func RunContext(ctx context.Context, name string, args ...string) Result {
 // exactly when Wait completes. Callers configure the embedded exec.Cmd fields as usual.
 type Cmd struct {
 	*exec.Cmd
-	processGroup int
+	processGroup    int
+	transactionWait bool
 }
 
 func (c *Cmd) Start() error {
+	processStartMu.Lock()
+	defer processStartMu.Unlock()
+	if c.transactionWait && terminating.Load() {
+		return context.Canceled
+	}
 	if err := c.Cmd.Start(); err != nil {
 		return err
 	}
@@ -192,6 +199,23 @@ func (c *Cmd) Run() error {
 		return err
 	}
 	return c.Wait()
+}
+
+// RunWithTerminationWait runs a child that performs its own transactional
+// rollback on termination. The first signal is forwarded to the child and the
+// parent waits for its exit; a second signal still forces termination. Keep the
+// command's deadline context independent of TerminationContext: canceling an
+// exec context on the first signal would SIGKILL the child during rollback.
+func (c *Cmd) RunWithTerminationWait() error {
+	_, complete := TerminationContext(context.Background())
+	defer func() {
+		complete()
+		if terminating.Load() && !terminationWaitActive() {
+			<-terminationBarrier
+		}
+	}()
+	c.transactionWait = true
+	return c.Run()
 }
 
 func CommandContext(ctx context.Context, name string, args ...string) *Cmd {
@@ -236,10 +260,14 @@ func InstallSignalForwarding() {
 			if !ok {
 				sig = syscall.SIGTERM
 			}
+			processStartMu.Lock()
 			terminating.Store(true)
-			waiters := cancelTerminationWaiters()
-			runTerminationCleanups()
+			// Signal only commands that were running before cancellation. Rollback
+			// helpers may start after cancellation and must not receive this signal.
 			signalActiveProcessGroups(sig)
+			waiters := cancelTerminationWaiters()
+			processStartMu.Unlock()
+			runTerminationCleanups()
 
 			waitForTermination(signals, waiters)
 			signalActiveProcessGroups(syscall.SIGKILL)

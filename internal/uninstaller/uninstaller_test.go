@@ -547,20 +547,29 @@ func TestRestoreFileStateDetectsSameSizeRewriteWithRestoredMtime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(file, []byte("modified"), before.Mode().Perm()); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chtimes(file, mtime, mtime); err != nil {
-		t.Fatal(err)
-	}
-	after, err := os.Stat(file)
-	if err != nil {
-		t.Fatal(err)
-	}
 	beforeStat := before.Sys().(*syscall.Stat_t)
-	afterStat := after.Sys().(*syscall.Stat_t)
-	if beforeStat.Ctim == afterStat.Ctim {
-		t.Skip("filesystem did not expose a ctime change for the rewrite")
+	var after os.FileInfo
+	deadline := time.Now().Add(time.Second)
+	for {
+		if err := os.WriteFile(file, []byte("modified"), before.Mode().Perm()); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(file, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+		after, err = os.Stat(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if beforeStat.Ctim != after.Sys().(*syscall.Stat_t).Ctim {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Skip("filesystem did not expose a ctime change for the rewrite")
+		}
+		// Fast rewrites can share the same filesystem clock tick. Retry after
+		// a tick instead of silently skipping the state-check regression.
+		time.Sleep(10 * time.Millisecond)
 	}
 	if !sameRestoreFileInfo(before, after) {
 		t.Fatal("rewrite fixture changed metadata other than ctime")
