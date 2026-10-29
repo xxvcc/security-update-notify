@@ -38,6 +38,11 @@
   无换行尾随数据，防止发布端接受客户端会拒绝的资产集合。
   Release CI, mirror synchronization, and public verification enforce the clients' exact single-record
   checksum protocol, rejecting single-space separators, extra records, and trailing unterminated data.
+- 生命周期测试在一次性 Ubuntu 容器中停用镜像自带的 Docker 周期更新禁用配置，以实测正常自动更新策略；
+  产品仍拒绝管理员后置禁用配置并回滚。更新上游已回收的 CentOS Stream 9/10 容器固定摘要。
+  Lifecycle fixtures remove the Ubuntu container image's Docker-only periodic-update disablement so
+  normal automatic-update policy can be exercised. The product still rejects later administrator
+  disablement and rolls back. Refreshes retired CentOS Stream 9/10 image digests.
 
 ## 3.3.2
 

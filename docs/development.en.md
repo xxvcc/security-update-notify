@@ -109,6 +109,8 @@ container and a read-only `/src`. Debian 11 uses official archive HTTPS sources 
 read-only at `/sun-test-ca-certificates.crt`; this tests historical compatibility, not ongoing security support. Fedora 44 disables
 zchunk only inside the test container to avoid stalled metadata chunk transfers. TLS, signatures, checksums, and APT expiry checks
 remain enabled. These settings are not part of the installer and do not change user hosts.
+Ubuntu lifecycle containers also disable the image-specific `docker-disable-periodic-update` configuration so periodic updates can
+be exercised. The product installer neither removes that file nor bypasses its effective APT master-switch check.
 
 ## Related documentation
 

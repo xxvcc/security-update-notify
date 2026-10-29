@@ -13,6 +13,18 @@ awk '$5 == "/src" { found = 1; if ($6 !~ /(^|,)ro(,|$)/) unsafe = 1 } END { exit
   exit 2
 }
 
+# Official Ubuntu container images disable periodic jobs; this fixture tests
+# their lifecycle. Remove only that exact image policy after the isolation gate.
+docker_periodic=/etc/apt/apt.conf.d/docker-disable-periodic-update
+if [[ -e "$docker_periodic" || -L "$docker_periodic" ]]; then
+  if [[ ! -f "$docker_periodic" || -L "$docker_periodic" ]] ||
+    ! cmp -s "$docker_periodic" <(printf 'APT::Periodic::Enable "0";\n'); then
+    echo "unexpected Docker periodic policy; refusing to change it" >&2
+    exit 1
+  fi
+  rm -- "$docker_periodic"
+fi
+
 ok() {
   if eval "$1"; then
     echo "  ok: $2"
@@ -200,6 +212,35 @@ config_sha="$(sha256sum /etc/security-update-notify/telegram.env | awk '{print $
 service_sha="$(sha256sum /etc/systemd/system/security-update-notify.service | awk '{print $1}')"
 timer_sha="$(sha256sum /etc/systemd/system/security-update-notify.timer | awk '{print $1}')"
 apt_sha="$(sha256sum /etc/apt/apt.conf.d/20auto-upgrades | awk '{print $1}')"
+
+echo "### Later administrator APT disable rejects installation and rolls back"
+policy_override=/etc/apt/apt.conf.d/99sun-test-periodic-disable
+[[ ! -e "$policy_override" && ! -L "$policy_override" ]]
+printf 'APT::Periodic::Enable "0";\n' >"$policy_override"
+policy_paths=(/usr/local/sbin/security-update-notify /etc/security-update-notify/telegram.env
+  /etc/systemd/system/security-update-notify.service /etc/systemd/system/security-update-notify.timer
+  /etc/apt/apt.conf.d/20auto-upgrades /etc/apt/apt.conf.d/20auto-upgrades.security-update-notify.bak
+  "$policy_override")
+sha256sum "${policy_paths[@]}" >/tmp/policy-before.sha256
+stat -c '%n %a %u %g' "${policy_paths[@]}" >/tmp/policy-before.stat
+set +e
+"$runtime" install --host-label should-not-survive-policy-rejection \
+  --skip-notify-test --non-interactive -y --skip-post-install-check --lang en \
+  "${best_effort_args[@]}" >/tmp/policy-rejected.out 2>&1
+policy_rc=$?
+set -e
+ok "[[ '$policy_rc' -eq 1 ]]" "effective APT disable returned 1"
+ok "grep -qF 'verify effective APT configuration' /tmp/policy-rejected.out" "effective policy failure retained its cause"
+ok "sha256sum --status --check /tmp/policy-before.sha256" "policy rejection restored exact file contents"
+stat -c '%n %a %u %g' "${policy_paths[@]}" >/tmp/policy-after.stat
+ok "cmp -s /tmp/policy-before.stat /tmp/policy-after.stat" "policy rejection restored file modes and owners"
+ok "[[ -L /etc/systemd/system/timers.target.wants/security-update-notify.timer \
+       && -e /tmp/mock-systemd/active ]]" "policy rejection restored timer enablement and activity"
+ok "flock -n /run/security-update-notify.install.lock true && flock -n /run/security-update-notify.lock true" \
+  "policy rejection released both transaction locks"
+ok "! find /var/backups/security-update-notify -name transaction.json -print | grep -q ." \
+  "policy rejection removed the transaction journal"
+rm -- "$policy_override"
 
 echo "### Late upgrade failure rolls back files and timer state"
 set +e
