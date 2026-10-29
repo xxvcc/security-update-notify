@@ -87,7 +87,7 @@ func restoreAPTWithRemove(root string, beforeRemove func(string) error) (string,
 				return "", errors.New("inspect apt dependency proof: proof does not match 20auto-upgrades")
 			}
 			preserveDependencyDefault = true
-		} else if !managedHistory || (configSnapshot.exists && !bytes.Equal(configSnapshot.data, []byte(aptconfig.Periodic))) {
+		} else if !managedHistory || (configSnapshot.exists && !aptconfig.IsManagedPeriodic(configSnapshot.data)) {
 			return "", errors.New("inspect apt dependency proof: cannot prove that 20auto-upgrades is a SUN-managed file or retained dependency default")
 		}
 	}
@@ -191,7 +191,7 @@ func readAPTMarkerSnapshot(directory *restoreDirectory, name string) (regularSna
 func aptBackupsContainOnlyManagedPolicyAt(snapshots map[string]regularSnapshot, names []string) bool {
 	for _, candidate := range names {
 		snapshot := snapshots[candidate]
-		if !bytes.Equal(snapshot.data, []byte(aptconfig.Periodic)) {
+		if !aptconfig.IsManagedPeriodic(snapshot.data) {
 			return false
 		}
 	}

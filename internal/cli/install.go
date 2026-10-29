@@ -38,6 +38,8 @@ type feishuPreflight interface {
 
 type installConsole struct {
 	in         *bufio.Reader
+	input      *os.File
+	context    context.Context
 	out        io.Writer
 	errOut     io.Writer
 	readSecret func(string) (string, error)
@@ -87,12 +89,9 @@ func defaultInstallCommandWithReader(reader *bufio.Reader) *installCommand {
 	if reader == nil {
 		reader = bufio.NewReader(os.Stdin)
 	}
-	return &installCommand{
+	command := &installCommand{
 		console: installConsole{
-			in: reader, out: os.Stdout, errOut: os.Stderr,
-			readSecret: func(prompt string) (string, error) {
-				return readHiddenLine(os.Stdin, reader, os.Stdout, prompt)
-			},
+			in: reader, input: os.Stdin, out: os.Stdout, errOut: os.Stderr,
 		},
 		newInstaller: func() (installerAPI, error) { return installer.New(installer.Dependencies{}) },
 		readRuntime:  currentExecutable,
@@ -102,6 +101,10 @@ func defaultInstallCommandWithReader(reader *bufio.Reader) *installCommand {
 		feishu:       &feishu.Client{HTTP: httpx.New(30 * time.Second)},
 		hostname:     os.Hostname,
 	}
+	command.console.readSecret = func(prompt string) (string, error) {
+		return readHiddenLineContext(command.console.context, command.console.input, reader, command.console.out, prompt)
+	}
+	return command
 }
 
 func installModeWithReader(_ string, args []string, reader *bufio.Reader) int {
@@ -214,6 +217,8 @@ func (c *installCommand) run(rawArgs []string, configure bool) int {
 	preflight := c.makePreflight(&parsed, effective, original, existing)
 	installContext, installComplete := sysexec.TerminationContext(context.Background())
 	defer installComplete()
+	c.console.context = installContext
+	defer func() { c.console.context = nil }()
 	result, err := api.Install(installContext, installer.Options{
 		Config: parsed.config, CheckTime: parsed.checkTime, AllowBestEffort: parsed.allowBestEffort,
 		Payload: installer.Payload{Runtime: runtime}, FeishuSecret: parsed.feishuSecret,

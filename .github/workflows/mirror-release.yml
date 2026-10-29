@@ -275,17 +275,7 @@ jobs:
               exit 1
             }
           fi
-          [[ "$(wc -l < "rel/$tarball.sha256")" -eq 1 ]] || {
-            echo "::error::checksum manifest must contain exactly one line"
-            exit 1
-          }
-          read -r expected_sha expected_name extra < "rel/$tarball.sha256"
-          [[ "$expected_sha" =~ ^[0-9a-f]{64}$ \
-             && "$expected_name" == "$tarball" \
-             && -z "${extra:-}" ]] || {
-            echo "::error::checksum manifest is not bound to $tarball"
-            exit 1
-          }
+          python3 -I build/verify-checksum.py "rel/$tarball" "rel/$tarball.sha256"
           expected_pin='C678256ACBFC6491BF5076655F3AE24999921FFC'
           source_pin="$(sed -n 's/^RELEASE_SIGNING_FINGERPRINT="\([0-9A-Fa-f]\{40\}\)"$/\1/p' released-source/sun.sh)"
           [[ "$source_pin" == "$expected_pin" \
@@ -304,8 +294,6 @@ jobs:
             echo "::error::release keyring is not exactly the pinned primary key"
             exit 1
           }
-          actual_sha="$(sha256sum "rel/$tarball" | awk '{print $1}')"
-          [[ "$actual_sha" == "$expected_sha" ]] || { echo "::error::checksum mismatch"; exit 1; }
           verify_log="$(mktemp)"
           status="$(gpg --no-options --batch --status-fd=1 \
             --verify "rel/$tarball.asc" "rel/$tarball" 2>"$verify_log")" || {
@@ -930,18 +918,8 @@ jobs:
         run: |
           set -euo pipefail
           release_dir="deploy/$TAG"
-          [[ "$(wc -l < "$release_dir/$TARBALL.sha256")" -eq 1 ]] || {
-            echo "::error::checksum manifest must contain exactly one line"
-            exit 1
-          }
-          read -r expected_sha expected_name extra < "$release_dir/$TARBALL.sha256"
-          [[ "$expected_sha" =~ ^[0-9a-f]{64}$ \
-             && "$expected_name" == "$TARBALL" && -z "${extra:-}" ]] || {
-            echo "::error::checksum manifest is not bound to $TARBALL"
-            exit 1
-          }
-          actual_sha="$(sha256sum "$release_dir/$TARBALL" | awk '{print $1}')"
-          [[ "$actual_sha" == "$expected_sha" ]] || { echo "::error::checksum mismatch"; exit 1; }
+          expected_sha="$(python3 -I build/verify-checksum.py \
+            "$release_dir/$TARBALL" "$release_dir/$TARBALL.sha256")"
           GNUPGHOME="$(mktemp -d)"
           export GNUPGHOME
           chmod 700 "$GNUPGHOME"
@@ -1105,7 +1083,7 @@ jobs:
               "$MIRROR_BASE_URL/$TAG/$asset?run=$GITHUB_RUN_ID&attempt=$GITHUB_RUN_ATTEMPT"
             cmp "deploy/$TAG/$asset" "public-check/$asset"
           done
-          (cd public-check && sha256sum -c "$TARBALL.sha256")
+          python3 -I build/verify-checksum.py "public-check/$TARBALL" "public-check/$TARBALL.sha256"
           GNUPGHOME="$(mktemp -d)"
           export GNUPGHOME
           chmod 700 "$GNUPGHOME"

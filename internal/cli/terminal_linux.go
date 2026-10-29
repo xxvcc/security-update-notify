@@ -4,6 +4,7 @@ package cli
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +22,10 @@ import (
 // input (for example an automation pipe) is read normally from the shared
 // buffered reader so bytes already buffered by earlier prompts are preserved.
 func readHiddenLine(input *os.File, reader *bufio.Reader, out io.Writer, prompt string) (line string, returnErr error) {
+	return readHiddenLineContext(context.Background(), input, reader, out, prompt)
+}
+
+func readHiddenLineContext(ctx context.Context, input *os.File, reader *bufio.Reader, out io.Writer, prompt string) (line string, returnErr error) {
 	if _, err := fmt.Fprint(out, prompt); err != nil {
 		return "", err
 	}
@@ -29,7 +34,7 @@ func readHiddenLine(input *os.File, reader *bufio.Reader, out io.Writer, prompt 
 	var original syscall.Termios
 	if err := terminalIOCTL(fd, syscall.TCGETS, &original); err != nil {
 		if errors.Is(err, syscall.ENOTTY) || errors.Is(err, syscall.EINVAL) {
-			return readBoundedLine(reader)
+			return readBoundedLineContext(ctx, input, reader)
 		}
 		return "", fmt.Errorf("inspect terminal: %w", err)
 	}
@@ -54,8 +59,39 @@ func readHiddenLine(input *os.File, reader *bufio.Reader, out io.Writer, prompt 
 		}
 	}()
 
-	line, returnErr = readBoundedLine(reader)
+	line, returnErr = readBoundedLineContext(ctx, input, reader)
 	return line, returnErr
+}
+
+func waitInteractiveInput(ctx context.Context, input *os.File) error {
+	// ppoll supports terminals, pipes, and regular files without changing the
+	// shared descriptor's blocking mode or imposing a limit on its fd number.
+	fd := input.Fd()
+	if fd == ^uintptr(0) {
+		return os.ErrClosed
+	}
+	poll := struct {
+		fd      int32
+		events  int16
+		revents int16
+	}{fd: int32(fd), events: 1} // POLLIN
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		timeout := syscall.NsecToTimespec(100_000_000)
+		count, _, errno := syscall.Syscall6(syscall.SYS_PPOLL, uintptr(unsafe.Pointer(&poll)), 1,
+			uintptr(unsafe.Pointer(&timeout)), 0, 0, 0)
+		if errno == syscall.EINTR {
+			continue
+		}
+		if errno != 0 {
+			return errno
+		}
+		if count > 0 {
+			return ctx.Err()
+		}
+	}
 }
 
 func isTerminalFile(file *os.File) bool {

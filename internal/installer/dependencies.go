@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"time"
+
+	"github.com/xxvcc/security-update-notify/internal/watchdog"
 )
 
 // installDependencies reports whether the package installation command was
@@ -102,7 +104,7 @@ func (i *Installer) verifyBackendCommands(ctx context.Context, plan installPlan)
 	})
 }
 
-func (i *Installer) verifyBackendPolicyFile(plan installPlan) error {
+func (i *Installer) verifyBackendPolicyFile(ctx context.Context, plan installPlan) error {
 	if plan.profile.AutomaticConfig == "" {
 		return failure("verify backend readiness", errors.New("automatic-update configuration path is unavailable"))
 	}
@@ -112,6 +114,17 @@ func (i *Installer) verifyBackendPolicyFile(plan installPlan) error {
 	}
 	if !exists {
 		return failure("verify automatic-update configuration", fs.ErrNotExist)
+	}
+	if plan.backend == "apt" {
+		// Later administrator snippets can override the managed periodic file.
+		// Check the effective switch even when post-install doctor is skipped.
+		result := i.runner.Run(ctx, Command{Name: "apt-config", Args: []string{"dump"}, Timeout: 30 * time.Second})
+		if commandResultIncomplete(result) || result.Err != nil || result.Code != 0 {
+			return failure("verify effective APT configuration", commandResultError(result))
+		}
+		if !watchdog.APTPeriodicEnabled(string(result.Stdout)) {
+			return failure("verify effective APT configuration", errors.New("APT::Periodic::Enable is disabled or invalid; inspect administrator overrides in apt.conf and apt.conf.d"))
+		}
 	}
 	if plan.backend == "dnf" {
 		values, err := parseStrictINI(data)

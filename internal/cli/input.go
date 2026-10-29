@@ -2,8 +2,11 @@ package cli
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"errors"
 	"io"
+	"os"
 	"strings"
 )
 
@@ -15,11 +18,42 @@ var errInteractiveLineTooLong = errors.New("interactive input line is too long")
 // an oversized line so the next prompt stays aligned with the next answer.
 // The returned text includes a trailing newline, matching bufio.Reader.ReadString.
 func readBoundedLine(reader *bufio.Reader) (string, error) {
+	return readBoundedLineFragments(func() ([]byte, error) { return reader.ReadSlice('\n') })
+}
+
+// Read only bytes already buffered after waiting for the descriptor. A canceled
+// prompt must not leave a background reader consuming a later prompt's input.
+func readBoundedLineContext(ctx context.Context, input *os.File, reader *bufio.Reader) (string, error) {
+	if ctx == nil || input == nil {
+		return readBoundedLine(reader)
+	}
+	return readBoundedLineFragments(func() ([]byte, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if reader.Buffered() == 0 {
+			if err := waitInteractiveInput(ctx, input); err != nil {
+				return nil, err
+			}
+			if _, err := reader.Peek(1); err != nil {
+				return nil, err
+			}
+		}
+		buffered, _ := reader.Peek(reader.Buffered())
+		if end := bytes.IndexByte(buffered, '\n'); end >= 0 {
+			return reader.ReadSlice('\n')
+		}
+		_, _ = reader.Discard(len(buffered))
+		return buffered, bufio.ErrBufferFull
+	})
+}
+
+func readBoundedLineFragments(next func() ([]byte, error)) (string, error) {
 	var line strings.Builder
 	tooLong := false
 	gotInput := false
 	for {
-		fragment, err := reader.ReadSlice('\n')
+		fragment, err := next()
 		if len(fragment) > 0 {
 			gotInput = true
 			hasNewline := fragment[len(fragment)-1] == '\n'

@@ -158,17 +158,24 @@ printf 'trusted release bytes\n' >"$TMP/checksum/$pkg"
 digest="$(sha256sum "$TMP/checksum/$pkg")"
 digest="${digest%% *}"
 printf '%s  %s\n' "$digest" "$pkg" >"$TMP/checksum/valid.sha256"
-(
-  cd "$TMP/checksum"
-  "$TMP/checksum-harness.sh" "$pkg" valid.sha256
-)
+printf '%s  %s\n' "${digest^^}" "$pkg" >"$TMP/checksum/uppercase.sha256"
+for checksum in valid uppercase; do
+  (
+    cd "$TMP/checksum"
+    "$TMP/checksum-harness.sh" "$pkg" "$checksum.sha256"
+  )
+  [[ "$(python3 -I "$ROOT/build/verify-checksum.py" \
+    "$TMP/checksum/$pkg" "$TMP/checksum/$checksum.sha256")" == "$digest" ]]
+done
 
 printf '%s  %s\n' "$digest" other.tar.gz >"$TMP/checksum/wrong-name.sha256"
 printf '%s  %s\n%s  %s\n' "$digest" "$pkg" "$digest" other.tar.gz >"$TMP/checksum/multiple.sha256"
 printf '%s %s\n' "$digest" "$pkg" >"$TMP/checksum/one-space.sha256"
 printf '%s *%s\n' "$digest" "$pkg" >"$TMP/checksum/binary-marker.sha256"
 printf '%s  %s' "$digest" "$pkg" >"$TMP/checksum/no-newline.sha256"
-for checksum in wrong-name multiple one-space binary-marker no-newline; do
+printf '%s  %s\nJUNK' "$digest" "$pkg" >"$TMP/checksum/trailing-junk.sha256"
+printf '%s  %s\r\n' "$digest" "$pkg" >"$TMP/checksum/crlf.sha256"
+for checksum in wrong-name multiple one-space binary-marker no-newline trailing-junk crlf; do
   if (
     cd "$TMP/checksum"
     "$TMP/checksum-harness.sh" "$pkg" "$checksum.sha256"
@@ -177,7 +184,21 @@ for checksum in wrong-name multiple one-space binary-marker no-newline; do
     exit 1
   fi
   grep -Fq 'Invalid checksum file' "$TMP/checksum-$checksum.out"
+  if python3 -I "$ROOT/build/verify-checksum.py" \
+    "$TMP/checksum/$pkg" "$TMP/checksum/$checksum.sha256" \
+    >"$TMP/gate-checksum-$checksum.out" 2>&1; then
+    echo "release gate accepted malformed checksum file: $checksum" >&2
+    exit 1
+  fi
+  grep -Fq 'Invalid checksum file' "$TMP/gate-checksum-$checksum.out"
 done
+printf 'modified release bytes\n' >"$TMP/checksum/$pkg"
+if python3 -I "$ROOT/build/verify-checksum.py" \
+  "$TMP/checksum/$pkg" "$TMP/checksum/valid.sha256" >"$TMP/checksum-mismatch.out" 2>&1; then
+  echo 'release gate accepted a checksum mismatch' >&2
+  exit 1
+fi
+grep -Fq 'release checksum mismatch' "$TMP/checksum-mismatch.out"
 
 "$TMP/curl-retry-harness.sh" all-errors "$TMP/curl-all.args"
 grep -Fxq -- '--retry-all-errors' "$TMP/curl-all.args"

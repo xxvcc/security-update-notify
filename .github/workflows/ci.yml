@@ -221,7 +221,8 @@ jobs:
             build/download-retry-test.py \
             build/pty-driver.py \
             build/pty-driver-test.py \
-            build/release-archive-test.py
+            build/release-archive-test.py \
+            build/verify-checksum.py
 
       - name: Test PTY process-group cleanup
         run: python3 -I build/pty-driver-test.py
@@ -469,7 +470,7 @@ jobs:
               echo "::error::$dir must contain exactly the unsigned tarball and checksum"
               exit 1
             }
-            (cd "$dir" && sha256sum -c "$archive.sha256")
+            python3 -I build/verify-checksum.py "$dir/$archive" "$dir/$archive.sha256"
           done
           cmp "dist-a/$archive" "dist-b/$archive"
           cmp "dist-a/$archive.sha256" "dist-b/$archive.sha256"
@@ -1020,14 +1021,7 @@ jobs:
             }
           fi
 
-          [[ "$(wc -l <"rel/$archive.sha256")" -eq 1 ]]
-          read -r expected_sha expected_name extra <"rel/$archive.sha256"
-          [[ "$expected_sha" =~ ^[0-9a-f]{64}$ && "$expected_name" == "$archive" && -z "${extra:-}" ]] || {
-            echo "::error::checksum manifest is not bound to $archive"
-            exit 1
-          }
-          actual_sha="$(sha256sum "rel/$archive" | awk '{print $1}')"
-          [[ "$actual_sha" == "$expected_sha" ]] || { echo "::error::checksum mismatch"; exit 1; }
+          python3 -I build/verify-checksum.py "rel/$archive" "rel/$archive.sha256"
 
           expected_pin='C678256ACBFC6491BF5076655F3AE24999921FFC'
           source_pin="$(sed -n 's/^RELEASE_SIGNING_FINGERPRINT="\([0-9A-Fa-f]\{40\}\)"$/\1/p' released-source/sun.sh)"

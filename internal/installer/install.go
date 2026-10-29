@@ -321,7 +321,7 @@ func (i *Installer) Install(ctx context.Context, options Options) (result Result
 	if err != nil {
 		return Result{}, err
 	}
-	if err := i.verifyBackendPolicyFile(plan); err != nil {
+	if err := i.verifyBackendPolicyFile(ctx, plan); err != nil {
 		return Result{}, err
 	}
 	postInstallTest, postInstallDoctor, err := i.activateAndVerify(ctx, plan, options, previousVersion, automaticUnits, runtimeLock)

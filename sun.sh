@@ -12,9 +12,10 @@ fi
 
 # In -p mode Bash ignores exported function definitions but can retain their
 # raw BASH_FUNC_* environment entries. Re-exec with an empty environment so a
-# later Bash-script child cannot import them. For a pipe, the clean Bash reads
-# the unconsumed script body from stdin; for a file, it reopens this same file.
-if [[ ${SUN_BOOTSTRAP_CLEAN_PID:-} != "$BASHPID" ]]; then
+# later Bash-script child cannot import them. Never trust an inherited marker
+# to skip this step. For a pipe, the clean Bash reads the unconsumed body; for
+# a file, it opens the body separately so the original stdin stays available.
+{
   sun_clean_env=(
     PATH=/usr/sbin:/usr/bin:/sbin:/bin
     LC_ALL=C
@@ -32,14 +33,31 @@ if [[ ${SUN_BOOTSTRAP_CLEAN_PID:-} != "$BASHPID" ]]; then
     "SUN_LANG=${SUN_LANG-}"
   )
   if [[ -n ${BASH_SOURCE[0]:-} ]]; then
+    # shellcheck disable=SC2016 # These expressions run only in the clean child.
     exec -c /usr/bin/env -i "${sun_clean_env[@]}" \
-      "SUN_BOOTSTRAP_CLEAN_PID=$BASHPID" \
-      /bin/bash -p "${BASH_SOURCE[0]}" "$@"
+      /bin/bash -p -c '
+        exec 3<"$0" || exit 1
+        while IFS= read -r sun_header <&3; do
+          if [[ "$sun_header" == "# SUN_BOOTSTRAP_BODY" ]]; then
+            unset sun_header
+            if IFS= read -r -d "" sun_body <&3; then
+              printf "%s\n" "sun.sh: unexpected NUL in bootstrap body" >&2
+              exit 1
+            fi
+            exec 3<&-
+            eval "$sun_body"
+            exit "$?"
+          fi
+        done
+        printf "%s\n" "sun.sh: missing bootstrap body" >&2
+        exit 1
+      ' "${BASH_SOURCE[0]}" "$@"
   fi
   exec -c /usr/bin/env -i "${sun_clean_env[@]}" \
     /bin/bash -p -s -- "$@"
-fi
+}
 
+# SUN_BOOTSTRAP_BODY
 set -euo pipefail
 
 # Privileged bootstrap helpers must not be selected from /usr/local or a

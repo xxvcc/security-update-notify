@@ -84,9 +84,13 @@ Package-manager invocation is a separate fail-closed boundary. Before invoking i
 
 Self-upgrade also waits for the installer child to finish rollback after the first signal. A second termination signal forces exit; the installer still has a one-hour deadline.
 
+Dependency confirmations, notification setup, and hidden credential prompts also respond to the first termination signal without requiring Enter. Leaving hidden input restores terminal echo. Cancellation before package-manager mutation follows normal transaction rollback, restoring the previous configuration and timer and releasing the locks.
+
 This package-manager boundary includes `apt-get update`: it can run privileged APT hooks before package installation begins. A refresh failure after the existing timer has stopped can therefore retain an unsafe journal and leave that timer stopped. Inspect the journal and hook effects before manual recovery; a network error alone does not prove that no system state changed.
 
 Installer cleanup preserves `.security-update-notify-remove.*` entries whose ownership cannot be verified, including legacy entries. Only a validated `.security-update-notify-remove-owned.*` identity can resume deletion automatically. If cleanup reports a conflict, inspect both the original path and retained entry before restoring or deleting anything.
+
+Uninstall and purge apply the same checks during recursive directory cleanup. Authorization to remove a parent does not establish a child's identity: nested pending, legacy, or identity-mismatched quarantine entries are preserved and prevent removal of their parent.
 
 ## Backend details
 
@@ -100,6 +104,10 @@ SUN configures or uses:
 - apt periodic timers
 
 The installer enables unattended-upgrades security update timers. Before each overwrite of `/etc/apt/apt.conf.d/20auto-upgrades`, it saves a timestamped SUN-specific backup. If the file existed before SUN, the first install also preserves a fixed original baseline; if it was absent, SUN records a validated, rollback-protected absence marker before package-manager writes. When the `unattended-upgrades` dependency installed by this SUN transaction creates the distribution default, SUN binds its exact contents to a SHA-256 proof, promotes that file to the fixed baseline, and removes the absence marker. Purge can therefore retain the package and distribution timer while restoring a usable vendor configuration. A partial dependency transaction may be retried or purged only when the proof exactly matches the current file; a missing, damaged, or mismatched proof fails closed and preserves the evidence. If the package did not create the file, the original-absence marker remains authoritative and purge restores the file to absence. Markers, proofs, and timestamped backups in the APT configuration directory end in `.bak`, so apt silently ignores them instead of printing invalid-extension notices; upgrades migrate the older names. `--purge-config` finally removes SUN's baseline, marker, proof, and timestamped backups, and also cleans up the 1.1.x-era `/etc/apt/apt.conf.d/52unattended-upgrades-local`, but only when that file's bytes exactly match the policy 1.1.x wrote. 3.x never creates it, so an administrator's own file at the same path is left untouched.
+
+The managed periodic policy explicitly sets `APT::Periodic::Enable "1"`. Before committing installation, SUN reads the effective `apt-config dump`. If a later administrator configuration still disables the master switch, or the query fails or is incomplete, installation rolls back without editing that administrator configuration. Runtime checks distinguish the numeric master switch, interval values, and the boolean reboot policy. Intervals support positive day counts, `always`, and APT's `s`, `m`, `h`, and `d` units; `true`, `yes`, and `on` are not interval values. Older SUN periodic templates remain recognizable so upgrades and purge preserve the original baseline.
+
+When every security Origins-Pattern specifies a literal codename, SUN compares those names with readable local security InRelease Codename fields and reports when none match. Variables, wildcards, Allowed-Origins, and additional broad rules require unattended-upgrades' own interpretation. This check does not simulate its complete origin matching or dependency resolution; no reported policy issue does not guarantee that every security candidate can be installed automatically.
 
 It checks:
 

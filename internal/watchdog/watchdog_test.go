@@ -246,13 +246,13 @@ Unattended-Upgrade::Automatic-Reboot "false";`
 	if issues := CheckAPTPolicy(strings.Replace(apt, `"1"`, `"0"`, 1), false); len(issues) < 2 {
 		t.Fatalf("drifted apt policy issues=%v", issues)
 	}
-	for _, value := range []string{"1", "true", "yes", "on"} {
+	for _, value := range []string{"1", "2", "7", "always", "12h", "30m", "60s", "2d"} {
 		aptEquivalentTrue := `APT::Periodic::Update-Package-Lists "` + value + `";
 APT::Periodic::Unattended-Upgrade "` + value + `";
 Unattended-Upgrade::Origins-Pattern:: "origin=Debian,label=Debian-Security";
 Unattended-Upgrade::Automatic-Reboot "false";`
 		if issues := CheckAPTPolicy(aptEquivalentTrue, true); len(issues) != 0 {
-			t.Errorf("APT true value %q issues=%v", value, issues)
+			t.Errorf("APT interval %q issues=%v", value, issues)
 		}
 	}
 	for _, origin := range []string{
