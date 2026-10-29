@@ -297,6 +297,10 @@ func BlockedDNF5(unrestrictedAdvisoryJSON, checkUpgradeOutput, unrestrictedCheck
 	if err != nil {
 		return nil, err
 	}
+	return blockedDNFAdvisories(advisories, upgrades, unrestricted)
+}
+
+func blockedDNFAdvisories(advisories []DNF5Advisory, upgrades, unrestricted []DNF5Upgrade) ([]string, error) {
 	eligibleByKey := make(map[string]string)
 	for _, upgrade := range upgrades {
 		_, evr, ok := parseDNF5NEVRA(upgrade.NEVRA)

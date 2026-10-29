@@ -221,7 +221,8 @@ jobs:
             build/download-retry-test.py \
             build/pty-driver.py \
             build/pty-driver-test.py \
-            build/release-archive-test.py
+            build/release-archive-test.py \
+            build/verify-checksum.py
 
       - name: Test PTY process-group cleanup
         run: python3 -I build/pty-driver-test.py
@@ -469,7 +470,7 @@ jobs:
               echo "::error::$dir must contain exactly the unsigned tarball and checksum"
               exit 1
             }
-            (cd "$dir" && sha256sum -c "$archive.sha256")
+            python3 -I build/verify-checksum.py "$dir/$archive" "$dir/$archive.sha256"
           done
           cmp "dist-a/$archive" "dist-b/$archive"
           cmp "dist-a/$archive.sha256" "dist-b/$archive.sha256"
@@ -591,8 +592,8 @@ jobs:
       max-parallel: 3
       matrix:
         image:
-          - 'quay.io/centos/centos:stream9@sha256:467b387a39503bb0c7a34199477bbc848a25699937990ec7f6692d46a492a3fe'
-          - 'quay.io/centos/centos:stream10@sha256:bab116bbc06c9128e248c47ac9c4a4892ae3cb89d339eb7c2911150e92d0e5ff'
+          - 'quay.io/centos/centos:stream9@sha256:6f8045fc4f552544d8a401d61848bafc8d06ca7c11897c5b54a2c37fc419a20a'
+          - 'quay.io/centos/centos:stream10@sha256:99b8fe27dd4958b5dc2630ce35f5f6a7ff7bf9b2b1a72078102fde50d3277550'
           - 'oraclelinux:8-slim@sha256:aaef2b765b654067ef27e101dfb15c24df2133967575dfcf66bc968ff815c264'
           - 'oraclelinux:9-slim@sha256:33bcb689f7c8e6bd15bcee9a253538bc0b7cafeadb8b1a9d6ac90669c4497ce3'
           - 'oraclelinux:10-slim@sha256:afab39c390428a4fa3c909038c718dd893bc6b06b85bcad86c998fa9d0597c10'
@@ -1020,14 +1021,7 @@ jobs:
             }
           fi
 
-          [[ "$(wc -l <"rel/$archive.sha256")" -eq 1 ]]
-          read -r expected_sha expected_name extra <"rel/$archive.sha256"
-          [[ "$expected_sha" =~ ^[0-9a-f]{64}$ && "$expected_name" == "$archive" && -z "${extra:-}" ]] || {
-            echo "::error::checksum manifest is not bound to $archive"
-            exit 1
-          }
-          actual_sha="$(sha256sum "rel/$archive" | awk '{print $1}')"
-          [[ "$actual_sha" == "$expected_sha" ]] || { echo "::error::checksum mismatch"; exit 1; }
+          python3 -I build/verify-checksum.py "rel/$archive" "rel/$archive.sha256"
 
           expected_pin='C678256ACBFC6491BF5076655F3AE24999921FFC'
           source_pin="$(sed -n 's/^RELEASE_SIGNING_FINGERPRINT="\([0-9A-Fa-f]\{40\}\)"$/\1/p' released-source/sun.sh)"

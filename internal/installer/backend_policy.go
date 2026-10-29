@@ -1,8 +1,6 @@
 package installer
 
 import (
-	"bytes"
-
 	"errors"
 	"fmt"
 	"io/fs"
@@ -10,6 +8,7 @@ import (
 	"path"
 	"strings"
 
+	"github.com/xxvcc/security-update-notify/internal/aptconfig"
 	"github.com/xxvcc/security-update-notify/internal/dnfconfig"
 )
 
@@ -200,7 +199,7 @@ func (i *Installer) oldestAPTProjectBackup(skipManagedPolicy bool) (string, erro
 				}
 				return "", err
 			}
-			if bytes.Equal(data, []byte(aptPeriodicConfig)) {
+			if aptconfig.IsManagedPeriodic(data) {
 				continue
 			}
 		}

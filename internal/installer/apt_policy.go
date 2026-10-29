@@ -10,6 +10,7 @@ import (
 	"path"
 	"strings"
 
+	"github.com/xxvcc/security-update-notify/internal/aptconfig"
 	"github.com/xxvcc/security-update-notify/internal/dependencyproof"
 )
 
@@ -202,7 +203,7 @@ func (i *Installer) persistAPTDependencyBaseline(b *backup, configOriginallyAbse
 				// A marker plus the exact SUN policy and no timestamp history is the
 				// normal state when the package was already installed but this file was
 				// absent. Keep the absence baseline for purge.
-				if bytes.Equal(data, []byte(aptPeriodicConfig)) {
+				if aptconfig.IsManagedPeriodic(data) {
 					return nil
 				}
 				proven, err := i.validAPTDependencyProof(data)

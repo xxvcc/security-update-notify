@@ -2,11 +2,21 @@
 // and fail-closed uninstall provenance checks.
 package aptconfig
 
-const Periodic = `APT::Periodic::Update-Package-Lists "1";
+import "bytes"
+
+const Periodic = `APT::Periodic::Enable "1";
+` + LegacyPeriodic
+
+// LegacyPeriodic remains recognizable when restoring pre-3.3.3 SUN backups.
+const LegacyPeriodic = `APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::AutocleanInterval "7";
 APT::Periodic::Unattended-Upgrade "1";
 `
+
+func IsManagedPeriodic(content []byte) bool {
+	return bytes.Equal(content, []byte(Periodic)) || bytes.Equal(content, []byte(LegacyPeriodic))
+}
 
 // LegacyLocalPolicy is the exact unattended-upgrades policy that SUN 1.1.x
 // wrote to /etc/apt/apt.conf.d/52unattended-upgrades-local. Releases from 1.2

@@ -632,6 +632,10 @@ func removeClaimedTreeWithSync(directory *os.File, beforeChild func(string) erro
 	defer func() {
 		returnErr = errors.Join(returnErr, syncDirectory(directory))
 	}()
+	// Ownership of the parent does not verify an interrupted child claim.
+	if err := cleanupUninstallRemovalArtifacts(directory, trustedParentRemovalRecovery); err != nil {
+		return err
+	}
 	entries, readErr := directory.ReadDir(-1)
 	if readErr == nil {
 		for _, entry := range entries {

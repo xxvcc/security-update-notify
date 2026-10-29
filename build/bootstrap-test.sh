@@ -501,6 +501,8 @@ hostile_environment=(
   "BASH_FUNC_builtin%%=() { : >\"$TMP/function-called\"; return 97; }"
   "BASH_FUNC_readonly%%=() { : >\"$TMP/function-called\"; return 97; }"
   "BASH_FUNC_mapfile%%=() { : >\"$TMP/function-called\"; return 97; }"
+  "BASH_FUNC_read%%=() { : >\"$TMP/function-called\"; return 97; }"
+  "BASH_FUNC_eval%%=() { : >\"$TMP/function-called\"; return 97; }"
   "BASH_FUNC_command%%=() { : >\"$TMP/function-called\"; return 97; }"
   "BASH_FUNC_exec%%=() { : >\"$TMP/function-called\"; return 97; }"
   "BASH_FUNC_exit%%=() { : >\"$TMP/function-called\"; return 97; }"
@@ -527,5 +529,44 @@ grep -Fq 'All release download sources failed.' "$TMP/out"
 [[ ! -e "$TMP/bash-env-called" && ! -e "$TMP/function-called" ]]
 grep -Fxq 'BASH_ENV=unset' "$TMP/clean-env"
 grep -Fxq 'LD_PRELOAD=unset' "$TMP/clean-env"
+
+# A caller can predict the PID retained across exec. A matching inherited
+# cleanup marker must not leave raw exported functions in Bash-script helpers.
+for entry in file pipe; do
+  rm -f "$TMP/clean-env"
+  if [[ "$entry" == file ]]; then
+    # shellcheck disable=SC2016 # Forge the retained PID inside the child shell.
+    expect_rc 1 /usr/bin/env "${hostile_environment[@]}" /bin/bash -p -c '
+      export SUN_BOOTSTRAP_CLEAN_PID="$BASHPID"
+      exec /bin/bash -p "$@"
+    ' -- "$TMP/clean-env-sun.sh" \
+      --lang en --verify-signature off install --non-interactive
+  else
+    # shellcheck disable=SC2016 # Forge the retained PID inside the child shell.
+    expect_rc 1 /usr/bin/env "${hostile_environment[@]}" /bin/bash -p -c '
+      export SUN_BOOTSTRAP_CLEAN_PID="$BASHPID"
+      exec /bin/bash -p -s -- "$@"
+    ' -- --lang en --verify-signature off install --non-interactive \
+      <"$TMP/clean-env-sun.sh"
+  fi
+  grep -Fq 'All release download sources failed.' "$TMP/out"
+  [[ ! -e "$TMP/bash-env-called" && ! -e "$TMP/function-called" ]]
+  grep -Fxq 'UI_LANG=en' "$TMP/clean-env"
+  grep -Fxq 'https_proxy=http://proxy.example.invalid:8080' "$TMP/clean-env"
+  grep -Fxq 'BASH_ENV=unset' "$TMP/clean-env"
+  grep -Fxq 'LD_PRELOAD=unset' "$TMP/clean-env"
+  grep -Fxq 'readonly_type=builtin' "$TMP/clean-env"
+done
+
+# Exercise the production entry header with a tiny body to make sure clean
+# file dispatch retains both positional arguments and the original stdin.
+sed -n '1,/^# SUN_BOOTSTRAP_BODY$/p' "$ROOT/sun.sh" >"$TMP/entry-probe.sh"
+cat >>"$TMP/entry-probe.sh" <<'EOF'
+IFS= read -r input
+printf 'input=%s\narg=%s\n' "$input" "$1"
+EOF
+expect_rc 0 /bin/bash -p "$TMP/entry-probe.sh" 'argument with spaces' <<<'original stdin'
+grep -Fxq 'input=original stdin' "$TMP/out"
+grep -Fxq 'arg=argument with spaces' "$TMP/out"
 
 echo 'Bootstrap argument, TTY, and package-selection tests passed'

@@ -1,5 +1,49 @@
 # 变更记录
 
+## 3.3.3
+
+- 修复 APT 周期更新总开关漏检：受管配置明确启用 `APT::Periodic::Enable`，安装提交前检查实际生效的
+  总开关；后置管理员配置仍关闭它时回滚安装并保留管理员文件。周期值按 APT 的天数、`always` 和时间单位
+  检查，不再把 `true`、`yes`、`on` 当作有效周期。升级和卸载继续识别旧版受管模板，保护原始配置基线。
+  Detects a disabled APT periodic master switch, explicitly enables it in the managed policy, and checks
+  the effective switch before installation commits. Later administrator overrides cause rollback and remain
+  untouched. Interval checks accept APT day counts, `always`, and time units instead of boolean words.
+  Older managed templates remain recognizable during upgrade and purge to preserve the original baseline.
+  当全部安全源规则均指定固定 codename 时，还会对照本地安全源 InRelease 检测遗留的发行版不匹配；
+  含变量、通配符、Allowed-Origins 或宽泛匹配规则时不推断完整来源匹配结果。
+  When all security origin rules specify literal codenames, SUN also checks for release mismatches against
+  local security InRelease metadata. Variable, wildcard, Allowed-Origins, and broad rules remain outside
+  this limited check.
+- DNF4 阻塞检测改用实际应用 versionlock 的安全更新候选查询，并比较 RPM 版本覆盖关系，修复锁定的安全
+  更新漏报。DNF5 安全公告与更新候选不一致时保留未知状态，不再把空的回退结果当作已恢复并清除等待时长。
+  DNF4 blocked-update detection uses versionlock-aware security candidates and RPM version coverage,
+  fixing missed locked security updates. Inconsistent DNF5 advisories and candidates remain unknown;
+  an empty fallback no longer counts as recovery or clears the pending-update age.
+- 安装器在等待依赖确认、预检或隐藏凭据输入时可响应首次终止信号，恢复终端回显并沿正常事务路径回滚，
+  不再等待用户额外输入或遗留后台输入读取者。
+  Dependency, preflight, and hidden-credential prompts respond to the first termination signal, restore
+  terminal echo, and return through normal transaction rollback without waiting for more input or leaving
+  a background reader behind.
+- 卸载递归清理先验证嵌套隔离项；父目录的删除授权不再覆盖子项的未决状态。中断后重试仍保留 pending、
+  旧格式及身份冲突的子项和恢复证据。
+  Recursive uninstall cleanup validates nested quarantines independently of their parent's authorization.
+  Retrying an interrupted removal preserves pending, legacy, and identity-conflicting child entries and
+  their recovery evidence.
+- 引导器无条件在空环境中重新执行，不再信任可由调用者伪造的 PID 标记，阻断原始 `BASH_FUNC_*` 环境项
+  传入后续 Bash 子进程；文件与管道入口均保留参数和交互输入。
+  Bootstrap unconditionally re-executes in an empty environment instead of trusting a caller-controlled
+  PID marker, preventing raw `BASH_FUNC_*` entries from reaching later Bash children while preserving
+  arguments and interactive input for both file and pipe entrypoints.
+- 发布 CI、镜像同步与公网验证统一使用客户端相同的单条 checksum 字节协议，拒绝单空格分隔、额外记录及
+  无换行尾随数据，防止发布端接受客户端会拒绝的资产集合。
+  Release CI, mirror synchronization, and public verification enforce the clients' exact single-record
+  checksum protocol, rejecting single-space separators, extra records, and trailing unterminated data.
+- 生命周期测试在一次性 Ubuntu 容器中停用镜像自带的 Docker 周期更新禁用配置，以实测正常自动更新策略；
+  产品仍拒绝管理员后置禁用配置并回滚。更新上游已回收的 CentOS Stream 9/10 容器固定摘要。
+  Lifecycle fixtures remove the Ubuntu container image's Docker-only periodic-update disablement so
+  normal automatic-update policy can be exercised. The product still rejects later administrator
+  disablement and rolls back. Refreshes retired CentOS Stream 9/10 image digests.
+
 ## 3.3.2
 
 - 构建和 CI 工具链更新为 Go 1.26.10。服务沙箱保留检测其他用户进程所需的 `CAP_SYS_PTRACE`，

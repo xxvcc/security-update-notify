@@ -63,6 +63,13 @@ func (runtime dnfRuntime) advisoryArgs(unrestricted bool) []string {
 
 func (runtime dnfRuntime) checkUpgradeArgs(unrestricted bool) []string {
 	args := []string{"-q"}
+	if !runtime.isDNF5() {
+		args = append(args, "--setopt=autocheck_running_kernel=False")
+		if unrestricted {
+			args = append(args, "--disableplugin=versionlock", "--disableexcludes=all")
+		}
+		return append(args, "check-update", "--security")
+	}
 	if unrestricted {
 		// DNF5 implements versionlock inside PackageSack filtering rather than as a
 		// plugin. This per-query option bypasses every exclude source without changing

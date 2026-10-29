@@ -12,6 +12,18 @@ awk '$5 == "/src" { found = 1; if ($6 !~ /(^|,)ro(,|$)/) unsafe = 1 } END { exit
   exit 2
 }
 
+# Official Ubuntu container images disable periodic jobs; this fixture tests
+# their lifecycle. Remove only that exact image policy after the isolation gate.
+docker_periodic=/etc/apt/apt.conf.d/docker-disable-periodic-update
+if [[ -e "$docker_periodic" || -L "$docker_periodic" ]]; then
+  if [[ ! -f "$docker_periodic" || -L "$docker_periodic" ]] ||
+    ! cmp -s "$docker_periodic" <(printf 'APT::Periodic::Enable "0";\n'); then
+    echo "unexpected Docker periodic policy; refusing to change it" >&2
+    exit 1
+  fi
+  rm -- "$docker_periodic"
+fi
+
 ok() {
   if eval "$1"; then
     echo "  ok: $2"

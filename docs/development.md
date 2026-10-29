@@ -106,6 +106,7 @@ RPM 和尽力支持 APT 的 CI 容器通过 `build/container-lifecycle-test.sh c
 包装器在任何系统路径写入前检查一次性容器与只读 `/src`。Debian 11 使用官方 archive HTTPS 源，并要求将宿主公共 CA bundle
 只读挂载到 `/sun-test-ca-certificates.crt`；这只验证历史系统兼容性，不代表仍有持续安全支持。Fedora 44 仅在测试容器中关闭
 zchunk，以避开元数据分块传输阻塞。TLS、签名、校验和与 APT 过期检查保持开启；这些设置不进入安装器或用户主机。
+Ubuntu 生命周期容器还会停用镜像专有的 `docker-disable-periodic-update` 配置，使测试能启用周期更新；产品安装器不会删除该文件或绕过实际生效的 APT 总开关检查。
 
 ## 相关文档
 

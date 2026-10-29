@@ -134,9 +134,11 @@ func collectAPTPackageFactsObserved(healthEnabled bool, now time.Time, stale int
 	}
 
 	aptConfig := sysexec.RunTimeout(patchCommandTimeout, "apt-config", "dump")
+	effectiveAPTConfig := ""
 	if aptConfig.Code != 0 || commandOutputIncomplete(aptConfig) {
 		issues = append(issues, watchdog.Issue{Code: "apt-config-unreadable", ZH: "无法读取 APT 有效配置", EN: "Could not read the effective APT configuration"})
 	} else {
+		effectiveAPTConfig = aptConfig.Stdout
 		aptDailyEnabled := systemd.IsEnabled("apt-daily.timer")
 		issues = append(issues, watchdog.CheckAPTPolicy(aptConfig.Stdout, aptDailyEnabled)...)
 	}
@@ -148,7 +150,7 @@ func collectAPTPackageFactsObserved(healthEnabled bool, now time.Time, stale int
 	if aptCheck.Code != 0 || commandOutputIncomplete(aptCheck) {
 		issues = append(issues, watchdog.Issue{Code: "apt-check", ZH: "APT 依赖一致性检查失败，请运行 apt-get check", EN: "APT dependency consistency check failed; run apt-get check"})
 	}
-	issues = append(issues, checkAPTRepository(now, stale)...)
+	issues = append(issues, checkAPTRepositoryWithPolicy(now, stale, effectiveAPTConfig)...)
 	return pending, pendingObservation, blocked, issues
 }
 
@@ -192,7 +194,30 @@ func collectDNFPackageFactsObserved(healthEnabled bool) (watchdog.Pending, state
 	if issue, failed := dnfRepositoryIssue(unrestricted, unrestricted.Code == 0); failed {
 		issues = append(issues, issue, dnfBlockedQueryIssue())
 	} else if !regularFailed {
-		blocked = watchdog.BlockedDNF(pending, watchdog.CollectPending("dnf", unrestricted.Stdout))
+		restrictedCandidates := sysexec.RunTimeout(patchCommandTimeout, runtime.Command, runtime.checkUpgradeArgs(false)...)
+		unrestrictedCandidates := sysexec.RunTimeout(patchCommandTimeout, runtime.Command, runtime.checkUpgradeArgs(true)...)
+		queriesUsable := true
+		for _, result := range []sysexec.Result{restrictedCandidates, unrestrictedCandidates} {
+			if issue, failed := dnfRepositoryIssue(result, result.Code == 0 || result.Code == 100); failed {
+				issues = append(issues, issue)
+				queriesUsable = false
+				continue
+			}
+			candidates, err := backend.ParseDNF4CheckUpgrades(result.Stdout)
+			if err != nil || (result.Code == 0) != (len(candidates) == 0) {
+				queriesUsable = false
+			}
+		}
+		if queriesUsable {
+			var err error
+			blocked, err = backend.BlockedDNF4(unrestricted.Stdout, restrictedCandidates.Stdout, unrestrictedCandidates.Stdout)
+			queriesUsable = err == nil
+		}
+		if !queriesUsable {
+			issues = append(issues, dnfBlockedQueryIssue())
+			pending.Known = false
+			pendingObservation = observationFor(pending.Count > 0, false)
+		}
 	}
 	content, err := readBoundedFile(dnfAutomaticConfigPath(), maxAutomaticConfigBytes)
 	if err != nil {
@@ -219,10 +244,12 @@ func collectDNF5PackageFactsObserved(healthEnabled bool, runtime dnfRuntime) (wa
 
 	normalized := ""
 	var parseErr error
+	associationFailed := false
 	if !regularFailed {
 		if transactionUsable {
 			normalized, parseErr = backend.NormalizeDNF5Pending(regular.Stdout, transaction.Stdout)
 			if parseErr != nil {
+				associationFailed = true
 				// A valid advisory response is stronger evidence than a failed
 				// advisory/transaction join. Conservatively over-report the
 				// advisories instead of turning parser drift into a false green.
@@ -233,8 +260,8 @@ func collectDNF5PackageFactsObserved(healthEnabled bool, runtime dnfRuntime) (wa
 		}
 	}
 	pending := watchdog.CollectPending("dnf", normalized)
-	pending.Known = !regularFailed && parseErr == nil && transactionUsable
-	pendingObservation := observationFor(pending.Count > 0, !regularFailed && parseErr == nil)
+	pending.Known = !regularFailed && parseErr == nil && transactionUsable && !associationFailed
+	pendingObservation := observationFor(pending.Count > 0, pending.Known)
 	if !healthEnabled {
 		return pending, pendingObservation, nil, nil
 	}
@@ -245,6 +272,8 @@ func collectDNF5PackageFactsObserved(healthEnabled bool, runtime dnfRuntime) (wa
 		issues = append(issues, regularIssue)
 	} else if parseErr != nil {
 		issues = append(issues, watchdog.Issue{Code: "dnf-advisory-output-invalid", ZH: "DNF5 返回了无法解析的安全公告数据", EN: "DNF5 returned unparseable security-advisory data"})
+	} else if associationFailed {
+		issues = append(issues, watchdog.Issue{Code: "dnf-security-transaction-invalid", ZH: "DNF5 安全公告与更新事务不一致，无法确认补丁状态", EN: "DNF5 security advisories and update candidates disagree; patch state could not be confirmed"})
 	}
 	if transactionFailed {
 		issues = append(issues, transactionIssue)
@@ -297,13 +326,17 @@ func collectDNF5PackageFactsObserved(healthEnabled bool, runtime dnfRuntime) (wa
 }
 
 func checkAPTRepository(now time.Time, stale int) []watchdog.Issue {
+	return checkAPTRepositoryWithPolicy(now, stale, "")
+}
+
+func checkAPTRepositoryWithPolicy(now time.Time, stale int, policy string) []watchdog.Issue {
 	var issues []watchdog.Issue
 	show := sysexec.RunTimeout(patchCommandTimeout, "systemctl", "show", "apt-daily.service", "-p", "Result", "--value")
 	result := strings.TrimSpace(show.Stdout)
 	if show.Code != 0 || commandOutputIncomplete(show) || strings.TrimSpace(show.Stderr) != "" ||
 		result == "" || len(strings.Fields(result)) != 1 {
 		issues = append(issues, watchdog.Issue{Code: "apt-daily-status-unreadable", ZH: "无法读取上次 APT 软件源刷新结果（apt-daily.service）", EN: "Could not read the last APT metadata-refresh result (apt-daily.service)"})
-		return append(issues, inspectAPTMetadata(aptListsPath(), now, stale)...)
+		return append(issues, inspectAPTMetadataWithPolicy(aptListsPath(), now, stale, policy)...)
 	}
 	if result != "success" {
 		journal := sysexec.RunTimeout(patchCommandTimeout, "journalctl", "-u", "apt-daily.service", "-n", "100", "--no-pager", "-o", "cat")
@@ -313,15 +346,20 @@ func checkAPTRepository(now time.Time, stale int) []watchdog.Issue {
 			issues = append(issues, watchdog.Issue{Code: "apt-daily-failed", ZH: "上次 APT 软件源刷新失败（apt-daily.service）", EN: "The last APT metadata refresh failed (apt-daily.service)"})
 		}
 	}
-	return append(issues, inspectAPTMetadata(aptListsPath(), now, stale)...)
+	return append(issues, inspectAPTMetadataWithPolicy(aptListsPath(), now, stale, policy)...)
 }
 
 func inspectAPTMetadata(dir string, now time.Time, stale int) []watchdog.Issue {
+	return inspectAPTMetadataWithPolicy(dir, now, stale, "")
+}
+
+func inspectAPTMetadataWithPolicy(dir string, now time.Time, stale int, policy string) []watchdog.Issue {
 	paths, _ := filepath.Glob(filepath.Join(dir, "*InRelease"))
 	if len(paths) == 0 {
 		return []watchdog.Issue{{Code: "apt-metadata-missing", ZH: "未发现已验证的 APT InRelease 元数据", EN: "No verified APT InRelease metadata was found"}}
 	}
 	latestSecurity := time.Time{}
+	var securityCodenames []string
 	hasSecurity, expired, unreadable := false, false, false
 	for _, path := range paths {
 		name := strings.ToLower(filepath.Base(path))
@@ -338,6 +376,11 @@ func inspectAPTMetadata(dir string, now time.Time, stale int) []watchdog.Issue {
 			}
 		}
 		for _, line := range strings.Split(b, "\n") {
+			if isSecurity && strings.HasPrefix(line, "Codename:") {
+				if codename := strings.TrimSpace(strings.TrimPrefix(line, "Codename:")); codename != "" {
+					securityCodenames = append(securityCodenames, codename)
+				}
+			}
 			if !strings.HasPrefix(strings.ToLower(line), "valid-until:") {
 				continue
 			}
@@ -347,7 +390,6 @@ func inspectAPTMetadata(dir string, now time.Time, stale int) []watchdog.Issue {
 					expired = true
 				}
 			}
-			break
 		}
 	}
 	var issues []watchdog.Issue
@@ -362,6 +404,9 @@ func inspectAPTMetadata(dir string, now time.Time, stale int) []watchdog.Issue {
 	}
 	if stale > 0 && !latestSecurity.IsZero() && durationExceedsDays(now.Sub(latestSecurity), stale) {
 		issues = append(issues, watchdog.Issue{Code: "apt-metadata-stale", ZH: fmt.Sprintf("APT 软件源元数据已超过 %d 天未刷新", stale), EN: fmt.Sprintf("APT repository metadata has not been refreshed for more than %d days", stale)})
+	}
+	if !unreadable {
+		issues = append(issues, watchdog.CheckAPTSecurityOriginCodenames(policy, securityCodenames)...)
 	}
 	return issues
 }

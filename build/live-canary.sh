@@ -247,12 +247,10 @@ if [[ -n "$bootstrap_signature_asset" ]]; then
     die "GitHub/mirror mismatch: $bootstrap_signature_asset"
 fi
 
-[[ "$(wc -l <"$work/mirror/$archive.sha256")" -eq 1 ]] || die "invalid checksum manifest line count"
-read -r expected_sha expected_name extra <"$work/mirror/$archive.sha256"
-[[ "$expected_sha" == "$manifest_sha" && "$expected_name" == "$archive" && -z "${extra:-}" ]] ||
+expected_sha="$(python3 -I "$root_dir/build/verify-checksum.py" \
+  "$work/mirror/$archive" "$work/mirror/$archive.sha256")"
+[[ "$expected_sha" == "$manifest_sha" ]] ||
   die "checksum manifest is not bound to latest.json"
-actual_sha="$(sha256sum "$work/mirror/$archive" | awk '{print $1}')"
-[[ "$actual_sha" == "$expected_sha" ]] || die "release checksum mismatch"
 
 export GNUPGHOME="$work/gnupg"
 install -d -m 0700 "$GNUPGHOME"
